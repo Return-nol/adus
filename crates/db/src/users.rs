@@ -59,6 +59,34 @@ pub async fn insert(pool: &PgPool, email: &str, password_hash: &str, role: Role)
     .await
 }
 
+/// Buat admin pertama hanya jika tabel `users` kosong; `None` = sudah ada user.
+/// Tabel dikunci selama transaksi supaya dua setup bersamaan tidak membuat dua admin.
+pub async fn insert_first_admin(
+    pool: &PgPool,
+    email: &str,
+    password_hash: &str,
+) -> Result<Option<User>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE users IN EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let existing: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&mut *tx)
+        .await?;
+    if existing > 0 {
+        return Ok(None);
+    }
+    let user = sqlx::query_as(&format!(
+        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'admin') RETURNING {COLUMNS}"
+    ))
+    .bind(email)
+    .bind(password_hash)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(user))
+}
+
 pub async fn by_email(pool: &PgPool, email: &str) -> Result<Option<User>> {
     sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM users WHERE email = $1::citext"
@@ -136,6 +164,19 @@ mod tests {
         );
         let found = by_email(&pool, "ANN@example.com").await.unwrap().unwrap();
         assert_eq!(found.email, "Ann@Example.com");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn first_admin_only_when_table_empty(pool: PgPool) {
+        let first = insert_first_admin(&pool, "a@x.io", "h").await.unwrap();
+        assert_eq!(first.unwrap().role, Role::Admin);
+        assert!(
+            insert_first_admin(&pool, "b@x.io", "h")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count(&pool).await.unwrap(), 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

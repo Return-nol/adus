@@ -17,12 +17,14 @@ adus-review = { path = "crates/review" }
 adus-server = { path = "crates/server" }
 
 aes-gcm = "0.10"
+argon2 = "0.5"
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["derive", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls", "chrono", "uuid"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
