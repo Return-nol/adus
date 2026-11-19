@@ -9,3 +9,8 @@ workspace = true
 
 [dependencies]
 adus-core.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+similar.workspace = true
+thiserror.workspace = true
