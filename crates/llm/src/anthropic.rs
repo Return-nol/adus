@@ -5,7 +5,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::types::{ChatRequest, ChatResponse, LlmClient, LlmError, decode, non_empty, send};
+use crate::types::{
+    ChatRequest, ChatResponse, LlmClient, LlmError, decode, key_header, non_empty, send,
+};
 
 pub struct AnthropicClient {
     http: Client,
@@ -54,7 +56,7 @@ impl LlmClient for AnthropicClient {
         let request = self
             .http
             .post(url)
-            .header("x-api-key", api_key)
+            .header("x-api-key", key_header(api_key)?)
             .header("anthropic-version", "2023-06-01")
             .json(&body);
         let messages: Messages = decode(send(request).await?).await?;

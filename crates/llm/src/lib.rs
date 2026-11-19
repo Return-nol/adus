@@ -32,9 +32,9 @@ pub fn client_for(
         return Box::new(MissingBaseUrl);
     };
     match kind {
-        ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
-            Box::new(OpenAiClient::new(http, base))
-        }
+        // OpenAI asli menolak `max_tokens` di model baru; server kompatibel umumnya hanya kenal itu.
+        ProviderKind::Openai => Box::new(OpenAiClient::new(http, base, "max_completion_tokens")),
+        ProviderKind::OpenaiCompatible => Box::new(OpenAiClient::new(http, base, "max_tokens")),
         ProviderKind::Anthropic => Box::new(AnthropicClient::new(http, base)),
         ProviderKind::Gemini => Box::new(GeminiClient::new(http, base)),
     }

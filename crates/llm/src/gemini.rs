@@ -5,7 +5,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::types::{ChatRequest, ChatResponse, LlmClient, LlmError, decode, non_empty, send};
+use crate::types::{
+    ChatRequest, ChatResponse, LlmClient, LlmError, decode, key_header, non_empty, send,
+};
 
 pub struct GeminiClient {
     http: Client,
@@ -74,7 +76,7 @@ impl LlmClient for GeminiClient {
         let request = self
             .http
             .post(url)
-            .header("x-goog-api-key", api_key)
+            .header("x-goog-api-key", key_header(api_key)?)
             .json(&body);
         let generated: Generated = decode(send(request).await?).await?;
         if let Some(reason) = generated.prompt_feedback.and_then(|f| f.block_reason) {

@@ -59,7 +59,7 @@ async fn openai_parses_text_and_usage() {
         .and(header("authorization", format!("Bearer {KEY}").as_str()))
         .and(body_partial_json(json!({
             "model": "m-1",
-            "max_tokens": 321,
+            "max_completion_tokens": 321,
             "messages": [
                 {"role": "system", "content": "be brief"},
                 {"role": "user", "content": "hello"},
@@ -82,6 +82,36 @@ async fn openai_parses_text_and_usage() {
             output_tokens: 7
         }
     );
+}
+
+#[tokio::test]
+async fn openai_sends_max_completion_tokens_only() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{"message": {"content": "x"}}]})),
+    )
+    .await;
+    chat(ProviderKind::Openai, &server).await.unwrap();
+    let body: Value = server.received_requests().await.unwrap()[0]
+        .body_json()
+        .unwrap();
+    assert_eq!(body["max_completion_tokens"], 321);
+    assert!(body.get("max_tokens").is_none());
+}
+
+#[tokio::test]
+async fn compatible_sends_max_tokens_only() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{"message": {"content": "x"}}]})),
+    )
+    .await;
+    chat(ProviderKind::OpenaiCompatible, &server).await.unwrap();
+    let body: Value = server.received_requests().await.unwrap()[0]
+        .body_json()
+        .unwrap();
+    assert_eq!(body["max_tokens"], 321);
+    assert!(body.get("max_completion_tokens").is_none());
 }
 
 #[tokio::test]
@@ -386,4 +416,121 @@ async fn other_status_is_invalid_without_body() {
     let server = serve(OPENAI_PATH, ResponseTemplate::new(418)).await;
     let err = chat(ProviderKind::Openai, &server).await.unwrap_err();
     assert!(matches!(err, LlmError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn gemini_invalid_api_key_is_unauthorized() {
+    let by_reason = json!({"error": {
+        "code": 400,
+        "message": "whatever",
+        "status": "INVALID_ARGUMENT",
+        "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "API_KEY_INVALID"}],
+    }});
+    let by_status = json!({"error": {
+        "code": 400,
+        "message": "API key not valid. Please pass a valid API key.",
+        "status": "INVALID_ARGUMENT",
+    }});
+    for body in [by_reason, by_status] {
+        let server = serve(GEMINI_PATH, ResponseTemplate::new(400).set_body_json(body)).await;
+        assert_eq!(
+            chat(ProviderKind::Gemini, &server).await.unwrap_err(),
+            LlmError::Unauthorized
+        );
+    }
+}
+
+#[tokio::test]
+async fn gemini_other_invalid_argument_stays_invalid() {
+    let server = serve(
+        GEMINI_PATH,
+        ResponseTemplate::new(400).set_body_json(
+            json!({"error": {"message": "Unknown field", "status": "INVALID_ARGUMENT"}}),
+        ),
+    )
+    .await;
+    let err = chat(ProviderKind::Gemini, &server).await.unwrap_err();
+    assert!(matches!(err, LlmError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn retry_after_is_clamped_to_one_hour() {
+    let server = serve(
+        OPENAI_PATH,
+        ResponseTemplate::new(429).insert_header("retry-after", u64::MAX.to_string().as_str()),
+    )
+    .await;
+    assert_eq!(
+        chat(ProviderKind::Openai, &server).await.unwrap_err(),
+        LlmError::RateLimited {
+            retry_after: Some(Duration::from_secs(3600))
+        }
+    );
+}
+
+#[tokio::test]
+async fn malformed_base_url_is_invalid_not_transient() {
+    let err = client_for(
+        ProviderKind::Openai,
+        Some("not a url"),
+        reqwest::Client::new(),
+    )
+    .chat(KEY, &request())
+    .await
+    .unwrap_err();
+    assert_eq!(err, LlmError::Invalid("invalid request".into()));
+}
+
+#[tokio::test]
+async fn truncated_200_body_is_transient_but_bad_json_is_invalid() {
+    // Server mentah: janji 100 byte, kirim 4 byte, lalu tutup koneksi.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let response = [
+            "HTTP/1.1 200 OK",
+            "content-type: application/json",
+            "content-length: 100",
+            "",
+            "{\"a\"",
+        ]
+        .join(
+            "
+",
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+    let err = client_for(ProviderKind::Openai, Some(&uri), reqwest::Client::new())
+        .chat(KEY, &request())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LlmError::Transient(_)), "{err:?}");
+
+    let server = serve(
+        OPENAI_PATH,
+        ResponseTemplate::new(200).set_body_string("not json"),
+    )
+    .await;
+    assert_eq!(
+        chat(ProviderKind::Openai, &server).await.unwrap_err(),
+        LlmError::Invalid("malformed response".into())
+    );
+}
+
+#[tokio::test]
+async fn multibyte_message_is_truncated_on_char_boundary() {
+    let long = "é".repeat(300);
+    let server = serve(
+        OPENAI_PATH,
+        ResponseTemplate::new(400).set_body_json(json!({"error": {"message": long}})),
+    )
+    .await;
+    let LlmError::Invalid(msg) = chat(ProviderKind::Openai, &server).await.unwrap_err() else {
+        panic!("expected Invalid");
+    };
+    assert_eq!(msg.matches('é').count(), 200);
 }

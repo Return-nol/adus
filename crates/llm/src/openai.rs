@@ -2,21 +2,27 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
+use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::types::{ChatRequest, ChatResponse, LlmClient, LlmError, decode, non_empty, send};
+use crate::types::{
+    ChatRequest, ChatResponse, LlmClient, LlmError, decode, key_header, non_empty, send,
+};
 
 pub struct OpenAiClient {
     http: Client,
     base_url: String,
+    /// Nama field batas token: OpenAI asli `max_completion_tokens`, server kompatibel `max_tokens`.
+    max_tokens_field: &'static str,
 }
 
 impl OpenAiClient {
-    pub fn new(http: Client, base_url: &str) -> Self {
+    pub fn new(http: Client, base_url: &str, max_tokens_field: &'static str) -> Self {
         Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
+            max_tokens_field,
         }
     }
 }
@@ -47,16 +53,23 @@ struct Usage {
 #[async_trait]
 impl LlmClient for OpenAiClient {
     async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        let body = json!({
+        let mut body = json!({
             "model": req.model,
             "messages": [
                 {"role": "system", "content": req.system},
                 {"role": "user", "content": req.user},
             ],
-            "max_tokens": req.max_tokens,
         });
+        body[self.max_tokens_field] = req.max_tokens.into();
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = send(self.http.post(url).bearer_auth(api_key).json(&body)).await?;
+        let bearer = key_header(&format!("Bearer {api_key}"))?;
+        let resp = send(
+            self.http
+                .post(url)
+                .header(AUTHORIZATION, bearer)
+                .json(&body),
+        )
+        .await?;
         let completion: Completion = decode(resp).await?;
         let text = completion
             .choices
