@@ -1,0 +1,7 @@
+{
+  "authenticatedUser": {
+    "id": "aaaa1111-0000-0000-0000-000000000001",
+    "providerDisplayName": "Ana Dev",
+    "properties": { "Account": { "$type": "System.String", "$value": "ana@example.com" } }
+  }
+}

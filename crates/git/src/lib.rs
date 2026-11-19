@@ -1,3 +1,4 @@
+pub mod azure;
 pub mod diff;
 pub mod github;
 pub mod types;
@@ -7,6 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 pub use adus_core::types::{ConnectionKind, normalize_path};
+pub use azure::AzureProvider;
 pub use github::GithubProvider;
 pub use types::{
     FileDiff, FileStatus, GitError, InlineComment, PatOwner, PullRequest, RemoteRepo, RepoRef,
@@ -54,9 +56,44 @@ pub trait GitProviderFactory: Send + Sync {
     -> Arc<dyn GitProvider>;
 }
 
-/// Pabrik provider asli. `impl GitProviderFactory` ditambahkan di Task 8-9 saat GitHub/Azure ada.
+/// Pabrik provider asli: membuat `GithubProvider` / `AzureProvider` per token.
 pub struct HttpGitProviderFactory {
     pub http: reqwest::Client,
     pub github_base: String,
     pub azure_base: String,
+}
+
+impl HttpGitProviderFactory {
+    /// Base URL publik: `https://api.github.com` dan `https://dev.azure.com`.
+    pub fn new(http: reqwest::Client) -> Self {
+        Self {
+            http,
+            github_base: "https://api.github.com".into(),
+            azure_base: "https://dev.azure.com".into(),
+        }
+    }
+}
+
+impl GitProviderFactory for HttpGitProviderFactory {
+    /// `org_or_owner` dipakai Azure sebagai organization; GitHub tidak memakainya.
+    fn create(
+        &self,
+        kind: ConnectionKind,
+        org_or_owner: &str,
+        token: &str,
+    ) -> Arc<dyn GitProvider> {
+        match kind {
+            ConnectionKind::Github => Arc::new(GithubProvider::new(
+                self.http.clone(),
+                self.github_base.clone(),
+                token.to_string(),
+            )),
+            ConnectionKind::AzureDevops => Arc::new(AzureProvider::new(
+                self.http.clone(),
+                self.azure_base.clone(),
+                org_or_owner.to_string(),
+                token.to_string(),
+            )),
+        }
+    }
 }

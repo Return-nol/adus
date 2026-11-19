@@ -1,0 +1,6 @@
+{
+  "allChangesIncluded": true,
+  "changes": [
+    { "changeType": "edit", "item": { "path": "/src/a.rs", "gitObjectType": "blob" } }
+  ]
+}

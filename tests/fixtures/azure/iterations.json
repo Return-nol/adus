@@ -1,0 +1,7 @@
+{
+  "count": 2,
+  "value": [
+    { "id": 1, "commonRefCommit": { "commitId": "oldbase" } },
+    { "id": 2, "commonRefCommit": { "commitId": "mergebase" } }
+  ]
+}

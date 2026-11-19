@@ -1,0 +1,16 @@
+{
+  "count": 2,
+  "value": [
+    {
+      "id": "rrrr0000-0000-0000-0000-000000000001",
+      "name": "alpha",
+      "defaultBranch": "refs/heads/main",
+      "project": { "id": "pppp0000-0000-0000-0000-000000000001", "name": "Shop" }
+    },
+    {
+      "id": "rrrr0000-0000-0000-0000-000000000002",
+      "name": "empty-repo",
+      "project": { "id": "pppp0000-0000-0000-0000-000000000001", "name": "Shop" }
+    }
+  ]
+}

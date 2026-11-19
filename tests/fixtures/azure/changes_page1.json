@@ -1,0 +1,8 @@
+{
+  "changeEntries": [
+    { "changeType": "edit", "item": { "path": "/src/a.rs", "gitObjectType": "blob" } },
+    { "changeType": "add", "item": { "path": "/src", "isFolder": true, "gitObjectType": "tree" } }
+  ],
+  "nextSkip": 2,
+  "nextTop": 2
+}

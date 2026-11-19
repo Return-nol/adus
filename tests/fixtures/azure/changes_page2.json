@@ -1,0 +1,10 @@
+{
+  "changeEntries": [
+    { "changeType": "add", "item": { "path": "/src/new.rs", "gitObjectType": "blob" } },
+    { "changeType": "delete", "item": { "path": "/src/gone.rs", "gitObjectType": "blob" } },
+    { "changeType": "edit, rename", "item": { "path": "/src/moved.rs", "gitObjectType": "blob" }, "originalPath": "/src/orig.rs" },
+    { "changeType": "edit", "item": { "path": "/img/logo.png", "gitObjectType": "blob" } }
+  ],
+  "nextSkip": 0,
+  "nextTop": 0
+}
