@@ -24,13 +24,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{error::ApiError, state::AppState};
+use crate::{
+    error::{ApiError, ApiJson},
+    state::AppState,
+};
 
 const COOKIE_NAME: &str = "adus_session";
 const SESSION_DAYS: i64 = 30;
 const MIN_PASSWORD_LEN: usize = 8;
 
 pub fn routes() -> Router<AppState> {
+    // Hitung hash palsu sekarang (saat start), bukan di request login pertama.
+    dummy_hash();
     Router::new()
         .route("/auth/status", get(status))
         .route("/auth/setup", post(setup))
@@ -76,7 +81,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<serde_json::Value>
 
 async fn setup(
     State(state): State<AppState>,
-    Json(body): Json<Credentials>,
+    ApiJson(body): ApiJson<Credentials>,
 ) -> Result<Response, ApiError> {
     let email = body.email.trim();
     if !email.contains('@') {
@@ -88,13 +93,14 @@ async fn setup(
         )));
     }
 
+    // Cek murah sebelum hashing; transaksi di bawah tetap penjaga yang menentukan.
+    if users::count(&state.db).await? > 0 {
+        return Err(already_set_up());
+    }
+
     let hash = hash_password(body.password).await?;
     let Some(user) = users::insert_first_admin(&state.db, email, &hash).await? else {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "already_set_up",
-            "Adus is already set up",
-        ));
+        return Err(already_set_up());
     };
 
     let cookie = start_session(&state, &user).await?;
@@ -106,16 +112,21 @@ async fn setup(
     Ok(reply.into_response())
 }
 
+fn already_set_up() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "already_set_up",
+        "Adus is already set up",
+    )
+}
+
 async fn login(
     State(state): State<AppState>,
-    Json(body): Json<Credentials>,
+    ApiJson(body): ApiJson<Credentials>,
 ) -> Result<Response, ApiError> {
     let found = users::by_email(&state.db, body.email.trim()).await?;
     // Email tidak dikenal tetap memverifikasi hash palsu supaya waktu respons mirip.
-    let hash = match &found {
-        Some(user) => user.password_hash.clone(),
-        None => dummy_hash().to_string(),
-    };
+    let hash = found.as_ref().map(|user| user.password_hash.clone());
     let password_ok = verify_password(body.password, hash).await?;
 
     match found {
@@ -242,20 +253,28 @@ fn hash_password_sync(password: &str) -> Result<String, argon2::password_hash::E
 async fn hash_password(password: String) -> Result<String, ApiError> {
     match tokio::task::spawn_blocking(move || hash_password_sync(&password)).await {
         Ok(Ok(hash)) => Ok(hash),
-        _ => {
-            tracing::error!("password hashing failed");
+        Ok(Err(err)) => {
+            tracing::error!("password hashing failed: {err}");
+            Err(ApiError::internal())
+        }
+        Err(err) => {
+            tracing::error!("password hashing task failed: {err}");
             Err(ApiError::internal())
         }
     }
 }
 
 /// `false` jika password salah atau hash tidak bisa di-parse.
-async fn verify_password(password: String, hash: String) -> Result<bool, ApiError> {
-    let verified = tokio::task::spawn_blocking(move || match PasswordHash::new(&hash) {
-        Ok(parsed) => Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok(),
-        Err(_) => false,
+/// `hash = None` (user tidak ada) memverifikasi hash palsu; semuanya di thread blocking.
+async fn verify_password(password: String, hash: Option<String>) -> Result<bool, ApiError> {
+    let verified = tokio::task::spawn_blocking(move || {
+        let hash = hash.unwrap_or_else(|| dummy_hash().to_string());
+        match PasswordHash::new(&hash) {
+            Ok(parsed) => Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok(),
+            Err(_) => false,
+        }
     })
     .await;
     verified.map_err(|err| {

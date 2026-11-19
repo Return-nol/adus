@@ -1,5 +1,6 @@
 use axum::{
     Json,
+    extract::{FromRequest, rejection::JsonRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -63,5 +64,26 @@ impl From<sqlx::Error> for ApiError {
     fn from(err: sqlx::Error) -> ApiError {
         tracing::error!("database error: {err}");
         ApiError::internal()
+    }
+}
+
+/// Seperti `axum::Json`, tetapi penolakan (JSON rusak, field hilang, content-type salah)
+/// memakai format `ApiError`. Pakai ini di semua handler yang menerima body JSON.
+#[derive(FromRequest)]
+#[from_request(via(axum::Json), rejection(ApiError))]
+pub struct ApiJson<T>(pub T);
+
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> ApiError {
+        let message = rejection.body_text();
+        match rejection {
+            JsonRejection::JsonDataError(_) => ApiError::validation(message),
+            JsonRejection::MissingJsonContentType(_) => ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                message,
+            ),
+            _ => ApiError::new(StatusCode::BAD_REQUEST, "bad_request", message),
+        }
     }
 }

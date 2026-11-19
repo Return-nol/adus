@@ -1,6 +1,9 @@
 mod common;
 
-use axum::http::StatusCode;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode, header},
+};
 use common::{app, app_with_url, cookie_pair, get, post_empty, post_json, send, set_cookie};
 use serde_json::json;
 use sqlx::PgPool;
@@ -202,4 +205,33 @@ async fn email_without_at_is_422(pool: PgPool) {
     let reply = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
     assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(reply.body["error"]["code"], "validation_error");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn bad_json_bodies_use_api_error_format(pool: PgPool) {
+    let app = app(pool);
+    let raw = |body: &str, content_type: Option<&str>| {
+        let mut req = Request::post("/api/v1/auth/login");
+        if let Some(ct) = content_type {
+            req = req.header(header::CONTENT_TYPE, ct);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    };
+
+    let cases = [
+        ("{not json", Some("application/json"), 400, "bad_request"),
+        (
+            r#"{"email":"a@x.io"}"#,
+            Some("application/json"),
+            422,
+            "validation_error",
+        ),
+        ("{}", None, 415, "unsupported_media_type"),
+    ];
+    for (body, content_type, status, code) in cases {
+        let reply = send(&app, raw(body, content_type)).await;
+        assert_eq!(reply.status.as_u16(), status, "body {body}");
+        assert_eq!(reply.body["error"]["code"], code, "body {body}");
+        assert!(reply.body["error"]["message"].is_string());
+    }
 }
