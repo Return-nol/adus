@@ -19,7 +19,7 @@
 		{ label: 'AI Providers', href: '/ai-providers', icon: RiRobot2Line, admin: false },
 		{ label: 'Review Rules', href: '/review-rules', icon: RiRulerLine, admin: false },
 		{ label: 'Reviews', href: '/reviews', icon: RiGitPullRequestLine, admin: false },
-		{ label: 'Token Usage', href: '/token-usage', icon: RiBarChartLine, admin: false },
+		{ label: 'Token Usage', href: '/usage', icon: RiBarChartLine, admin: false },
 		{ label: 'Users', href: '/users', icon: RiGroupLine, admin: true },
 		{ label: 'Settings', href: '/settings', icon: RiSettings3Line, admin: true },
 		{ label: 'System status', href: '/system', icon: RiPulseLine, admin: true },

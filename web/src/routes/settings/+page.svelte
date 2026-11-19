@@ -1,0 +1,126 @@
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import { toast } from 'svelte-sonner';
+	import { api, ApiError } from '$lib/api';
+	import { session } from '$lib/session.svelte';
+	import type { Provider } from '$lib/components/provider-dialog.svelte';
+	import { Button } from '$lib/components/ui/button/index.js';
+	import * as Card from '$lib/components/ui/card/index.js';
+	import { Input } from '$lib/components/ui/input/index.js';
+	import { Label } from '$lib/components/ui/label/index.js';
+	import * as Select from '$lib/components/ui/select/index.js';
+
+	type Settings = {
+		default_provider_id: string | null;
+		default_model: string | null;
+		max_files_per_review: number;
+		max_patch_lines_per_file: number;
+	};
+
+	const isAdmin = $derived(session.user?.role === 'admin');
+	let providers = $state<Provider[]>([]);
+	let loaded = $state(false);
+	let busy = $state(false);
+	// '' = no default provider.
+	let providerId = $state('');
+	let model = $state('');
+	let maxFiles = $state(0);
+	let maxPatchLines = $state(0);
+
+	function fail(e: unknown) {
+		toast.error(e instanceof ApiError ? e.message : 'Could not reach the server');
+	}
+
+	function fill(s: Settings) {
+		providerId = s.default_provider_id ?? '';
+		model = s.default_model ?? '';
+		maxFiles = s.max_files_per_review;
+		maxPatchLines = s.max_patch_lines_per_file;
+	}
+
+	onMount(async () => {
+		if (!isAdmin) return;
+		try {
+			const [p, s] = await Promise.all([
+				api<Provider[]>('GET', '/ai-providers'),
+				api<Settings>('GET', '/settings')
+			]);
+			providers = p;
+			fill(s);
+			loaded = true;
+		} catch (e) {
+			fail(e);
+		}
+	});
+
+	async function save(event: SubmitEvent) {
+		event.preventDefault();
+		busy = true;
+		try {
+			fill(
+				await api<Settings>('PUT', '/settings', {
+					default_provider_id: providerId || null,
+					default_model: model.trim() || null,
+					max_files_per_review: maxFiles,
+					max_patch_lines_per_file: maxPatchLines
+				})
+			);
+			toast.success('Settings saved');
+		} catch (e) {
+			fail(e); // e.g. 422 default_model required
+		} finally {
+			busy = false;
+		}
+	}
+</script>
+
+<h1 class="mb-6 text-2xl font-semibold">Settings</h1>
+
+{#if !isAdmin}
+	<p class="text-muted-foreground">Settings are for admins only.</p>
+{:else if loaded}
+	<Card.Root class="max-w-xl">
+		<Card.Content>
+			<form class="grid gap-4" onsubmit={save}>
+				<div class="grid gap-2">
+					<Label>Default provider</Label>
+					<Select.Root type="single" bind:value={providerId}>
+						<Select.Trigger class="w-full">
+							{providers.find((p) => p.id === providerId)?.name ?? 'None'}
+						</Select.Trigger>
+						<Select.Content>
+							<Select.Item value="" label="None">None</Select.Item>
+							{#each providers as p (p.id)}
+								<Select.Item value={p.id} label={p.name}>{p.name}</Select.Item>
+							{/each}
+						</Select.Content>
+					</Select.Root>
+				</div>
+				<div class="grid gap-2">
+					<Label for="s-model">Default model</Label>
+					<Input
+						id="s-model"
+						placeholder="Required when a default provider is set"
+						bind:value={model}
+					/>
+				</div>
+				<div class="grid gap-2">
+					<Label for="s-files">Max files per review (1-500)</Label>
+					<Input id="s-files" type="number" min="1" max="500" required bind:value={maxFiles} />
+				</div>
+				<div class="grid gap-2">
+					<Label for="s-lines">Max patch lines per file (1-100000)</Label>
+					<Input
+						id="s-lines"
+						type="number"
+						min="1"
+						max="100000"
+						required
+						bind:value={maxPatchLines}
+					/>
+				</div>
+				<div><Button type="submit" disabled={busy}>Save</Button></div>
+			</form>
+		</Card.Content>
+	</Card.Root>
+{/if}
