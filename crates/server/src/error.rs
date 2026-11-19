@@ -1,6 +1,9 @@
 use axum::{
     Json,
-    extract::{FromRequest, rejection::JsonRejection},
+    extract::{
+        FromRequest, FromRequestParts,
+        rejection::{JsonRejection, PathRejection},
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -41,6 +44,14 @@ impl ApiError {
 
     pub fn forbidden() -> ApiError {
         ApiError::new(StatusCode::FORBIDDEN, "forbidden", "admin access required")
+    }
+
+    pub fn not_found() -> ApiError {
+        ApiError::new(StatusCode::NOT_FOUND, "not_found", "not found")
+    }
+
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> ApiError {
+        ApiError::new(StatusCode::CONFLICT, code, message)
     }
 
     pub fn internal() -> ApiError {
@@ -85,5 +96,16 @@ impl From<JsonRejection> for ApiError {
             ),
             _ => ApiError::new(StatusCode::BAD_REQUEST, "bad_request", message),
         }
+    }
+}
+
+/// Seperti `axum::extract::Path`, tetapi path yang tidak valid (mis. bukan UUID) menjadi 404 `not_found`.
+#[derive(FromRequestParts)]
+#[from_request(via(axum::extract::Path), rejection(ApiError))]
+pub struct ApiPath<T>(pub T);
+
+impl From<PathRejection> for ApiError {
+    fn from(_: PathRejection) -> ApiError {
+        ApiError::not_found()
     }
 }

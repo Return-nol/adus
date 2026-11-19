@@ -80,6 +80,18 @@ pub fn post_json(uri: &str, body: &Value, cookie: Option<&str>) -> Request<Body>
     req.body(Body::from(body.to_string())).unwrap()
 }
 
+/// Request JSON dengan method bebas (PUT, PATCH, ...).
+pub fn json_req(method: &str, uri: &str, body: &Value, cookie: Option<&str>) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(cookie) = cookie {
+        req = req.header(header::COOKIE, cookie);
+    }
+    req.body(Body::from(body.to_string())).unwrap()
+}
+
 pub fn post_empty(uri: &str, cookie: Option<&str>) -> Request<Body> {
     let mut req = Request::post(uri);
     if let Some(cookie) = cookie {

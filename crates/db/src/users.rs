@@ -48,13 +48,20 @@ pub async fn count_active_admins(pool: &PgPool) -> Result<i64> {
         .await
 }
 
-pub async fn insert(pool: &PgPool, email: &str, password_hash: &str, role: Role) -> Result<User> {
+pub async fn insert(
+    pool: &PgPool,
+    email: &str,
+    password_hash: &str,
+    role: Role,
+    github_login: Option<&str>,
+) -> Result<User> {
     sqlx::query_as(&format!(
-        "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING {COLUMNS}"
+        "INSERT INTO users (email, password_hash, role, github_login)          VALUES ($1, $2, $3, $4::citext) RETURNING {COLUMNS}"
     ))
     .bind(email)
     .bind(password_hash)
     .bind(role)
+    .bind(github_login)
     .fetch_one(pool)
     .await
 }
@@ -139,6 +146,55 @@ pub async fn update(pool: &PgPool, id: Uuid, patch: UserPatch) -> Result<User> {
     .await
 }
 
+/// Hasil `update_guarded`.
+#[derive(Debug)]
+pub enum GuardedUpdate {
+    Updated(User),
+    NotFound,
+    /// Perubahan akan menghilangkan admin aktif terakhir; tidak ada yang diubah.
+    LastAdmin,
+}
+
+/// Seperti `update`, tetapi menolak (`LastAdmin`) menurunkan peran atau menonaktifkan admin aktif terakhir.
+/// Baris admin aktif dikunci (`FOR UPDATE`) selama transaksi, jadi dua perubahan bersamaan
+/// diproses bergantian dan tidak bisa sama-sama lolos cek.
+pub async fn update_guarded(pool: &PgPool, id: Uuid, patch: UserPatch) -> Result<GuardedUpdate> {
+    let mut tx = pool.begin().await?;
+    let admins: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE role = 'admin' AND NOT disabled ORDER BY id FOR UPDATE",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    // Baris target dikunci juga supaya cek di bawah tidak basi.
+    let target: Option<(Role, bool)> =
+        sqlx::query_as("SELECT role, disabled FROM users WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((role, disabled)) = target else {
+        return Ok(GuardedUpdate::NotFound);
+    };
+
+    let is_active_admin = role == Role::Admin && !disabled;
+    let loses_admin = patch.role == Some(Role::User) || patch.disabled == Some(true);
+    if is_active_admin && loses_admin && admins.len() == 1 {
+        return Ok(GuardedUpdate::LastAdmin);
+    }
+
+    let user = sqlx::query_as(&format!(
+        "UPDATE users SET            role = COALESCE($2, role),            disabled = COALESCE($3, disabled),            github_login = CASE WHEN $4 THEN $5::citext ELSE github_login END          WHERE id = $1 RETURNING {COLUMNS}"
+    ))
+    .bind(id)
+    .bind(patch.role)
+    .bind(patch.disabled)
+    .bind(patch.github_login.is_some())
+    .bind(patch.github_login.flatten())
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(GuardedUpdate::Updated(user))
+}
+
 pub async fn set_password(pool: &PgPool, id: Uuid, password_hash: &str) -> Result<()> {
     sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
         .bind(id)
@@ -154,11 +210,11 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn email_is_unique_case_insensitive(pool: PgPool) {
-        insert(&pool, "Ann@Example.com", "h", Role::User)
+        insert(&pool, "Ann@Example.com", "h", Role::User, None)
             .await
             .unwrap();
         assert!(
-            insert(&pool, "ann@example.COM", "h", Role::User)
+            insert(&pool, "ann@example.COM", "h", Role::User, None)
                 .await
                 .is_err()
         );
@@ -181,9 +237,15 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn count_active_admins_ignores_disabled(pool: PgPool) {
-        let a = insert(&pool, "a@x.io", "h", Role::Admin).await.unwrap();
-        insert(&pool, "b@x.io", "h", Role::Admin).await.unwrap();
-        insert(&pool, "c@x.io", "h", Role::User).await.unwrap();
+        let a = insert(&pool, "a@x.io", "h", Role::Admin, None)
+            .await
+            .unwrap();
+        insert(&pool, "b@x.io", "h", Role::Admin, None)
+            .await
+            .unwrap();
+        insert(&pool, "c@x.io", "h", Role::User, None)
+            .await
+            .unwrap();
         assert_eq!(count_active_admins(&pool).await.unwrap(), 2);
 
         let patch = UserPatch {
@@ -197,7 +259,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn github_login_set_clear_and_lookup(pool: PgPool) {
-        let u = insert(&pool, "a@x.io", "h", Role::User).await.unwrap();
+        let u = insert(&pool, "a@x.io", "h", Role::User, None)
+            .await
+            .unwrap();
         let set = UserPatch {
             github_login: Some(Some("Octo".into())),
             ..Default::default()
@@ -220,5 +284,105 @@ mod tests {
         let u = update(&pool, u.id, clear).await.unwrap();
         assert!(u.github_login.is_none());
         assert!(by_github_login(&pool, "octo").await.unwrap().is_none());
+    }
+
+    fn demote() -> UserPatch {
+        UserPatch {
+            role: Some(Role::User),
+            ..Default::default()
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn guarded_update_refuses_last_active_admin(pool: PgPool) {
+        let admin = insert(&pool, "a@x.io", "h", Role::Admin, None)
+            .await
+            .unwrap();
+        let disable = UserPatch {
+            disabled: Some(true),
+            ..Default::default()
+        };
+        assert!(matches!(
+            update_guarded(&pool, admin.id, demote()).await.unwrap(),
+            GuardedUpdate::LastAdmin
+        ));
+        assert!(matches!(
+            update_guarded(&pool, admin.id, disable).await.unwrap(),
+            GuardedUpdate::LastAdmin
+        ));
+        assert_eq!(count_active_admins(&pool).await.unwrap(), 1);
+
+        // Perubahan lain tetap boleh.
+        let login = UserPatch {
+            github_login: Some(Some("octo".into())),
+            ..Default::default()
+        };
+        assert!(matches!(
+            update_guarded(&pool, admin.id, login).await.unwrap(),
+            GuardedUpdate::Updated(_)
+        ));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn guarded_update_allows_demoting_when_another_admin_exists(pool: PgPool) {
+        let a = insert(&pool, "a@x.io", "h", Role::Admin, None)
+            .await
+            .unwrap();
+        insert(&pool, "b@x.io", "h", Role::Admin, None)
+            .await
+            .unwrap();
+        let GuardedUpdate::Updated(user) = update_guarded(&pool, a.id, demote()).await.unwrap()
+        else {
+            panic!("expected Updated");
+        };
+        assert_eq!(user.role, Role::User);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn guarded_update_unknown_id_is_not_found(pool: PgPool) {
+        let result = update_guarded(&pool, Uuid::new_v4(), demote())
+            .await
+            .unwrap();
+        assert!(matches!(result, GuardedUpdate::NotFound));
+    }
+
+    /// Satu transaksi menahan kunci admin sambil menurunkan admin A; demosi B yang masuk
+    /// bersamaan harus menunggu, lalu melihat A sudah bukan admin dan ditolak.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_demotion_waits_for_admin_lock(pool: PgPool) {
+        let a = insert(&pool, "a@x.io", "h", Role::Admin, None)
+            .await
+            .unwrap();
+        let b = insert(&pool, "b@x.io", "h", Role::Admin, None)
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM users WHERE role = 'admin' FOR UPDATE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let other_pool = pool.clone();
+        let other = tokio::spawn(async move { update_guarded(&other_pool, b.id, demote()).await });
+        // Beri waktu agar `other` sampai ke kunci; tanpa kunci ia akan lolos dan test gagal.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("UPDATE users SET role = 'user' WHERE id = $1")
+            .bind(a.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let result = other.await.unwrap().unwrap();
+        assert!(matches!(result, GuardedUpdate::LastAdmin));
+        assert_eq!(count_active_admins(&pool).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn insert_with_github_login(pool: PgPool) {
+        let u = insert(&pool, "a@x.io", "h", Role::User, Some("Octo"))
+            .await
+            .unwrap();
+        assert_eq!(u.github_login.as_deref(), Some("Octo"));
     }
 }

@@ -84,14 +84,8 @@ async fn setup(
     ApiJson(body): ApiJson<Credentials>,
 ) -> Result<Response, ApiError> {
     let email = body.email.trim();
-    if !email.contains('@') {
-        return Err(ApiError::validation("email must contain '@'"));
-    }
-    if body.password.chars().count() < MIN_PASSWORD_LEN {
-        return Err(ApiError::validation(format!(
-            "password must be at least {MIN_PASSWORD_LEN} characters"
-        )));
-    }
+    validate_email(email)?;
+    validate_password(&body.password)?;
 
     // Cek murah sebelum hashing; transaksi di bawah tetap penjaga yang menentukan.
     if users::count(&state.db).await? > 0 {
@@ -110,6 +104,23 @@ async fn setup(
         Json(UserJson::from(user)),
     );
     Ok(reply.into_response())
+}
+
+pub(crate) fn validate_email(email: &str) -> Result<(), ApiError> {
+    if email.contains('@') {
+        Ok(())
+    } else {
+        Err(ApiError::validation("email must contain '@'"))
+    }
+}
+
+pub(crate) fn validate_password(password: &str) -> Result<(), ApiError> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(ApiError::validation(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        )));
+    }
+    Ok(())
 }
 
 fn already_set_up() -> ApiError {
@@ -226,7 +237,7 @@ fn cookie_headers(cookie: String) -> HeaderMap {
 }
 
 /// Token mentah dari header `Cookie`, jika ada.
-fn session_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn session_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -238,7 +249,7 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Yang disimpan di DB: SHA-256 heksadesimal dari token.
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
@@ -250,7 +261,7 @@ fn hash_password_sync(password: &str) -> Result<String, argon2::password_hash::E
 }
 
 /// Hash argon2 dihitung di thread blocking supaya runtime async tidak tersendat.
-async fn hash_password(password: String) -> Result<String, ApiError> {
+pub(crate) async fn hash_password(password: String) -> Result<String, ApiError> {
     match tokio::task::spawn_blocking(move || hash_password_sync(&password)).await {
         Ok(Ok(hash)) => Ok(hash),
         Ok(Err(err)) => {
@@ -266,7 +277,10 @@ async fn hash_password(password: String) -> Result<String, ApiError> {
 
 /// `false` jika password salah atau hash tidak bisa di-parse.
 /// `hash = None` (user tidak ada) memverifikasi hash palsu; semuanya di thread blocking.
-async fn verify_password(password: String, hash: Option<String>) -> Result<bool, ApiError> {
+pub(crate) async fn verify_password(
+    password: String,
+    hash: Option<String>,
+) -> Result<bool, ApiError> {
     let verified = tokio::task::spawn_blocking(move || {
         let hash = hash.unwrap_or_else(|| dummy_hash().to_string());
         match PasswordHash::new(&hash) {
