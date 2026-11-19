@@ -299,10 +299,10 @@ chart dan template Railway. Adus mengambil pola yang sama, disederhanakan untuk
 3 container:
 
 - **Image siap pakai.** GitHub Actions membangun dan mem-push
-  `ghcr.io/<owner>/adus:<versi>` (+ `latest`) saat tag `v*`, multi-arch
+  `ghcr.io/return-nol/adus:<versi>` (+ `latest`) saat tag `v*`, multi-arch
   (amd64, arm64), supaya pengguna tidak perlu meng-compile Rust. Compose memakai
-  `${ADUS_IMAGE:-ghcr.io/<owner>/adus}:${ADUS_VERSION:-latest}`; README
-  menyarankan pin versi. **[call]** `<owner>` diisi saat repo GitHub dibuat.
+  `${ADUS_IMAGE:-ghcr.io/return-nol/adus}:${ADUS_VERSION:-latest}`; README
+  menyarankan pin versi. Repo: https://github.com/Return-nol/adus (nama image GHCR wajib huruf kecil).
 - **`docker-compose.yml`:**
   - `adus` (port `8080`), `postgres:16` + `redis:7` (`appendonly yes`) dengan
     healthcheck dan volume `pgdata`, `redisdata`. DB/Redis tidak dipublish ke host.
