@@ -1,14 +1,14 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
-	import { api, ApiError } from '$lib/api';
-	import { session } from '$lib/session.svelte';
-	import type { Provider } from '$lib/components/provider-dialog.svelte';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import * as Card from '$lib/components/ui/card/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
-	import { Label } from '$lib/components/ui/label/index.js';
-	import * as Select from '$lib/components/ui/select/index.js';
+	import { api, ApiError } from '#lib/api.js';
+	import { session } from '#lib/session.svelte.js';
+	import type { Provider } from '#lib/components/provider-dialog.svelte';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
+	import { Input } from '#lib/components/ui/input/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
+	import * as Select from '#lib/components/ui/select/index.js';
 
 	type Settings = {
 		default_provider_id: string | null;
@@ -74,10 +74,14 @@
 	}
 </script>
 
-<h1 class="mb-6 text-2xl font-semibold">Settings</h1>
+<h1 class="mb-6 font-display text-3xl font-medium tracking-[0.01em] text-foreground">Settings</h1>
 
 {#if !isAdmin}
-	<p class="text-muted-foreground">Settings are for admins only.</p>
+	<div
+		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
+	>
+		Settings are for admins only.
+	</div>
 {:else if loaded}
 	<Card.Root class="max-w-xl">
 		<Card.Content>

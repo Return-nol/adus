@@ -1,19 +1,19 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
-	import { api, ApiError } from '$lib/api';
-	import { session } from '$lib/session.svelte';
-	import AddRepoDialog from '$lib/components/add-repo-dialog.svelte';
+	import { api, ApiError } from '#lib/api.js';
+	import { session } from '#lib/session.svelte.js';
+	import AddRepoDialog from '#lib/components/add-repo-dialog.svelte';
 	import ConnectionDialog, {
 		type Connection,
 		type WebhookError
-	} from '$lib/components/connection-dialog.svelte';
-	import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
-	import { Badge } from '$lib/components/ui/badge/index.js';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import * as Card from '$lib/components/ui/card/index.js';
-	import { Switch } from '$lib/components/ui/switch/index.js';
-	import * as Table from '$lib/components/ui/table/index.js';
+	} from '#lib/components/connection-dialog.svelte';
+	import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js';
+	import { Badge } from '#lib/components/ui/badge/index.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
+	import { Switch } from '#lib/components/ui/switch/index.js';
+	import * as Table from '#lib/components/ui/table/index.js';
 
 	type Repo = {
 		id: string;
@@ -113,23 +113,27 @@
 </script>
 
 <div class="mb-6 flex items-center justify-between">
-	<h1 class="text-2xl font-semibold">Repositories</h1>
+	<h1 class="font-display text-3xl font-medium tracking-[0.01em] text-foreground">Repositories</h1>
 	{#if isAdmin}
 		<Button
 			onclick={() => {
 				selected = null;
 				connDialogOpen = true;
-			}}>Add connection</Button
+			}}
 		>
+			Add connection
+		</Button>
 	{/if}
 </div>
 
 {#if loaded && connections.length === 0}
-	<p class="text-muted-foreground">
+	<div
+		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
+	>
 		{isAdmin
 			? 'Connect a Git provider to start reviewing pull requests.'
 			: 'No connections yet. An admin needs to connect a Git provider.'}
-	</p>
+	</div>
 {/if}
 
 <div class="space-y-6">
@@ -153,8 +157,10 @@
 							onclick={() => {
 								selected = c;
 								connDialogOpen = true;
-							}}>Rotate PAT</Button
+							}}
 						>
+							Rotate PAT
+						</Button>
 						<Button variant="outline" size="sm" onclick={() => resync(c)}>Resync webhooks</Button>
 						<Button
 							variant="outline"
@@ -162,8 +168,10 @@
 							onclick={() => {
 								selected = c;
 								addOpen = true;
-							}}>Add repositories</Button
+							}}
 						>
+							Add repositories
+						</Button>
 						<Button
 							variant="destructive"
 							size="sm"
@@ -172,8 +180,10 @@
 									`Delete connection ${c.name}?`,
 									'Remove its repositories first. This cannot be undone.',
 									`/connections/${c.id}`
-								)}>Delete</Button
+								)}
 						>
+							Delete
+						</Button>
 					</Card.Action>
 				{/if}
 			</Card.Header>
@@ -203,10 +213,14 @@
 									<Switch
 										aria-label={`Auto review: ${repo.name}`}
 										disabled={!isAdmin}
-										bind:checked={() => repo.auto_review, (v) => patchRepo(repo, { auto_review: v })}
+										bind:checked={
+											() => repo.auto_review, (v) => patchRepo(repo, { auto_review: v })
+										}
 									/>
 								</Table.Cell>
-								<Table.Cell class="text-muted-foreground">{repo.review_model ?? 'default'}</Table.Cell>
+								<Table.Cell class="text-muted-foreground">
+									{repo.review_model ?? 'default'}
+								</Table.Cell>
 								<Table.Cell class="text-right">
 									{#if isAdmin}
 										<Button
@@ -217,14 +231,18 @@
 													`Remove ${repo.owner}/${repo.name}?`,
 													'Its webhooks are deleted from the provider.',
 													`/repositories/${repo.id}`
-												)}>Remove</Button
+												)}
 										>
+											Remove
+										</Button>
 									{/if}
 								</Table.Cell>
 							</Table.Row>
 						{:else}
 							<Table.Row>
-								<Table.Cell colspan={5} class="text-muted-foreground">No repositories yet.</Table.Cell>
+								<Table.Cell colspan={5} class="text-muted-foreground">
+									No repositories yet.
+								</Table.Cell>
 							</Table.Row>
 						{/each}
 					</Table.Body>

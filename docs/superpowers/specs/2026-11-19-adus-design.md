@@ -283,6 +283,15 @@ Tipe job: `review_pr`, `pr_comment` (command `@adudu`).
   Users (admin) · Settings (admin) · System status (admin) · Profil (ganti
   password).
 - API: REST JSON di `/api/v1/...`.
+- **Sistem desain & tema (`DESIGN.md`):** semua pekerjaan di `web/` wajib
+  mengikuti `DESIGN.md` untuk tema terang (*light*) maupun gelap (*dark*) —
+  token warna OKLCH bernuansa hangat (krem/kopi + satu aksen oranye `#ff4f00`,
+  tanpa abu-abu dingin, putih murni, atau hitam murni), font self-hosted
+  `@fontsource-variable/mona-sans`, radius `12px` untuk kartu/tombol/modal dan
+  `6px` untuk input, serta pengalih tema Light / Dark / System berbasis
+  `mode-watcher` (dengan skrip pra-render anti-FOUC di `web/src/app.html`).
+  Selalu gunakan token semantik dan primitif `shadcn-svelte` yang sudah
+  diselaraskan agar konsisten di kedua tema.
 
 ### 6.12 Deploy & setup (mudah dijalankan)
 
@@ -361,7 +370,7 @@ yang diturunkan dari kode Enterprise Kodus.
 
 - Versi crate, susunan modul di dalam crate, nama endpoint detail.
 - Teks prompt sistem dan strategi batching file.
-- Layout visual detail tiap halaman (mengikuti komponen shadcn-svelte standar).
+- Layout visual detail tiap halaman (mengikuti `DESIGN.md` dan komponen shadcn-svelte yang sudah diselaraskan, mendukung tema terang & gelap).
 - Strategi test (minimal: unit test untuk pemetaan baris diff, verifikasi
   signature webhook, rotasi key; integration test DB bila praktis).
 - Urutan pengerjaan, dengan syarat setiap tahap bisa dijalankan end-to-end.

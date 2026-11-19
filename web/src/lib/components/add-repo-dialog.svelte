@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
-	import { api, ApiError } from '$lib/api';
-	import type { Connection } from '$lib/components/connection-dialog.svelte';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import * as Dialog from '$lib/components/ui/dialog/index.js';
+	import { api, ApiError } from '#lib/api.js';
+	import type { Connection } from '#lib/components/connection-dialog.svelte';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Dialog from '#lib/components/ui/dialog/index.js';
 
 	type RemoteRepo = {
 		ref: { external_id: string; owner: string; project: string | null; name: string };
@@ -89,6 +89,7 @@
 						<label class="flex items-center gap-2 text-sm">
 							<input
 								type="checkbox"
+								class="size-4 rounded-sm accent-primary"
 								disabled={repo.added || busy}
 								value={repo.ref.external_id}
 								bind:group={picked}

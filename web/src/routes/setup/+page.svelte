@@ -1,12 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { api, ApiError } from '$lib/api';
-	import { session, setUser, type User } from '$lib/session.svelte';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import * as Card from '$lib/components/ui/card/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
-	import { Label } from '$lib/components/ui/label/index.js';
+	import { api, ApiError } from '#lib/api.js';
+	import { session, setUser, type User } from '#lib/session.svelte.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
+	import { Input } from '#lib/components/ui/input/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
 
 	let email = $state('');
 	let password = $state('');
@@ -44,16 +44,26 @@
 </script>
 
 <div class="flex min-h-screen items-center justify-center p-4">
-	<Card.Root class="w-full max-w-sm">
+	<Card.Root class="w-full max-w-md">
 		<Card.Header>
-			<Card.Title>Welcome to Adus</Card.Title>
+			<p class="font-display text-xs font-medium tracking-[0.12em] text-primary uppercase">Adus</p>
+			<Card.Title class="font-display text-2xl font-medium tracking-tight">
+				Welcome to Adus
+			</Card.Title>
 			<Card.Description>Create the first admin account.</Card.Description>
 		</Card.Header>
 		<Card.Content>
 			<form class="grid gap-4" onsubmit={submit}>
 				<div class="grid gap-2">
 					<Label for="email">Email</Label>
-					<Input id="email" name="email" type="email" autocomplete="username" required bind:value={email} />
+					<Input
+						id="email"
+						name="email"
+						type="email"
+						autocomplete="username"
+						required
+						bind:value={email}
+					/>
 				</div>
 				<div class="grid gap-2">
 					<Label for="password">Password (at least 8 characters)</Label>
@@ -68,7 +78,7 @@
 					/>
 				</div>
 				{#if error}<p class="text-sm text-destructive" role="alert">{error}</p>{/if}
-				<Button type="submit" disabled={busy}>Create admin</Button>
+				<Button type="submit" class="w-full" disabled={busy}>Create admin</Button>
 			</form>
 		</Card.Content>
 	</Card.Root>

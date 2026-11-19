@@ -1,10 +1,10 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
-	import { api, ApiError } from '$lib/api';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import * as Dialog from '$lib/components/ui/dialog/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
-	import { Label } from '$lib/components/ui/label/index.js';
+	import { api, ApiError } from '#lib/api.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Dialog from '#lib/components/ui/dialog/index.js';
+	import { Input } from '#lib/components/ui/input/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
 	import type { AiKey } from './provider-dialog.svelte';
 
 	// `aiKey` set = edit that key (blank key field keeps the stored key); null = add a key to `providerId`.
@@ -69,7 +69,13 @@
 			</div>
 			<div class="grid gap-2">
 				<Label for="k-key">API key</Label>
-				<Input id="k-key" type="password" autocomplete="off" required={!aiKey} bind:value={secret} />
+				<Input
+					id="k-key"
+					type="password"
+					autocomplete="off"
+					required={!aiKey}
+					bind:value={secret}
+				/>
 			</div>
 			<Dialog.Footer>
 				<Button type="submit" disabled={busy}>{aiKey ? 'Save' : 'Add key'}</Button>

@@ -1,13 +1,18 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
 	import { BarChart } from 'layerchart';
-	import { api, ApiError } from '$lib/api';
-	import * as Chart from '$lib/components/ui/chart/index.js';
-	import * as Card from '$lib/components/ui/card/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
-	import { Label } from '$lib/components/ui/label/index.js';
-	import * as Table from '$lib/components/ui/table/index.js';
-	import * as Tabs from '$lib/components/ui/tabs/index.js';
+	import { DateFormatter, today } from '@internationalized/date';
+	import type { DateRange } from 'bits-ui';
+	import RiCalendarLine from 'remixicon-svelte/icons/calendar-line';
+	import { api, ApiError } from '#lib/api.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Chart from '#lib/components/ui/chart/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
+	import * as Popover from '#lib/components/ui/popover/index.js';
+	import { RangeCalendar } from '#lib/components/ui/range-calendar/index.js';
+	import * as Table from '#lib/components/ui/table/index.js';
+	import * as Tabs from '#lib/components/ui/tabs/index.js';
 
 	type Daily = {
 		date: string;
@@ -16,12 +21,25 @@
 		calls: number;
 		failed_calls: number;
 	};
-	type Row = { id?: string; label: string; input_tokens: number; output_tokens: number; calls: number };
+	type Row = {
+		id?: string;
+		label: string;
+		input_tokens: number;
+		output_tokens: number;
+		calls: number;
+	};
 
 	// The server counts days in UTC, so the default range is too: last 30 days ending today.
-	const day = (ago: number) => new Date(Date.now() - ago * 86_400_000).toISOString().slice(0, 10);
-	let from = $state(day(29));
-	let to = $state(day(0));
+	const defaultEnd = today('UTC');
+	const defaultStart = defaultEnd.subtract({ days: 29 });
+	const df = new DateFormatter('en-US', { dateStyle: 'medium', timeZone: 'UTC' });
+
+	let range = $state<DateRange | undefined>({
+		start: defaultStart,
+		end: defaultEnd
+	});
+	const from = $derived(range?.start?.toString().slice(0, 10));
+	const to = $derived(range?.end?.toString().slice(0, 10));
 	let by = $state('repository');
 	let daily = $state<Daily[]>([]);
 	let rows = $state<Row[]>([]);
@@ -66,16 +84,38 @@
 	});
 </script>
 
-<h1 class="mb-6 text-2xl font-semibold">Token Usage</h1>
+<h1 class="mb-6 font-display text-3xl font-medium tracking-[0.01em] text-foreground">
+	Token Usage
+</h1>
 
 <div class="mb-6 flex flex-wrap gap-4">
 	<div class="grid gap-2">
-		<Label for="u-from">From</Label>
-		<Input id="u-from" type="date" max={to} bind:value={from} />
-	</div>
-	<div class="grid gap-2">
-		<Label for="u-to">To</Label>
-		<Input id="u-to" type="date" min={from} bind:value={to} />
+		<Label for="usage-date-range">Date range</Label>
+		<Popover.Root>
+			<Popover.Trigger id="usage-date-range">
+				{#snippet child({ props })}
+					<Button
+						{...props}
+						variant="outline"
+						class="w-fit min-w-64 justify-start rounded-sm font-normal tabular-nums"
+					>
+						<RiCalendarLine data-icon="inline-start" class="text-muted-foreground" />
+						{#if range?.start}
+							{#if range.end}
+								{df.format(range.start.toDate('UTC'))} – {df.format(range.end.toDate('UTC'))}
+							{:else}
+								{df.format(range.start.toDate('UTC'))}
+							{/if}
+						{:else}
+							<span class="text-muted-foreground">Pick a date range</span>
+						{/if}
+					</Button>
+				{/snippet}
+			</Popover.Trigger>
+			<Popover.Content class="w-auto p-0" align="start">
+				<RangeCalendar bind:value={range} numberOfMonths={2} maxDays={366} />
+			</Popover.Content>
+		</Popover.Root>
 	</div>
 </div>
 
@@ -122,7 +162,7 @@
 			<Table.Root>
 				<Table.Header>
 					<Table.Row>
-						<Table.Head class="capitalize">{by}</Table.Head>
+						<Table.Head>{by}</Table.Head>
 						<Table.Head class="text-right">Input</Table.Head>
 						<Table.Head class="text-right">Output</Table.Head>
 						<Table.Head class="text-right">Total</Table.Head>
@@ -133,14 +173,18 @@
 					{#each rows as r (r.id ?? r.label)}
 						<Table.Row>
 							<Table.Cell>{r.label}</Table.Cell>
-							<Table.Cell class="text-right">{n(r.input_tokens)}</Table.Cell>
-							<Table.Cell class="text-right">{n(r.output_tokens)}</Table.Cell>
-							<Table.Cell class="text-right">{n(r.input_tokens + r.output_tokens)}</Table.Cell>
-							<Table.Cell class="text-right">{n(r.calls)}</Table.Cell>
+							<Table.Cell class="text-right tabular-nums">{n(r.input_tokens)}</Table.Cell>
+							<Table.Cell class="text-right tabular-nums">{n(r.output_tokens)}</Table.Cell>
+							<Table.Cell class="text-right tabular-nums">
+								{n(r.input_tokens + r.output_tokens)}
+							</Table.Cell>
+							<Table.Cell class="text-right tabular-nums">{n(r.calls)}</Table.Cell>
 						</Table.Row>
 					{:else}
 						<Table.Row>
-							<Table.Cell colspan={5} class="text-muted-foreground">No usage in this range.</Table.Cell>
+							<Table.Cell colspan={5} class="text-muted-foreground">
+								No usage in this range.
+							</Table.Cell>
 						</Table.Row>
 					{/each}
 				</Table.Body>

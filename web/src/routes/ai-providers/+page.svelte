@@ -2,23 +2,23 @@
 	import { onMount } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { toast } from 'svelte-sonner';
-	import { api, ApiError } from '$lib/api';
-	import { session } from '$lib/session.svelte';
-	import AiKeyDialog from '$lib/components/ai-key-dialog.svelte';
+	import { api, ApiError } from '#lib/api.js';
+	import { session } from '#lib/session.svelte.js';
+	import AiKeyDialog from '#lib/components/ai-key-dialog.svelte';
 	import ProviderDialog, {
 		kindLabel,
 		type AiKey,
 		type Provider
-	} from '$lib/components/provider-dialog.svelte';
-	import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
-	import { Badge } from '$lib/components/ui/badge/index.js';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import * as Card from '$lib/components/ui/card/index.js';
-	import * as Dialog from '$lib/components/ui/dialog/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
-	import { Label } from '$lib/components/ui/label/index.js';
-	import { Switch } from '$lib/components/ui/switch/index.js';
-	import * as Table from '$lib/components/ui/table/index.js';
+	} from '#lib/components/provider-dialog.svelte';
+	import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js';
+	import { Badge } from '#lib/components/ui/badge/index.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
+	import * as Dialog from '#lib/components/ui/dialog/index.js';
+	import { Input } from '#lib/components/ui/input/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
+	import { Switch } from '#lib/components/ui/switch/index.js';
+	import * as Table from '#lib/components/ui/table/index.js';
 
 	type Settings = { default_provider_id: string | null; default_model: string | null };
 
@@ -41,7 +41,11 @@
 
 	// The server enforces admin too; this only hides/disables controls for role `user`.
 	const isAdmin = $derived(session.user?.role === 'admin');
-	const statusVariant = { ok: 'default', invalid: 'destructive', rate_limited: 'secondary' } as const;
+	const statusVariant = {
+		ok: 'default',
+		invalid: 'destructive',
+		rate_limited: 'secondary'
+	} as const;
 	const statusLabel = { ok: 'ok', invalid: 'invalid', rate_limited: 'rate limited' } as const;
 
 	function fail(e: unknown) {
@@ -111,23 +115,27 @@
 </script>
 
 <div class="mb-6 flex items-center justify-between">
-	<h1 class="text-2xl font-semibold">AI Providers</h1>
+	<h1 class="font-display text-3xl font-medium tracking-[0.01em] text-foreground">AI Providers</h1>
 	{#if isAdmin}
 		<Button
 			onclick={() => {
 				editProvider = null;
 				providerOpen = true;
-			}}>Add provider</Button
+			}}
 		>
+			Add provider
+		</Button>
 	{/if}
 </div>
 
 {#if loaded && providers.length === 0}
-	<p class="text-muted-foreground">
+	<div
+		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
+	>
 		{isAdmin
 			? 'Add an AI provider, then add one or more API keys to it.'
 			: 'No AI providers yet. An admin needs to add one.'}
-	</p>
+	</div>
 {/if}
 
 <div class="space-y-6">
@@ -158,8 +166,10 @@
 							onclick={() => {
 								editProvider = p;
 								providerOpen = true;
-							}}>Edit</Button
+							}}
 						>
+							Edit
+						</Button>
 						<Button
 							variant="destructive"
 							size="sm"
@@ -170,8 +180,10 @@
 									`Delete provider ${p.name}?`,
 									'Its keys are deleted too. A provider that is the default or used by a repository cannot be deleted.',
 									`/ai-providers/${p.id}`
-								)}>Delete</Button
+								)}
 						>
+							Delete
+						</Button>
 					</Card.Action>
 				{/if}
 			</Card.Header>
@@ -212,8 +224,10 @@
 											variant="outline"
 											size="sm"
 											disabled={busy.has(k.id)}
-											onclick={() => openTest(p, k)}>Test</Button
+											onclick={() => openTest(p, k)}
 										>
+											Test
+										</Button>
 										<Button
 											variant="outline"
 											size="sm"
@@ -222,8 +236,10 @@
 												keyProviderId = p.id;
 												editKey = k;
 												keyOpen = true;
-											}}>Edit</Button
+											}}
 										>
+											Edit
+										</Button>
 										<Button
 											variant="outline"
 											size="sm"
@@ -234,8 +250,10 @@
 													`Delete key ${k.label}?`,
 													'Usage history is kept. This cannot be undone.',
 													`/ai-keys/${k.id}`
-												)}>Delete</Button
+												)}
 										>
+											Delete
+										</Button>
 									{/if}
 								</Table.Cell>
 							</Table.Row>
@@ -254,8 +272,10 @@
 							keyProviderId = p.id;
 							editKey = null;
 							keyOpen = true;
-						}}>Add key</Button
+						}}
 					>
+						Add key
+					</Button>
 				{/if}
 			</Card.Content>
 		</Card.Root>

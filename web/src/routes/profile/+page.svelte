@@ -1,11 +1,11 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
-	import { api, ApiError } from '$lib/api';
-	import { session, type User } from '$lib/session.svelte';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import * as Card from '$lib/components/ui/card/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
-	import { Label } from '$lib/components/ui/label/index.js';
+	import { api, ApiError } from '#lib/api.js';
+	import { session, type User } from '#lib/session.svelte.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
+	import { Input } from '#lib/components/ui/input/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
 
 	let githubLogin = $state(session.user?.github_login ?? '');
 	let currentPassword = $state('');
@@ -43,14 +43,16 @@
 	}
 </script>
 
-<h1 class="mb-6 text-2xl font-semibold">Profile</h1>
+<h1 class="mb-1 font-display text-3xl font-medium tracking-[0.01em] text-foreground">Profile</h1>
 <p class="mb-6 text-sm text-muted-foreground">{session.user?.email} ({session.user?.role})</p>
 
 <div class="grid max-w-md gap-6">
 	<Card.Root>
 		<Card.Header>
 			<Card.Title>GitHub login</Card.Title>
-			<Card.Description>Used to match your <code>@adudu</code> commands on GitHub. Leave empty to clear.</Card.Description>
+			<Card.Description>
+				Used to match your <code>@adudu</code> commands on GitHub. Leave empty to clear.
+			</Card.Description>
 		</Card.Header>
 		<Card.Content>
 			<form class="grid gap-4" onsubmit={saveLogin}>
@@ -71,11 +73,24 @@
 			<form class="grid gap-4" onsubmit={changePassword}>
 				<div class="grid gap-2">
 					<Label for="current">Current password</Label>
-					<Input id="current" type="password" autocomplete="current-password" required bind:value={currentPassword} />
+					<Input
+						id="current"
+						type="password"
+						autocomplete="current-password"
+						required
+						bind:value={currentPassword}
+					/>
 				</div>
 				<div class="grid gap-2">
 					<Label for="new">New password (at least 8 characters)</Label>
-					<Input id="new" type="password" autocomplete="new-password" minlength={8} required bind:value={newPassword} />
+					<Input
+						id="new"
+						type="password"
+						autocomplete="new-password"
+						minlength={8}
+						required
+						bind:value={newPassword}
+					/>
 				</div>
 				<Button type="submit">Change password</Button>
 			</form>
