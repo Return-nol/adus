@@ -2,7 +2,7 @@ use axum::{
     Json,
     extract::{
         FromRequest, FromRequestParts,
-        rejection::{JsonRejection, PathRejection},
+        rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -115,5 +115,20 @@ impl From<PathRejection> for ApiError {
                 ApiError::internal()
             }
         }
+    }
+}
+
+/// Seperti `axum::extract::Query`, tetapi query yang tidak valid menjadi 400 `bad_request`.
+#[derive(FromRequestParts)]
+#[from_request(via(axum::extract::Query), rejection(ApiError))]
+pub struct ApiQuery<T>(pub T);
+
+impl From<QueryRejection> for ApiError {
+    fn from(rejection: QueryRejection) -> ApiError {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            rejection.body_text(),
+        )
     }
 }

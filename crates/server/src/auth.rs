@@ -202,11 +202,16 @@ impl FromRequestParts<AppState> for AdminUser {
     }
 }
 
-/// Buat sesi baru di DB dan kembalikan nilai header `Set-Cookie`.
-async fn start_session(state: &AppState, user: &User) -> Result<String, ApiError> {
+/// 32 byte acak dari OS, di-encode base64url. Dipakai untuk token sesi dan token webhook.
+pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
-    let token = URL_SAFE_NO_PAD.encode(bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Buat sesi baru di DB dan kembalikan nilai header `Set-Cookie`.
+async fn start_session(state: &AppState, user: &User) -> Result<String, ApiError> {
+    let token = random_token();
 
     let expires_at = Utc::now() + Duration::days(SESSION_DAYS);
     sessions::create(&state.db, user.id, &hash_token(&token), expires_at).await?;

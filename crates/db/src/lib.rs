@@ -1,5 +1,7 @@
 //! Akses Postgres: koneksi, migrasi, dan query per tabel.
 
+pub mod connections;
+pub mod repositories;
 pub mod sessions;
 pub mod users;
 

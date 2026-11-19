@@ -16,6 +16,7 @@ adus-queue.workspace = true
 adus-review.workspace = true
 adus-server.workspace = true
 axum.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
