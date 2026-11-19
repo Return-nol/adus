@@ -196,10 +196,12 @@ pub async fn candidate_keys(
     .await
 }
 
-/// Panggilan sukses: key sehat lagi (status `ok`, cooldown hilang).
+/// Panggilan sukses. Key `invalid` tidak disentuh (hanya edit yang memulihkannya). Key kembali
+/// `ok` hanya jika cooldown-nya kosong atau sudah lewat; cooldown yang dipasang worker lain
+/// (karena 429) tidak dihapus oleh sukses yang datang bersamaan.
 pub async fn mark_used(pool: &PgPool, key_id: Uuid, now: DateTime<Utc>) -> Result<()> {
     sqlx::query(
-        "UPDATE ai_keys SET last_used_at = $2, status = 'ok', cooldown_until = NULL WHERE id = $1",
+        "UPDATE ai_keys SET last_used_at = $2,            status = CASE WHEN cooldown_until IS NULL OR cooldown_until <= $2                          THEN 'ok'::ai_key_status ELSE status END,            cooldown_until = CASE WHEN cooldown_until IS NULL OR cooldown_until <= $2                                  THEN NULL ELSE cooldown_until END          WHERE id = $1 AND status <> 'invalid'",
     )
     .bind(key_id)
     .bind(now)
@@ -208,12 +210,15 @@ pub async fn mark_used(pool: &PgPool, key_id: Uuid, now: DateTime<Utc>) -> Resul
     Ok(())
 }
 
+/// Key `invalid` tetap `invalid`; cooldown yang sudah ada tidak diperpendek.
 pub async fn mark_cooldown(pool: &PgPool, key_id: Uuid, until: DateTime<Utc>) -> Result<()> {
-    sqlx::query("UPDATE ai_keys SET status = 'rate_limited', cooldown_until = $2 WHERE id = $1")
-        .bind(key_id)
-        .bind(until)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE ai_keys SET status = 'rate_limited',            cooldown_until = GREATEST(COALESCE(cooldown_until, $2), $2)          WHERE id = $1 AND status <> 'invalid'",
+    )
+    .bind(key_id)
+    .bind(until)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

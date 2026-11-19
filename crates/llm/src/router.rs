@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use adus_core::crypto::Cipher;
 use adus_core::types::ProviderKind;
-use adus_db::ai::{self, AiKey};
+use adus_db::ai::{self, AiKey, AiKeyStatus};
 use adus_db::usage::{self, NewUsage};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -28,7 +28,8 @@ pub struct UsageContext {
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ChatError {
-    /// Tidak ada key yang boleh dipakai sekarang (kosong, disabled, invalid, atau cooldown).
+    /// Provider tidak punya key yang bisa dipakai: tidak ada key, semua disabled/invalid, atau
+    /// provider dinonaktifkan/tidak ada. Key yang hanya cooldown menghasilkan `AllKeysFailed`.
     #[error("no usable API keys")]
     NoKeys,
     /// Semua key yang dicoba gagal. `retry_after` = cooldown terdekat di antara key yang kena
@@ -84,6 +85,28 @@ impl LlmRouter {
         }
     }
 
+    /// Provider aktif tapi tanpa key siap pakai. Ada key yang hanya sedang cooldown -> pemanggil
+    /// bisa mencoba lagi nanti (`AllKeysFailed` dengan sisa cooldown terdekat); selain itu
+    /// provider memang belum punya key yang bisa dipakai (`NoKeys`).
+    async fn why_no_candidates(&self, provider_id: Uuid, now: DateTime<Utc>) -> ChatError {
+        let keys = match ai::list_keys(&self.db, provider_id).await {
+            Ok(keys) => keys,
+            Err(e) => return ChatError::Internal(e.to_string()),
+        };
+        let soonest = keys
+            .iter()
+            .filter(|k| k.enabled && k.status != AiKeyStatus::Invalid)
+            .filter_map(|k| k.cooldown_until)
+            .filter(|until| *until > now)
+            .min();
+        match soonest {
+            Some(until) => ChatError::AllKeysFailed {
+                retry_after: Some((until - now).to_std().unwrap_or(Duration::ZERO)),
+            },
+            None => ChatError::NoKeys,
+        }
+    }
+
     /// Catat satu percobaan. Gagal mencatat tidak boleh menggagalkan panggilan LLM
     /// (yang mungkin sudah berhasil dan berbayar), jadi hanya di-log.
     async fn log_usage(
@@ -120,16 +143,18 @@ impl ChatService for LlmRouter {
         req: ChatRequest,
         ctx: UsageContext,
     ) -> Result<ChatResponse, ChatError> {
-        let keys = ai::candidate_keys(&self.db, provider_id, Utc::now())
+        let now = Utc::now();
+        let keys = ai::candidate_keys(&self.db, provider_id, now)
             .await
             .map_err(|e| ChatError::Internal(e.to_string()))?;
-        if keys.is_empty() {
-            return Err(ChatError::NoKeys);
-        }
         let provider = ai::get_provider(&self.db, provider_id)
             .await
             .map_err(|e| ChatError::Internal(e.to_string()))?
+            .filter(|p| p.enabled)
             .ok_or(ChatError::NoKeys)?;
+        if keys.is_empty() {
+            return Err(self.why_no_candidates(provider_id, now).await);
+        }
         let client = (self.make_client)(provider.kind, provider.base_url.as_deref());
 
         // Cooldown terpendek di antara key yang kena rate limit pada panggilan ini.

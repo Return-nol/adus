@@ -8,7 +8,7 @@ use adus_db::ai::{self, AiKey, AiKeyStatus, AiProvider};
 use adus_llm::router::{ChatError, ChatService, LlmRouter, UsageContext};
 use adus_llm::{ChatRequest, ChatResponse, LlmClient, LlmError};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 const SECRET_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -204,7 +204,10 @@ async fn cooled_down_key_returns_after_until(pool: PgPool) {
     assert_eq!(late.len(), 1);
 
     // Cooldown yang sudah lewat: router memakai key lagi dan memulihkannya ke `ok`.
-    ai::mark_cooldown(&pool, s.keys[0].id, now - chrono::Duration::seconds(1))
+    sqlx::query("UPDATE ai_keys SET cooldown_until = $2 WHERE id = $1")
+        .bind(s.keys[0].id)
+        .bind(now - chrono::Duration::seconds(1))
+        .execute(&pool)
         .await
         .unwrap();
     chat(&s).await.unwrap();
@@ -245,8 +248,96 @@ async fn all_keys_rate_limited_returns_all_keys_failed_with_retry_after(pool: Pg
     );
     // Setiap key dicoba tepat sekali.
     assert_eq!(s.fake.calls().len(), 2);
-    // Semua key sedang cooldown.
+    // Semua key sedang cooldown: bukan NoKeys, tapi AllKeysFailed dengan sisa cooldown terdekat.
+    assert_cooling_for_about(chat(&s).await.unwrap_err(), 30);
+    assert_eq!(s.fake.calls().len(), 2);
+}
+
+fn assert_cooling_for_about(err: ChatError, secs: u64) {
+    let ChatError::AllKeysFailed {
+        retry_after: Some(left),
+    } = err
+    else {
+        panic!("expected AllKeysFailed with retry_after, got {err:?}");
+    };
+    assert!(left <= Duration::from_secs(secs), "{left:?}");
+    assert!(left > Duration::from_secs(secs - 5), "{left:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_cooling_keys_report_retry_after_but_disabled_or_invalid_report_no_keys(pool: PgPool) {
+    let s = setup(&pool, ProviderKind::Openai, 3).await;
+    let until = Utc::now() + chrono::Duration::seconds(120);
+    ai::mark_cooldown(&pool, s.keys[0].id, until).await.unwrap();
+    // Key invalid dan key disabled yang cooldown-nya lebih pendek tidak dihitung.
+    ai::mark_cooldown(
+        &pool,
+        s.keys[1].id,
+        Utc::now() + chrono::Duration::seconds(10),
+    )
+    .await
+    .unwrap();
+    ai::mark_invalid(&pool, s.keys[1].id).await.unwrap();
+    ai::mark_cooldown(
+        &pool,
+        s.keys[2].id,
+        Utc::now() + chrono::Duration::seconds(5),
+    )
+    .await
+    .unwrap();
+    let off = ai::KeyPatch {
+        enabled: Some(false),
+        ..Default::default()
+    };
+    ai::update_key(&pool, s.keys[2].id, off).await.unwrap();
+
+    assert_cooling_for_about(chat(&s).await.unwrap_err(), 120);
+    assert!(s.fake.calls().is_empty());
+
+    // Tanpa key yang cooldown: NoKeys.
+    ai::mark_invalid(&pool, s.keys[0].id).await.unwrap();
     assert_eq!(chat(&s).await.unwrap_err(), ChatError::NoKeys);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn invalid_key_stays_invalid_and_cooldown_survives_concurrent_success(pool: PgPool) {
+    let s = setup(&pool, ProviderKind::Openai, 2).await;
+    let now = Utc::now();
+
+    // Key invalid tidak dipulihkan oleh mark_used maupun diubah jadi rate_limited.
+    ai::mark_invalid(&pool, s.keys[0].id).await.unwrap();
+    ai::mark_used(&pool, s.keys[0].id, now).await.unwrap();
+    assert_eq!(key_state(&pool, &s, 0).await.status, AiKeyStatus::Invalid);
+    ai::mark_cooldown(&pool, s.keys[0].id, now + chrono::Duration::seconds(30))
+        .await
+        .unwrap();
+    let invalid = key_state(&pool, &s, 0).await;
+    assert_eq!(invalid.status, AiKeyStatus::Invalid);
+    assert!(invalid.cooldown_until.is_none());
+
+    // Sukses yang datang sebelum cooldown berakhir tidak menghapus cooldown.
+    // Postgres menyimpan mikrodetik; potong supaya perbandingan sama persis.
+    let until = now + chrono::Duration::seconds(60);
+    let until = DateTime::from_timestamp_micros(until.timestamp_micros()).unwrap();
+    ai::mark_cooldown(&pool, s.keys[1].id, until).await.unwrap();
+    ai::mark_used(&pool, s.keys[1].id, now).await.unwrap();
+    let cooling = key_state(&pool, &s, 1).await;
+    assert_eq!(cooling.status, AiKeyStatus::RateLimited);
+    assert_eq!(cooling.cooldown_until, Some(until));
+
+    // Cooldown yang lebih pendek tidak memperpendek yang ada.
+    ai::mark_cooldown(&pool, s.keys[1].id, now + chrono::Duration::seconds(5))
+        .await
+        .unwrap();
+    assert_eq!(key_state(&pool, &s, 1).await.cooldown_until, Some(until));
+
+    // Setelah cooldown lewat, sukses memulihkan key.
+    ai::mark_used(&pool, s.keys[1].id, until + chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    let key = key_state(&pool, &s, 1).await;
+    assert_eq!(key.status, AiKeyStatus::Ok);
+    assert!(key.cooldown_until.is_none());
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -279,6 +370,10 @@ async fn invalid_request_stops_without_trying_other_keys(pool: PgPool) {
     let err = chat(&s).await.unwrap_err();
     assert!(matches!(err, ChatError::Invalid(m) if m.contains("bad model")));
     assert_eq!(s.fake.calls().len(), 1);
+    // Request yang salah bukan salah key: status tidak berubah dan key tidak dianggap terpakai.
+    let key = key_state(&pool, &s, 0).await;
+    assert_eq!(key.status, AiKeyStatus::Ok);
+    assert!(key.last_used_at.is_none());
     let rows: i64 =
         sqlx::query_scalar("SELECT count(*) FROM llm_usage WHERE error_kind = 'invalid'")
             .fetch_one(&pool)
