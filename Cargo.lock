@@ -66,6 +66,13 @@ version = "0.1.0"
 dependencies = [
  "adus-core",
  "adus-db",
+ "async-trait",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]
