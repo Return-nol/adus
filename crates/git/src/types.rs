@@ -61,7 +61,7 @@ pub struct InlineComment {
     pub body: String,
 }
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum GitError {
     #[error("unauthorized")]
     Unauthorized,

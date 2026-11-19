@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use similar::TextDiff;
 
-/// Nomor baris sisi kanan (file baru) untuk setiap baris `+` di patch.
+/// Nomor baris sisi kanan (file baru) untuk setiap baris `+` di patch. Hanya untuk patch satu file.
 pub fn commentable_lines(patch: &str) -> BTreeSet<u32> {
     let mut lines = BTreeSet::new();
     let mut right = 0u32;
@@ -25,11 +25,12 @@ pub fn commentable_lines(patch: &str) -> BTreeSet<u32> {
     lines
 }
 
+/// Jumlah baris `+` di patch. Hanya untuk patch satu file.
 pub fn added_line_count(patch: &str) -> usize {
     let mut in_hunk = false;
     let mut count = 0;
     for line in patch.lines() {
-        if line.starts_with("@@") {
+        if hunk_right_start(line).is_some() {
             in_hunk = true;
         } else if in_hunk && line.starts_with('+') {
             count += 1;
@@ -74,6 +75,35 @@ mod tests {
     #[test]
     fn no_newline_marker_ignored() {
         let p = "@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+B\n\\ No newline at end of file\n";
+        assert_eq!(commentable_lines(p), BTreeSet::from([2]));
+        assert_eq!(added_line_count(p), 1);
+    }
+
+    #[test]
+    fn hunk_header_without_counts() {
+        let p = "@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(commentable_lines(p), BTreeSet::from([1]));
+        assert_eq!(added_line_count(p), 1);
+    }
+
+    #[test]
+    fn plus_and_minus_prefixed_content_inside_hunk() {
+        // "+++x" adalah baris tambahan berisi "++x"; "---x" adalah baris yang dihapus.
+        let p = "@@ -1,2 +1,2 @@\n---x\n+++x\n a\n";
+        assert_eq!(commentable_lines(p), BTreeSet::from([1]));
+        assert_eq!(added_line_count(p), 1);
+    }
+
+    #[test]
+    fn empty_context_line_counts() {
+        // Baris kosong tanpa spasi di depan tetap konteks.
+        let p = "@@ -1,3 +1,3 @@\n a\n\n-b\n+B\n";
+        assert_eq!(commentable_lines(p), BTreeSet::from([3]));
+    }
+
+    #[test]
+    fn crlf_patch() {
+        let p = "@@ -1,2 +1,2 @@\r\n a\r\n-b\r\n+B\r\n";
         assert_eq!(commentable_lines(p), BTreeSet::from([2]));
         assert_eq!(added_line_count(p), 1);
     }
