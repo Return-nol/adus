@@ -226,10 +226,19 @@ async fn ensure_webhooks_creates_three_subscriptions() {
     assert_eq!(ids, vec!["sub-0", "sub-1", "sub-2"]);
 }
 
+fn healthy_sub(id: &str, event: &str, url: &str) -> Value {
+    json!({
+        "id": id,
+        "eventType": event,
+        "status": "enabled",
+        "consumerInputs": { "url": url },
+    })
+}
+
 #[tokio::test]
 async fn ensure_webhooks_recreates_only_missing() {
     let server = MockServer::start().await;
-    let sub = |id: &str, event: &str| json!({ "id": id, "eventType": event });
+    let sub = |id: &str, event: &str| healthy_sub(id, event, "https://adus.test/h");
     Mock::given(method("GET"))
         .and(path("/acme/_apis/hooks/subscriptions/keep-1"))
         .respond_with(
@@ -324,7 +333,7 @@ async fn pr_diff_builds_patch_from_contents_and_strips_leading_slash() {
     mock_pr_iterations_and_changes(&server).await;
     mock_item(&server, "/src/a.rs", "mergebase", text("a\nb\n")).await;
     mock_item(&server, "/src/a.rs", "headsha", text("a\nB\n")).await;
-    // File baru: tidak ada di base, jadi tidak diambil. File terhapus: 404 di head = kosong.
+    // File baru: sisi base tidak diambil. File terhapus: sisi head tidak diambil.
     mock_item(&server, "/src/new.rs", "headsha", text("x\n")).await;
     mock_item(&server, "/src/gone.rs", "mergebase", text("y\n")).await;
     // Rename: isi lama diambil dari path lama.
@@ -384,11 +393,17 @@ async fn binary_content_gives_none_patch() {
     let files = provider(&server).pr_diff(&repo(), &pr()).await.unwrap();
     let png = files.iter().find(|f| f.path == "img/logo.png").unwrap();
     assert_eq!(png.patch, None);
-    assert!(
-        files
-            .iter()
-            .filter(|f| f.path != "img/logo.png")
-            .all(|f| f.patch.is_some())
+    // Teks lain tetap dapat patch: a.rs sama (kosong), new.rs +t, gone.rs -t, moved.rs sama.
+    let patches: Vec<_> = files.iter().map(|f| f.patch.as_deref()).collect();
+    assert_eq!(
+        patches,
+        [
+            Some(""),
+            Some("@@ -0,0 +1 @@\n+t\n"),
+            Some("@@ -1 +0,0 @@\n-t\n"),
+            Some(""),
+            None
+        ]
     );
 }
 
@@ -567,4 +582,197 @@ async fn changes_pagination_stops_at_page_cap() {
         .unwrap();
     // Semua entri folder, jadi tidak ada file; yang diuji: berhenti di 30 request.
     assert!(files.is_empty());
+}
+
+#[tokio::test]
+async fn ensure_webhooks_replaces_disabled_and_wrong_url_subscriptions() {
+    let server = MockServer::start().await;
+    let url = "https://adus.test/h";
+    let created = "git.pullrequest.created";
+    let updated = "git.pullrequest.updated";
+    let comment = "ms.vss-code.git-pullrequest-comment-event";
+    let get = |id: &str, body: Value| {
+        Mock::given(method("GET"))
+            .and(path(format!("/acme/_apis/hooks/subscriptions/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+    };
+    let mut disabled = healthy_sub("dead", created, url);
+    disabled["status"] = json!("disabledBySystem");
+    get("dead", disabled).mount(&server).await;
+    get("stale", healthy_sub("stale", updated, "https://old.test/h"))
+        .mount(&server)
+        .await;
+    get("ok", healthy_sub("ok", comment, url))
+        .mount(&server)
+        .await;
+    // Yang nonaktif/salah URL dihapus (404 saat hapus diabaikan), yang sehat tidak disentuh.
+    for (id, status) in [("dead", 204), ("stale", 404)] {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/acme/_apis/hooks/subscriptions/{id}")))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("DELETE"))
+        .and(path("/acme/_apis/hooks/subscriptions/ok"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    for (id, event) in [("new-1", created), ("new-2", updated)] {
+        Mock::given(method("POST"))
+            .and(path("/acme/_apis/hooks/subscriptions"))
+            .and(body_partial_json(json!({ "eventType": event })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(healthy_sub(id, event, url)))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let existing = ["dead".to_string(), "stale".into(), "ok".into()];
+    let ids = provider(&server)
+        .ensure_webhooks(&repo(), url, "s", &existing)
+        .await
+        .unwrap();
+    assert_eq!(ids, vec!["ok", "new-1", "new-2"]);
+}
+
+/// Satu file `Modified` di `diffs/commits` aaa..bbb; `base`/`head` = respons item per sisi.
+async fn modified_file_error(base: ResponseTemplate, head: ResponseTemplate) -> GitError {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{REPO_BASE}/diffs/commits")))
+        .respond_with(json_body("diffs.json"))
+        .mount(&server)
+        .await;
+    mock_item(&server, "/src/a.rs", "aaa", base).await;
+    mock_item(&server, "/src/a.rs", "bbb", head).await;
+    provider(&server)
+        .diff_between(&repo(), "aaa", "bbb")
+        .await
+        .unwrap_err()
+}
+
+#[tokio::test]
+async fn content_404_on_a_fetched_side_is_not_found() {
+    let not_found = || ResponseTemplate::new(404);
+    // 404 di base, di head, dan di keduanya: error, bukan patch kosong / add / delete diam-diam.
+    assert_eq!(
+        modified_file_error(not_found(), text("a\n")).await,
+        GitError::NotFound
+    );
+    assert_eq!(
+        modified_file_error(text("a\n"), not_found()).await,
+        GitError::NotFound
+    );
+    assert_eq!(
+        modified_file_error(not_found(), not_found()).await,
+        GitError::NotFound
+    );
+}
+
+#[tokio::test]
+async fn pr_diff_uses_iteration_matching_head_sha() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/iterations")))
+        .respond_with(json_body("iterations.json"))
+        .mount(&server)
+        .await;
+    // Hanya iterasi 1 yang dipakai; iterasi 2 (lebih baru) tidak boleh diminta.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "{REPO_BASE}/pullRequests/7/iterations/1/changes"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "changeEntries": [{ "changeType": "edit", "item": { "path": "/src/a.rs" } }],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "{REPO_BASE}/pullRequests/7/iterations/2/changes"
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    // Isi file di commit milik iterasi 1, bukan `pr.base_sha`.
+    mock_item(&server, "/src/a.rs", "oldbase", text("a\nb\n")).await;
+    mock_item(&server, "/src/a.rs", "oldhead", text("a\nB\n")).await;
+
+    let mut stale = pr();
+    stale.head_sha = "oldhead".into();
+    stale.base_sha = "ignored".into();
+    let files = provider(&server).pr_diff(&repo(), &stale).await.unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[0].patch.as_deref(),
+        Some("@@ -1,2 +1,2 @@\n a\n-b\n+B\n")
+    );
+}
+
+#[tokio::test]
+async fn pr_diff_falls_back_to_latest_iteration_shas() {
+    let server = MockServer::start().await;
+    mock_pr_iterations_and_changes(&server).await;
+    for (p, sha, body) in [
+        ("/src/a.rs", "mergebase", "a\nb\n"),
+        ("/src/a.rs", "headsha", "a\nB\n"),
+        ("/src/new.rs", "headsha", "x\n"),
+        ("/src/gone.rs", "mergebase", "y\n"),
+        ("/src/orig.rs", "mergebase", "1\n"),
+        ("/src/moved.rs", "headsha", "1\n"),
+        ("/img/logo.png", "mergebase", "p\n"),
+        ("/img/logo.png", "headsha", "p\n"),
+    ] {
+        mock_item(&server, p, sha, text(body)).await;
+    }
+
+    // Tidak ada iterasi dengan head "unknown": pakai iterasi terbaru dan shas miliknya.
+    let mut unknown = pr();
+    unknown.head_sha = "unknown".into();
+    unknown.base_sha = "ignored".into();
+    let files = provider(&server).pr_diff(&repo(), &unknown).await.unwrap();
+    assert_eq!(
+        files[0].patch.as_deref(),
+        Some("@@ -1,2 +1,2 @@\n a\n-b\n+B\n")
+    );
+}
+
+#[tokio::test]
+async fn rename_entries_and_submodules() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{REPO_BASE}/diffs/commits")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "allChangesIncluded": true,
+            "changes": [
+                // Entri sisi-lama rename: dilewati.
+                { "changeType": "delete, sourceRename", "item": { "path": "/old.txt" } },
+                // "add, rename" = Renamed (bukan Added), isi lama dari path lama.
+                { "changeType": "add, rename", "item": { "path": "/new.txt" }, "originalPath": "/old.txt" },
+                // Submodule: dilewati.
+                { "changeType": "edit", "item": { "path": "/vendor/lib", "gitObjectType": "commit" } },
+            ],
+        })))
+        .mount(&server)
+        .await;
+    mock_item(&server, "/old.txt", "aaa", text("1\n2\n")).await;
+    mock_item(&server, "/new.txt", "bbb", text("1\n3\n")).await;
+
+    let files = provider(&server)
+        .diff_between(&repo(), "aaa", "bbb")
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "new.txt");
+    assert_eq!(files[0].status, FileStatus::Renamed);
+    assert_eq!(files[0].old_path.as_deref(), Some("old.txt"));
+    assert_eq!(
+        files[0].patch.as_deref(),
+        Some("@@ -1,2 +1,2 @@\n 1\n-2\n+3\n")
+    );
 }

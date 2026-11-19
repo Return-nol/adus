@@ -113,15 +113,12 @@ impl AzureProvider {
         decode(self.send(self.get(url)).await?).await
     }
 
-    /// Iterasi terakhir PR (id terbesar). Dari sini diambil merge base dan id untuk `changes`.
-    async fn last_iteration(&self, repo: &RepoRef, number: i64) -> Result<AzIteration, GitError> {
+    /// Semua iterasi PR. Tiap iterasi punya merge base (`commonRefCommit`) dan head (`sourceRefCommit`).
+    async fn iterations(&self, repo: &RepoRef, number: i64) -> Result<Vec<AzIteration>, GitError> {
         let list: AzList<AzIteration> = self
             .get_json(&self.repo_url(repo, &format!("/pullRequests/{number}/iterations"))?)
             .await?;
-        list.value
-            .into_iter()
-            .max_by_key(|i| i.id)
-            .ok_or_else(|| GitError::Decode("pull request has no iterations".into()))
+        Ok(list.value)
     }
 
     /// Ambil semua perubahan lewat `$top`/`$skip` (maks `MAX_PAGES`). Berlanjut selama respons
@@ -154,7 +151,8 @@ impl AzureProvider {
         Ok(all)
     }
 
-    /// Isi file pada commit `sha`. 404 (file belum ada / sudah dihapus di sisi itu) = kosong.
+    /// Isi file pada commit `sha`. 404 = `NotFound`: pemanggil hanya meminta sisi yang seharusnya
+    /// ada, jadi 404 berarti GUID/sha/path salah, bukan file kosong.
     async fn content(&self, repo: &RepoRef, path: &str, sha: &str) -> Result<Vec<u8>, GitError> {
         let slash_path = format!("/{path}");
         let req = self.get(&self.repo_url(repo, "/items")?).query(&[
@@ -169,7 +167,6 @@ impl AzureProvider {
                 .await
                 .map(|b| b.to_vec())
                 .map_err(|e| GitError::Http(e.without_url().to_string())),
-            Err(GitError::NotFound) => Ok(Vec::new()),
             Err(e) => Err(e),
         }
     }
@@ -186,7 +183,12 @@ impl AzureProvider {
     ) -> Result<Vec<FileDiff>, GitError> {
         let mut out = Vec::new();
         for c in changes {
-            if c.item.is_folder || c.item.git_object_type.as_deref() == Some("tree") {
+            // Lewati folder, submodule (`commit`), dan entri sisi-lama rename (`sourceRename`).
+            let object_type = c.item.git_object_type.as_deref();
+            if c.item.is_folder
+                || matches!(object_type, Some("tree" | "commit"))
+                || c.has_change_type("sourceRename")
+            {
                 continue;
             }
             let status = c.status();
@@ -317,6 +319,7 @@ struct AzCommit {
 struct AzIteration {
     id: i64,
     common_ref_commit: AzCommit,
+    source_ref_commit: AzCommit,
 }
 
 /// Respons `iterations/{n}/changes` (`changeEntries`) dan `diffs/commits` (`changes`).
@@ -350,21 +353,22 @@ struct AzItem {
 }
 
 impl AzChange {
-    /// `changeType` bisa daftar seperti "edit, rename". Dicocokkan per kata supaya
-    /// "undelete" tidak dianggap "delete".
-    fn status(&self) -> FileStatus {
-        let types: Vec<String> = self
-            .change_type
+    /// `changeType` bisa daftar seperti "edit, rename". Dicocokkan per kata (tanpa huruf besar/kecil)
+    /// supaya "undelete" tidak dianggap "delete".
+    fn has_change_type(&self, name: &str) -> bool {
+        self.change_type
             .split(',')
-            .map(|t| t.trim().to_lowercase())
-            .collect();
-        let has = |name: &str| types.iter().any(|t| t == name);
-        if has("delete") {
+            .any(|t| t.trim().eq_ignore_ascii_case(name))
+    }
+
+    /// `rename` dicek sebelum `add`: "add, rename" adalah file hasil pindah, bukan file baru.
+    fn status(&self) -> FileStatus {
+        if self.has_change_type("delete") {
             FileStatus::Deleted
-        } else if has("add") {
-            FileStatus::Added
-        } else if has("rename") {
+        } else if self.has_change_type("rename") {
             FileStatus::Renamed
+        } else if self.has_change_type("add") {
+            FileStatus::Added
         } else {
             FileStatus::Modified
         }
@@ -376,6 +380,25 @@ impl AzChange {
 struct AzSubscription {
     id: String,
     event_type: String,
+    status: Option<String>,
+    consumer_inputs: Option<AzConsumerInputs>,
+}
+
+#[derive(Deserialize)]
+struct AzConsumerInputs {
+    url: Option<String>,
+}
+
+impl AzSubscription {
+    /// Sehat = aktif dan mengarah ke `url` yang diminta. `disabledBySystem`/`disabledByUser`
+    /// atau URL lain dianggap hilang.
+    fn is_healthy(&self, url: &str) -> bool {
+        let active = self.status.as_deref().is_some_and(|s| {
+            s.eq_ignore_ascii_case("enabled") || s.eq_ignore_ascii_case("onProbation")
+        });
+        let same_url = self.consumer_inputs.as_ref().and_then(|c| c.url.as_deref()) == Some(url);
+        active && same_url
+    }
 }
 
 #[async_trait]
@@ -413,7 +436,7 @@ impl GitProvider for AzureProvider {
     }
 
     /// Satu subscription per event. Id di `existing` yang masih ada (non-404) dipertahankan;
-    /// hanya event yang belum punya subscription yang dibuat. Azure tidak memakai `secret`.
+    /// hanya event yang belum punya subscription sehat yang dibuat. Azure tidak memakai `secret`.
     async fn ensure_webhooks(
         &self,
         repo: &RepoRef,
@@ -432,10 +455,12 @@ impl GitProvider for AzureProvider {
                 .get_json::<AzSubscription>(&self.org_url(&format!("/hooks/subscriptions/{id}")))
                 .await
             {
-                Ok(sub) => {
+                Ok(sub) if sub.is_healthy(url) => {
                     covered.push(sub.event_type);
                     alive.push(id.clone());
                 }
+                // Nonaktif atau salah URL: hapus lalu dibuat ulang di bawah.
+                Ok(_) => self.delete_webhooks(repo, std::slice::from_ref(id)).await?,
                 Err(GitError::NotFound) => {}
                 Err(e) => return Err(e),
             }
@@ -477,7 +502,12 @@ impl GitProvider for AzureProvider {
         let pull: AzPull = self
             .get_json(&self.repo_url(repo, &format!("/pullrequests/{number}"))?)
             .await?;
-        let iteration = self.last_iteration(repo, number).await?;
+        let iteration = self
+            .iterations(repo, number)
+            .await?
+            .into_iter()
+            .max_by_key(|i| i.id)
+            .ok_or_else(|| GitError::Decode("pull request has no iterations".into()))?;
         Ok(PullRequest {
             number: pull.pull_request_id,
             title: pull.title,
@@ -488,8 +518,17 @@ impl GitProvider for AzureProvider {
         })
     }
 
+    /// Memakai iterasi yang `sourceRefCommit`-nya = `pr.head_sha` (fallback: iterasi terbaru) dan
+    /// mengambil isi file di commit milik iterasi itu, supaya daftar perubahan dan isi file
+    /// konsisten walau ada push di antara `get_pr` dan `pr_diff`.
     async fn pr_diff(&self, repo: &RepoRef, pr: &PullRequest) -> Result<Vec<FileDiff>, GitError> {
-        let iteration = self.last_iteration(repo, pr.number).await?;
+        let mut iterations = self.iterations(repo, pr.number).await?;
+        iterations.sort_by_key(|i| i.id);
+        let iteration = iterations
+            .iter()
+            .rfind(|i| i.source_ref_commit.commit_id == pr.head_sha)
+            .or(iterations.last())
+            .ok_or_else(|| GitError::Decode("pull request has no iterations".into()))?;
         let url = self.repo_url(
             repo,
             &format!(
@@ -498,8 +537,9 @@ impl GitProvider for AzureProvider {
             ),
         )?;
         let changes = self.get_changes(&url, &[("$compareTo", "0")]).await?;
-        self.with_patches(repo, &pr.base_sha, &pr.head_sha, changes)
-            .await
+        let base_sha = &iteration.common_ref_commit.commit_id;
+        let head_sha = &iteration.source_ref_commit.commit_id;
+        self.with_patches(repo, base_sha, head_sha, changes).await
     }
 
     async fn diff_between(
