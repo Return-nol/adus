@@ -4,6 +4,7 @@
 	import { page } from '$app/state';
 	import favicon from '#lib/assets/favicon.svg';
 	import AppSidebar from '$lib/components/app-sidebar.svelte';
+	import { Button } from '$lib/components/ui/button/index.js';
 	import * as Sidebar from '$lib/components/ui/sidebar/index.js';
 	import { Toaster } from '$lib/components/ui/sonner/index.js';
 	import { loadSession, session } from '$lib/session.svelte';
@@ -26,6 +27,13 @@
 
 {#if isPublic}
 	{@render children()}
+{:else if !session.ready}
+	<p class="p-6 text-muted-foreground">Loading...</p>
+{:else if session.error}
+	<div class="grid gap-4 p-6">
+		<p>Cannot reach the server.</p>
+		<Button class="w-fit" onclick={loadSession}>Retry</Button>
+	</div>
 {:else if session.user}
 	<Sidebar.Provider>
 		<AppSidebar />

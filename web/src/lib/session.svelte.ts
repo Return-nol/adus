@@ -10,30 +10,61 @@ export type User = {
 	created_at: string;
 };
 
-/** Current user. `ready` turns true once the first status/me check has finished. */
-export const session = $state<{ user: User | null; ready: boolean }>({ user: null, ready: false });
+/**
+ * Current user. `ready` turns true once the first status/me check has finished;
+ * `error` is true when that check failed for a reason other than "not logged in".
+ */
+export const session = $state<{ user: User | null; ready: boolean; error: boolean }>({
+	user: null,
+	ready: false,
+	error: false
+});
+
+// Bumped by every session change so a slower, older `loadSession` cannot overwrite a newer result.
+let generation = 0;
+
+/** Call after a successful login or setup. Also invalidates any `loadSession` still in flight. */
+export function setUser(user: User): void {
+	generation++;
+	session.user = user;
+	session.ready = true;
+	session.error = false;
+}
 
 /** Checks first-run setup and the login cookie; redirects to /setup or /login when needed. */
 export async function loadSession(): Promise<void> {
-	const status = await api<{ needs_setup: boolean }>('GET', '/auth/status');
-	if (status.needs_setup) {
-		session.user = null;
-		session.ready = true;
-		await goto('/setup');
-		return;
-	}
+	const mine = ++generation;
+	session.ready = false;
+	session.error = false;
 	try {
-		session.user = await api<User>('GET', '/auth/me');
+		const status = await api<{ needs_setup: boolean }>('GET', '/auth/status');
+		if (mine !== generation) return;
+		if (status.needs_setup) {
+			session.user = null;
+			session.ready = true;
+			await goto('/setup');
+			return;
+		}
+		// No automatic /login redirect here: we decide below, once we know the result is still current.
+		const user = await api<User>('GET', '/auth/me', undefined, { redirectOn401: false });
+		if (mine !== generation) return;
+		session.user = user;
 	} catch (e) {
-		// api() already redirected to /login on 401.
-		if (!(e instanceof ApiError && e.status === 401)) throw e;
-		session.user = null;
+		if (mine !== generation) return;
+		if (e instanceof ApiError && e.status === 401) {
+			session.user = null;
+			// Public pages (/login, /setup) stay where they are.
+			if (!['/login', '/setup'].includes(location.pathname)) await goto('/login');
+		} else {
+			session.error = true;
+		}
 	}
 	session.ready = true;
 }
 
 export async function logout(): Promise<void> {
 	await api<void>('POST', '/auth/logout');
+	generation++;
 	session.user = null;
 	await goto('/login');
 }

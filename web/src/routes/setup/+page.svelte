@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { api, ApiError } from '$lib/api';
-	import { session, type User } from '$lib/session.svelte';
+	import { session, setUser, type User } from '$lib/session.svelte';
 	import { Button } from '$lib/components/ui/button/index.js';
 	import * as Card from '$lib/components/ui/card/index.js';
 	import { Input } from '$lib/components/ui/input/index.js';
@@ -13,10 +13,19 @@
 	let error = $state('');
 	let busy = $state(false);
 
+	// Already logged in (or just logged in): go to the app.
+	$effect(() => {
+		if (session.user) goto('/repositories', { replaceState: true });
+	});
+
 	// Setup only exists until the first admin is created.
 	onMount(async () => {
-		const status = await api<{ needs_setup: boolean }>('GET', '/auth/status');
-		if (!status.needs_setup) await goto('/login', { replaceState: true });
+		try {
+			const status = await api<{ needs_setup: boolean }>('GET', '/auth/status');
+			if (!status.needs_setup) await goto('/login', { replaceState: true });
+		} catch {
+			// Server unreachable: the form's own error message covers it on submit.
+		}
 	});
 
 	async function submit(event: SubmitEvent) {
@@ -25,8 +34,7 @@
 		error = '';
 		try {
 			// Setup also starts a session, so the new admin is logged in.
-			session.user = await api<User>('POST', '/auth/setup', { email, password });
-			await goto('/repositories');
+			setUser(await api<User>('POST', '/auth/setup', { email, password }));
 		} catch (e) {
 			error = e instanceof ApiError ? e.message : 'Could not reach the server';
 		} finally {
@@ -45,12 +53,13 @@
 			<form class="grid gap-4" onsubmit={submit}>
 				<div class="grid gap-2">
 					<Label for="email">Email</Label>
-					<Input id="email" type="email" autocomplete="username" required bind:value={email} />
+					<Input id="email" name="email" type="email" autocomplete="username" required bind:value={email} />
 				</div>
 				<div class="grid gap-2">
 					<Label for="password">Password (at least 8 characters)</Label>
 					<Input
 						id="password"
+						name="password"
 						type="password"
 						autocomplete="new-password"
 						minlength={8}

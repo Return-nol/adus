@@ -4,7 +4,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use axum::http::header;
-use common::{app, get, send};
+use common::{app, get, post_empty, send};
 use http_body_util::BodyExt;
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -71,4 +71,11 @@ async fn asset_has_correct_content_type(pool: PgPool) {
         res.headers()[header::CACHE_CONTROL],
         "public, max-age=31536000, immutable"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn non_get_on_unknown_page_path_is_json_404(pool: PgPool) {
+    let reply = send(&app(pool), post_empty("/repositories", None)).await;
+    assert_eq!(reply.status, 404);
+    assert_eq!(reply.body["error"]["code"], "not_found");
 }

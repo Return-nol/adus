@@ -2,7 +2,7 @@
 //! Build release memuat file saat compile; build debug membacanya dari disk.
 
 use axum::{
-    http::{StatusCode, Uri, header},
+    http::{Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use rust_embed::RustEmbed;
@@ -15,11 +15,13 @@ use crate::error::ApiError;
 #[allow_missing = true]
 struct Assets;
 
-/// Fallback router: file statis jika ada, `/api/*` dan `/webhooks/*` yang tak dikenal 404 JSON,
+/// Fallback router (hanya GET/HEAD; method lain 404 JSON): file statis jika ada,
+/// `/api/*` dan `/webhooks/*` yang tak dikenal 404 JSON,
 /// selain itu `index.html` supaya router sisi klien SvelteKit yang menangani path-nya.
-pub async fn spa_handler(uri: Uri) -> Response {
+pub async fn spa_handler(method: Method, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    if is_backend_path(path) {
+    // Only page loads get the SPA; e.g. a POST to an unknown path is a plain 404.
+    if !matches!(method, Method::GET | Method::HEAD) || is_backend_path(path) {
         return ApiError::not_found().into_response();
     }
     if let Some(response) = asset(path) {

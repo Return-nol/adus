@@ -13,8 +13,13 @@ export class ApiError extends Error {
 
 type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
-/** Calls `/api/v1{path}` with the session cookie. Throws `ApiError`; a 401 also redirects to /login. */
-export async function api<T>(method: Method, path: string, body?: unknown): Promise<T> {
+/** Calls `/api/v1{path}` with the session cookie. Throws `ApiError`; a 401 also redirects to /login unless `redirectOn401` is false. */
+export async function api<T>(
+	method: Method,
+	path: string,
+	body?: unknown,
+	options: { redirectOn401?: boolean } = {}
+): Promise<T> {
 	const res = await fetch(`/api/v1${path}`, {
 		method,
 		credentials: 'include',
@@ -30,7 +35,7 @@ export async function api<T>(method: Method, path: string, body?: unknown): Prom
 			payload?.error?.code ?? 'unknown',
 			payload?.error?.message ?? res.statusText
 		);
-		if (res.status === 401) await goto('/login');
+		if (res.status === 401 && options.redirectOn401 !== false) await goto('/login');
 		throw err;
 	}
 
