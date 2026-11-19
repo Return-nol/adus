@@ -51,6 +51,7 @@ cara posting komentar, konsep Rules vs Memory), **bukan sumber kode yang di-port
 - Biaya (USD) per token — v1 hanya menghitung token.
 - Fitur Kodus lain: custom agents, sandbox (e2b), MCP, CLI, analytics cockpit,
   auto-generate rules dari histori review, integrasi Jira/Linear, approval PR otomatis.
+- Helm chart / Kubernetes, template Railway (lihat 6.12).
 - Horizontal scaling API/worker terpisah (struktur crate memungkinkan ini nanti).
 
 ## 4. Anti-goals
@@ -279,17 +280,64 @@ Tipe job: `review_pr`, `pr_comment` (command `@adudu`).
 - Dev: Vite dev server dengan proxy `/api` ke axum.
 - Halaman: Login · Repositories (Connections + repo) · AI Providers (provider +
   keys) · Review Rules (tab Rules / Memory) · Reviews (riwayat) · Token Usage ·
-  Users (admin) · Settings (admin) · Profil (ganti password).
+  Users (admin) · Settings (admin) · System status (admin) · Profil (ganti
+  password).
 - API: REST JSON di `/api/v1/...`.
 
-### 6.12 Deploy & config
+### 6.12 Deploy & setup (mudah dijalankan)
 
-- `docker-compose.yml`: `adus`, `postgres:16`, `redis:7`.
-- Env utama: `DATABASE_URL`, `REDIS_URL`, `ADUS_SECRET_KEY`, `ADUS_PUBLIC_URL`
-  (dipakai untuk membentuk URL webhook; harus bisa dijangkau GitHub/Azure dari
-  internet), `ADUS_BIND_ADDR`.
-- Migrasi DB dijalankan otomatis saat start.
-- Endpoint `/healthz`.
+Pelajaran dari [kodus-installer](https://github.com/kodustech/kodus-installer)
+(lisensi MIT): `.env.example` + `generate-secrets.sh` (mint rahasia),
+`validate-env.sh` (var wajib, tipe, URL webhook harus `https://`), `install.sh`
+(cek Docker/Compose, validasi, `up`, tunggu health, cetak URL), `doctor.sh`
+(vonis "Reviews: OK / DEGRADED / NOT RUNNING" lalu daftar masalah + dampak +
+perbaikan, termasuk cek dari dalam app: worker mengambil job, panggilan nyata ke
+model, token Git dan webhook tiap repo; tidak pernah mencetak rahasia), toggle
+DB/broker eksternal (`USE_LOCAL_DB`), init SQL ekstensi, image ter-pin per versi
+(`IMAGE_TAG`), dokumentasi port, backup volume, update, troubleshooting. Plus Helm
+chart dan template Railway. Adus mengambil pola yang sama, disederhanakan untuk
+3 container:
+
+- **Image siap pakai.** GitHub Actions membangun dan mem-push
+  `ghcr.io/<owner>/adus:<versi>` (+ `latest`) saat tag `v*`, multi-arch
+  (amd64, arm64), supaya pengguna tidak perlu meng-compile Rust. Compose memakai
+  `${ADUS_IMAGE:-ghcr.io/<owner>/adus}:${ADUS_VERSION:-latest}`; README
+  menyarankan pin versi. **[call]** `<owner>` diisi saat repo GitHub dibuat.
+- **`docker-compose.yml`:**
+  - `adus` (port `8080`), `postgres:16` + `redis:7` (`appendonly yes`) dengan
+    healthcheck dan volume `pgdata`, `redisdata`. DB/Redis tidak dipublish ke host.
+  - Postgres dan Redis berada di profile `bundled`; `.env.example` mengisi
+    `COMPOSE_PROFILES=bundled`. Pengguna DB/Redis eksternal menghapus profile itu
+    dan mengisi `DATABASE_URL` / `REDIS_URL` (padanan `USE_LOCAL_DB` Kodus).
+  - Profile opsional `https`: container Caddy dengan HTTPS otomatis untuk
+    `ADUS_DOMAIN` (port 80/443) — cara termudah mendapat URL webhook `https://`
+    publik.
+- **`.env.example` pendek** (±15 variabel), tiap variabel diberi komentar.
+- **Subcommand binary** (lintas platform, tanpa `openssl`/bash):
+  - `adus serve` (default) — server + worker.
+  - `adus gen-secret` — mencetak 32 byte acak base64.
+  - `adus check-config` — validasi env tanpa konek DB: variabel wajib ada,
+    `ADUS_SECRET_KEY` 32 byte, `ADUS_PUBLIC_URL` URL valid; peringatan bila bukan
+    `https://` atau berupa `localhost` (GitHub/Azure tidak bisa mengirim webhook).
+  - `adus doctor` — vonis pertama `Reviews: OK | DEGRADED | NOT RUNNING`, lalu
+    tiap masalah dengan dampak dan perbaikan: konfigurasi, Postgres + migrasi,
+    Redis, heartbeat worker, model default terisi + ada key yang bisa dipakai,
+    token tiap Connection valid, webhook tiap repo aktif masih ada. Tidak
+    mengubah apa pun, tidak mencetak rahasia; exit code ≠ 0 bila `NOT RUNNING`.
+- **Halaman admin "System status"** di dashboard menampilkan cek yang sama
+  (`GET /api/v1/admin/doctor`).
+- **Skrip install** `scripts/install.sh` (Linux/macOS) dan `scripts/install.ps1`
+  (Windows): cek Docker + Compose → salin `.env.example` ke `.env` bila belum ada
+  → isi `ADUS_SECRET_KEY` dan `POSTGRES_PASSWORD` yang kosong via
+  `adus gen-secret` → `adus check-config` → `docker compose up -d` → tunggu
+  `/healthz` (maks 180 dtk) → cetak URL dan langkah berikutnya (buka `/setup`).
+  Skrip tidak pernah menimpa nilai yang sudah ada.
+- Migrasi DB dijalankan otomatis saat start. Endpoint `/healthz`.
+- README: quick start, tabel env, port, backup volume, update versi
+  (`ADUS_VERSION` → `docker compose pull && docker compose up -d`),
+  troubleshooting (mulai dari `adus doctor`), scope PAT.
+- **Non-goal v1:** Helm chart, template Railway, skill instalasi Claude Code,
+  skrip pengumpul diagnostik.
 
 ### 6.13 Kebijakan clean-room untuk fitur Enterprise Kodus
 
