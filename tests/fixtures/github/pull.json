@@ -1,0 +1,8 @@
+{
+  "number": 7,
+  "title": "Add feature",
+  "body": null,
+  "draft": true,
+  "head": { "sha": "headsha" },
+  "base": { "sha": "basesha" }
+}

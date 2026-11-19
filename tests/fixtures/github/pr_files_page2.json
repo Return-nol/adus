@@ -1,0 +1,4 @@
+[
+  { "filename": "src/new_name.rs", "previous_filename": "src/old_name.rs", "status": "renamed", "patch": "@@ -1 +1 @@\n-x\n+y" },
+  { "filename": "src/gone.rs", "status": "removed", "patch": "@@ -1 +0,0 @@\n-z" }
+]

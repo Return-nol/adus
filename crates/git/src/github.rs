@@ -1,0 +1,362 @@
+//! Provider GitHub (REST v3) dengan PAT.
+
+use async_trait::async_trait;
+use reqwest::{RequestBuilder, Response, StatusCode};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::json;
+
+use crate::{
+    FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest, RemoteRepo,
+    RepoRef, normalize_path,
+};
+
+/// Batas halaman saat mengikuti header `Link` (30 x 100 = 3000 item).
+const MAX_PAGES: usize = 30;
+
+pub struct GithubProvider {
+    http: reqwest::Client,
+    base_url: String,
+    token: String,
+}
+
+impl GithubProvider {
+    /// `http` dibuat pemanggil (timeout diatur di sana). `base_url` contoh `https://api.github.com`.
+    pub fn new(http: reqwest::Client, base_url: String, token: String) -> Self {
+        Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token,
+        }
+    }
+
+    fn repo_url(&self, repo: &RepoRef, rest: &str) -> String {
+        format!(
+            "{}/repos/{}/{}{}",
+            self.base_url, repo.owner, repo.name, rest
+        )
+    }
+
+    fn get(&self, url: &str) -> RequestBuilder {
+        self.with_headers(self.http.get(url))
+    }
+
+    fn post(&self, url: &str) -> RequestBuilder {
+        self.with_headers(self.http.post(url))
+    }
+
+    fn with_headers(&self, req: RequestBuilder) -> RequestBuilder {
+        req.bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "adus")
+    }
+
+    /// Kirim request lalu petakan status gagal ke `GitError`. Token tidak pernah masuk pesan error.
+    async fn send(&self, req: RequestBuilder) -> Result<Response, GitError> {
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| GitError::Http(e.without_url().to_string()))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let rate_limit_exhausted = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .is_some_and(|v| v == "0");
+        Err(match status {
+            StatusCode::UNAUTHORIZED => GitError::Unauthorized,
+            StatusCode::TOO_MANY_REQUESTS => GitError::RateLimited,
+            StatusCode::FORBIDDEN if rate_limit_exhausted => GitError::RateLimited,
+            StatusCode::NOT_FOUND => GitError::NotFound,
+            other => GitError::Http(format!("unexpected status {other}")),
+        })
+    }
+
+    async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, GitError> {
+        decode(self.send(self.get(url)).await?).await
+    }
+
+    /// Ambil semua halaman (mengikuti `Link: rel="next"`, maks `MAX_PAGES`). Tiap halaman di-decode ke `P`.
+    async fn get_pages<P: DeserializeOwned>(&self, first_url: String) -> Result<Vec<P>, GitError> {
+        let mut pages = Vec::new();
+        let mut next = Some(first_url);
+        while let Some(url) = next {
+            if pages.len() == MAX_PAGES {
+                break;
+            }
+            let resp = self.send(self.get(&url)).await?;
+            next = next_link(&resp);
+            pages.push(decode(resp).await?);
+        }
+        Ok(pages)
+    }
+
+    async fn files_of(&self, first_url: String) -> Result<Vec<FileDiff>, GitError> {
+        let pages: Vec<Vec<GhFile>> = self.get_pages(first_url).await?;
+        Ok(pages.into_iter().flatten().map(GhFile::into_diff).collect())
+    }
+}
+
+async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, GitError> {
+    resp.json::<T>()
+        .await
+        .map_err(|e| GitError::Decode(e.without_url().to_string()))
+}
+
+/// URL `rel="next"` dari header `Link`, kalau ada.
+fn next_link(resp: &Response) -> Option<String> {
+    let link = resp.headers().get("link")?.to_str().ok()?;
+    link.split(',').find_map(|part| {
+        let (url, rel) = part.split_once(';')?;
+        if !rel.contains("rel=\"next\"") {
+            return None;
+        }
+        Some(
+            url.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string(),
+        )
+    })
+}
+
+#[derive(Deserialize)]
+struct GhUser {
+    id: i64,
+    login: String,
+    email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GhRepo {
+    id: i64,
+    name: String,
+    default_branch: Option<String>,
+    owner: GhOwner,
+}
+
+#[derive(Deserialize)]
+struct GhOwner {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct GhHook {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct GhPull {
+    number: i64,
+    title: String,
+    body: Option<String>,
+    #[serde(default)]
+    draft: bool,
+    head: GhRef,
+    base: GhRef,
+}
+
+#[derive(Deserialize)]
+struct GhRef {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GhCompare {
+    merge_base_commit: GhRef,
+    #[serde(default)]
+    files: Vec<GhFile>,
+}
+
+#[derive(Deserialize)]
+struct GhFile {
+    filename: String,
+    previous_filename: Option<String>,
+    status: String,
+    patch: Option<String>,
+}
+
+impl GhFile {
+    fn into_diff(self) -> FileDiff {
+        let status = match self.status.as_str() {
+            "added" | "copied" => FileStatus::Added,
+            "removed" => FileStatus::Deleted,
+            "renamed" => FileStatus::Renamed,
+            // "modified", "changed", "unchanged" dan status baru yang tak dikenal.
+            _ => FileStatus::Modified,
+        };
+        FileDiff {
+            path: normalize_path(&self.filename),
+            old_path: self.previous_filename.as_deref().map(normalize_path),
+            status,
+            patch: self.patch,
+        }
+    }
+}
+
+#[async_trait]
+impl GitProvider for GithubProvider {
+    async fn verify(&self) -> Result<PatOwner, GitError> {
+        let user: GhUser = self.get_json(&format!("{}/user", self.base_url)).await?;
+        Ok(PatOwner {
+            id: user.id.to_string(),
+            login: user.login,
+            email: user.email,
+        })
+    }
+
+    async fn list_repos(&self) -> Result<Vec<RemoteRepo>, GitError> {
+        let url = format!(
+            "{}/user/repos?per_page=100&affiliation=owner,collaborator,organization_member",
+            self.base_url
+        );
+        let pages: Vec<Vec<GhRepo>> = self.get_pages(url).await?;
+        Ok(pages
+            .into_iter()
+            .flatten()
+            .map(|r| RemoteRepo {
+                r#ref: RepoRef {
+                    external_id: r.id.to_string(),
+                    owner: r.owner.login,
+                    project: None,
+                    name: r.name,
+                },
+                default_branch: r.default_branch,
+            })
+            .collect())
+    }
+
+    /// GitHub hanya butuh satu hook. Id di `existing` yang masih ada (non-404) dipertahankan;
+    /// kalau tidak ada yang tersisa, dibuat satu hook baru. Tidak pernah membuat duplikat.
+    async fn ensure_webhooks(
+        &self,
+        repo: &RepoRef,
+        url: &str,
+        secret: &str,
+        existing: &[String],
+    ) -> Result<Vec<String>, GitError> {
+        let mut alive = Vec::new();
+        for id in existing {
+            match self
+                .get_json::<GhHook>(&self.repo_url(repo, &format!("/hooks/{id}")))
+                .await
+            {
+                Ok(_) => alive.push(id.clone()),
+                Err(GitError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if alive.is_empty() {
+            let body = json!({
+                "name": "web",
+                "active": true,
+                "events": ["pull_request", "issue_comment", "pull_request_review_comment"],
+                "config": { "url": url, "content_type": "json", "secret": secret },
+            });
+            let resp = self
+                .send(self.post(&self.repo_url(repo, "/hooks")).json(&body))
+                .await?;
+            let hook: GhHook = decode(resp).await?;
+            alive.push(hook.id.to_string());
+        }
+        Ok(alive)
+    }
+
+    /// 404 saat menghapus dianggap sukses (hook sudah hilang).
+    async fn delete_webhooks(&self, repo: &RepoRef, ids: &[String]) -> Result<(), GitError> {
+        for id in ids {
+            let req = self.with_headers(
+                self.http
+                    .delete(self.repo_url(repo, &format!("/hooks/{id}"))),
+            );
+            match self.send(req).await {
+                Ok(_) | Err(GitError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_pr(&self, repo: &RepoRef, number: i64) -> Result<PullRequest, GitError> {
+        let pull: GhPull = self
+            .get_json(&self.repo_url(repo, &format!("/pulls/{number}")))
+            .await?;
+        // `base.sha` adalah ujung branch target; yang dipakai review adalah merge base.
+        let compare: GhCompare = self
+            .get_json(&self.repo_url(
+                repo,
+                &format!("/compare/{}...{}?per_page=1", pull.base.sha, pull.head.sha),
+            ))
+            .await?;
+        Ok(PullRequest {
+            number: pull.number,
+            title: pull.title,
+            description: pull.body.unwrap_or_default(),
+            head_sha: pull.head.sha,
+            base_sha: compare.merge_base_commit.sha,
+            is_draft: pull.draft,
+        })
+    }
+
+    async fn pr_diff(&self, repo: &RepoRef, pr: &PullRequest) -> Result<Vec<FileDiff>, GitError> {
+        self.files_of(self.repo_url(repo, &format!("/pulls/{}/files?per_page=100", pr.number)))
+            .await
+    }
+
+    async fn diff_between(
+        &self,
+        repo: &RepoRef,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<Vec<FileDiff>, GitError> {
+        let url = self.repo_url(
+            repo,
+            &format!("/compare/{base_sha}...{head_sha}?per_page=100"),
+        );
+        let pages: Vec<GhCompare> = self.get_pages(url).await?;
+        Ok(pages
+            .into_iter()
+            .flat_map(|p| p.files)
+            .map(GhFile::into_diff)
+            .collect())
+    }
+
+    /// Selalu satu review `COMMENT` di commit `pr.head_sha`; daftar komentar kosong tetap
+    /// mengirim review yang hanya berisi `summary`. Return jumlah komentar inline.
+    async fn post_review(
+        &self,
+        repo: &RepoRef,
+        pr: &PullRequest,
+        comments: &[InlineComment],
+        summary: &str,
+    ) -> Result<usize, GitError> {
+        let inline: Vec<_> = comments
+            .iter()
+            .map(|c| json!({ "path": c.path, "line": c.line, "side": "RIGHT", "body": c.body }))
+            .collect();
+        let body = json!({
+            "commit_id": pr.head_sha,
+            "event": "COMMENT",
+            "body": summary,
+            "comments": inline,
+        });
+        let url = self.repo_url(repo, &format!("/pulls/{}/reviews", pr.number));
+        self.send(self.post(&url).json(&body)).await?;
+        Ok(comments.len())
+    }
+
+    async fn post_comment(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        body: &str,
+    ) -> Result<(), GitError> {
+        let url = self.repo_url(repo, &format!("/issues/{pr_number}/comments"));
+        self.send(self.post(&url).json(&json!({ "body": body })))
+            .await?;
+        Ok(())
+    }
+}

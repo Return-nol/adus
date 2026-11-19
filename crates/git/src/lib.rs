@@ -1,4 +1,5 @@
 pub mod diff;
+pub mod github;
 pub mod types;
 
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 pub use adus_core::types::{ConnectionKind, normalize_path};
+pub use github::GithubProvider;
 pub use types::{
     FileDiff, FileStatus, GitError, InlineComment, PatOwner, PullRequest, RemoteRepo, RepoRef,
 };

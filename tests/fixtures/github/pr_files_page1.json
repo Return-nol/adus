@@ -1,0 +1,4 @@
+[
+  { "filename": "src/a.rs", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b" },
+  { "filename": "logo.png", "status": "added" }
+]

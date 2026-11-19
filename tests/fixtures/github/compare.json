@@ -1,0 +1,6 @@
+{
+  "merge_base_commit": { "sha": "mergebase" },
+  "files": [
+    { "filename": "src/new.rs", "status": "added", "patch": "@@ -0,0 +1 @@\n+hi" }
+  ]
+}

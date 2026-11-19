@@ -14,3 +14,8 @@ reqwest.workspace = true
 serde.workspace = true
 similar.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock.workspace = true
