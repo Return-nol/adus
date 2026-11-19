@@ -5,7 +5,7 @@ Adus is a self-hosted AI code review platform: it reviews pull requests on Azure
 ## Development
 
 ```sh
-docker compose -f docker-compose.dev.yml up -d   # postgres 16 + redis 7
+docker compose -f docker-compose.dev.yml up -d   # postgres 16 (host port 55432) + redis 7 (host port 55379)
 cp .env.example .env                              # fill ADUS_SECRET_KEY
 cargo test --workspace
 cargo run -p adus                                 # needs the variables from .env exported

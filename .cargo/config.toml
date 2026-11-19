@@ -1,6 +1,6 @@
 # Env untuk test/dev lokal (cocok dengan docker-compose.dev.yml).
 [env]
-DATABASE_URL = "postgres://adus:adus@localhost:5432/adus"
-REDIS_URL = "redis://localhost:6379"
+DATABASE_URL = "postgres://adus:adus@localhost:55432/adus"
+REDIS_URL = "redis://localhost:55379"
 # base64 dari 32 byte nol - HANYA untuk test
 ADUS_SECRET_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
