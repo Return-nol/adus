@@ -1,8 +1,11 @@
 //! Akses Postgres: koneksi, migrasi, dan query per tabel.
 
+pub mod ai;
 pub mod connections;
 pub mod repositories;
 pub mod sessions;
+pub mod settings;
+pub mod usage;
 pub mod users;
 
 use sqlx::PgPool;

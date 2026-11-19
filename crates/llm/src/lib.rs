@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
+pub mod router;
 pub mod types;
 
 use async_trait::async_trait;

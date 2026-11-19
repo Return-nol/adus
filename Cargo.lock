@@ -67,11 +67,15 @@ dependencies = [
  "adus-core",
  "adus-db",
  "async-trait",
+ "chrono",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
+ "tracing",
+ "uuid",
  "wiremock",
 ]
 
