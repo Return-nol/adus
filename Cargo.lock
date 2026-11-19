@@ -113,6 +113,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "http-body-util",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
@@ -122,6 +123,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -27,7 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db,
         cipher: Arc::new(cipher),
         config: Arc::new(config),
-        git: Arc::new(HttpGitProviderFactory::new(http)),
+        git: Arc::new(HttpGitProviderFactory::new(http.clone())),
+        http,
     };
     axum::serve(listener, router(state)).await?;
     Ok(())

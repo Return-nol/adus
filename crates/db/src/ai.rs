@@ -135,6 +135,24 @@ pub async fn insert_key(
     .await
 }
 
+pub async fn get_key(pool: &PgPool, id: Uuid) -> Result<Option<AiKey>> {
+    sqlx::query_as(&format!("SELECT {KEY_COLUMNS} FROM ai_keys WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Dipakai settings (provider default) atau repo aktif (override review)? Menghapusnya akan
+/// diam-diam mengosongkan pilihan itu lewat FK, jadi API menolak dulu.
+pub async fn provider_in_use(pool: &PgPool, id: Uuid) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM settings WHERE default_provider_id = $1)              OR EXISTS (SELECT 1 FROM repositories                         WHERE review_provider_id = $1 AND deleted_at IS NULL)",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn list_keys(pool: &PgPool, provider_id: Uuid) -> Result<Vec<AiKey>> {
     sqlx::query_as(&format!(
         "SELECT {KEY_COLUMNS} FROM ai_keys WHERE provider_id = $1 ORDER BY created_at, id"

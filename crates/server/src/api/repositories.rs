@@ -49,7 +49,7 @@ struct UpdateRepository {
 }
 
 /// Membedakan field yang tidak dikirim (`None`) dari field yang dikirim `null` (`Some(None)`).
-fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(super) fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,

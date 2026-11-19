@@ -203,7 +203,7 @@ async fn list(
     Ok(Json(out))
 }
 
-fn required(value: &str, field: &str) -> Result<String, ApiError> {
+pub(super) fn required(value: &str, field: &str) -> Result<String, ApiError> {
     let value = value.trim();
     if value.is_empty() {
         return Err(ApiError::validation(format!("{field} must not be empty")));

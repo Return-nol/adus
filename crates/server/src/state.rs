@@ -11,4 +11,6 @@ pub struct AppState {
     pub cipher: Arc<Cipher>,
     pub config: Arc<Config>,
     pub git: Arc<dyn GitProviderFactory>,
+    /// Dipakai untuk tes key AI; tiap panggilan LLM memasang timeout-nya sendiri (120 dtk).
+    pub http: reqwest::Client,
 }

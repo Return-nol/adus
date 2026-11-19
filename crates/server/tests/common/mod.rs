@@ -53,6 +53,7 @@ pub fn app_with_git(pool: PgPool, public_url: &str, git: Arc<FakeGitFactory>) ->
         cipher: Arc::new(test_cipher()),
         config: Arc::new(test_config(public_url)),
         git,
+        http: reqwest::Client::new(),
     })
 }
 
