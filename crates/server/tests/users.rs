@@ -242,6 +242,24 @@ async fn change_own_password_requires_current(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn admin_resetting_own_password_keeps_current_session(pool: PgPool) {
+    let app = app(pool);
+    let admin = setup_admin(&app).await;
+    let other = cookie_pair(&login(&app, "admin@example.com", PASSWORD).await);
+    let id = admin_id(&app, &admin).await;
+
+    let body = json!({ "password": "reset by self" });
+    let uri = format!("/api/v1/users/{id}/password");
+    let reply = send(&app, post_json(&uri, &body, Some(&admin))).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+
+    assert_eq!(status_of_me(&app, &admin).await, StatusCode::OK);
+    assert_eq!(status_of_me(&app, &other).await, StatusCode::UNAUTHORIZED);
+    let reply = login(&app, "admin@example.com", "reset by self").await;
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn admin_resets_password_and_ends_sessions(pool: PgPool) {
     let app = app(pool);
     let admin = setup_admin(&app).await;

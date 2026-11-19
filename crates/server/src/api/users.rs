@@ -118,8 +118,9 @@ async fn update(
 }
 
 async fn reset_password(
-    _admin: AdminUser,
+    AdminUser(admin): AdminUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(body): ApiJson<SetPassword>,
 ) -> Result<StatusCode, ApiError> {
@@ -129,7 +130,11 @@ async fn reset_password(
     }
     let hash = hash_password(body.password).await?;
     users::set_password(&state.db, id, &hash).await?;
-    sessions::delete_for_user(&state.db, id, None).await?;
+    // Mengganti password sendiri lewat jalur admin: sesi yang sedang dipakai tetap hidup.
+    let current = (admin.id == id)
+        .then(|| session_token(&headers).map(|token| hash_token(&token)))
+        .flatten();
+    sessions::delete_for_user(&state.db, id, current.as_deref()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::Result;
@@ -56,7 +56,8 @@ pub async fn insert(
     github_login: Option<&str>,
 ) -> Result<User> {
     sqlx::query_as(&format!(
-        "INSERT INTO users (email, password_hash, role, github_login)          VALUES ($1, $2, $3, $4::citext) RETURNING {COLUMNS}"
+        "INSERT INTO users (email, password_hash, role, github_login) \
+         VALUES ($1, $2, $3, $4::citext) RETURNING {COLUMNS}"
     ))
     .bind(email)
     .bind(password_hash)
@@ -129,20 +130,22 @@ pub async fn list(pool: &PgPool) -> Result<Vec<User>> {
 }
 
 pub async fn update(pool: &PgPool, id: Uuid, patch: UserPatch) -> Result<User> {
+    let mut conn = pool.acquire().await?;
+    apply_patch(&mut conn, id, patch).await
+}
+
+/// Satu-satunya `UPDATE` untuk `UserPatch`; dipakai `update` dan `update_guarded`.
+async fn apply_patch(conn: &mut PgConnection, id: Uuid, patch: UserPatch) -> Result<User> {
     // $4 menandai apakah github_login diubah (termasuk dikosongkan); $5 nilai barunya.
     sqlx::query_as(&format!(
-        "UPDATE users SET \
-           role = COALESCE($2, role), \
-           disabled = COALESCE($3, disabled), \
-           github_login = CASE WHEN $4 THEN $5::citext ELSE github_login END \
-         WHERE id = $1 RETURNING {COLUMNS}"
+        "UPDATE users SET            role = COALESCE($2, role),            disabled = COALESCE($3, disabled),            github_login = CASE WHEN $4 THEN $5::citext ELSE github_login END          WHERE id = $1 RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(patch.role)
     .bind(patch.disabled)
     .bind(patch.github_login.is_some())
     .bind(patch.github_login.flatten())
-    .fetch_one(pool)
+    .fetch_one(conn)
     .await
 }
 
@@ -181,16 +184,7 @@ pub async fn update_guarded(pool: &PgPool, id: Uuid, patch: UserPatch) -> Result
         return Ok(GuardedUpdate::LastAdmin);
     }
 
-    let user = sqlx::query_as(&format!(
-        "UPDATE users SET            role = COALESCE($2, role),            disabled = COALESCE($3, disabled),            github_login = CASE WHEN $4 THEN $5::citext ELSE github_login END          WHERE id = $1 RETURNING {COLUMNS}"
-    ))
-    .bind(id)
-    .bind(patch.role)
-    .bind(patch.disabled)
-    .bind(patch.github_login.is_some())
-    .bind(patch.github_login.flatten())
-    .fetch_one(&mut *tx)
-    .await?;
+    let user = apply_patch(&mut tx, id, patch).await?;
     tx.commit().await?;
     Ok(GuardedUpdate::Updated(user))
 }

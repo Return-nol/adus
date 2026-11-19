@@ -105,7 +105,15 @@ impl From<JsonRejection> for ApiError {
 pub struct ApiPath<T>(pub T);
 
 impl From<PathRejection> for ApiError {
-    fn from(_: PathRejection) -> ApiError {
-        ApiError::not_found()
+    fn from(rejection: PathRejection) -> ApiError {
+        match rejection {
+            // Segmen path tidak cocok tipenya (mis. bukan UUID): sumber daya tidak ada.
+            PathRejection::FailedToDeserializePathParams(_) => ApiError::not_found(),
+            // Selain itu (MissingPathParams dll.) salah routing di sisi server.
+            other => {
+                tracing::error!("path extraction failed: {other}");
+                ApiError::internal()
+            }
+        }
     }
 }
