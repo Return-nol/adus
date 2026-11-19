@@ -1,2 +1,251 @@
-<h1 class="text-2xl font-semibold">Repositories</h1>
-<p class="mt-2 text-muted-foreground">Connect a Git provider to start reviewing pull requests.</p>
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import { toast } from 'svelte-sonner';
+	import { api, ApiError } from '$lib/api';
+	import { session } from '$lib/session.svelte';
+	import AddRepoDialog from '$lib/components/add-repo-dialog.svelte';
+	import ConnectionDialog, {
+		type Connection,
+		type WebhookError
+	} from '$lib/components/connection-dialog.svelte';
+	import * as AlertDialog from '$lib/components/ui/alert-dialog/index.js';
+	import { Badge } from '$lib/components/ui/badge/index.js';
+	import { Button } from '$lib/components/ui/button/index.js';
+	import * as Card from '$lib/components/ui/card/index.js';
+	import { Switch } from '$lib/components/ui/switch/index.js';
+	import * as Table from '$lib/components/ui/table/index.js';
+
+	type Repo = {
+		id: string;
+		connection_id: string;
+		owner: string;
+		name: string;
+		enabled: boolean;
+		auto_review: boolean;
+		review_model: string | null;
+		webhook_count: number;
+	};
+
+	let connections = $state<Connection[]>([]);
+	let repos = $state<Repo[]>([]);
+	let loaded = $state(false);
+	let connDialogOpen = $state(false);
+	let addOpen = $state(false);
+	let selected = $state<Connection | null>(null);
+	let confirmOpen = $state(false);
+	let confirm = $state<{ title: string; text: string; run: () => Promise<void> } | null>(null);
+
+	// The server enforces admin too; this only disables controls for role `user`.
+	const isAdmin = $derived(session.user?.role === 'admin');
+	const kindLabel = { azure_devops: 'Azure DevOps', github: 'GitHub' };
+	const statusVariant = { ok: 'default', invalid: 'destructive', unverified: 'secondary' } as const;
+
+	function fail(e: unknown) {
+		toast.error(e instanceof ApiError ? e.message : 'Could not reach the server');
+	}
+
+	async function load() {
+		try {
+			[connections, repos] = await Promise.all([
+				api<Connection[]>('GET', '/connections'),
+				api<Repo[]>('GET', '/repositories')
+			]);
+		} catch (e) {
+			fail(e);
+		}
+		loaded = true;
+	}
+
+	onMount(load);
+
+	function warnWebhooks(errors: WebhookError[]) {
+		if (errors.length === 0) return;
+		const lines = errors.map((w) => {
+			const repo = repos.find((r) => r.id === w.repository_id);
+			return `${repo ? `${repo.owner}/${repo.name}` : w.repository_id}: ${w.message}`;
+		});
+		toast.warning('Some webhooks could not be synced', { description: lines.join('\n') });
+	}
+
+	async function afterSave(errors: WebhookError[]) {
+		await load();
+		warnWebhooks(errors);
+	}
+
+	async function resync(c: Connection) {
+		try {
+			const r = await api<{ synced: number; webhook_errors: WebhookError[] }>(
+				'POST',
+				`/connections/${c.id}/resync-webhooks`
+			);
+			toast.success(`Webhooks synced for ${r.synced} repositor${r.synced === 1 ? 'y' : 'ies'}`);
+			await load();
+			warnWebhooks(r.webhook_errors);
+		} catch (e) {
+			fail(e);
+		}
+	}
+
+	async function patchRepo(repo: Repo, patch: { enabled?: boolean; auto_review?: boolean }) {
+		try {
+			await api('PATCH', `/repositories/${repo.id}`, patch);
+		} catch (e) {
+			fail(e);
+		}
+		await load(); // also snaps a failed switch back
+	}
+
+	function askDelete(title: string, text: string, path: string) {
+		confirm = {
+			title,
+			text,
+			run: async () => {
+				try {
+					await api('DELETE', path);
+					await load();
+				} catch (e) {
+					fail(e); // e.g. 409 connection_in_use
+				}
+			}
+		};
+		confirmOpen = true;
+	}
+</script>
+
+<div class="mb-6 flex items-center justify-between">
+	<h1 class="text-2xl font-semibold">Repositories</h1>
+	{#if isAdmin}
+		<Button
+			onclick={() => {
+				selected = null;
+				connDialogOpen = true;
+			}}>Add connection</Button
+		>
+	{/if}
+</div>
+
+{#if loaded && connections.length === 0}
+	<p class="text-muted-foreground">
+		{isAdmin
+			? 'Connect a Git provider to start reviewing pull requests.'
+			: 'No connections yet. An admin needs to connect a Git provider.'}
+	</p>
+{/if}
+
+<div class="space-y-6">
+	{#each connections as c (c.id)}
+		{@const connRepos = repos.filter((r) => r.connection_id === c.id)}
+		<Card.Root>
+			<Card.Header>
+				<Card.Title class="flex flex-wrap items-center gap-2">
+					{c.name}
+					<Badge variant="secondary">{kindLabel[c.kind]}</Badge>
+					<Badge variant={statusVariant[c.status]}>{c.status}</Badge>
+				</Card.Title>
+				<Card.Description>
+					{c.org_or_owner} · PAT owner {c.pat_owner ?? 'unknown'} · <code>••••{c.token_last4}</code>
+				</Card.Description>
+				{#if isAdmin}
+					<Card.Action class="flex flex-wrap gap-2">
+						<Button
+							variant="outline"
+							size="sm"
+							onclick={() => {
+								selected = c;
+								connDialogOpen = true;
+							}}>Rotate PAT</Button
+						>
+						<Button variant="outline" size="sm" onclick={() => resync(c)}>Resync webhooks</Button>
+						<Button
+							variant="outline"
+							size="sm"
+							onclick={() => {
+								selected = c;
+								addOpen = true;
+							}}>Add repositories</Button
+						>
+						<Button
+							variant="destructive"
+							size="sm"
+							onclick={() =>
+								askDelete(
+									`Delete connection ${c.name}?`,
+									'Remove its repositories first. This cannot be undone.',
+									`/connections/${c.id}`
+								)}>Delete</Button
+						>
+					</Card.Action>
+				{/if}
+			</Card.Header>
+			<Card.Content>
+				<Table.Root>
+					<Table.Header>
+						<Table.Row>
+							<Table.Head>Repository</Table.Head>
+							<Table.Head>Enabled</Table.Head>
+							<Table.Head>Auto review</Table.Head>
+							<Table.Head>Model override</Table.Head>
+							<Table.Head class="text-right">Actions</Table.Head>
+						</Table.Row>
+					</Table.Header>
+					<Table.Body>
+						{#each connRepos as repo (repo.id)}
+							<Table.Row>
+								<Table.Cell>{repo.owner}/{repo.name}</Table.Cell>
+								<Table.Cell>
+									<Switch
+										aria-label={`Enabled: ${repo.name}`}
+										disabled={!isAdmin}
+										bind:checked={() => repo.enabled, (v) => patchRepo(repo, { enabled: v })}
+									/>
+								</Table.Cell>
+								<Table.Cell>
+									<Switch
+										aria-label={`Auto review: ${repo.name}`}
+										disabled={!isAdmin}
+										bind:checked={() => repo.auto_review, (v) => patchRepo(repo, { auto_review: v })}
+									/>
+								</Table.Cell>
+								<Table.Cell class="text-muted-foreground">{repo.review_model ?? 'default'}</Table.Cell>
+								<Table.Cell class="text-right">
+									{#if isAdmin}
+										<Button
+											variant="outline"
+											size="sm"
+											onclick={() =>
+												askDelete(
+													`Remove ${repo.owner}/${repo.name}?`,
+													'Its webhooks are deleted from the provider.',
+													`/repositories/${repo.id}`
+												)}>Remove</Button
+										>
+									{/if}
+								</Table.Cell>
+							</Table.Row>
+						{:else}
+							<Table.Row>
+								<Table.Cell colspan={5} class="text-muted-foreground">No repositories yet.</Table.Cell>
+							</Table.Row>
+						{/each}
+					</Table.Body>
+				</Table.Root>
+			</Card.Content>
+		</Card.Root>
+	{/each}
+</div>
+
+<ConnectionDialog bind:open={connDialogOpen} connection={selected} onsaved={afterSave} />
+<AddRepoDialog bind:open={addOpen} connection={selected} onadded={load} />
+
+<AlertDialog.Root bind:open={confirmOpen}>
+	<AlertDialog.Content>
+		<AlertDialog.Header>
+			<AlertDialog.Title>{confirm?.title}</AlertDialog.Title>
+			<AlertDialog.Description>{confirm?.text}</AlertDialog.Description>
+		</AlertDialog.Header>
+		<AlertDialog.Footer>
+			<AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
+			<AlertDialog.Action onclick={() => confirm?.run()}>Delete</AlertDialog.Action>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>
