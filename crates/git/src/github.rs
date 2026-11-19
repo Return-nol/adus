@@ -66,10 +66,12 @@ impl GithubProvider {
             .headers()
             .get("x-ratelimit-remaining")
             .is_some_and(|v| v == "0");
+        // Secondary rate limit GitHub: 403 dengan `Retry-After`.
+        let retry_after = resp.headers().contains_key("retry-after");
         Err(match status {
             StatusCode::UNAUTHORIZED => GitError::Unauthorized,
             StatusCode::TOO_MANY_REQUESTS => GitError::RateLimited,
-            StatusCode::FORBIDDEN if rate_limit_exhausted => GitError::RateLimited,
+            StatusCode::FORBIDDEN if rate_limit_exhausted || retry_after => GitError::RateLimited,
             StatusCode::NOT_FOUND => GitError::NotFound,
             other => GitError::Http(format!("unexpected status {other}")),
         })
@@ -80,16 +82,27 @@ impl GithubProvider {
     }
 
     /// Ambil semua halaman (mengikuti `Link: rel="next"`, maks `MAX_PAGES`). Tiap halaman di-decode ke `P`.
+    /// URL `next` harus di bawah `base_url`; selain itu berhenti dengan error (PAT tidak dikirim ke host lain).
     async fn get_pages<P: DeserializeOwned>(&self, first_url: String) -> Result<Vec<P>, GitError> {
         let mut pages = Vec::new();
-        let mut next = Some(first_url);
-        while let Some(url) = next {
+        let mut url = first_url;
+        loop {
+            let resp = self.send(self.get(&url)).await?;
+            let next = resp
+                .headers()
+                .get("link")
+                .and_then(|v| v.to_str().ok())
+                .and_then(next_link);
+            pages.push(decode(resp).await?);
+            let Some(next) = next else { break };
+            if !next.starts_with(&format!("{}/", self.base_url)) {
+                return Err(GitError::Http("unexpected pagination host".into()));
+            }
             if pages.len() == MAX_PAGES {
+                tracing::warn!(max_pages = MAX_PAGES, "github pagination truncated");
                 break;
             }
-            let resp = self.send(self.get(&url)).await?;
-            next = next_link(&resp);
-            pages.push(decode(resp).await?);
+            url = next;
         }
         Ok(pages)
     }
@@ -106,21 +119,33 @@ async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, GitError> {
         .map_err(|e| GitError::Decode(e.without_url().to_string()))
 }
 
-/// URL `rel="next"` dari header `Link`, kalau ada.
-fn next_link(resp: &Response) -> Option<String> {
-    let link = resp.headers().get("link")?.to_str().ok()?;
-    link.split(',').find_map(|part| {
-        let (url, rel) = part.split_once(';')?;
-        if !rel.contains("rel=\"next\"") {
-            return None;
+/// URL `rel="next"` dari nilai header `Link`, kalau ada. URL bisa memuat koma literal
+/// (`affiliation=a,b`), jadi di-parse lewat `<...>`, bukan dipecah di koma.
+fn next_link(link: &str) -> Option<String> {
+    let mut rest = link;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        let end = after.find('>')?;
+        let url = &after[..end];
+        let tail = &after[end + 1..];
+        // Parameter berlaku sampai `<` berikutnya.
+        let (params, remaining) = match tail.find('<') {
+            Some(i) => tail.split_at(i),
+            None => (tail, ""),
+        };
+        let is_next = params.split(';').any(|p| {
+            p.trim().strip_prefix("rel=").is_some_and(|v| {
+                v.trim_matches(|c: char| c == '"' || c == ',' || c.is_whitespace())
+                    .split_whitespace()
+                    .any(|r| r == "next")
+            })
+        });
+        if is_next {
+            return Some(url.to_string());
         }
-        Some(
-            url.trim()
-                .trim_start_matches('<')
-                .trim_end_matches('>')
-                .to_string(),
-        )
-    })
+        rest = remaining;
+    }
+    None
 }
 
 #[derive(Deserialize)]

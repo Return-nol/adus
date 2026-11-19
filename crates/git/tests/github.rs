@@ -103,10 +103,18 @@ async fn plain_403_is_http_error_without_token() {
 #[tokio::test]
 async fn list_repos_follows_link_pagination() {
     let server = MockServer::start().await;
-    let next = format!("<{}/user/repos?page=2>; rel=\"next\"", server.uri());
+    // Koma literal di URL `next` (persis query yang dikirim `list_repos`) tidak boleh merusak parser.
+    let next = format!(
+        "<{0}/user/repos?per_page=100&affiliation=owner,collaborator,organization_member&page=2>; rel=\"next\", <{0}/user/repos?page=9>; rel=\"last\"",
+        server.uri()
+    );
     Mock::given(method("GET"))
         .and(path("/user/repos"))
         .and(query_param("page", "2"))
+        .and(query_param(
+            "affiliation",
+            "owner,collaborator,organization_member",
+        ))
         .respond_with(json_body("repos_page2.json"))
         .mount(&server)
         .await;
@@ -117,6 +125,7 @@ async fn list_repos_follows_link_pagination() {
             "affiliation",
             "owner,collaborator,organization_member",
         ))
+        .and(wiremock::matchers::query_param_is_missing("page"))
         .respond_with(json_body("repos_page1.json").insert_header("link", next.as_str()))
         .mount(&server)
         .await;
@@ -372,4 +381,131 @@ async fn not_found_and_decode_errors() {
         GitError::NotFound
     );
     assert!(matches!(p.verify().await.unwrap_err(), GitError::Decode(_)));
+}
+
+#[tokio::test]
+async fn pagination_accepts_unquoted_rel_and_next_after_other_rels() {
+    let server = MockServer::start().await;
+    let link = format!(
+        "<{0}/user/repos?page=1>; rel=prev, <{0}/user/repos?page=2>; rel=next",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path("/user/repos"))
+        .and(query_param("page", "2"))
+        .respond_with(json_body("repos_page2.json"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/user/repos"))
+        .and(wiremock::matchers::query_param_is_missing("page"))
+        .respond_with(json_body("repos_page1.json").insert_header("link", link.as_str()))
+        .mount(&server)
+        .await;
+
+    let repos = provider(&server).list_repos().await.unwrap();
+    assert_eq!(repos.len(), 2);
+}
+
+#[tokio::test]
+async fn pagination_refuses_foreign_host() {
+    let server = MockServer::start().await;
+    let evil = MockServer::start().await;
+    let link = format!("<{}/user/repos?page=2>; rel=\"next\"", evil.uri());
+    Mock::given(method("GET"))
+        .and(path("/user/repos"))
+        .respond_with(json_body("repos_page1.json").insert_header("link", link.as_str()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&evil)
+        .await;
+
+    let err = provider(&server).list_repos().await.unwrap_err();
+    assert_eq!(err, GitError::Http("unexpected pagination host".into()));
+}
+
+#[tokio::test]
+async fn pagination_stops_at_page_cap() {
+    let server = MockServer::start().await;
+    let link = format!("<{}/user/repos?page=2>; rel=\"next\"", server.uri());
+    // Setiap halaman menunjuk halaman berikutnya tanpa akhir; harus berhenti di 30 request.
+    Mock::given(method("GET"))
+        .and(path("/user/repos"))
+        .respond_with(json_body("repos_page1.json").insert_header("link", link.as_str()))
+        .expect(30)
+        .mount(&server)
+        .await;
+
+    let repos = provider(&server).list_repos().await.unwrap();
+    assert_eq!(repos.len(), 30);
+}
+
+#[tokio::test]
+async fn secondary_rate_limit_403_with_retry_after_is_rate_limited() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(403).insert_header("retry-after", "60"))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server).verify().await.unwrap_err();
+    assert_eq!(err, GitError::RateLimited);
+}
+
+#[tokio::test]
+async fn ensure_webhooks_returns_non_404_error_and_creates_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/hooks/55"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/alpha/hooks"))
+        .respond_with(json_body("hook_created.json"))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let err = provider(&server)
+        .ensure_webhooks(&repo(), "https://adus.example/hook", "s3", &["55".into()])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GitError::Http(_)));
+}
+
+#[tokio::test]
+async fn ensure_webhooks_keeps_live_hook_and_drops_missing_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/hooks/55"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/hooks/56"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 56 })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/alpha/hooks"))
+        .respond_with(json_body("hook_created.json"))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let ids = provider(&server)
+        .ensure_webhooks(
+            &repo(),
+            "https://adus.example/hook",
+            "s3",
+            &["55".into(), "56".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec!["56".to_string()]);
 }

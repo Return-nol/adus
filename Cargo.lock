@@ -55,6 +55,7 @@ dependencies = [
  "similar",
  "thiserror",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 
