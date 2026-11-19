@@ -1,0 +1,21 @@
+[package]
+name = "adus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+adus-core.workspace = true
+adus-db.workspace = true
+adus-git.workspace = true
+adus-llm.workspace = true
+adus-queue.workspace = true
+adus-review.workspace = true
+adus-server.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,6 @@
+/target
+.env
+.superpowers/
+node_modules/
+web/build/
+web/.svelte-kit/

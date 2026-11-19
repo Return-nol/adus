@@ -1,0 +1,15 @@
+[package]
+name = "adus-review"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+adus-core.workspace = true
+adus-db.workspace = true
+adus-git.workspace = true
+adus-llm.workspace = true
+adus-queue.workspace = true

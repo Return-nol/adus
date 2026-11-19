@@ -1,0 +1,11 @@
+[package]
+name = "adus-queue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+adus-core.workspace = true

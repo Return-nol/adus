@@ -1,0 +1,22 @@
+[package]
+name = "adus-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+adus-core.workspace = true
+adus-db.workspace = true
+adus-git.workspace = true
+adus-llm.workspace = true
+adus-queue.workspace = true
+adus-review.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tokio.workspace = true
+tower.workspace = true
