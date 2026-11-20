@@ -11,6 +11,7 @@ use adus_git::{
     ConnectionKind, FileDiff, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
     PullRequest, RemoteRepo, RepoRef,
 };
+use adus_llm::router::LlmRouter;
 use adus_queue::Queue;
 use adus_server::{AppState, router};
 use async_trait::async_trait;
@@ -68,12 +69,15 @@ pub async fn cleanup_queue(prefix: &str) {
 }
 
 fn build_app(pool: PgPool, public_url: &str, git: Arc<FakeGitFactory>, queue: Queue) -> Router {
+    let cipher = Arc::new(test_cipher());
+    let http = reqwest::Client::new();
     router(AppState {
+        chat: Arc::new(LlmRouter::new(pool.clone(), cipher.clone(), http.clone())),
         db: pool,
-        cipher: Arc::new(test_cipher()),
+        cipher,
         config: Arc::new(test_config(public_url)),
         git,
-        http: reqwest::Client::new(),
+        http,
         queue,
     })
 }

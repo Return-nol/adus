@@ -6,6 +6,7 @@
 //! - `{prefix}:delayed`     sorted set job retry, score = waktu jatuh tempo (unix ms)
 //! - `{prefix}:dedup:{key}` penanda delivery webhook yang sudah pernah dilihat
 //! - `{prefix}:lock:{key}`  lock dengan token
+//! - `{prefix}:worker:{name}:hb` heartbeat worker (unix detik), kedaluwarsa setelah 30 dtk
 //!
 //! Tiap entri stream punya field `job` (JSON) dan `attempt` (angka desimal, default 1).
 
@@ -28,6 +29,8 @@ const RECLAIM_IDLE_MS: u64 = 15 * 60 * 1000;
 const DEDUP_TTL_SECS: u64 = 86_400;
 /// Batas job yang dipindah satu kali `promote_due`.
 const PROMOTE_BATCH: u32 = 100;
+/// Heartbeat yang tidak diperbarui selama ini hilang; worker-nya dianggap mati.
+const HEARTBEAT_TTL_SECS: u64 = 30;
 
 /// Pindahkan job delayed yang jatuh tempo ke stream. ZREM dulu, XADD hanya jika ZREM
 /// berhasil, supaya dua scheduler yang jalan bersamaan tidak menggandakan job.
@@ -317,6 +320,49 @@ impl Queue {
         Ok(())
     }
 
+    /// Tandai `worker` masih hidup selama 30 dtk ke depan. Worker memanggilnya tiap 10 dtk.
+    pub async fn heartbeat(&self, worker: &str) -> Result<(), QueueError> {
+        let _: () = redis::cmd("SET")
+            .arg(self.heartbeat_key(worker))
+            .arg(chrono::Utc::now().timestamp())
+            .arg("EX")
+            .arg(HEARTBEAT_TTL_SECS)
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Nama worker yang heartbeat-nya belum kedaluwarsa, urut abjad.
+    pub async fn live_workers(&self) -> Result<Vec<String>, QueueError> {
+        let head = format!("{}:worker:", self.prefix);
+        let pattern = self.heartbeat_key("*");
+        let mut workers = Vec::new();
+        let mut cursor: u64 = 0;
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut self.conn.clone())
+                .await?;
+            for key in keys {
+                if let Some(name) = key.strip_prefix(&head).and_then(|k| k.strip_suffix(":hb")) {
+                    workers.push(name.to_string());
+                }
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        // SCAN boleh mengembalikan key yang sama lebih dari sekali.
+        workers.sort();
+        workers.dedup();
+        Ok(workers)
+    }
+
     /// XAUTOCLAIM satu entri yang idle lebih dari 15 menit.
     async fn reclaim_stale(&self, consumer: &str) -> Result<Option<StreamId>, QueueError> {
         let reply: StreamAutoClaimReply = redis::cmd("XAUTOCLAIM")
@@ -467,6 +513,10 @@ impl Queue {
 
     fn lock_key(&self, key: &str) -> String {
         format!("{}:lock:{key}", self.prefix)
+    }
+
+    fn heartbeat_key(&self, worker: &str) -> String {
+        format!("{}:worker:{worker}:hb", self.prefix)
     }
 }
 

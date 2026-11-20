@@ -13,11 +13,17 @@ dependencies = [
  "adus-queue",
  "adus-review",
  "adus-server",
+ "async-trait",
  "axum",
+ "redis",
  "reqwest",
+ "serde_json",
+ "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Worker juga dipakai test integrasi di tests/, jadi diekspos sebagai library.
+[lib]
+path = "src/worker.rs"
+
 [lints]
 workspace = true
 
@@ -15,8 +19,16 @@ adus-llm.workspace = true
 adus-queue.workspace = true
 adus-review.workspace = true
 adus-server.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+redis.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
