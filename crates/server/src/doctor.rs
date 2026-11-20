@@ -274,9 +274,11 @@ async fn check_git(state: &AppState, out: &mut Vec<Check>) {
             let found = if repo.webhook_external_ids.is_empty() {
                 Ok(Ok(false))
             } else {
+                // URL yang sekarang: hook yang masih mengarah ke ADUS_PUBLIC_URL lama dianggap hilang.
+                let url = repositories::webhook_url(&state.config.public_url, repo, conn.kind);
                 tokio::time::timeout(
                     PROVIDER_TIMEOUT,
-                    provider.webhooks_exist(&repo_ref(repo), &repo.webhook_external_ids),
+                    provider.webhooks_exist(&repo_ref(repo), &repo.webhook_external_ids, &url),
                 )
                 .await
             };

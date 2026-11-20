@@ -171,7 +171,28 @@ struct GhOwner {
 #[derive(Deserialize)]
 struct GhHook {
     id: i64,
+    #[serde(default)]
+    active: bool,
+    config: Option<GhHookConfig>,
 }
+
+#[derive(Deserialize)]
+struct GhHookConfig {
+    url: Option<String>,
+}
+
+impl GhHook {
+    /// Sehat = aktif dan mengarah ke `url` yang diminta.
+    fn is_healthy(&self, url: &str) -> bool {
+        self.active && self.config.as_ref().and_then(|c| c.url.as_deref()) == Some(url)
+    }
+}
+
+const HOOK_EVENTS: [&str; 3] = [
+    "pull_request",
+    "issue_comment",
+    "pull_request_review_comment",
+];
 
 #[derive(Deserialize)]
 struct GhPull {
@@ -255,7 +276,8 @@ impl GitProvider for GithubProvider {
     }
 
     /// GitHub hanya butuh satu hook. Id di `existing` yang masih ada (non-404) dipertahankan;
-    /// kalau tidak ada yang tersisa, dibuat satu hook baru. Tidak pernah membuat duplikat.
+    /// yang nonaktif atau mengarah ke URL lain di-PATCH (id tetap). Kalau tidak ada yang
+    /// tersisa, dibuat satu hook baru. Tidak pernah membuat duplikat.
     async fn ensure_webhooks(
         &self,
         repo: &RepoRef,
@@ -263,13 +285,18 @@ impl GitProvider for GithubProvider {
         secret: &str,
         existing: &[String],
     ) -> Result<Vec<String>, GitError> {
+        let config = json!({ "url": url, "content_type": "json", "secret": secret });
         let mut alive = Vec::new();
         for id in existing {
-            match self
-                .get_json::<GhHook>(&self.repo_url(repo, &format!("/hooks/{id}")))
-                .await
-            {
-                Ok(_) => alive.push(id.clone()),
+            let hook_url = self.repo_url(repo, &format!("/hooks/{id}"));
+            match self.get_json::<GhHook>(&hook_url).await {
+                Ok(hook) if hook.is_healthy(url) => alive.push(id.clone()),
+                Ok(_) => {
+                    let body = json!({ "config": config, "events": HOOK_EVENTS, "active": true });
+                    let req = self.with_headers(self.http.patch(&hook_url)).json(&body);
+                    self.send(req).await?;
+                    alive.push(id.clone());
+                }
                 Err(GitError::NotFound) => {}
                 Err(e) => return Err(e),
             }
@@ -278,8 +305,8 @@ impl GitProvider for GithubProvider {
             let body = json!({
                 "name": "web",
                 "active": true,
-                "events": ["pull_request", "issue_comment", "pull_request_review_comment"],
-                "config": { "url": url, "content_type": "json", "secret": secret },
+                "events": HOOK_EVENTS,
+                "config": config,
             });
             let resp = self
                 .send(self.post(&self.repo_url(repo, "/hooks")).json(&body))
@@ -305,14 +332,20 @@ impl GitProvider for GithubProvider {
         Ok(())
     }
 
-    async fn webhooks_exist(&self, repo: &RepoRef, ids: &[String]) -> Result<bool, GitError> {
+    async fn webhooks_exist(
+        &self,
+        repo: &RepoRef,
+        ids: &[String],
+        url: &str,
+    ) -> Result<bool, GitError> {
         for id in ids {
             match self
                 .get_json::<GhHook>(&self.repo_url(repo, &format!("/hooks/{id}")))
                 .await
             {
-                Ok(_) => {}
-                Err(GitError::NotFound) => return Ok(false),
+                Ok(hook) if hook.is_healthy(url) => {}
+                // Nonaktif atau URL lama sama saja dengan hilang.
+                Ok(_) | Err(GitError::NotFound) => return Ok(false),
                 Err(e) => return Err(e),
             }
         }

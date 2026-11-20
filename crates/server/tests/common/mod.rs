@@ -145,6 +145,8 @@ pub struct FakeGitState {
     pub delete_error: Option<GitError>,
     /// `webhooks_exist` memberi `false` untuk repo dengan external_id ini.
     pub missing_webhooks: HashSet<String>,
+    /// Jika diisi, `webhooks_exist` memberi `false` saat ditanya URL lain (hook mengarah ke sini).
+    pub registered_webhook_url: Option<String>,
     pub ensure_calls: Vec<EnsureCall>,
     pub delete_calls: Vec<DeleteCall>,
 }
@@ -163,6 +165,7 @@ impl Default for FakeGitState {
             ensure_errors: HashMap::new(),
             delete_error: None,
             missing_webhooks: HashSet::new(),
+            registered_webhook_url: None,
             ensure_calls: Vec::new(),
             delete_calls: Vec::new(),
         }
@@ -267,10 +270,19 @@ impl GitProvider for FakeGit {
         }
     }
 
-    async fn webhooks_exist(&self, repo: &RepoRef, _ids: &[String]) -> Result<bool, GitError> {
+    async fn webhooks_exist(
+        &self,
+        repo: &RepoRef,
+        _ids: &[String],
+        url: &str,
+    ) -> Result<bool, GitError> {
         let state = self.state.lock().unwrap();
         self.check_token(&state)?;
-        Ok(!state.missing_webhooks.contains(&repo.external_id))
+        let url_matches = state
+            .registered_webhook_url
+            .as_deref()
+            .is_none_or(|registered| registered == url);
+        Ok(url_matches && !state.missing_webhooks.contains(&repo.external_id))
     }
 
     async fn get_pr(&self, _repo: &RepoRef, _number: i64) -> Result<PullRequest, GitError> {

@@ -127,7 +127,12 @@ impl GitProvider for FakeGit {
         unimplemented!("not used by the engine")
     }
 
-    async fn webhooks_exist(&self, _repo: &RepoRef, _ids: &[String]) -> Result<bool, GitError> {
+    async fn webhooks_exist(
+        &self,
+        _repo: &RepoRef,
+        _ids: &[String],
+        _url: &str,
+    ) -> Result<bool, GitError> {
         unimplemented!("not used by the engine")
     }
 

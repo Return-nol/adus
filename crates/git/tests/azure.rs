@@ -300,9 +300,19 @@ async fn webhooks_exist_false_when_one_missing() {
         .await;
 
     let p = provider(&server);
-    assert!(p.webhooks_exist(&repo(), &["a".to_string()]).await.unwrap());
     assert!(
-        !p.webhooks_exist(&repo(), &["a".to_string(), "b".into()])
+        p.webhooks_exist(&repo(), &["a".to_string()], "u")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !p.webhooks_exist(&repo(), &["a".to_string(), "b".into()], "u")
+            .await
+            .unwrap()
+    );
+    // URL publik berubah: subscription lama tidak lagi dianggap ada.
+    assert!(
+        !p.webhooks_exist(&repo(), &["a".to_string()], "https://new.example/h")
             .await
             .unwrap()
     );
@@ -324,7 +334,7 @@ async fn webhooks_exist_false_when_subscription_disabled() {
 
     assert!(
         !provider(&server)
-            .webhooks_exist(&repo(), &["off".to_string()])
+            .webhooks_exist(&repo(), &["off".to_string()], "u")
             .await
             .unwrap()
     );

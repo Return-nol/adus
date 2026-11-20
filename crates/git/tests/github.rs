@@ -169,18 +169,85 @@ async fn ensure_webhooks_recreates_missing_hook() {
     assert_eq!(ids, vec!["999".to_string()]);
 }
 
+fn hook(id: i64, url: &str, active: bool) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "id": id,
+        "active": active,
+        "config": { "url": url, "content_type": "json", "insecure_ssl": "0" },
+    }))
+}
+
 #[tokio::test]
 async fn ensure_webhooks_keeps_existing() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/repos/octocat/alpha/hooks/55"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 55 })))
+        .respond_with(hook(55, "https://adus.example/hook", true))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/repos/octocat/alpha/hooks"))
         .respond_with(ResponseTemplate::new(500))
         .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let ids = provider(&server)
+        .ensure_webhooks(&repo(), "https://adus.example/hook", "s3", &["55".into()])
+        .await
+        .unwrap();
+    assert_eq!(ids, vec!["55".to_string()]);
+}
+
+#[tokio::test]
+async fn ensure_webhooks_patches_hook_with_old_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/hooks/55"))
+        .respond_with(hook(55, "https://old.example/hook", true))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/octocat/alpha/hooks/55"))
+        .and(body_json(json!({
+            "config": { "url": "https://adus.example/hook", "content_type": "json", "secret": "s3" },
+            "events": ["pull_request", "issue_comment", "pull_request_review_comment"],
+            "active": true,
+        })))
+        .respond_with(hook(55, "https://adus.example/hook", true))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let ids = provider(&server)
+        .ensure_webhooks(&repo(), "https://adus.example/hook", "s3", &["55".into()])
+        .await
+        .unwrap();
+    assert_eq!(ids, vec!["55".to_string()]);
+}
+
+#[tokio::test]
+async fn ensure_webhooks_patches_inactive_hook() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/hooks/55"))
+        .respond_with(hook(55, "https://adus.example/hook", false))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/octocat/alpha/hooks/55"))
+        .respond_with(hook(55, "https://adus.example/hook", true))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -196,7 +263,7 @@ async fn webhooks_exist_false_when_one_missing() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/repos/octocat/alpha/hooks/55"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 55 })))
+        .respond_with(hook(55, "https://adus.example/hook", true))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -212,12 +279,22 @@ async fn webhooks_exist_false_when_one_missing() {
 
     let p = provider(&server);
     assert!(
-        p.webhooks_exist(&repo(), &["55".to_string()])
+        p.webhooks_exist(&repo(), &["55".to_string()], "https://adus.example/hook")
             .await
             .unwrap()
     );
     assert!(
-        !p.webhooks_exist(&repo(), &["55".to_string(), "56".into()])
+        !p.webhooks_exist(
+            &repo(),
+            &["55".to_string(), "56".into()],
+            "https://adus.example/hook"
+        )
+        .await
+        .unwrap()
+    );
+    // URL publik berubah: hook lama tidak lagi dianggap ada.
+    assert!(
+        !p.webhooks_exist(&repo(), &["55".to_string()], "https://new.example/hook")
             .await
             .unwrap()
     );
@@ -520,7 +597,7 @@ async fn ensure_webhooks_keeps_live_hook_and_drops_missing_one() {
         .await;
     Mock::given(method("GET"))
         .and(path("/repos/octocat/alpha/hooks/56"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 56 })))
+        .respond_with(hook(56, "https://adus.example/hook", true))
         .mount(&server)
         .await;
     Mock::given(method("POST"))

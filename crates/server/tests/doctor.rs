@@ -226,6 +226,19 @@ async fn doctor_degraded_when_webhook_missing(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn doctor_degraded_when_webhook_points_to_old_public_url(pool: PgPool) {
+    let w = healthy_world(pool).await;
+    w.git.with(|s| {
+        s.registered_webhook_url = Some("https://old.example/webhooks/github/x".into());
+    });
+
+    let report = doctor::run(&w.state).await;
+    assert_eq!(report.verdict, Verdict::Degraded);
+    assert_eq!(fails(&report), vec!["Webhooks: acme/api"]);
+    cleanup_queue(&w.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn doctor_never_calls_ensure_webhooks(pool: PgPool) {
     let w = healthy_world(pool.clone()).await;
     w.git.with(|s| {

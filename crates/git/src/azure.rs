@@ -501,14 +501,19 @@ impl GitProvider for AzureProvider {
         Ok(())
     }
 
-    async fn webhooks_exist(&self, _repo: &RepoRef, ids: &[String]) -> Result<bool, GitError> {
+    async fn webhooks_exist(
+        &self,
+        _repo: &RepoRef,
+        ids: &[String],
+        url: &str,
+    ) -> Result<bool, GitError> {
         for id in ids {
             match self
                 .get_json::<AzSubscription>(&self.org_url(&format!("/hooks/subscriptions/{id}")))
                 .await
             {
-                Ok(sub) if sub.is_active() => {}
-                // Nonaktif sama saja dengan hilang: Azure tidak mengirim event darinya.
+                Ok(sub) if sub.is_healthy(url) => {}
+                // Nonaktif atau URL lama sama saja dengan hilang.
                 Ok(_) | Err(GitError::NotFound) => return Ok(false),
                 Err(e) => return Err(e),
             }
