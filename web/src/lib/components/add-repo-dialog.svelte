@@ -4,6 +4,12 @@
 	import type { Connection } from '#lib/components/connection-dialog.svelte';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Dialog from '#lib/components/ui/dialog/index.js';
+	import * as Popover from '#lib/components/ui/popover/index.js';
+	import * as Command from '#lib/components/ui/command/index.js';
+	import { Badge } from '#lib/components/ui/badge/index.js';
+	import RiArrowDownSLine from 'remixicon-svelte/icons/arrow-down-s-line';
+	import RiCloseLine from 'remixicon-svelte/icons/close-line';
+	import RiLoader3Line from 'remixicon-svelte/icons/loader-3-line';
 
 	type RemoteRepo = {
 		ref: { external_id: string; owner: string; project: string | null; name: string };
@@ -23,6 +29,17 @@
 	let busy = $state(false);
 	let loadError = $state('');
 	let failures = $state<string[]>([]);
+	let pickerOpen = $state(false);
+
+	const label = (repo: RemoteRepo) => `${repo.ref.owner}/${repo.ref.name}`;
+	const nameOf = (id: string) => {
+		const repo = remote.find((r) => r.ref.external_id === id);
+		return repo ? label(repo) : id;
+	};
+
+	function toggle(id: string) {
+		picked = picked.includes(id) ? picked.filter((p) => p !== id) : [...picked, id];
+	}
 
 	async function loadRemote() {
 		if (!connection) return;
@@ -42,6 +59,7 @@
 		if (!open) return;
 		picked = [];
 		failures = [];
+		pickerOpen = false;
 		loadRemote();
 	});
 
@@ -49,6 +67,7 @@
 	async function addPicked() {
 		if (!connection) return;
 		busy = true;
+		pickerOpen = false;
 		failures = [];
 		let added = 0;
 		for (const id of picked) {
@@ -79,30 +98,74 @@
 			<Dialog.Description>A webhook is registered for each repository you add.</Dialog.Description>
 		</Dialog.Header>
 		{#if loading}
-			<p class="text-sm text-muted-foreground">Loading repositories...</p>
+			<p class="flex min-h-4 items-center justify-center gap-2 py-2 text-sm text-muted-foreground">
+				<RiLoader3Line class="size-4 animate-spin" aria-hidden="true" />
+				Loading repositories...
+			</p>
 		{:else if loadError}
 			<p class="text-sm text-destructive" role="alert">{loadError}</p>
 		{:else}
-			<ul class="max-h-72 space-y-2 overflow-y-auto">
-				{#each remote as repo (repo.ref.external_id)}
-					<li>
-						<label class="flex items-center gap-2 text-sm">
-							<input
-								type="checkbox"
-								class="size-4 rounded-sm accent-primary"
-								disabled={repo.added || busy}
-								value={repo.ref.external_id}
-								bind:group={picked}
-							/>
-							<span class={repo.added ? 'text-muted-foreground' : ''}>
-								{repo.ref.owner}/{repo.ref.name}{repo.added ? ' (added)' : ''}
-							</span>
-						</label>
-					</li>
-				{:else}
-					<li class="text-sm text-muted-foreground">No repositories visible to this token.</li>
-				{/each}
-			</ul>
+			<Popover.Root bind:open={pickerOpen}>
+				<Popover.Trigger disabled={busy}>
+					{#snippet child({ props })}
+						<Button
+							{...props}
+							variant="outline"
+							role="combobox"
+							aria-expanded={pickerOpen}
+							class="w-full justify-between rounded-sm font-normal"
+						>
+							{#if picked.length}
+								{picked.length} repositor{picked.length === 1 ? 'y' : 'ies'} selected
+							{:else}
+								<span class="text-muted-foreground">Select repositories...</span>
+							{/if}
+							<RiArrowDownSLine data-icon="inline-end" class="text-muted-foreground" />
+						</Button>
+					{/snippet}
+				</Popover.Trigger>
+				<Popover.Content class="w-(--bits-popover-anchor-width) p-0" align="start">
+					<Command.Root>
+						<Command.Input placeholder="Search repositories..." />
+						<Command.List>
+							<Command.Empty>
+								{remote.length ? 'No repository found.' : 'No repositories visible to this token.'}
+							</Command.Empty>
+							{#each remote as repo (repo.ref.external_id)}
+								<Command.Item
+									value={label(repo)}
+									disabled={repo.added}
+									data-checked={picked.includes(repo.ref.external_id)}
+									onSelect={() => toggle(repo.ref.external_id)}
+								>
+									<span class="truncate">{label(repo)}</span>
+									{#if repo.added}
+										<span class="text-xs text-muted-foreground">added</span>
+									{/if}
+								</Command.Item>
+							{/each}
+						</Command.List>
+					</Command.Root>
+				</Popover.Content>
+			</Popover.Root>
+			{#if picked.length}
+				<div class="flex max-h-32 flex-wrap gap-1.5 overflow-y-auto">
+					{#each picked as id (id)}
+						<Badge variant="secondary" class="max-w-full">
+							<span class="truncate">{nameOf(id)}</span>
+							<button
+								type="button"
+								class="rounded-full hover:text-foreground disabled:opacity-50"
+								aria-label="Remove {nameOf(id)}"
+								disabled={busy}
+								onclick={() => toggle(id)}
+							>
+								<RiCloseLine class="size-3" />
+							</button>
+						</Badge>
+					{/each}
+				</div>
+			{/if}
 		{/if}
 		{#if failures.length}
 			<ul class="space-y-1 text-sm text-destructive" role="alert">

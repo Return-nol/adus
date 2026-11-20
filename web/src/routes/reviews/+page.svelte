@@ -7,6 +7,7 @@
 	import * as Card from '#lib/components/ui/card/index.js';
 	import * as Select from '#lib/components/ui/select/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
+	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
 	import { safeHttpUrl } from '#lib/utils.js';
 
@@ -180,7 +181,23 @@
 		Could not load reviews.
 		<Button variant="outline" size="sm" class="ml-2" onclick={() => load()}>Retry</Button>
 	</div>
-{:else if loaded && items.length === 0}
+{:else if !loaded}
+	<TableSkeleton
+		card
+		headers={[
+			'Repository',
+			'PR',
+			'Trigger',
+			'Status',
+			'Comments',
+			'Input tokens',
+			'Output tokens',
+			'Started',
+			'Duration'
+		]}
+		right={['Comments', 'Input tokens', 'Output tokens', 'Duration']}
+	/>
+{:else if items.length === 0}
 	<div
 		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 	>
@@ -192,77 +209,79 @@
 		{/if}
 	</div>
 {:else if items.length > 0}
-<Card.Root class="py-0">
+	<Card.Root class="py-0">
 		<Card.Content class="px-0">
-	<Table.Root>
-		<Table.Header>
-			<Table.Row>
-				<Table.Head>Repository</Table.Head>
-				<Table.Head>PR</Table.Head>
-				<Table.Head>Trigger</Table.Head>
-				<Table.Head>Status</Table.Head>
-				<Table.Head class="text-right">Comments</Table.Head>
-				<Table.Head class="text-right">Input tokens</Table.Head>
-				<Table.Head class="text-right">Output tokens</Table.Head>
-				<Table.Head>Started</Table.Head>
-				<Table.Head class="text-right">Duration</Table.Head>
-			</Table.Row>
-		</Table.Header>
-		<Table.Body>
-			{#each items as r (r.id)}
-				<Table.Row>
-					<Table.Cell class="font-medium">{r.repository.name}</Table.Cell>
-					<Table.Cell>
-						{#if safeHttpUrl(r.pr_url)}
-							<a
-								href={safeHttpUrl(r.pr_url)}
-								target="_blank"
-								rel="noopener noreferrer"
-								class="text-primary underline-offset-4 hover:underline"
-							>
-								#{r.pr_number}
-							</a>
-						{:else}
-							#{r.pr_number}
-						{/if}
-					</Table.Cell>
-					<Table.Cell class="text-muted-foreground">{triggerLabel[r.trigger]}</Table.Cell>
-					<Table.Cell>
-						{#if r.status === 'failed' && r.error}
-							<Tooltip.Root>
-								<Tooltip.Trigger title={r.error}>
-									<Badge variant={statusVariant.failed}>failed</Badge>
-								</Tooltip.Trigger>
-								<Tooltip.Content class="max-w-sm whitespace-pre-wrap">{r.error}</Tooltip.Content>
-							</Tooltip.Root>
-						{:else}
-							<Badge variant={statusVariant[r.status]}>{r.status}</Badge>
-						{/if}
-						{#if r.status === 'skipped' && r.skip_reason}
-							<span class="ml-1 text-xs text-muted-foreground">
-								{skipLabel[r.skip_reason] ?? r.skip_reason}
-							</span>
-						{/if}
-					</Table.Cell>
-					<Table.Cell class="text-right tabular-nums">{n(r.comments_posted)}</Table.Cell>
-					<Table.Cell class="text-right tabular-nums">{n(r.input_tokens)}</Table.Cell>
-					<Table.Cell class="text-right tabular-nums">{n(r.output_tokens)}</Table.Cell>
-					<Table.Cell class="text-muted-foreground">
-						{#if r.started_at}
-							<time datetime={r.started_at}>{dateFormat.format(new Date(r.started_at))}</time>
-						{:else}
-							—
-						{/if}
-					</Table.Cell>
-					<Table.Cell class="text-right text-muted-foreground tabular-nums">
-						{duration(r)}
-					</Table.Cell>
-				</Table.Row>
-			{/each}
-		</Table.Body>
-	</Table.Root>
+			<Table.Root>
+				<Table.Header>
+					<Table.Row>
+						<Table.Head>Repository</Table.Head>
+						<Table.Head>PR</Table.Head>
+						<Table.Head>Trigger</Table.Head>
+						<Table.Head>Status</Table.Head>
+						<Table.Head class="text-right">Comments</Table.Head>
+						<Table.Head class="text-right">Input tokens</Table.Head>
+						<Table.Head class="text-right">Output tokens</Table.Head>
+						<Table.Head>Started</Table.Head>
+						<Table.Head class="text-right">Duration</Table.Head>
+					</Table.Row>
+				</Table.Header>
+				<Table.Body>
+					{#each items as r (r.id)}
+						<Table.Row>
+							<Table.Cell class="font-medium">{r.repository.name}</Table.Cell>
+							<Table.Cell>
+								{#if safeHttpUrl(r.pr_url)}
+									<a
+										href={safeHttpUrl(r.pr_url)}
+										target="_blank"
+										rel="noopener noreferrer"
+										class="text-primary underline-offset-4 hover:underline"
+									>
+										#{r.pr_number}
+									</a>
+								{:else}
+									#{r.pr_number}
+								{/if}
+							</Table.Cell>
+							<Table.Cell class="text-muted-foreground">{triggerLabel[r.trigger]}</Table.Cell>
+							<Table.Cell>
+								{#if r.status === 'failed' && r.error}
+									<Tooltip.Root>
+										<Tooltip.Trigger title={r.error}>
+											<Badge variant={statusVariant.failed}>failed</Badge>
+										</Tooltip.Trigger>
+										<Tooltip.Content class="max-w-sm whitespace-pre-wrap">
+											{r.error}
+										</Tooltip.Content>
+									</Tooltip.Root>
+								{:else}
+									<Badge variant={statusVariant[r.status]}>{r.status}</Badge>
+								{/if}
+								{#if r.status === 'skipped' && r.skip_reason}
+									<span class="ml-1 text-xs text-muted-foreground">
+										{skipLabel[r.skip_reason] ?? r.skip_reason}
+									</span>
+								{/if}
+							</Table.Cell>
+							<Table.Cell class="text-right tabular-nums">{n(r.comments_posted)}</Table.Cell>
+							<Table.Cell class="text-right tabular-nums">{n(r.input_tokens)}</Table.Cell>
+							<Table.Cell class="text-right tabular-nums">{n(r.output_tokens)}</Table.Cell>
+							<Table.Cell class="text-muted-foreground">
+								{#if r.started_at}
+									<time datetime={r.started_at}>{dateFormat.format(new Date(r.started_at))}</time>
+								{:else}
+									—
+								{/if}
+							</Table.Cell>
+							<Table.Cell class="text-right text-muted-foreground tabular-nums">
+								{duration(r)}
+							</Table.Cell>
+						</Table.Row>
+					{/each}
+				</Table.Body>
+			</Table.Root>
 		</Card.Content>
-</Card.Root>
+	</Card.Root>
 
 	<div class="mt-4 flex items-center justify-end gap-3 text-sm text-muted-foreground">
 		<span>Page {page} of {pages}</span>

@@ -9,6 +9,7 @@
 	import { Input } from '#lib/components/ui/input/index.js';
 	import { Label } from '#lib/components/ui/label/index.js';
 	import * as Select from '#lib/components/ui/select/index.js';
+	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
 
 	type Settings = {
 		default_provider_id: string | null;
@@ -20,6 +21,7 @@
 	const isAdmin = $derived(session.user?.role === 'admin');
 	let providers = $state<Provider[]>([]);
 	let loaded = $state(false);
+	let loadError = $state(false);
 	let busy = $state(false);
 	// '' = no default provider.
 	let providerId = $state('');
@@ -38,8 +40,8 @@
 		maxPatchLines = s.max_patch_lines_per_file;
 	}
 
-	onMount(async () => {
-		if (!isAdmin) return;
+	async function load() {
+		loadError = false;
 		try {
 			const [p, s] = await Promise.all([
 				api<Provider[]>('GET', '/ai-providers'),
@@ -49,8 +51,13 @@
 			fill(s);
 			loaded = true;
 		} catch (e) {
+			loadError = true;
 			fail(e);
 		}
+	}
+
+	onMount(() => {
+		if (isAdmin) load();
 	});
 
 	async function save(event: SubmitEvent) {
@@ -82,7 +89,27 @@
 	>
 		Settings are for admins only.
 	</div>
-{:else if loaded}
+{:else if loadError}
+	<div
+		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
+	>
+		Could not load settings.
+		<Button variant="outline" size="sm" class="ml-2" onclick={load}>Retry</Button>
+	</div>
+{:else if !loaded}
+	<Card.Root class="max-w-xl" aria-busy="true">
+		<Card.Content class="grid gap-4">
+			<span class="sr-only" role="status">Loading…</span>
+			{#each ['w-28', 'w-24', 'w-44', 'w-52'] as w, i (i)}
+				<div class="grid gap-2">
+					<Skeleton class={`h-4 ${w}`} />
+					<Skeleton class="h-9 w-full rounded-sm" />
+				</div>
+			{/each}
+			<Skeleton class="h-9 w-16 rounded-lg" />
+		</Card.Content>
+	</Card.Root>
+{:else}
 	<Card.Root class="max-w-xl">
 		<Card.Content>
 			<form class="grid gap-4" onsubmit={save}>
