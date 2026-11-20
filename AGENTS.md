@@ -66,8 +66,10 @@ pnpm -C web install
 pnpm -C web check                                  # must report 0 errors
 pnpm -C web build                                  # required before the spa tests and before release builds
 pnpm -C web dev                                    # http://localhost:5173, proxies /api and /webhooks to :8080
-cargo run -p adus                                  # http://localhost:8080; export the variables from .env first
+ADUS_PUBLIC_URL=http://localhost:8080 cargo run -p adus   # http://localhost:8080; dev env comes from .cargo/config.toml
 ```
+
+CI: GitHub Actions. `.github/workflows/ci.yml` runs on every push and PR (job `rust`: fmt, clippy, tests against Postgres/Redis services; job `web`: check, fmt:check). `.github/workflows/release.yml` runs on `v*` tags and pushes a multi-arch (amd64 + arm64) image to `ghcr.io/return-nol/adus` tagged `{version}` and `latest`.
 
 On Windows, if `cargo` is not on PATH, it is in `%USERPROFILE%\.cargo\bin`. The rustup MSVC toolchain is used.
 
