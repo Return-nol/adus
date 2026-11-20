@@ -1,5 +1,5 @@
 import { goto } from '$app/navigation';
-import { api, ApiError } from '$lib/api';
+import { api, ApiError } from '#lib/api.js';
 
 export type User = {
 	id: string;

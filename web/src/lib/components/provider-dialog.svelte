@@ -27,12 +27,12 @@
 
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
-	import { api, ApiError } from '$lib/api';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import * as Dialog from '$lib/components/ui/dialog/index.js';
-	import { Input } from '$lib/components/ui/input/index.js';
-	import { Label } from '$lib/components/ui/label/index.js';
-	import * as Select from '$lib/components/ui/select/index.js';
+	import { api, ApiError } from '#lib/api.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Dialog from '#lib/components/ui/dialog/index.js';
+	import { Input } from '#lib/components/ui/input/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
+	import * as Select from '#lib/components/ui/select/index.js';
 
 	// `provider` set = edit it (kind is fixed); null = create a new provider.
 	let {
@@ -104,7 +104,13 @@
 			{#if shownKind === 'openai_compatible'}
 				<div class="grid gap-2">
 					<Label for="p-url">Base URL</Label>
-					<Input id="p-url" type="url" required placeholder="https://host/v1" bind:value={baseUrl} />
+					<Input
+						id="p-url"
+						type="url"
+						required
+						placeholder="https://host/v1"
+						bind:value={baseUrl}
+					/>
 				</div>
 			{/if}
 			<Dialog.Footer>

@@ -1,14 +1,15 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { toast } from 'svelte-sonner';
-	import { api, ApiError } from '$lib/api';
-	import { session, type User } from '$lib/session.svelte';
-	import ResetPasswordDialog from '$lib/components/reset-password-dialog.svelte';
-	import UserFormDialog from '$lib/components/user-form-dialog.svelte';
-	import { Badge } from '$lib/components/ui/badge/index.js';
-	import { Button } from '$lib/components/ui/button/index.js';
-	import { Switch } from '$lib/components/ui/switch/index.js';
-	import * as Table from '$lib/components/ui/table/index.js';
+	import { api, ApiError } from '#lib/api.js';
+	import { session, type User } from '#lib/session.svelte.js';
+	import ResetPasswordDialog from '#lib/components/reset-password-dialog.svelte';
+	import UserFormDialog from '#lib/components/user-form-dialog.svelte';
+	import { Badge } from '#lib/components/ui/badge/index.js';
+	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
+	import { Switch } from '#lib/components/ui/switch/index.js';
+	import * as Table from '#lib/components/ui/table/index.js';
 
 	let users = $state<User[]>([]);
 	let forbidden = $state(false);
@@ -49,46 +50,56 @@
 </script>
 
 <div class="mb-6 flex items-center justify-between">
-	<h1 class="text-2xl font-semibold">Users</h1>
+	<h1 class="font-display text-3xl font-medium tracking-[0.01em] text-foreground">Users</h1>
 	{#if !forbidden}<Button onclick={() => openForm(null)}>Add user</Button>{/if}
 </div>
 
 {#if forbidden}
-	<p class="text-muted-foreground">Only admins can manage users.</p>
+	<div
+		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
+	>
+		Only admins can manage users.
+	</div>
 {:else}
-	<Table.Root>
-		<Table.Header>
-			<Table.Row>
-				<Table.Head>Email</Table.Head>
-				<Table.Head>Role</Table.Head>
-				<Table.Head>GitHub login</Table.Head>
-				<Table.Head>Active</Table.Head>
-				<Table.Head class="text-right">Actions</Table.Head>
-			</Table.Row>
-		</Table.Header>
-		<Table.Body>
-			{#each users as user (user.id)}
-				<Table.Row>
-					<Table.Cell>{user.email}</Table.Cell>
-					<Table.Cell>
-						<Badge variant={user.role === 'admin' ? 'default' : 'secondary'}>{user.role}</Badge>
-					</Table.Cell>
-					<Table.Cell>{user.github_login ?? ''}</Table.Cell>
-					<Table.Cell>
-						<Switch
-							aria-label={`Active: ${user.email}`}
-							disabled={user.id === session.user?.id}
-							bind:checked={() => !user.disabled, (active) => setActive(user, active)}
-						/>
-					</Table.Cell>
-					<Table.Cell class="space-x-2 text-right">
-						<Button variant="outline" size="sm" onclick={() => openForm(user)}>Edit</Button>
-						<Button variant="outline" size="sm" onclick={() => openReset(user)}>Reset password</Button>
-					</Table.Cell>
-				</Table.Row>
-			{/each}
-		</Table.Body>
-	</Table.Root>
+	<Card.Root>
+		<Card.Content>
+			<Table.Root>
+				<Table.Header>
+					<Table.Row>
+						<Table.Head>Email</Table.Head>
+						<Table.Head>Role</Table.Head>
+						<Table.Head>GitHub login</Table.Head>
+						<Table.Head>Active</Table.Head>
+						<Table.Head class="text-right">Actions</Table.Head>
+					</Table.Row>
+				</Table.Header>
+				<Table.Body>
+					{#each users as user (user.id)}
+						<Table.Row>
+							<Table.Cell>{user.email}</Table.Cell>
+							<Table.Cell>
+								<Badge variant={user.role === 'admin' ? 'default' : 'secondary'}>{user.role}</Badge>
+							</Table.Cell>
+							<Table.Cell>{user.github_login ?? ''}</Table.Cell>
+							<Table.Cell>
+								<Switch
+									aria-label={`Active: ${user.email}`}
+									disabled={user.id === session.user?.id}
+									bind:checked={() => !user.disabled, (active) => setActive(user, active)}
+								/>
+							</Table.Cell>
+							<Table.Cell class="space-x-2 text-right">
+								<Button variant="outline" size="sm" onclick={() => openForm(user)}>Edit</Button>
+								<Button variant="outline" size="sm" onclick={() => openReset(user)}>
+									Reset password
+								</Button>
+							</Table.Cell>
+						</Table.Row>
+					{/each}
+				</Table.Body>
+			</Table.Root>
+		</Card.Content>
+	</Card.Root>
 {/if}
 
 <UserFormDialog bind:open={formOpen} user={selected} onsaved={load} />

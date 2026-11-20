@@ -12,9 +12,7 @@ export default defineConfig({
 				runes: ({ filename }) =>
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true
 			},
-			adapter: adapter({ fallback: 'index.html' }),
-			// shadcn-svelte generates `$lib/...` imports
-			alias: { $lib: 'src/lib' },
+			adapter: adapter({ fallback: 'index.html' })
 		})
 	],
 	server: {
