@@ -638,3 +638,12 @@ async fn settings_row_exists_with_defaults(pool: PgPool) {
         None
     );
 }
+
+#[test]
+fn internal_error_display_text() {
+    let err = ChatError::Internal("cannot decrypt API keys — check ADUS_SECRET_KEY".into());
+    assert_eq!(
+        err.to_string(),
+        "internal error: cannot decrypt API keys — check ADUS_SECRET_KEY"
+    );
+}

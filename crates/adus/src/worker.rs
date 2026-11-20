@@ -1,6 +1,6 @@
 //! Worker: ambil job dari antrian, jalankan lewat `JobRunner` (engine review), lalu ack,
 //! jadwalkan ulang, atau pindahkan ke stream dead. Plus scheduler yang memindahkan job
-//! delayed yang jatuh tempo ke stream.
+//! delayed yang jatuh tempo ke stream dan menandai review yang tertinggal sebagai gagal.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,6 +10,7 @@ use adus_db::reviews::{self, NewReview};
 use adus_queue::{Delivery, MAX_ATTEMPTS, Queue, QueueError, backoff};
 use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT};
 use async_trait::async_trait;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -25,6 +26,8 @@ const LOCK_BUSY_DELAY: Duration = Duration::from_secs(30);
 const NEXT_BLOCK: Duration = Duration::from_secs(5);
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(10);
 const PROMOTE_EVERY: Duration = Duration::from_secs(1);
+/// Jarak antar `reviews::fail_stale` di scheduler (produksi).
+pub const STALE_SWEEP_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Jeda setelah error Redis (koneksi putus sesaat) sebelum mencoba lagi.
 const ERROR_PAUSE: Duration = Duration::from_secs(1);
 
@@ -117,16 +120,31 @@ pub async fn run_worker(
     tracing::info!(worker = %name, "worker stopped");
 }
 
-/// Pindahkan job delayed yang jatuh tempo ke stream tiap detik, sampai `shutdown` dibatalkan.
-pub async fn run_scheduler(queue: Queue, shutdown: CancellationToken) {
-    let mut interval = tokio::time::interval(PROMOTE_EVERY);
+/// Pindahkan job delayed yang jatuh tempo ke stream tiap detik, dan tiap `sweep_every` tandai
+/// review `queued`/`running` yang tertinggal sebagai gagal, sampai `shutdown` dibatalkan.
+pub async fn run_scheduler(
+    queue: Queue,
+    db: PgPool,
+    sweep_every: Duration,
+    shutdown: CancellationToken,
+) {
+    let mut promote = tokio::time::interval(PROMOTE_EVERY);
+    // Sapuan pertama setelah satu jeda penuh: `main` sudah menyapu saat start.
+    let first_sweep = tokio::time::Instant::now() + sweep_every;
+    let mut sweep = tokio::time::interval_at(first_sweep, sweep_every);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = interval.tick() => {}
-        }
-        if let Err(err) = queue.promote_due().await {
-            tracing::warn!(error = %err, "could not promote delayed jobs");
+            _ = promote.tick() => {
+                if let Err(err) = queue.promote_due().await {
+                    tracing::warn!(error = %err, "could not promote delayed jobs");
+                }
+            }
+            _ = sweep.tick() => match reviews::fail_stale(&db).await {
+                Ok(0) => {}
+                Ok(count) => tracing::warn!(count, "marked stale reviews as failed"),
+                Err(err) => tracing::warn!(error = %err, "could not mark stale reviews as failed"),
+            },
         }
     }
 }

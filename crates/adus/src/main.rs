@@ -1,6 +1,6 @@
 use std::{collections::HashMap, process::ExitCode, sync::Arc, time::Duration};
 
-use adus::{JOB_TIMEOUT, run_scheduler, run_worker};
+use adus::{JOB_TIMEOUT, STALE_SWEEP_EVERY, run_scheduler, run_worker};
 use adus_core::{
     config::{self, Config, Level},
     crypto::{Cipher, generate_secret_key},
@@ -136,7 +136,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             shutdown.clone(),
         ));
     }
-    tasks.spawn(run_scheduler(state.queue.clone(), shutdown.clone()));
+    tasks.spawn(run_scheduler(
+        state.queue.clone(),
+        state.db.clone(),
+        STALE_SWEEP_EVERY,
+        shutdown.clone(),
+    ));
     let signal_token = shutdown.clone();
     tokio::spawn(async move {
         wait_for_signal().await;

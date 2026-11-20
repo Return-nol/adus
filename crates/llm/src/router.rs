@@ -39,8 +39,8 @@ pub enum ChatError {
     /// Request-nya sendiri ditolak provider; key lain tidak akan membantu.
     #[error("invalid request: {0}")]
     Invalid(String),
-    /// Database tidak bisa dibaca; panggilan LLM belum dicoba.
-    #[error("database error: {0}")]
+    /// Database tidak bisa dibaca, atau tidak ada key yang bisa didekripsi; LLM belum dipanggil.
+    #[error("internal error: {0}")]
     Internal(String),
 }
 

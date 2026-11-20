@@ -5,11 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adus_core::crypto::Cipher;
-use adus_core::default_ignore::DEFAULT_IGNORE_PATHS;
 use adus_core::job::Trigger;
 use adus_core::types::{ConnectionKind, Severity};
 use adus_db::connections::{self, Connection, ConnectionStatus};
-use adus_db::ignore::{IgnoreMatcher, effective_ignore_paths, title_matches};
+use adus_db::ignore::{IgnoreMatcher, default_ignore_paths, effective_ignore_paths, title_matches};
 use adus_db::repositories::{self, Repository};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::{memories, rules, settings};
@@ -172,8 +171,9 @@ impl Engine {
         let Some((provider_id, model)) = model else {
             // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
             // atau diminta lewat `@adudu review`, supaya tidak spam.
+            // Bukan kegagalan: tanpa baris failed atau dead letter untuk setiap push.
             if trigger == Trigger::Updated {
-                return Err(EngineError::Fatal("no review model configured".into()));
+                return Ok(Outcome::Skipped("no_model"));
             }
             let body = format!(
                 "{MARKER}\nAdudu can't review yet: no AI model is configured. \
@@ -227,14 +227,15 @@ impl Engine {
         let mut skipped: Vec<(String, &'static str)> = Vec::new();
         let mut ignored = 0;
         for target in candidates {
+            // File terhapus tidak pernah direview, jadi juga tidak dihitung sebagai di-ignore.
+            if target.file.status == FileStatus::Deleted {
+                continue;
+            }
             // Hanya `path` baru yang dicocokkan, juga untuk file yang di-rename.
             if let Some(matcher) = &matcher
                 && matcher.is_ignored(&target.file.path)
             {
                 ignored += 1;
-                continue;
-            }
-            if target.file.status == FileStatus::Deleted {
                 continue;
             }
             let Some(patch) = &target.file.patch else {
@@ -426,8 +427,7 @@ fn ignore_matcher(patterns: &[String]) -> Option<IgnoreMatcher> {
             tracing::warn!(error = %err, "stored ignore list is invalid, using the defaults")
         }
     }
-    let defaults: Vec<String> = DEFAULT_IGNORE_PATHS.iter().map(|p| p.to_string()).collect();
-    match IgnoreMatcher::new(&defaults) {
+    match IgnoreMatcher::new(&default_ignore_paths()) {
         Ok(matcher) => Some(matcher),
         Err(err) => {
             tracing::warn!(error = %err, "default ignore list is invalid, ignoring no files");

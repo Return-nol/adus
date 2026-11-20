@@ -18,11 +18,16 @@ pub enum IgnoreError {
     TooMany,
 }
 
+/// Daftar bawaan Kodus sebagai `Vec<String>`.
+pub fn default_ignore_paths() -> Vec<String> {
+    DEFAULT_IGNORE_PATHS.iter().map(|p| p.to_string()).collect()
+}
+
 /// Daftar yang tersimpan, atau daftar bawaan Kodus bila belum pernah disimpan (NULL).
 pub fn effective_ignore_paths(settings: &Settings) -> Vec<String> {
     match &settings.ignore_paths {
         Some(paths) => paths.clone(),
-        None => DEFAULT_IGNORE_PATHS.iter().map(|p| p.to_string()).collect(),
+        None => default_ignore_paths(),
     }
 }
 

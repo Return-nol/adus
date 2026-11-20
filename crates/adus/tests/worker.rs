@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use adus::{JOB_TIMEOUT, JobRunner, handle_delivery, run_worker};
+use adus::{JOB_TIMEOUT, JobRunner, handle_delivery, run_scheduler, run_worker};
 use adus_core::crypto::Cipher;
 use adus_core::job::{Job, Trigger};
 use adus_core::types::ConnectionKind;
-use adus_db::reviews::ReviewStatus;
+use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::{connections, repositories};
 use adus_git::HttpGitProviderFactory;
 use adus_llm::router::LlmRouter;
@@ -202,12 +202,10 @@ async fn retryable_error_requeued_with_backoff() {
     }
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool) {
-    let (queue, prefix) = new_queue().await;
-    let cipher = Arc::new(Cipher::from_base64_key(TEST_KEY).unwrap());
+/// Koneksi GitHub `acme` dengan satu repo `acme/api`.
+async fn insert_repo(pool: &PgPool, cipher: &Cipher) -> repositories::Repository {
     let conn = connections::insert(
-        &pool,
+        pool,
         ConnectionKind::Github,
         "gh",
         "acme",
@@ -227,10 +225,14 @@ async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool)
         default_branch: Some("main"),
         webhook_token: "t",
     };
-    let repo = repositories::insert(&pool, new_repo)
-        .await
-        .unwrap()
-        .unwrap();
+    repositories::insert(pool, new_repo).await.unwrap().unwrap()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool) {
+    let (queue, prefix) = new_queue().await;
+    let cipher = Arc::new(Cipher::from_base64_key(TEST_KEY).unwrap());
+    let repo = insert_repo(&pool, &cipher).await;
     // Port 1 menolak koneksi: GitHub "sedang down", jadi engine mengembalikan Retryable.
     let http = reqwest::Client::new();
     let git = HttpGitProviderFactory {
@@ -475,5 +477,60 @@ async fn panicking_job_does_not_kill_worker() {
     assert_eq!(attempts, vec![2, 2]);
     assert!(!lock_exists(&prefix, first, 1).await);
     assert!(!lock_exists(&prefix, second, 1).await);
+    cleanup(&prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn scheduler_sweeps_stale_reviews(pool: PgPool) {
+    let (queue, prefix) = new_queue().await;
+    let cipher = Cipher::from_base64_key(TEST_KEY).unwrap();
+    let repo = insert_repo(&pool, &cipher).await;
+    let new = |pr_number| NewReview {
+        repository_id: repo.id,
+        pr_number,
+        trigger: Trigger::Opened,
+    };
+    let stale = reviews::insert(&pool, new(1)).await.unwrap().id;
+    let fresh = reviews::insert(&pool, new(2)).await.unwrap().id;
+    sqlx::query("UPDATE reviews SET created_at = now() - interval '20 minutes' WHERE id = $1")
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let status = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let row: (ReviewStatus,) = sqlx::query_as("SELECT status FROM reviews WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            row.0
+        }
+    };
+
+    let shutdown = CancellationToken::new();
+    let scheduler = tokio::spawn(run_scheduler(
+        queue,
+        pool.clone(),
+        Duration::from_millis(50),
+        shutdown.clone(),
+    ));
+    let mut swept = false;
+    for _ in 0..100 {
+        if status(stale).await == ReviewStatus::Failed {
+            swept = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    shutdown.cancel();
+    scheduler.await.unwrap();
+
+    assert!(
+        swept,
+        "the stale review is marked failed while the scheduler runs"
+    );
+    assert_eq!(status(fresh).await, ReviewStatus::Queued);
     cleanup(&prefix).await;
 }

@@ -421,19 +421,23 @@ async fn no_model_configured_fails_with_pr_comment(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn no_model_on_updated_posts_no_comment(pool: PgPool) {
+async fn no_model_on_updated_is_skipped_not_failed(pool: PgPool) {
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
     let mut current = settings::get(&pool).await.unwrap();
     current.default_provider_id = None;
     settings::update(&pool, &current).await.unwrap();
 
-    let err = run(&s, Trigger::Updated).await.unwrap_err();
+    let id = run(&s, Trigger::Updated).await.unwrap();
 
-    assert_eq!(
-        err,
-        EngineError::Fatal("no review model configured".to_string())
-    );
-    assert!(s.git.state().comments.is_empty());
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Skipped);
+    assert_eq!(row.skip_reason.as_deref(), Some("no_model"));
+    assert!(row.error.is_none());
+    {
+        let git = s.git.state();
+        assert!(git.comments.is_empty());
+        assert!(git.reviews.is_empty());
+    }
     assert!(s.chat.calls().is_empty());
 
     run(&s, Trigger::Command).await.unwrap_err();
@@ -653,7 +657,15 @@ async fn set_ignore(pool: &PgPool, paths: Option<&[&str]>, keywords: &[&str]) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn ignored_files_not_sent_to_llm(pool: PgPool) {
-    let files = vec![file("a.json", PATCH_2), file("b.rs", PATCH_2)];
+    // File terhapus yang cocok dengan daftar ignore tidak ikut dihitung.
+    let mut deleted = file(
+        "gone.json",
+        "@@ -1,1 +0,0 @@
+-a
+",
+    );
+    deleted.status = FileStatus::Deleted;
+    let files = vec![file("a.json", PATCH_2), deleted, file("b.rs", PATCH_2)];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
     set_ignore(&pool, Some(&["**/*.json"]), &[]).await;
 
