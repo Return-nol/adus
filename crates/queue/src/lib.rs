@@ -50,6 +50,20 @@ return moved
     )
 });
 
+/// Penanda dedup dan XADD dalam satu langkah atomik: job masuk stream tepat sekali per
+/// `dedup_key`, dan penanda tidak pernah ada tanpa job-nya (atau sebaliknya).
+static ENQUEUE_ONCE_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
+if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then
+  redis.call('XADD', KEYS[2], '*', 'job', ARGV[2], 'attempt', '1')
+  return 1
+end
+return 0
+",
+    )
+});
+
 /// Hapus lock hanya jika tokennya masih milik pemanggil.
 static UNLOCK_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
@@ -124,7 +138,7 @@ impl Queue {
     /// `true` hanya untuk pemanggilan pertama dengan `dedup_key` ini dalam 24 jam.
     pub async fn first_seen(&self, dedup_key: &str) -> Result<bool, QueueError> {
         let reply: Option<String> = redis::cmd("SET")
-            .arg(format!("{}:dedup:{dedup_key}", self.prefix))
+            .arg(self.dedup_key(dedup_key))
             .arg(1)
             .arg("NX")
             .arg("EX")
@@ -146,6 +160,19 @@ impl Queue {
             .query_async(&mut self.conn.clone())
             .await?;
         Ok(())
+    }
+
+    /// Seperti `enqueue`, tetapi hanya jika `dedup_key` belum terlihat dalam 24 jam
+    /// (atomik, lihat `ENQUEUE_ONCE_SCRIPT`). `false` = duplikat, tidak ada yang ditambahkan.
+    pub async fn enqueue_once(&self, job: &Job, dedup_key: &str) -> Result<bool, QueueError> {
+        let added: i64 = ENQUEUE_ONCE_SCRIPT
+            .key(self.dedup_key(dedup_key))
+            .key(self.jobs_key())
+            .arg(DEDUP_TTL_SECS)
+            .arg(serde_json::to_string(job)?)
+            .invoke_async(&mut self.conn.clone())
+            .await?;
+        Ok(added == 1)
     }
 
     /// Simpan job untuk dijalankan lagi setelah `delay`. Baru masuk stream lewat `promote_due`.
@@ -428,6 +455,10 @@ impl Queue {
 
     fn jobs_key(&self) -> String {
         format!("{}:jobs", self.prefix)
+    }
+
+    fn dedup_key(&self, key: &str) -> String {
+        format!("{}:dedup:{key}", self.prefix)
     }
 
     fn delayed_key(&self) -> String {

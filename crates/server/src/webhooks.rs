@@ -17,13 +17,14 @@ use adus_db::{
 use adus_queue::QueueError;
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{DefaultBodyLimit, State, rejection::BytesRejection},
+    body::{Body, Bytes},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
 };
 use hmac::{Hmac, Mac};
+use http_body_util::LengthLimitError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -35,14 +36,14 @@ use crate::{
     state::AppState,
 };
 
-/// Payload GitHub bisa sampai 25 MB; batas ini hanya berlaku untuk route webhook.
+/// Payload GitHub bisa sampai 25 MB. Body dibaca sendiri dengan batas ini (lihat `read_body`),
+/// jadi batas default 2 MB axum tetap berlaku untuk route lain.
 const MAX_BODY_BYTES: usize = 25 * 1024 * 1024;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/webhooks/github/{repo_id}", post(github))
         .route("/webhooks/azure/{repo_id}", post(azure))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
 #[derive(Deserialize)]
@@ -54,10 +55,10 @@ async fn github(
     State(state): State<AppState>,
     ApiPath(repo_id): ApiPath<Uuid>,
     headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Result<Response, ApiError> {
-    let body = body?;
     let repo = find_repo(&state, repo_id, ConnectionKind::Github).await?;
+    let body = read_body(body).await?;
     let signature = header_str(&headers, "x-hub-signature-256");
     if !verify_github_signature(webhook_token(&repo), &body, signature) {
         return Err(invalid_signature());
@@ -68,29 +69,33 @@ async fn github(
     let payload = parse_json(&body)?;
     let event = header_str(&headers, "x-github-event").unwrap_or_default();
     let job = parse_github(event, &payload, repo.id);
-    let dedup_key = header_str(&headers, "x-github-delivery").map(|id| format!("gh:{id}"));
-    enqueue_once(&state, job, dedup_key).await
+    let dedup_key =
+        header_str(&headers, "x-github-delivery").map(|id| format!("gh:{}:{id}", repo.id));
+    queue_job(&state, job, dedup_key).await
 }
 
 async fn azure(
     State(state): State<AppState>,
     ApiPath(repo_id): ApiPath<Uuid>,
     ApiQuery(query): ApiQuery<AzureQuery>,
-    body: Result<Bytes, BytesRejection>,
+    body: Body,
 ) -> Result<Response, ApiError> {
-    let body = body?;
     let repo = find_repo(&state, repo_id, ConnectionKind::AzureDevops).await?;
+    // Token ada di URL, jadi diperiksa sebelum body di-buffer.
     let given = query.token.unwrap_or_default();
     if !tokens_match(webhook_token(&repo), &given) {
         return Err(invalid_signature());
     }
+    let body = read_body(body).await?;
     if !repo.enabled {
         return Ok(status_reply(StatusCode::OK, "ignored"));
     }
     let payload = parse_json(&body)?;
     let job = parse_azure(&payload, repo.id);
-    let dedup_key = payload["id"].as_str().map(|id| format!("az:{id}"));
-    enqueue_once(&state, job, dedup_key).await
+    let dedup_key = payload["id"]
+        .as_str()
+        .map(|id| format!("az:{}:{id}", repo.id));
+    queue_job(&state, job, dedup_key).await
 }
 
 /// Repo aktif yang connection-nya sesuai endpoint. Selain itu 404.
@@ -109,6 +114,30 @@ async fn find_repo(
         return Err(ApiError::not_found());
     }
     Ok(repo)
+}
+
+/// Dibaca setelah repo ditemukan (dan untuk Azure setelah token cocok), supaya request yang
+/// pasti ditolak tidak di-buffer.
+async fn read_body(body: Body) -> Result<Bytes, ApiError> {
+    axum::body::to_bytes(body, MAX_BODY_BYTES)
+        .await
+        .map_err(|err| {
+            let too_large =
+                std::error::Error::source(&err).is_some_and(|inner| inner.is::<LengthLimitError>());
+            if too_large {
+                ApiError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "payload_too_large",
+                    "webhook body is too large",
+                )
+            } else {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "failed to read request body",
+                )
+            }
+        })
 }
 
 /// Token kosong (repo lama tanpa token) membuat semua verifikasi gagal.
@@ -137,8 +166,9 @@ fn status_reply(status: StatusCode, text: &str) -> Response {
     (status, Json(json!({ "status": text }))).into_response()
 }
 
-/// `None` = event diabaikan. Tanpa `dedup_key` job tetap di-enqueue.
-async fn enqueue_once(
+/// `None` = event diabaikan. Dengan `dedup_key`, penanda dan job ditulis atomik
+/// (`Queue::enqueue_once`); tanpa key job tetap di-enqueue.
+async fn queue_job(
     state: &AppState,
     job: Option<Job>,
     dedup_key: Option<String>,
@@ -146,12 +176,14 @@ async fn enqueue_once(
     let Some(job) = job else {
         return Ok(status_reply(StatusCode::OK, "ignored"));
     };
-    if let Some(key) = dedup_key
-        && !state.queue.first_seen(&key).await.map_err(queue_error)?
-    {
+    let queued = match dedup_key {
+        Some(key) => state.queue.enqueue_once(&job, &key).await,
+        None => state.queue.enqueue(&job).await.map(|()| true),
+    }
+    .map_err(queue_error)?;
+    if !queued {
         return Ok(status_reply(StatusCode::OK, "duplicate"));
     }
-    state.queue.enqueue(&job).await.map_err(queue_error)?;
     Ok(status_reply(StatusCode::ACCEPTED, "queued"))
 }
 

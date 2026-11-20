@@ -2,7 +2,7 @@ use axum::{
     Json,
     extract::{
         FromRequest, FromRequestParts,
-        rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection},
+        rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -87,6 +87,7 @@ pub struct ApiJson<T>(pub T);
 impl From<JsonRejection> for ApiError {
     fn from(rejection: JsonRejection) -> ApiError {
         let message = rejection.body_text();
+        let status = rejection.status();
         match rejection {
             JsonRejection::JsonDataError(_) => ApiError::validation(message),
             JsonRejection::MissingJsonContentType(_) => ApiError::new(
@@ -94,6 +95,10 @@ impl From<JsonRejection> for ApiError {
                 "unsupported_media_type",
                 message,
             ),
+            // Body melebihi `DefaultBodyLimit` (2 MB).
+            _ if status == StatusCode::PAYLOAD_TOO_LARGE => {
+                ApiError::new(status, "payload_too_large", message)
+            }
             _ => ApiError::new(StatusCode::BAD_REQUEST, "bad_request", message),
         }
     }
@@ -130,18 +135,5 @@ impl From<QueryRejection> for ApiError {
             "bad_request",
             rejection.body_text(),
         )
-    }
-}
-
-/// Body mentah (`Bytes`) gagal dibaca, mis. melebihi `DefaultBodyLimit`.
-impl From<BytesRejection> for ApiError {
-    fn from(rejection: BytesRejection) -> ApiError {
-        let status = rejection.status();
-        let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
-            "payload_too_large"
-        } else {
-            "bad_request"
-        };
-        ApiError::new(status, code, rejection.body_text())
     }
 }

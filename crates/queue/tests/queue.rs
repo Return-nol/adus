@@ -117,6 +117,27 @@ async fn first_seen_true_once() {
 }
 
 #[tokio::test]
+async fn enqueue_once_adds_one_entry_per_key() {
+    let (queue, prefix) = new_queue().await;
+    assert!(queue.enqueue_once(&review_job(1), "gh:d-1").await.unwrap());
+    assert!(!queue.enqueue_once(&review_job(1), "gh:d-1").await.unwrap());
+    assert!(queue.enqueue_once(&review_job(2), "gh:d-2").await.unwrap());
+
+    let entries = stream_entries(&format!("{prefix}:jobs")).await;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].1["attempt"], "1");
+    let delivery = queue.next("worker-1", SHORT_BLOCK).await.unwrap().unwrap();
+    assert!(matches!(delivery.job, Job::ReviewPr { pr_number: 1, .. }));
+    assert_eq!(delivery.attempt, 1);
+
+    let mut conn = raw_connection().await;
+    let ttl: i64 = conn.ttl(format!("{prefix}:dedup:gh:d-1")).await.unwrap();
+    assert!(ttl > 86_000 && ttl <= 86_400, "ttl was {ttl}");
+
+    cleanup(&prefix).await;
+}
+
+#[tokio::test]
 async fn delayed_job_not_visible_before_due() {
     let (queue, prefix) = new_queue().await;
     queue

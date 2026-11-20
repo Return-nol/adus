@@ -20,6 +20,7 @@ base64.workspace = true
 chrono.workspace = true
 hex.workspace = true
 hmac.workspace = true
+http-body-util.workspace = true
 reqwest.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
@@ -33,7 +34,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-http-body-util.workspace = true
 redis.workspace = true
 tower.workspace = true
 wiremock.workspace = true

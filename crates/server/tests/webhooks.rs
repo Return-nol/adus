@@ -94,6 +94,16 @@ async fn queued_jobs(prefix: &str) -> Vec<Job> {
         .collect()
 }
 
+async fn dedup_key_exists(prefix: &str, key: &str) -> bool {
+    let client = redis::Client::open(common::redis_url()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("EXISTS")
+        .arg(format!("{prefix}:dedup:{key}"))
+        .query_async(&mut conn)
+        .await
+        .unwrap()
+}
+
 /// Ubah fixture JSON lalu kembalikan sebagai teks.
 fn edited(fixture: &str, edit: impl FnOnce(&mut Value)) -> String {
     let mut value: Value = serde_json::from_str(fixture).unwrap();
@@ -218,6 +228,8 @@ async fn github_duplicate_delivery_enqueues_once(pool: PgPool) {
     assert_eq!(again.status, StatusCode::OK);
     assert_eq!(again.body, status_body("duplicate"));
     assert_eq!(queued_jobs(&hook.prefix).await.len(), 1);
+    // Key dedup per repo: delivery id yang sama di repo lain tidak bertabrakan.
+    assert!(dedup_key_exists(&hook.prefix, &format!("gh:{}:same-delivery", hook.repo_id)).await);
     common::cleanup_queue(&hook.prefix).await;
 }
 
@@ -461,4 +473,57 @@ async fn own_marker_comment_ignored(pool: PgPool) {
     assert_eq!(reply.body, status_body("ignored"));
     assert!(queued_jobs(&hook.prefix).await.is_empty());
     common::cleanup_queue(&hook.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn webhook_body_limit_is_25mb(pool: PgPool) {
+    let hook = setup(pool, ConnectionKind::Github).await;
+    // ~3 MB: di atas batas default axum (2 MB), di bawah batas webhook.
+    let big = edited(GH_PR_OPENED, |v| {
+        v["pull_request"]["body"] = json!("x".repeat(3 * 1024 * 1024))
+    });
+    let reply = common::send(
+        &hook.app,
+        github_signed(hook.repo_id, "pull_request", "d-1", &big),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::ACCEPTED);
+
+    let huge = "x".repeat(25 * 1024 * 1024 + 1);
+    let reply = common::send(
+        &hook.app,
+        github_signed(hook.repo_id, "pull_request", "d-2", &huge),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(reply.body["error"]["code"], "payload_too_large");
+
+    // Repo tidak ada: 404 sebelum body dibaca, walau body melebihi batas.
+    let reply = common::send(
+        &hook.app,
+        github_signed(Uuid::new_v4(), "pull_request", "d-3", &huge),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    common::cleanup_queue(&hook.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn azure_token_checked_before_body_is_read(pool: PgPool) {
+    let hook = setup(pool, ConnectionKind::AzureDevops).await;
+    let huge = "x".repeat(25 * 1024 * 1024 + 1);
+    let reply = common::send(&hook.app, azure_request(hook.repo_id, "nope", &huge)).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    let reply = common::send(&hook.app, azure_request(hook.repo_id, TOKEN, &huge)).await;
+    assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+    common::cleanup_queue(&hook.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn api_json_route_keeps_default_body_limit(pool: PgPool) {
+    let app = common::app(pool).await;
+    let body = json!({ "email": "a@b.test", "password": "x".repeat(3 * 1024 * 1024) });
+    let reply = common::send(&app, common::post_json("/api/v1/auth/login", &body, None)).await;
+    assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(reply.body["error"]["code"], "payload_too_large");
 }
