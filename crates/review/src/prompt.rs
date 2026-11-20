@@ -190,7 +190,7 @@ pub fn format_inline(s: &Suggestion) -> String {
 }
 
 /// Komentar ringkasan review. `skipped` = (path, alasan) dengan alasan
-/// `binary` | `too_large` | `file_limit` | `unparseable`.
+/// `no_patch` | `too_large` | `file_limit` | `unparseable` | `llm_error`.
 pub fn format_summary(
     counts: &BTreeMap<Severity, usize>,
     skipped: &[(String, &'static str)],
@@ -220,10 +220,11 @@ pub fn format_summary(
 
 fn skip_reason_label(reason: &str) -> &str {
     match reason {
-        "binary" => "binary file",
+        "no_patch" => "no diff available (binary or too large)",
         "too_large" => "patch too large",
         "file_limit" => "file limit reached",
         "unparseable" => "review output could not be parsed",
+        "llm_error" => "LLM error",
         other => other,
     }
 }
@@ -402,7 +403,7 @@ mod tests {
             (Severity::Critical, 2),
         ]);
         let skipped = [
-            ("logo.png".to_string(), "binary"),
+            ("logo.png".to_string(), "no_patch"),
             ("big.rs".to_string(), "too_large"),
         ];
         let summary = format_summary(&counts, &skipped);
@@ -412,7 +413,7 @@ mod tests {
         assert!(!summary.contains("Warning"));
         assert!(
             summary.contains(
-                "**Skipped files**\n- `logo.png`: binary file\n- `big.rs`: patch too large"
+                "**Skipped files**\n- `logo.png`: no diff available (binary or too large)\n- `big.rs`: patch too large"
             )
         );
 

@@ -87,7 +87,7 @@ async fn rate_limit_403_maps_to_rate_limited() {
 }
 
 #[tokio::test]
-async fn plain_403_is_http_error_without_token() {
+async fn plain_403_is_status_error_without_token() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/user"))
@@ -96,7 +96,7 @@ async fn plain_403_is_http_error_without_token() {
         .await;
 
     let err = provider(&server).verify().await.unwrap_err();
-    assert!(matches!(&err, GitError::Http(m) if m.contains("403")));
+    assert_eq!(err, GitError::Status(403));
     assert!(!err.to_string().contains("ghp_secret"));
 }
 
@@ -584,7 +584,7 @@ async fn ensure_webhooks_returns_non_404_error_and_creates_nothing() {
         .ensure_webhooks(&repo(), "https://adus.example/hook", "s3", &["55".into()])
         .await
         .unwrap_err();
-    assert!(matches!(err, GitError::Http(_)));
+    assert_eq!(err, GitError::Status(500));
 }
 
 #[tokio::test]

@@ -69,8 +69,12 @@ pub enum GitError {
     NotFound,
     #[error("rate limited")]
     RateLimited,
+    /// Gagal sebelum ada jawaban (jaringan, timeout).
     #[error("http error: {0}")]
     Http(String),
+    /// Provider menjawab dengan status gagal yang tidak punya varian sendiri.
+    #[error("unexpected status {0}")]
+    Status(u16),
     #[error("decode error: {0}")]
     Decode(String),
 }

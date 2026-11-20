@@ -73,7 +73,7 @@ impl GithubProvider {
             StatusCode::TOO_MANY_REQUESTS => GitError::RateLimited,
             StatusCode::FORBIDDEN if rate_limit_exhausted || retry_after => GitError::RateLimited,
             StatusCode::NOT_FOUND => GitError::NotFound,
-            other => GitError::Http(format!("unexpected status {other}")),
+            other => GitError::Status(other.as_u16()),
         })
     }
 

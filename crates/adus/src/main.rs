@@ -106,6 +106,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let state = build_state(Config::from_env()?, true).await?;
+    // Sebelum worker jalan: review yang tertinggal `queued`/`running` dari proses sebelumnya.
+    match adus_db::reviews::fail_stale(&state.db).await {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(count, "marked interrupted reviews as failed"),
+        Err(err) => tracing::warn!(error = %err, "could not mark interrupted reviews as failed"),
+    }
     let listener = tokio::net::TcpListener::bind(&state.config.bind_addr).await?;
     tracing::info!("listening on {}", state.config.bind_addr);
     let engine = Arc::new(Engine {

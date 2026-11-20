@@ -100,7 +100,7 @@ async fn full_review_posts_valid_comments_and_summary(pool: PgPool) {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].provider_id, s.provider_id);
     assert_eq!(calls[0].model, "gpt-test");
-    assert_eq!(calls[0].max_tokens, 4096);
+    assert_eq!(calls[0].max_tokens, 8192);
     assert!(calls[0].user.contains("No unwrap"));
 }
 
@@ -249,7 +249,7 @@ async fn large_and_binary_files_skipped_with_reason_in_summary(pool: PgPool) {
     assert!(calls[0].user.contains("<file_path>\nok.rs\n</file_path>"));
     let summary = s.git.state().reviews[0].summary.clone();
     assert!(summary.contains("`big.rs`: patch too large"));
-    assert!(summary.contains("`logo.png`: binary file"));
+    assert!(summary.contains("`logo.png`: no diff available (binary or too large)"));
     assert!(!summary.contains("gone.rs"));
 }
 
@@ -275,9 +275,11 @@ async fn file_limit_respected(pool: PgPool) {
 async fn unparseable_output_retried_once_then_skipped(pool: PgPool) {
     let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    // Kedua file berjalan bersamaan: panggilan pertama a.rs, lalu b.rs, lalu ulangan keduanya.
+    s.chat.delay("b.rs", Duration::from_millis(50));
     s.chat.push(Ok("I think it's fine"));
-    s.chat.push(Ok(&finding("a.rs", 2, "Second try")));
     s.chat.push(Ok("nope"));
+    s.chat.push(Ok(&finding("a.rs", 2, "Second try")));
     s.chat.push(Ok("still nope"));
 
     let id = run(&s, Trigger::Opened).await.unwrap();
@@ -313,20 +315,80 @@ async fn all_keys_failed_is_retryable_and_posts_nothing(pool: PgPool) {
         assert!(git.reviews.is_empty());
         assert!(git.comments.is_empty());
     }
-    let rows = reviews::list(&pool, None, 1, 10).await.unwrap();
-    assert_eq!(rows[0].status, ReviewStatus::Failed);
-    assert!(rows[0].error.is_some());
+    // Retryable: barisnya dihapus, percobaan ulang membuat baris baru.
+    assert!(reviews::list(&pool, None, 1, 10).await.unwrap().is_empty());
 
     s.chat.push(Err(ChatError::NoKeys));
     assert!(matches!(
         run(&s, Trigger::Opened).await,
         Err(EngineError::Retryable(_, None))
     ));
-    s.chat.push(Err(ChatError::Invalid("bad model".into())));
-    assert!(matches!(
-        run(&s, Trigger::Opened).await,
-        Err(EngineError::Fatal(_))
-    ));
+    assert!(reviews::list(&pool, None, 1, 10).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn one_invalid_file_is_skipped_and_review_posted(pool: PgPool) {
+    let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    s.chat
+        .push(Err(ChatError::Invalid("empty response".into())));
+    s.chat.push(Ok(&finding("b.rs", 2, "Bug")));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    assert_eq!(git.reviews[0].comments[0].path, "b.rs");
+    assert!(git.reviews[0].summary.contains("`a.rs`: LLM error"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_file_invalid_is_fatal(pool: PgPool) {
+    let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    s.chat
+        .push(Err(ChatError::Invalid("model not found".into())));
+    s.chat
+        .push(Err(ChatError::Invalid("model not found".into())));
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert!(
+        matches!(&err, EngineError::Fatal(m) if m.contains("model not found")),
+        "{err:?}"
+    );
+    assert!(s.git.state().reviews.is_empty());
+    let row = latest(&pool).await;
+    assert_eq!(row.status, ReviewStatus::Failed);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_files_keep_comment_order(pool: PgPool) {
+    let paths = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f.rs"];
+    let files = paths.iter().map(|p| file(p, PATCH_2)).collect();
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    for path in paths {
+        s.chat.push(Ok(&finding(path, 2, path)));
+    }
+    // Yang pertama paling lambat: tanpa urutan terjaga, komentarnya akan terakhir.
+    s.chat.delay("a.rs", Duration::from_millis(300));
+    s.chat.delay("b.rs", Duration::from_millis(150));
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let posted: Vec<String> = s.git.state().reviews[0]
+        .comments
+        .iter()
+        .map(|c| c.path.clone())
+        .collect();
+    assert_eq!(posted, paths);
+    assert!(
+        s.chat.max_in_flight() > 1,
+        "files are reviewed concurrently"
+    );
+    assert!(s.chat.max_in_flight() <= 4, "at most 4 at once");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -354,6 +416,26 @@ async fn no_model_configured_fails_with_pr_comment(pool: PgPool) {
     let rows = reviews::list(&pool, None, 1, 10).await.unwrap();
     assert_eq!(rows[0].status, ReviewStatus::Failed);
     assert_eq!(rows[0].error.as_deref(), Some("no review model configured"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_model_on_updated_posts_no_comment(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    let mut current = settings::get(&pool).await.unwrap();
+    current.default_provider_id = None;
+    settings::update(&pool, &current).await.unwrap();
+
+    let err = run(&s, Trigger::Updated).await.unwrap_err();
+
+    assert_eq!(
+        err,
+        EngineError::Fatal("no review model configured".to_string())
+    );
+    assert!(s.git.state().comments.is_empty());
+    assert!(s.chat.calls().is_empty());
+
+    run(&s, Trigger::Command).await.unwrap_err();
+    assert_eq!(s.git.state().comments.len(), 1, "a command still explains");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -410,15 +492,30 @@ async fn unauthorized_pat_marks_connection_invalid(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn post_error_retryable_on_github_fatal_on_azure(pool: PgPool) {
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
-    s.git.state().post_error = Some(GitError::Http("502".into()));
+    for retryable in [
+        GitError::Status(502),
+        GitError::RateLimited,
+        GitError::Http("connection reset".into()),
+    ] {
+        s.git.state().post_error = Some(retryable);
+        assert!(matches!(
+            run(&s, Trigger::Opened).await,
+            Err(EngineError::Retryable(_, None))
+        ));
+    }
+    assert!(reviews::list(&pool, None, 1, 10).await.unwrap().is_empty());
+
+    // 4xx lain tidak akan berubah dengan mengulang.
+    s.git.state().post_error = Some(GitError::Status(422));
     assert!(matches!(
         run(&s, Trigger::Opened).await,
-        Err(EngineError::Retryable(_, None))
+        Err(EngineError::Fatal(_))
     ));
     let row = latest(&pool).await;
     assert_eq!(row.status, ReviewStatus::Failed);
     assert!(row.error.unwrap().contains("posting the review failed"));
 
+    s.git.state().post_error = Some(GitError::Status(502));
     sqlx::query("UPDATE connections SET kind = 'azure_devops'")
         .execute(&pool)
         .await
@@ -488,17 +585,14 @@ async fn missing_previous_head_falls_back_to_full_review(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn fetch_error_after_get_pr_is_retryable_and_fails_row(pool: PgPool) {
+async fn fetch_error_after_get_pr_is_retryable_and_leaves_no_row(pool: PgPool) {
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
     s.git.state().pr_diff_error = Some(GitError::Http("503".into()));
 
     let err = run(&s, Trigger::Opened).await.unwrap_err();
 
     assert!(matches!(err, EngineError::Retryable(_, None)));
-    let row = latest(&pool).await;
-    assert_eq!(row.status, ReviewStatus::Failed);
-    assert_eq!(row.head_sha.as_deref(), Some("h1"));
-    assert!(row.error.is_some());
+    assert!(reviews::list(&pool, None, 1, 10).await.unwrap().is_empty());
     assert!(s.git.state().reviews.is_empty());
 }
 
@@ -540,7 +634,7 @@ async fn slow_review_times_out_and_is_marked_failed(pool: PgPool) {
 
     let err = run(&s, Trigger::Opened).await.unwrap_err();
 
-    assert_eq!(err, EngineError::Retryable("review timed out".into(), None));
+    assert_eq!(err, EngineError::Fatal("review timed out".into()));
     let row = latest(&pool).await;
     assert_eq!(row.status, ReviewStatus::Failed);
     assert_eq!(row.error.as_deref(), Some("review timed out"));

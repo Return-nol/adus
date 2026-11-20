@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adus_core::job::Job;
+use adus_db::reviews::{self, NewReview};
 use adus_queue::{Delivery, MAX_ATTEMPTS, Queue, QueueError, backoff};
 use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT};
 use async_trait::async_trait;
@@ -31,6 +32,10 @@ const ERROR_PAUSE: Duration = Duration::from_secs(1);
 #[async_trait]
 pub trait JobRunner: Send + Sync {
     async fn run(&self, queue: &Queue, job: &Job) -> Result<(), EngineError>;
+
+    /// Dipanggil sekali setelah job menyerah karena semua percobaannya gagal sementara.
+    /// `error` sudah memuat jumlah percobaan. Bawaan: tidak melakukan apa pun.
+    async fn gave_up(&self, _job: &Job, _error: &str) {}
 }
 
 #[async_trait]
@@ -46,6 +51,27 @@ impl JobRunner for Engine {
                 .await
                 .map(|_review_id| ()),
             Job::PrComment { .. } => self.handle_comment(queue, job).await,
+        }
+    }
+
+    /// Engine menghapus barisnya sendiri pada error sementara, jadi review yang menyerah
+    /// dicatat di sini sebagai satu baris `failed`.
+    async fn gave_up(&self, job: &Job, error: &str) {
+        let Job::ReviewPr {
+            repository_id,
+            pr_number,
+            trigger,
+        } = job
+        else {
+            return;
+        };
+        let new = NewReview {
+            repository_id: *repository_id,
+            pr_number: *pr_number,
+            trigger: *trigger,
+        };
+        if let Err(err) = reviews::insert_failed(&self.db, new, error).await {
+            tracing::warn!(error = %err, "could not record the failed review");
         }
     }
 }
@@ -140,6 +166,7 @@ pub async fn handle_delivery(
         };
         // Job jalan di task sendiri: panic hanya menggagalkan job ini, bukan worker-nya.
         let (job_queue, job) = (queue.clone(), delivery.job.clone());
+        let runner_for_settle = runner.clone();
         let job_run = async move { runner.run(&job_queue, &job).await };
         let mut handle = tokio::spawn(job_run.in_current_span());
         let result = match tokio::time::timeout(job_timeout, &mut handle).await {
@@ -151,7 +178,7 @@ pub async fn handle_delivery(
                 Err(EngineError::Retryable("job timed out".into(), None))
             }
         };
-        let settled = settle(queue, &delivery, result).await;
+        let settled = settle(queue, runner_for_settle.as_ref(), &delivery, result).await;
         // Lock selalu dilepas, juga saat menyelesaikan job di antrian gagal.
         let unlocked = queue.unlock(&lock_key, &token).await;
         settled.and(unlocked)
@@ -163,6 +190,7 @@ pub async fn handle_delivery(
 /// Ack, jadwalkan ulang dengan backoff, atau pindahkan ke stream dead sesuai hasil job.
 async fn settle(
     queue: &Queue,
+    runner: &dyn JobRunner,
     delivery: &Delivery,
     result: Result<(), EngineError>,
 ) -> Result<(), QueueError> {
@@ -179,8 +207,14 @@ async fn settle(
             tracing::warn!(outcome = "retry", %error, delay_secs = delay.as_secs(), "job failed; will retry");
             queue.retry(delivery, delivery.attempt + 1, delay).await
         }
-        Err(err) => {
-            let error = err.to_string();
+        Err(EngineError::Retryable(error, _)) => {
+            let error = format!("{error} (gave up after {} attempts)", delivery.attempt);
+            tracing::error!(outcome = "dead", %error, "job failed permanently");
+            queue.dead_letter(delivery, &error).await?;
+            runner.gave_up(&delivery.job, &error).await;
+            Ok(())
+        }
+        Err(EngineError::Fatal(error)) => {
             tracing::error!(outcome = "dead", %error, "job failed permanently");
             queue.dead_letter(delivery, &error).await
         }

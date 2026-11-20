@@ -199,7 +199,9 @@ impl Engine {
         let message = format!("posting the reply failed: {err}");
         match err {
             GitError::Unauthorized => self.unauthorized(conn).await,
-            GitError::RateLimited | GitError::Http(_) => EngineError::Retryable(message, None),
+            GitError::RateLimited | GitError::Http(_) | GitError::Status(_) => {
+                EngineError::Retryable(message, None)
+            }
             GitError::NotFound | GitError::Decode(_) => EngineError::Fatal(message),
         }
     }

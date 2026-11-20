@@ -213,11 +213,14 @@ pub struct ChatCall {
     pub ctx: UsageContext,
 }
 
-/// LLM palsu: jawaban diambil berurutan dari `script`; habis → `[]`.
+/// LLM palsu: jawaban diambil berurutan dari `script`; habis → `[]`. Prompt yang memuat path di
+/// `delays` dijawab setelah jeda itu (urutan pengambilan jawaban tetap urutan panggilan).
 #[derive(Default)]
 pub struct FakeChat {
     script: Mutex<VecDeque<Result<String, ChatError>>>,
     calls: Mutex<Vec<ChatCall>>,
+    delays: Mutex<Vec<(String, Duration)>>,
+    in_flight: Mutex<(usize, usize)>,
 }
 
 impl FakeChat {
@@ -231,6 +234,16 @@ impl FakeChat {
     pub fn calls(&self) -> Vec<ChatCall> {
         self.calls.lock().unwrap().clone()
     }
+
+    /// Jawaban untuk file `path` ditunda selama `delay`.
+    pub fn delay(&self, path: &str, delay: Duration) {
+        self.delays.lock().unwrap().push((path.to_string(), delay));
+    }
+
+    /// Jumlah panggilan terbanyak yang pernah berjalan bersamaan.
+    pub fn max_in_flight(&self) -> usize {
+        self.in_flight.lock().unwrap().1
+    }
 }
 
 #[async_trait]
@@ -241,6 +254,13 @@ impl ChatService for FakeChat {
         req: ChatRequest,
         ctx: UsageContext,
     ) -> Result<ChatResponse, ChatError> {
+        let delay = self
+            .delays
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(path, _)| req.user.contains(&format!("<file_path>\n{path}\n")))
+            .map(|(_, delay)| *delay);
         self.calls.lock().unwrap().push(ChatCall {
             provider_id,
             model: req.model,
@@ -249,6 +269,14 @@ impl ChatService for FakeChat {
             ctx,
         });
         let next = self.script.lock().unwrap().pop_front();
+        {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            in_flight.0 += 1;
+            in_flight.1 = in_flight.1.max(in_flight.0);
+        }
+        // Selalu menunggu sebentar, supaya panggilan lain sempat mulai (concurrency terlihat).
+        tokio::time::sleep(delay.unwrap_or(Duration::from_millis(5))).await;
+        self.in_flight.lock().unwrap().0 -= 1;
         next.unwrap_or(Ok("[]".to_string()))
             .map(|text| ChatResponse {
                 text,

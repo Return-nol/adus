@@ -106,7 +106,9 @@ pub(crate) fn describe(err: &GitError) -> &'static str {
         GitError::Unauthorized => "the provider rejected the token",
         GitError::NotFound => "not found at the provider",
         GitError::RateLimited => "the provider rate limit was reached, try again later",
-        GitError::Http(_) | GitError::Decode(_) => "the provider request failed",
+        GitError::Http(_) | GitError::Status(_) | GitError::Decode(_) => {
+            "the provider request failed"
+        }
     }
 }
 

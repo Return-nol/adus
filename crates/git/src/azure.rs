@@ -105,7 +105,7 @@ impl AzureProvider {
             StatusCode::UNAUTHORIZED => GitError::Unauthorized,
             StatusCode::TOO_MANY_REQUESTS => GitError::RateLimited,
             StatusCode::NOT_FOUND => GitError::NotFound,
-            other => GitError::Http(format!("unexpected status {other}")),
+            other => GitError::Status(other.as_u16()),
         })
     }
 

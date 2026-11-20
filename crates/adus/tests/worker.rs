@@ -27,11 +27,12 @@ const SHORT_BLOCK: Duration = Duration::from_millis(100);
 const TEST_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 /// Pengganti `Engine`: tidur `delay`, lalu kembalikan `result`. Mencatat jumlah panggilan dan
-/// berapa job yang pernah berjalan bersamaan.
+/// berapa job yang pernah berjalan bersamaan, plus jumlah `gave_up`.
 struct FakeRunner {
     result: Result<(), EngineError>,
     delay: Duration,
     calls: AtomicUsize,
+    gave_up: AtomicUsize,
     running: AtomicUsize,
     max_running: AtomicUsize,
 }
@@ -42,6 +43,7 @@ impl FakeRunner {
             result,
             delay,
             calls: AtomicUsize::new(0),
+            gave_up: AtomicUsize::new(0),
             running: AtomicUsize::new(0),
             max_running: AtomicUsize::new(0),
         })
@@ -57,6 +59,10 @@ impl JobRunner for FakeRunner {
         tokio::time::sleep(self.delay).await;
         self.running.fetch_sub(1, Ordering::SeqCst);
         self.result.clone()
+    }
+
+    async fn gave_up(&self, _job: &Job, _error: &str) {
+        self.gave_up.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -185,6 +191,7 @@ async fn retryable_error_requeued_with_backoff() {
 
         let retries = delayed(&prefix).await;
         assert_eq!(retries.len(), 1);
+        assert_eq!(runner.gave_up.load(Ordering::SeqCst), 0);
         let (stored_attempt, due_in) = retries[0];
         assert_eq!(stored_attempt, next_attempt);
         let expected = (backoff_secs - 1.0)..=(backoff_secs + 0.5);
@@ -248,13 +255,18 @@ async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool)
     assert_eq!(dead[0].0, "5");
     assert!(dead[0].1.starts_with("git provider:"), "{}", dead[0].1);
     assert!(delayed(&prefix).await.is_empty());
-    let status: ReviewStatus =
-        sqlx::query_scalar("SELECT status FROM reviews WHERE repository_id = $1")
+    // Engine menghapus barisnya sendiri (Retryable); worker mencatat tepat satu baris gagal.
+    let rows: Vec<(ReviewStatus, Option<String>)> =
+        sqlx::query_as("SELECT status, error FROM reviews WHERE repository_id = $1")
             .bind(repo.id)
-            .fetch_one(&pool)
+            .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(status, ReviewStatus::Failed);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, ReviewStatus::Failed);
+    let error = rows[0].1.as_deref().unwrap();
+    assert!(error.starts_with("git provider:"), "{error}");
+    assert!(error.ends_with("(gave up after 5 attempts)"), "{error}");
     cleanup(&prefix).await;
 }
 
@@ -383,6 +395,8 @@ async fn fatal_goes_straight_to_dead_letter() {
         dead,
         vec![("1".to_string(), "pull request not found".to_string())]
     );
+    // Fatal: engine sudah mencatat barisnya sendiri.
+    assert_eq!(runner.gave_up.load(Ordering::SeqCst), 0);
     assert!(delayed(&prefix).await.is_empty());
     assert!(!lock_exists(&prefix, repository_id, 1).await);
     cleanup(&prefix).await;

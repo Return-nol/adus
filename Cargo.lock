@@ -116,6 +116,7 @@ dependencies = [
  "adus-queue",
  "async-trait",
  "chrono",
+ "futures",
  "redis",
  "serde_json",
  "sqlx",

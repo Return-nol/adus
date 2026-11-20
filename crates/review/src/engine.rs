@@ -17,6 +17,7 @@ use adus_git::{
 };
 use adus_llm::ChatRequest;
 use adus_llm::router::{ChatError, ChatService, UsageContext};
+use futures::StreamExt;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -24,7 +25,9 @@ use crate::{
     MARKER, Suggestion, build_prompt, format_inline, format_summary, keep_valid, parse_suggestions,
 };
 
-const MAX_OUTPUT_TOKENS: u32 = 4096;
+const MAX_OUTPUT_TOKENS: u32 = 8192;
+/// Maksimal file yang ditanyakan ke LLM bersamaan dalam satu review.
+const FILE_CONCURRENCY: usize = 4;
 /// Batas waktu bawaan satu review (`Engine::review_timeout`).
 pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(12 * 60);
 
@@ -33,7 +36,7 @@ pub struct Engine {
     pub cipher: Arc<Cipher>,
     pub git: Arc<dyn GitProviderFactory>,
     pub chat: Arc<dyn ChatService>,
-    /// Review yang lebih lama dari ini dihentikan dan dicatat gagal (Retryable). Produksi:
+    /// Review yang lebih lama dari ini dihentikan dan dicatat gagal (Fatal). Produksi:
     /// `REVIEW_TIMEOUT`; test memakai nilai pendek.
     pub review_timeout: Duration,
 }
@@ -65,7 +68,9 @@ struct Target {
 
 impl Engine {
     /// Review satu PR. Return id baris `reviews`, atau `None` jika repo tidak ada / sudah dihapus
-    /// (tidak ada repo untuk dicatat). Setiap hasil lain — selesai, dilewati, gagal — punya baris.
+    /// (tidak ada repo untuk dicatat). Selesai, dilewati, dan `Fatal` meninggalkan baris; pada
+    /// `Retryable` baris ini dihapus, karena percobaan ulang membuat baris baru (dan worker
+    /// mencatat satu baris `failed` jika percobaannya habis).
     pub async fn review_pr(
         &self,
         repository_id: Uuid,
@@ -85,23 +90,27 @@ impl Engine {
         };
         let review_id = reviews::insert(&self.db, new).await.map_err(db_error)?.id;
 
-        // Timeout di sini, bukan di worker, supaya baris review tetap dicatat gagal.
+        // Timeout di sini, bukan di worker, supaya baris review tetap dicatat gagal. Fatal:
+        // mengulang PR yang sama hanya menghabiskan token LLM lagi sampai timeout lagi.
         let run = self.run(&repo, review_id, pr_number, trigger);
         let outcome = match tokio::time::timeout(self.review_timeout, run).await {
             Ok(outcome) => outcome,
-            Err(_elapsed) => Err(EngineError::Retryable("review timed out".into(), None)),
+            Err(_elapsed) => Err(EngineError::Fatal("review timed out".into())),
         };
         let (status, posted, skip_reason) = match outcome {
             Ok(Outcome::Done { posted }) => (ReviewStatus::Done, posted, None),
             Ok(Outcome::Skipped(reason)) => (ReviewStatus::Skipped, 0, Some(reason)),
             Err(err) => {
-                let message = err.to_string();
-                let failed = ReviewStatus::Failed;
-                let finished =
-                    reviews::finish(&self.db, review_id, failed, 0, Some(&message), None);
+                let recorded = match &err {
+                    EngineError::Retryable(..) => reviews::delete(&self.db, review_id).await,
+                    EngineError::Fatal(message) => {
+                        let failed = ReviewStatus::Failed;
+                        reviews::finish(&self.db, review_id, failed, 0, Some(message), None).await
+                    }
+                };
                 // Error aslinya yang dikembalikan; gagal mencatat cukup di-log.
-                if let Err(db_err) = finished.await {
-                    tracing::warn!(%review_id, error = %db_err, "could not mark review failed");
+                if let Err(db_err) = recorded {
+                    tracing::warn!(%review_id, error = %db_err, "could not record review failure");
                 }
                 return Err(err);
             }
@@ -154,6 +163,11 @@ impl Engine {
                 .zip(settings.default_model.clone()),
         };
         let Some((provider_id, model)) = model else {
+            // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
+            // atau diminta lewat `@adudu review`, supaya tidak spam.
+            if trigger == Trigger::Updated {
+                return Err(EngineError::Fatal("no review model configured".into()));
+            }
             let body = format!(
                 "{MARKER}\nAdudu can't review yet: no AI model is configured. \
                  An admin can set one under Settings."
@@ -208,7 +222,7 @@ impl Engine {
                 continue;
             }
             let Some(patch) = &target.file.patch else {
-                skipped.push((target.file.path, "binary"));
+                skipped.push((target.file.path, "no_patch"));
                 continue;
             };
             if target.allowed.is_empty() {
@@ -237,34 +251,42 @@ impl Engine {
             review_id: Some(review_id),
             repository_id: Some(repo.id),
         };
+        let prompts: Vec<(String, String)> = targets
+            .iter()
+            .map(|target| build_prompt(&target.file, &rules, &memories, &pr))
+            .collect();
+        // Maksimal FILE_CONCURRENCY sekaligus; `buffered` menjaga urutan hasil = urutan file,
+        // jadi komentar selalu terposting dengan urutan yang sama.
+        let results: Vec<_> = futures::stream::iter(prompts)
+            .map(|(system, user)| self.ask(provider_id, &model, system, user, &ctx))
+            .buffered(FILE_CONCURRENCY)
+            .collect()
+            .await;
+
+        let sent = targets.len();
+        let mut rejected: Vec<ChatError> = Vec::new();
         let mut found: Vec<Suggestion> = Vec::new();
-        // ponytail: file direview berurutan; tambah concurrency terbatas jika review terasa lambat.
-        for target in targets {
-            let (system, user) = build_prompt(&target.file, &rules, &memories, &pr);
-            let mut parsed = None;
-            for _attempt in 0..2 {
-                let req = ChatRequest {
-                    model: model.clone(),
-                    system: system.clone(),
-                    user: user.clone(),
-                    max_tokens: MAX_OUTPUT_TOKENS,
-                };
-                let response = self
-                    .chat
-                    .chat(provider_id, req, ctx.clone())
-                    .await
-                    .map_err(chat_error)?;
-                if let Ok(suggestions) = parse_suggestions(&response.text) {
-                    parsed = Some(suggestions);
-                    break;
-                }
-            }
-            match parsed {
-                Some(suggestions) => {
+        for (target, result) in targets.into_iter().zip(results) {
+            match result {
+                Ok(Some(suggestions)) => {
                     found.extend(keep_valid(suggestions, &target.file, &target.allowed));
                 }
-                None => skipped.push((target.file.path, "unparseable")),
+                Ok(None) => skipped.push((target.file.path, "unparseable")),
+                // Satu file ditolak (mis. output kosong): lewati file itu saja.
+                Err(err @ ChatError::Invalid(_)) => {
+                    tracing::warn!(%review_id, error = %err, "LLM rejected one file; skipping it");
+                    skipped.push((target.file.path, "llm_error"));
+                    rejected.push(err);
+                }
+                Err(err) => return Err(chat_error(err)),
             }
+        }
+        // Semua ditolak (mis. nama model salah): gagal dengan jelas, jangan posting review kosong.
+        if sent > 0
+            && rejected.len() == sent
+            && let Some(err) = rejected.pop()
+        {
+            return Err(chat_error(err));
         }
 
         let mut counts: BTreeMap<Severity, usize> = BTreeMap::new();
@@ -284,6 +306,31 @@ impl Engine {
             Ok(posted) => Ok(Outcome::Done { posted }),
             Err(err) => Err(self.post_error(&conn, err).await),
         }
+    }
+
+    /// Minta review satu file; output yang tak terbaca diulang sekali. `Ok(None)`: tetap tak
+    /// terbaca.
+    async fn ask(
+        &self,
+        provider_id: Uuid,
+        model: &str,
+        system: String,
+        user: String,
+        ctx: &UsageContext,
+    ) -> Result<Option<Vec<Suggestion>>, ChatError> {
+        for _attempt in 0..2 {
+            let req = ChatRequest {
+                model: model.to_string(),
+                system: system.clone(),
+                user: user.clone(),
+                max_tokens: MAX_OUTPUT_TOKENS,
+            };
+            let response = self.chat.chat(provider_id, req, ctx.clone()).await?;
+            if let Ok(suggestions) = parse_suggestions(&response.text) {
+                return Ok(Some(suggestions));
+            }
+        }
+        Ok(None)
     }
 
     /// Connection milik repo.
@@ -322,13 +369,18 @@ impl Engine {
         }
     }
 
-    /// GitHub memposting review dalam satu request, jadi aman diulang. Azure memposting thread
-    /// satu per satu: mengulang akan menggandakan thread yang sudah terposting, jadi selalu fatal.
+    /// GitHub memposting review dalam satu request, jadi aman diulang saat rate limit, 5xx atau
+    /// gangguan jaringan; 4xx lain (mis. 422) tidak akan berubah, jadi fatal. Azure memposting
+    /// thread satu per satu: mengulang akan menggandakan thread yang sudah terposting, jadi
+    /// selalu fatal.
     async fn post_error(&self, conn: &Connection, err: GitError) -> EngineError {
         let message = format!("posting the review failed: {err}");
         match (err, conn.kind) {
             (GitError::Unauthorized, _) => self.unauthorized(conn).await,
             (GitError::RateLimited | GitError::Http(_), ConnectionKind::Github) => {
+                EngineError::Retryable(message, None)
+            }
+            (GitError::Status(status), ConnectionKind::Github) if status >= 500 => {
                 EngineError::Retryable(message, None)
             }
             _ => EngineError::Fatal(message),

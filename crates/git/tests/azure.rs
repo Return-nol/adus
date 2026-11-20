@@ -144,7 +144,7 @@ async fn error_statuses_map_without_leaking_token() {
         GitError::NotFound
     );
     let err = list_repos_error(ResponseTemplate::new(500)).await;
-    assert!(matches!(&err, GitError::Http(m) if m.contains("500")));
+    assert_eq!(err, GitError::Status(500));
     assert!(!err.to_string().contains("azpat"));
 }
 

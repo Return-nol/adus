@@ -93,6 +93,48 @@ pub async fn finish(
     Ok(())
 }
 
+/// Hapus baris review (engine: percobaan ulang akan membuat baris baru).
+pub async fn delete(pool: &PgPool, id: Uuid) -> Result<()> {
+    sqlx::query("DELETE FROM reviews WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Satu baris `failed` yang langsung selesai (worker: job review menyerah setelah semua
+/// percobaan). Tidak menulis apa pun jika repo-nya sudah tidak ada atau dihapus; return
+/// `true` jika baris dibuat.
+pub async fn insert_failed(pool: &PgPool, new: NewReview, error: &str) -> Result<bool> {
+    let inserted = sqlx::query(
+        "INSERT INTO reviews (repository_id, pr_number, trigger, status, error, started_at, \
+         finished_at) \
+         SELECT id, $2, $3, 'failed', $4, now(), now() FROM repositories \
+         WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(new.repository_id)
+    .bind(new.pr_number)
+    .bind(new.trigger)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(inserted.rows_affected() == 1)
+}
+
+/// Saat proses mulai: review `queued`/`running` yang sudah lebih dari 15 menit (lebih lama dari
+/// lock PR) tidak sedang dikerjakan siapa pun, jadi ditandai gagal. Return jumlah barisnya.
+pub async fn fail_stale(pool: &PgPool) -> Result<u64> {
+    let updated = sqlx::query(
+        "UPDATE reviews SET status = 'failed', error = 'interrupted (worker stopped)', \
+         finished_at = now() \
+         WHERE status IN ('queued', 'running') \
+         AND COALESCE(started_at, created_at) < now() - interval '15 minutes'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected())
+}
+
 /// Review `done` terakhir untuk PR ini (dasar review inkremental).
 pub async fn last_done(
     pool: &PgPool,
@@ -277,5 +319,82 @@ mod tests {
         assert_eq!(page1[0].id, failed.id, "newest first");
         assert_eq!(page1[0].error.as_deref(), Some("boom"));
         assert_eq!(page2[0].id, first.id);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_and_insert_failed(pool: PgPool) {
+        let a = repo(&pool, "1").await;
+        let row = insert(&pool, new(a)).await.unwrap();
+        delete(&pool, row.id).await.unwrap();
+        assert!(list(&pool, None, 1, 10).await.unwrap().is_empty());
+
+        assert!(
+            insert_failed(&pool, new(a), "boom (after 5 attempts)")
+                .await
+                .unwrap()
+        );
+        let rows = list(&pool, None, 1, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, ReviewStatus::Failed);
+        assert_eq!(rows[0].trigger, Trigger::Updated);
+        assert_eq!(rows[0].error.as_deref(), Some("boom (after 5 attempts)"));
+        assert!(rows[0].started_at.is_some() && rows[0].finished_at.is_some());
+
+        // Repo yang sudah dihapus atau tidak pernah ada: tidak ada baris.
+        repositories::soft_delete(&pool, a).await.unwrap();
+        assert!(!insert_failed(&pool, new(a), "x").await.unwrap());
+        assert!(
+            !insert_failed(&pool, new(Uuid::new_v4()), "x")
+                .await
+                .unwrap()
+        );
+        assert_eq!(list(&pool, None, 1, 10).await.unwrap().len(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fail_stale_marks_only_old_unfinished_rows(pool: PgPool) {
+        let a = repo(&pool, "1").await;
+        let old_queued = insert(&pool, new(a)).await.unwrap();
+        let old_running = insert(&pool, new(a)).await.unwrap();
+        set_running(&pool, old_running.id, "b", "h").await.unwrap();
+        let old_done = insert(&pool, new(a)).await.unwrap();
+        finish(&pool, old_done.id, ReviewStatus::Done, 0, None, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE reviews SET created_at = now() - interval '20 minutes', \
+             started_at = started_at - interval '20 minutes'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let fresh_queued = insert(&pool, new(a)).await.unwrap();
+        let fresh_running = insert(&pool, new(a)).await.unwrap();
+        set_running(&pool, fresh_running.id, "b", "h")
+            .await
+            .unwrap();
+        // Dibuat lama, tetapi baru mulai jalan: `started_at` yang dihitung.
+        let restarted = insert(&pool, new(a)).await.unwrap();
+        sqlx::query("UPDATE reviews SET created_at = now() - interval '20 minutes' WHERE id = $1")
+            .bind(restarted.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        set_running(&pool, restarted.id, "b", "h").await.unwrap();
+
+        assert_eq!(fail_stale(&pool).await.unwrap(), 2);
+
+        let rows = list(&pool, None, 1, 10).await.unwrap();
+        let status = |id: Uuid| rows.iter().find(|r| r.id == id).unwrap().clone();
+        for id in [old_queued.id, old_running.id] {
+            let row = status(id);
+            assert_eq!(row.status, ReviewStatus::Failed);
+            assert_eq!(row.error.as_deref(), Some("interrupted (worker stopped)"));
+            assert!(row.finished_at.is_some());
+        }
+        assert_eq!(status(old_done.id).status, ReviewStatus::Done);
+        assert_eq!(status(fresh_queued.id).status, ReviewStatus::Queued);
+        assert_eq!(status(fresh_running.id).status, ReviewStatus::Running);
+        assert_eq!(status(restarted.id).status, ReviewStatus::Running);
     }
 }
