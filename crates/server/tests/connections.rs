@@ -343,6 +343,14 @@ async fn add_repo_webhook_failure_502_and_not_stored(pool: PgPool) {
     let reply = add_repo(&app, &admin, &conn, "1").await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
     assert_eq!(reply.body["error"]["code"], "webhook_failed");
+    // Test memakai http://localhost:8080: provider tidak bisa menjangkaunya.
+    let message = reply.body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.ends_with(
+            " — GitHub/Azure must be able to reach ADUS_PUBLIC_URL (currently not public)"
+        ),
+        "{message}"
+    );
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM repositories")
         .fetch_one(&pool)
         .await

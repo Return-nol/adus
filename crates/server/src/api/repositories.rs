@@ -188,9 +188,30 @@ async fn create(
             Err(ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "webhook_failed",
-                format!("could not register the webhook: {}", describe(&err)),
+                format!(
+                    "could not register the webhook: {}{}",
+                    describe(&err),
+                    public_url_hint(&state.config.public_url)
+                ),
             ))
         }
+    }
+}
+
+/// Tambahan pesan gagal-webhook jika `ADUS_PUBLIC_URL` jelas tidak bisa dijangkau provider
+/// (bukan https, atau host lokal).
+fn public_url_hint(public_url: &str) -> &'static str {
+    let public = reqwest::Url::parse(public_url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && !matches!(
+                url.host_str(),
+                None | Some("localhost" | "127.0.0.1" | "0.0.0.0")
+            )
+    });
+    if public {
+        ""
+    } else {
+        " — GitHub/Azure must be able to reach ADUS_PUBLIC_URL (currently not public)"
     }
 }
 
@@ -236,4 +257,26 @@ async fn remove(
 
     repositories::soft_delete(&state.db, id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::public_url_hint;
+
+    #[test]
+    fn hint_only_for_non_public_urls() {
+        for url in [
+            "http://adus.example.com",
+            "https://localhost:8080",
+            "https://127.0.0.1",
+            "https://0.0.0.0:8080",
+            "not a url",
+        ] {
+            assert!(
+                public_url_hint(url).contains("currently not public"),
+                "{url}"
+            );
+        }
+        assert_eq!(public_url_hint("https://adus.example.com"), "");
+    }
 }
