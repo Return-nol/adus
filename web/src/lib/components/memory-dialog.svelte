@@ -75,7 +75,7 @@
 		<form class="grid gap-4" onsubmit={submit}>
 			<div class="grid gap-2">
 				<Label for="m-content">Content</Label>
-				<Textarea id="m-content" required rows={5} maxlength={2000} bind:value={content} />
+				<Textarea id="m-content" required maxlength={2000} bind:value={content} />
 			</div>
 			{#if formError}<p role="alert" class="text-sm text-destructive">{formError}</p>{/if}
 			<Dialog.Footer>

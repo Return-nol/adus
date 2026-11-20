@@ -19,6 +19,8 @@
 	import { Label } from '#lib/components/ui/label/index.js';
 	import { Switch } from '#lib/components/ui/switch/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
+	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
+	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 
 	type Settings = { default_provider_id: string | null; default_model: string | null };
 
@@ -118,6 +120,7 @@
 	<h1 class="font-display text-3xl font-medium tracking-[0.01em] text-foreground">AI Providers</h1>
 	{#if isAdmin}
 		<Button
+			disabled={!loaded}
 			onclick={() => {
 				editProvider = null;
 				providerOpen = true;
@@ -128,7 +131,28 @@
 	{/if}
 </div>
 
-{#if loaded && providers.length === 0}
+{#if !loaded}
+	<Card.Root>
+		<Card.Header>
+			<div class="flex items-center gap-2">
+				<Skeleton class="h-6 w-28" />
+				<Skeleton class="h-5 w-20 rounded-full" />
+				<Skeleton class="h-5 w-16 rounded-full" />
+			</div>
+			{#if isAdmin}
+				<Card.Action class="flex items-center gap-2">
+					<Skeleton class="h-5 w-9 rounded-full" />
+					<Skeleton class="h-8 w-14 rounded-lg" />
+					<Skeleton class="h-8 w-16 rounded-lg" />
+				</Card.Action>
+			{/if}
+		</Card.Header>
+		<Card.Content class="space-y-4">
+			<TableSkeleton headers={['Label', 'Key', 'Status', 'Cooldown', 'Enabled', 'Actions']} />
+			{#if isAdmin}<Skeleton class="h-8 w-20 rounded-lg" />{/if}
+		</Card.Content>
+	</Card.Root>
+{:else if providers.length === 0}
 	<div
 		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 	>

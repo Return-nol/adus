@@ -7,6 +7,7 @@
 	import * as Card from '#lib/components/ui/card/index.js';
 	import * as Select from '#lib/components/ui/select/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
+	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
 	import { safeHttpUrl } from '#lib/utils.js';
 
@@ -180,7 +181,23 @@
 		Could not load reviews.
 		<Button variant="outline" size="sm" class="ml-2" onclick={() => load()}>Retry</Button>
 	</div>
-{:else if loaded && items.length === 0}
+{:else if !loaded}
+	<TableSkeleton
+		card
+		headers={[
+			'Repository',
+			'PR',
+			'Trigger',
+			'Status',
+			'Comments',
+			'Input tokens',
+			'Output tokens',
+			'Started',
+			'Duration'
+		]}
+		right={['Comments', 'Input tokens', 'Output tokens', 'Duration']}
+	/>
+{:else if items.length === 0}
 	<div
 		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 	>

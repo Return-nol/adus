@@ -13,6 +13,8 @@
 	import { RangeCalendar } from '#lib/components/ui/range-calendar/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
 	import * as Tabs from '#lib/components/ui/tabs/index.js';
+	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
+	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 
 	type Daily = {
 		date: string;
@@ -44,6 +46,8 @@
 	let daily = $state<Daily[]>([]);
 	let rows = $state<Row[]>([]);
 	let loading = $state(false);
+	// False until the first load finishes; later reloads keep showing the old data.
+	let loaded = $state(false);
 
 	const chartConfig = {
 		input_tokens: { label: 'Input', color: 'var(--chart-2)' },
@@ -76,7 +80,10 @@
 			} catch (e) {
 				if (!stale) toast.error(e instanceof ApiError ? e.message : 'Could not reach the server');
 			}
-			if (!stale) loading = false;
+			if (!stale) {
+				loading = false;
+				loaded = true;
+			}
 		})();
 		return () => {
 			stale = true;
@@ -124,25 +131,33 @@
 		<Card.Header>
 			<Card.Title>Tokens per day</Card.Title>
 			<Card.Description>
-				{n(sum((d) => d.input_tokens))} input · {n(sum((d) => d.output_tokens))} output ·
-				{n(sum((d) => d.calls))} calls ({n(sum((d) => d.failed_calls))} failed)
+				{#if !loaded}
+					<Skeleton class="mt-1 h-4 w-72" />
+				{:else}
+					{n(sum((d) => d.input_tokens))} input · {n(sum((d) => d.output_tokens))} output ·
+					{n(sum((d) => d.calls))} calls ({n(sum((d) => d.failed_calls))} failed)
+				{/if}
 			</Card.Description>
 		</Card.Header>
 		<Card.Content>
-			<Chart.Container config={chartConfig} class="aspect-auto h-64 w-full">
-				<BarChart
-					data={daily}
-					x="date"
-					axis="x"
-					{series}
-					seriesLayout="stack"
-					props={{ xAxis: { format: (d: string) => d.slice(5), ticks: 8 } }}
-				>
-					{#snippet tooltip()}
-						<Chart.Tooltip />
-					{/snippet}
-				</BarChart>
-			</Chart.Container>
+			{#if !loaded}
+				<Skeleton class="h-64 w-full rounded-lg" />
+			{:else}
+				<Chart.Container config={chartConfig} class="aspect-auto h-64 w-full">
+					<BarChart
+						data={daily}
+						x="date"
+						axis="x"
+						{series}
+						seriesLayout="stack"
+						props={{ xAxis: { format: (d: string) => d.slice(5), ticks: 8 } }}
+					>
+						{#snippet tooltip()}
+							<Chart.Tooltip />
+						{/snippet}
+					</BarChart>
+				</Chart.Container>
+			{/if}
 		</Card.Content>
 	</Card.Root>
 
@@ -159,36 +174,43 @@
 					<Tabs.Trigger value="model">Model</Tabs.Trigger>
 				</Tabs.List>
 			</Tabs.Root>
-			<Table.Root>
-				<Table.Header>
-					<Table.Row>
-						<Table.Head>{by}</Table.Head>
-						<Table.Head class="text-right">Input</Table.Head>
-						<Table.Head class="text-right">Output</Table.Head>
-						<Table.Head class="text-right">Total</Table.Head>
-						<Table.Head class="text-right">Calls</Table.Head>
-					</Table.Row>
-				</Table.Header>
-				<Table.Body>
-					{#each rows as r (r.id ?? r.label)}
+			{#if !loaded}
+				<TableSkeleton
+					headers={[by, 'Input', 'Output', 'Total', 'Calls']}
+					right={['Input', 'Output', 'Total', 'Calls']}
+				/>
+			{:else}
+				<Table.Root>
+					<Table.Header>
 						<Table.Row>
-							<Table.Cell>{r.label}</Table.Cell>
-							<Table.Cell class="text-right tabular-nums">{n(r.input_tokens)}</Table.Cell>
-							<Table.Cell class="text-right tabular-nums">{n(r.output_tokens)}</Table.Cell>
-							<Table.Cell class="text-right tabular-nums">
-								{n(r.input_tokens + r.output_tokens)}
-							</Table.Cell>
-							<Table.Cell class="text-right tabular-nums">{n(r.calls)}</Table.Cell>
+							<Table.Head>{by}</Table.Head>
+							<Table.Head class="text-right">Input</Table.Head>
+							<Table.Head class="text-right">Output</Table.Head>
+							<Table.Head class="text-right">Total</Table.Head>
+							<Table.Head class="text-right">Calls</Table.Head>
 						</Table.Row>
-					{:else}
-						<Table.Row>
-							<Table.Cell colspan={5} class="text-muted-foreground">
-								No usage in this range.
-							</Table.Cell>
-						</Table.Row>
-					{/each}
-				</Table.Body>
-			</Table.Root>
+					</Table.Header>
+					<Table.Body>
+						{#each rows as r (r.id ?? r.label)}
+							<Table.Row>
+								<Table.Cell>{r.label}</Table.Cell>
+								<Table.Cell class="text-right tabular-nums">{n(r.input_tokens)}</Table.Cell>
+								<Table.Cell class="text-right tabular-nums">{n(r.output_tokens)}</Table.Cell>
+								<Table.Cell class="text-right tabular-nums">
+									{n(r.input_tokens + r.output_tokens)}
+								</Table.Cell>
+								<Table.Cell class="text-right tabular-nums">{n(r.calls)}</Table.Cell>
+							</Table.Row>
+						{:else}
+							<Table.Row>
+								<Table.Cell colspan={5} class="text-muted-foreground">
+									No usage in this range.
+								</Table.Cell>
+							</Table.Row>
+						{/each}
+					</Table.Body>
+				</Table.Root>
+			{/if}
 		</Card.Content>
 	</Card.Root>
 </div>

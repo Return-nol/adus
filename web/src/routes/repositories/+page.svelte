@@ -14,6 +14,8 @@
 	import * as Card from '#lib/components/ui/card/index.js';
 	import { Switch } from '#lib/components/ui/switch/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
+	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
+	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 
 	type Repo = {
 		id: string;
@@ -116,6 +118,7 @@
 	<h1 class="font-display text-3xl font-medium tracking-[0.01em] text-foreground">Repositories</h1>
 	{#if isAdmin}
 		<Button
+			disabled={!loaded}
 			onclick={() => {
 				selected = null;
 				connDialogOpen = true;
@@ -126,7 +129,30 @@
 	{/if}
 </div>
 
-{#if loaded && connections.length === 0}
+{#if !loaded}
+	<div class="space-y-6">
+		<Card.Root>
+			<Card.Header>
+				<div class="flex items-center gap-2">
+					<Skeleton class="h-6 w-32" />
+					<Skeleton class="h-5 w-24 rounded-full" />
+					<Skeleton class="h-5 w-10 rounded-full" />
+				</div>
+				<Skeleton class="h-4 w-72" />
+				{#if isAdmin}
+					<Card.Action class="flex flex-wrap gap-2">
+						{#each { length: 4 } as _, j (j)}<Skeleton class="h-8 w-28 rounded-lg" />{/each}
+					</Card.Action>
+				{/if}
+			</Card.Header>
+			<Card.Content>
+				<TableSkeleton
+					headers={['Repository', 'Enabled', 'Auto review', 'Model override', 'Actions']}
+				/>
+			</Card.Content>
+		</Card.Root>
+	</div>
+{:else if connections.length === 0}
 	<div
 		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 	>

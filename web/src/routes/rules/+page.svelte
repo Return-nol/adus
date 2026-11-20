@@ -12,9 +12,11 @@
 	import * as AlertDialog from '#lib/components/ui/alert-dialog/index.js';
 	import { Badge } from '#lib/components/ui/badge/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
 	import * as Select from '#lib/components/ui/select/index.js';
 	import { Switch } from '#lib/components/ui/switch/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
+	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 	import * as Tabs from '#lib/components/ui/tabs/index.js';
 	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
 	import { safeHttpUrl } from '#lib/utils.js';
@@ -149,6 +151,7 @@
 	<Tabs.Content value="rules" class="space-y-4">
 		<div class="flex justify-end">
 			<Button
+				disabled={!loaded}
 				onclick={() => {
 					editRule = null;
 					ruleOpen = true;
@@ -159,76 +162,83 @@
 		</div>
 		{#if loadError}
 			{@render loadFailed()}
-		{:else if loaded && rules.length === 0}
+		{:else if !loaded}
+			<TableSkeleton card headers={['Title', 'Path glob', 'Severity', 'Enabled', 'Actions']} />
+		{:else if rules.length === 0}
 			<div
 				class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 			>
 				No rules for this scope yet. Rules tell the reviewer what to look for.
 			</div>
 		{:else if rules.length > 0}
-			<Table.Root>
-				<Table.Header>
-					<Table.Row>
-						<Table.Head>Title</Table.Head>
-						<Table.Head>Path glob</Table.Head>
-						<Table.Head>Severity</Table.Head>
-						<Table.Head>Enabled</Table.Head>
-						<Table.Head class="text-right">Actions</Table.Head>
-					</Table.Row>
-				</Table.Header>
-				<Table.Body>
-					{#each rules as r (r.id)}
-						<Table.Row>
-							<Table.Cell class="font-medium">{r.title}</Table.Cell>
-							<Table.Cell>
-								{#if r.path_glob}<code>{r.path_glob}</code>{:else}
-									<span class="text-muted-foreground">all files</span>
-								{/if}
-							</Table.Cell>
-							<Table.Cell>
-								<Badge variant={severityVariant[r.severity]}>{severityLabel[r.severity]}</Badge>
-							</Table.Cell>
-							<Table.Cell>
-								<Switch
-									aria-label={`Enabled: ${r.title}`}
-									disabled={busy.has(r.id)}
-									bind:checked={
-										() => r.enabled,
-										(v) => guarded(r.id, () => api('PATCH', `/rules/${r.id}`, { enabled: v }))
-									}
-								/>
-							</Table.Cell>
-							<Table.Cell class="space-x-2 text-right">
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={busy.has(r.id)}
-									onclick={() => {
-										editRule = r;
-										ruleOpen = true;
-									}}
-								>
-									Edit
-								</Button>
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={busy.has(r.id)}
-									onclick={() => askDelete(r.id, `Delete rule ${r.title}?`, `/rules/${r.id}`)}
-								>
-									Delete
-								</Button>
-							</Table.Cell>
-						</Table.Row>
-					{/each}
-				</Table.Body>
-			</Table.Root>
+			<Card.Root class="py-0">
+				<Card.Content class="px-0">
+					<Table.Root>
+						<Table.Header>
+							<Table.Row>
+								<Table.Head>Title</Table.Head>
+								<Table.Head>Path glob</Table.Head>
+								<Table.Head>Severity</Table.Head>
+								<Table.Head>Enabled</Table.Head>
+								<Table.Head class="text-right">Actions</Table.Head>
+							</Table.Row>
+						</Table.Header>
+						<Table.Body>
+							{#each rules as r (r.id)}
+								<Table.Row>
+									<Table.Cell class="font-medium">{r.title}</Table.Cell>
+									<Table.Cell>
+										{#if r.path_glob}<code>{r.path_glob}</code>{:else}
+											<span class="text-muted-foreground">all files</span>
+										{/if}
+									</Table.Cell>
+									<Table.Cell>
+										<Badge variant={severityVariant[r.severity]}>{severityLabel[r.severity]}</Badge>
+									</Table.Cell>
+									<Table.Cell>
+										<Switch
+											aria-label={`Enabled: ${r.title}`}
+											disabled={busy.has(r.id)}
+											bind:checked={
+												() => r.enabled,
+												(v) => guarded(r.id, () => api('PATCH', `/rules/${r.id}`, { enabled: v }))
+											}
+										/>
+									</Table.Cell>
+									<Table.Cell class="space-x-2 text-right">
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={busy.has(r.id)}
+											onclick={() => {
+												editRule = r;
+												ruleOpen = true;
+											}}
+										>
+											Edit
+										</Button>
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={busy.has(r.id)}
+											onclick={() => askDelete(r.id, `Delete rule ${r.title}?`, `/rules/${r.id}`)}
+										>
+											Delete
+										</Button>
+									</Table.Cell>
+								</Table.Row>
+							{/each}
+						</Table.Body>
+					</Table.Root>
+				</Card.Content>
+			</Card.Root>
 		{/if}
 	</Tabs.Content>
 
 	<Tabs.Content value="memory" class="space-y-4">
 		<div class="flex justify-end">
 			<Button
+				disabled={!loaded}
 				onclick={() => {
 					editMemory = null;
 					memoryOpen = true;
@@ -239,7 +249,9 @@
 		</div>
 		{#if loadError}
 			{@render loadFailed()}
-		{:else if loaded && memories.length === 0}
+		{:else if !loaded}
+			<TableSkeleton card headers={['Content', 'Source', 'Created by', 'Enabled', 'Actions']} />
+		{:else if memories.length === 0}
 			<div
 				class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 			>
@@ -247,82 +259,91 @@
 				pull request.
 			</div>
 		{:else if memories.length > 0}
-			<Table.Root>
-				<Table.Header>
-					<Table.Row>
-						<Table.Head>Content</Table.Head>
-						<Table.Head>Source</Table.Head>
-						<Table.Head>Created by</Table.Head>
-						<Table.Head>Enabled</Table.Head>
-						<Table.Head class="text-right">Actions</Table.Head>
-					</Table.Row>
-				</Table.Header>
-				<Table.Body>
-					{#each memories as m (m.id)}
-						<Table.Row>
-							<Table.Cell class="max-w-md whitespace-normal">
-								{#if m.content.length > MEMORY_PREVIEW}
-									<Tooltip.Root>
-										<Tooltip.Trigger class="text-left" title={m.content}>
-											{m.content.slice(0, MEMORY_PREVIEW)}…
-										</Tooltip.Trigger>
-										<Tooltip.Content class="max-w-sm whitespace-pre-wrap">
+			<Card.Root class="py-0">
+				<Card.Content class="px-0">
+					<Table.Root>
+						<Table.Header>
+							<Table.Row>
+								<Table.Head>Content</Table.Head>
+								<Table.Head>Source</Table.Head>
+								<Table.Head>Created by</Table.Head>
+								<Table.Head>Enabled</Table.Head>
+								<Table.Head class="text-right">Actions</Table.Head>
+							</Table.Row>
+						</Table.Header>
+						<Table.Body>
+							{#each memories as m (m.id)}
+								<Table.Row>
+									<Table.Cell class="max-w-md whitespace-normal">
+										{#if m.content.length > MEMORY_PREVIEW}
+											<Tooltip.Root>
+												<Tooltip.Trigger class="text-left" title={m.content}>
+													{m.content.slice(0, MEMORY_PREVIEW)}…
+												</Tooltip.Trigger>
+												<Tooltip.Content class="max-w-sm whitespace-pre-wrap">
+													{m.content}
+												</Tooltip.Content>
+											</Tooltip.Root>
+										{:else}
 											{m.content}
-										</Tooltip.Content>
-									</Tooltip.Root>
-								{:else}
-									{m.content}
-								{/if}
-							</Table.Cell>
-							<Table.Cell>
-								<Badge variant="secondary">{m.source === 'manual' ? 'manual' : 'PR comment'}</Badge>
-								{#if safeHttpUrl(m.source_url)}
-									<a
-										href={safeHttpUrl(m.source_url)}
-										target="_blank"
-										rel="noopener noreferrer"
-										class="ml-1 text-sm text-primary underline-offset-4 hover:underline"
-									>
-										view
-									</a>
-								{/if}
-							</Table.Cell>
-							<Table.Cell class="text-muted-foreground">{m.created_by?.email ?? '—'}</Table.Cell>
-							<Table.Cell>
-								<Switch
-									aria-label="Enabled"
-									disabled={busy.has(m.id)}
-									bind:checked={
-										() => m.enabled,
-										(v) => guarded(m.id, () => api('PATCH', `/memories/${m.id}`, { enabled: v }))
-									}
-								/>
-							</Table.Cell>
-							<Table.Cell class="space-x-2 text-right">
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={busy.has(m.id)}
-									onclick={() => {
-										editMemory = m;
-										memoryOpen = true;
-									}}
-								>
-									Edit
-								</Button>
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={busy.has(m.id)}
-									onclick={() => askDelete(m.id, 'Delete this memory?', `/memories/${m.id}`)}
-								>
-									Delete
-								</Button>
-							</Table.Cell>
-						</Table.Row>
-					{/each}
-				</Table.Body>
-			</Table.Root>
+										{/if}
+									</Table.Cell>
+									<Table.Cell>
+										<Badge variant="secondary">
+											{m.source === 'manual' ? 'manual' : 'PR comment'}
+										</Badge>
+										{#if safeHttpUrl(m.source_url)}
+											<a
+												href={safeHttpUrl(m.source_url)}
+												target="_blank"
+												rel="noopener noreferrer"
+												class="ml-1 text-sm text-primary underline-offset-4 hover:underline"
+											>
+												view
+											</a>
+										{/if}
+									</Table.Cell>
+									<Table.Cell class="text-muted-foreground">
+										{m.created_by?.email ?? '—'}
+									</Table.Cell>
+									<Table.Cell>
+										<Switch
+											aria-label="Enabled"
+											disabled={busy.has(m.id)}
+											bind:checked={
+												() => m.enabled,
+												(v) =>
+													guarded(m.id, () => api('PATCH', `/memories/${m.id}`, { enabled: v }))
+											}
+										/>
+									</Table.Cell>
+									<Table.Cell class="space-x-2 text-right">
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={busy.has(m.id)}
+											onclick={() => {
+												editMemory = m;
+												memoryOpen = true;
+											}}
+										>
+											Edit
+										</Button>
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={busy.has(m.id)}
+											onclick={() => askDelete(m.id, 'Delete this memory?', `/memories/${m.id}`)}
+										>
+											Delete
+										</Button>
+									</Table.Cell>
+								</Table.Row>
+							{/each}
+						</Table.Body>
+					</Table.Root>
+				</Card.Content>
+			</Card.Root>
 		{/if}
 	</Tabs.Content>
 </Tabs.Root>
