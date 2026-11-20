@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use adus_core::crypto::Cipher;
 use adus_core::types::{ConnectionKind, ProviderKind};
@@ -13,7 +14,7 @@ use adus_git::{
 };
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use adus_llm::{ChatRequest, ChatResponse};
-use adus_review::engine::Engine;
+use adus_review::engine::{Engine, REVIEW_TIMEOUT};
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -38,6 +39,8 @@ pub struct GitState {
     pub incremental: Vec<FileDiff>,
     /// Jika diisi, `get_pr` gagal dengan error ini.
     pub get_pr_error: Option<GitError>,
+    /// `get_pr` menunggu selama ini sebelum menjawab (provider yang lambat).
+    pub get_pr_delay: Duration,
     /// Jika diisi, `pr_diff` gagal dengan error ini.
     pub pr_diff_error: Option<GitError>,
     /// Jika diisi, `diff_between` gagal dengan error ini.
@@ -68,6 +71,7 @@ impl FakeGit {
                 full,
                 incremental: Vec::new(),
                 get_pr_error: None,
+                get_pr_delay: Duration::ZERO,
                 pr_diff_error: None,
                 diff_between_error: None,
                 post_error: None,
@@ -124,6 +128,8 @@ impl GitProvider for FakeGit {
     }
 
     async fn get_pr(&self, _repo: &RepoRef, _number: i64) -> Result<PullRequest, GitError> {
+        let delay = self.state().get_pr_delay;
+        tokio::time::sleep(delay).await;
         let state = self.state();
         match &state.get_pr_error {
             Some(err) => Err(err.clone()),
@@ -291,6 +297,7 @@ pub async fn setup(pool: &PgPool, git: FakeGit) -> Setup {
             cipher: Arc::new(cipher),
             git: Arc::new(git.clone()),
             chat: chat.clone(),
+            review_timeout: REVIEW_TIMEOUT,
         },
         git,
         chat,

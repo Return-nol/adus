@@ -5,7 +5,7 @@ use adus_core::{config::Config, crypto::Cipher};
 use adus_git::{GitProviderFactory, HttpGitProviderFactory};
 use adus_llm::router::{ChatService, LlmRouter};
 use adus_queue::Queue;
-use adus_review::engine::Engine;
+use adus_review::engine::{Engine, REVIEW_TIMEOUT};
 use adus_server::{AppState, router};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cipher: cipher.clone(),
         git: git.clone(),
         chat: chat.clone(),
+        review_timeout: REVIEW_TIMEOUT,
     });
 
     let shutdown = CancellationToken::new();
@@ -74,12 +75,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         queue,
         chat,
     };
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-        .await?;
+    let server_token = shutdown.clone();
+    tasks.spawn(async move {
+        let server = axum::serve(listener, router(state))
+            .with_graceful_shutdown(server_token.clone().cancelled_owned());
+        if let Err(err) = server.await {
+            tracing::error!(error = %err, "HTTP server failed; shutting down");
+            server_token.cancel();
+        }
+    });
 
+    // Masa tenggang dihitung sejak sinyal berhenti, untuk HTTP dan worker bersama-sama.
+    shutdown.cancelled().await;
     let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
-        while tasks.join_next().await.is_some() {}
+        while let Some(joined) = tasks.join_next().await {
+            if let Err(err) = joined {
+                tracing::error!(error = %err, "task failed during shutdown");
+            }
+        }
     })
     .await;
     if drained.is_err() {

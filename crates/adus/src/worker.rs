@@ -7,15 +7,18 @@ use std::time::Duration;
 
 use adus_core::job::Job;
 use adus_queue::{Delivery, MAX_ATTEMPTS, Queue, QueueError, backoff};
-use adus_review::engine::{Engine, EngineError};
+use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-/// Batas waktu satu job. Di bawah TTL lock (15 menit) dan batas ambil-alih antrian (15 menit),
-/// jadi job yang macet tidak pernah dikerjakan dua worker sekaligus.
-pub const JOB_TIMEOUT: Duration = Duration::from_secs(12 * 60);
+/// Batas waktu cadangan satu job. Review sudah dibatasi 12 menit di dalam engine (supaya baris
+/// `reviews` tercatat gagal); ini menjaga sisanya. Di bawah TTL lock dan batas ambil-alih antrian
+/// (keduanya 15 menit), jadi job yang macet tidak pernah dikerjakan dua worker sekaligus.
+pub const JOB_TIMEOUT: Duration = Duration::from_secs(13 * 60);
 const LOCK_TTL: Duration = Duration::from_secs(15 * 60);
+const _: () = assert!(REVIEW_TIMEOUT.as_secs() < JOB_TIMEOUT.as_secs());
+const _: () = assert!(JOB_TIMEOUT.as_secs() < LOCK_TTL.as_secs());
 /// Jeda sebelum mencoba lagi job yang PR-nya sedang dikerjakan worker lain.
 const LOCK_BUSY_DELAY: Duration = Duration::from_secs(30);
 const NEXT_BLOCK: Duration = Duration::from_secs(5);
@@ -71,7 +74,7 @@ pub async fn run_worker(
         };
         let result = match next {
             Ok(Some(delivery)) => {
-                handle_delivery(&queue, runner.as_ref(), delivery, job_timeout).await
+                handle_delivery(&queue, runner.clone(), delivery, job_timeout).await
             }
             Ok(None) => Ok(()),
             Err(err) => Err(err),
@@ -106,7 +109,7 @@ pub async fn run_scheduler(queue: Queue, shutdown: CancellationToken) {
 /// Error yang dikembalikan hanya error antrian; error job sudah ditangani di sini.
 pub async fn handle_delivery(
     queue: &Queue,
-    runner: &dyn JobRunner,
+    runner: Arc<dyn JobRunner>,
     delivery: Delivery,
     job_timeout: Duration,
 ) -> Result<(), QueueError> {
@@ -135,10 +138,18 @@ pub async fn handle_delivery(
                 .retry(&delivery, delivery.attempt, LOCK_BUSY_DELAY)
                 .await;
         };
-        let result = match tokio::time::timeout(job_timeout, runner.run(queue, &delivery.job)).await
-        {
-            Ok(result) => result,
-            Err(_elapsed) => Err(EngineError::Retryable("job timed out".into(), None)),
+        // Job jalan di task sendiri: panic hanya menggagalkan job ini, bukan worker-nya.
+        let (job_queue, job) = (queue.clone(), delivery.job.clone());
+        let job_run = async move { runner.run(&job_queue, &job).await };
+        let mut handle = tokio::spawn(job_run.in_current_span());
+        let result = match tokio::time::timeout(job_timeout, &mut handle).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_join_error)) => Err(EngineError::Retryable("job panicked".into(), None)),
+            Err(_elapsed) => {
+                // Hentikan job, supaya tidak jalan terus setelah lock-nya dilepas.
+                handle.abort();
+                Err(EngineError::Retryable("job timed out".into(), None))
+            }
         };
         let settled = settle(queue, &delivery, result).await;
         // Lock selalu dilepas, juga saat menyelesaikan job di antrian gagal.

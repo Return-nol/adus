@@ -15,7 +15,7 @@ use adus_db::{connections, repositories};
 use adus_git::HttpGitProviderFactory;
 use adus_llm::router::LlmRouter;
 use adus_queue::{Delivery, Queue};
-use adus_review::engine::{Engine, EngineError};
+use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT};
 use async_trait::async_trait;
 use redis::AsyncCommands;
 use sqlx::PgPool;
@@ -37,14 +37,14 @@ struct FakeRunner {
 }
 
 impl FakeRunner {
-    fn new(result: Result<(), EngineError>, delay: Duration) -> FakeRunner {
-        FakeRunner {
+    fn new(result: Result<(), EngineError>, delay: Duration) -> Arc<FakeRunner> {
+        Arc::new(FakeRunner {
             result,
             delay,
             calls: AtomicUsize::new(0),
             running: AtomicUsize::new(0),
             max_running: AtomicUsize::new(0),
-        }
+        })
     }
 }
 
@@ -57,6 +57,16 @@ impl JobRunner for FakeRunner {
         tokio::time::sleep(self.delay).await;
         self.running.fetch_sub(1, Ordering::SeqCst);
         self.result.clone()
+    }
+}
+
+/// Job yang selalu panic.
+struct PanickingRunner;
+
+#[async_trait]
+impl JobRunner for PanickingRunner {
+    async fn run(&self, _queue: &Queue, _job: &Job) -> Result<(), EngineError> {
+        panic!("bug in job");
     }
 }
 
@@ -159,27 +169,30 @@ async fn lock_exists(prefix: &str, repository_id: Uuid, pr_number: i64) -> bool 
 
 #[tokio::test]
 async fn retryable_error_requeued_with_backoff() {
-    let (queue, prefix) = new_queue().await;
-    let repository_id = Uuid::new_v4();
-    let delivery = deliver(&queue, &review_job(repository_id, 1), 1).await;
-    let runner = FakeRunner::new(
-        Err(EngineError::Retryable("git provider: 502".into(), None)),
-        Duration::ZERO,
-    );
+    // (attempt sekarang, attempt berikutnya, backoff dalam detik)
+    for (attempt, next_attempt, backoff_secs) in [(1, 2, 10.0), (4, 5, 80.0)] {
+        let (queue, prefix) = new_queue().await;
+        let repository_id = Uuid::new_v4();
+        let delivery = deliver(&queue, &review_job(repository_id, 1), attempt).await;
+        let runner = FakeRunner::new(
+            Err(EngineError::Retryable("git provider: 502".into(), None)),
+            Duration::ZERO,
+        );
 
-    handle_delivery(&queue, &runner, delivery, JOB_TIMEOUT)
-        .await
-        .unwrap();
+        handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
+            .await
+            .unwrap();
 
-    let retries = delayed(&prefix).await;
-    assert_eq!(retries.len(), 1);
-    let (attempt, due_in) = retries[0];
-    assert_eq!(attempt, 2);
-    // backoff(1) = 10 dtk
-    assert!((9.0..=10.5).contains(&due_in), "due in {due_in}s");
-    assert_eq!(stream_len(&format!("{prefix}:jobs")).await, 0);
-    assert!(!lock_exists(&prefix, repository_id, 1).await);
-    cleanup(&prefix).await;
+        let retries = delayed(&prefix).await;
+        assert_eq!(retries.len(), 1);
+        let (stored_attempt, due_in) = retries[0];
+        assert_eq!(stored_attempt, next_attempt);
+        let expected = (backoff_secs - 1.0)..=(backoff_secs + 0.5);
+        assert!(expected.contains(&due_in), "due in {due_in}s");
+        assert_eq!(stream_len(&format!("{prefix}:jobs")).await, 0);
+        assert!(!lock_exists(&prefix, repository_id, 1).await);
+        cleanup(&prefix).await;
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -222,10 +235,11 @@ async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool)
         cipher: cipher.clone(),
         git: Arc::new(git),
         chat: Arc::new(LlmRouter::new(pool.clone(), cipher, http)),
+        review_timeout: REVIEW_TIMEOUT,
     };
     let delivery = deliver(&queue, &review_job(repo.id, 7), 5).await;
 
-    handle_delivery(&queue, &engine, delivery, JOB_TIMEOUT)
+    handle_delivery(&queue, Arc::new(engine), delivery, JOB_TIMEOUT)
         .await
         .unwrap();
 
@@ -256,7 +270,7 @@ async fn rate_limit_retry_uses_retry_after_when_longer() {
         Duration::ZERO,
     );
 
-    handle_delivery(&queue, &runner, delivery, JOB_TIMEOUT)
+    handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
         .await
         .unwrap();
 
@@ -272,7 +286,7 @@ async fn rate_limit_retry_uses_retry_after_when_longer() {
 async fn same_pr_jobs_never_run_concurrently() {
     let (queue, prefix) = new_queue().await;
     let repository_id = Uuid::new_v4();
-    let runner = Arc::new(FakeRunner::new(Ok(()), Duration::from_millis(500)));
+    let runner = FakeRunner::new(Ok(()), Duration::from_millis(500));
     let shutdown = CancellationToken::new();
     let workers: Vec<_> = (0..2)
         .map(|index| {
@@ -295,6 +309,11 @@ async fn same_pr_jobs_never_run_concurrently() {
         assert!(tokio::time::Instant::now() < deadline, "timed out");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let live = queue.live_workers().await.unwrap();
+    assert_eq!(
+        live,
+        vec!["test-worker-0".to_string(), "test-worker-1".to_string()]
+    );
     shutdown.cancel();
     for worker in workers {
         worker.await.unwrap();
@@ -329,7 +348,7 @@ async fn lock_busy_requeues_without_consuming_attempt() {
     let delivery = deliver(&queue, &comment, 3).await;
     let runner = FakeRunner::new(Ok(()), Duration::ZERO);
 
-    handle_delivery(&queue, &runner, delivery, JOB_TIMEOUT)
+    handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
         .await
         .unwrap();
 
@@ -355,7 +374,7 @@ async fn fatal_goes_straight_to_dead_letter() {
         Duration::ZERO,
     );
 
-    handle_delivery(&queue, &runner, delivery, JOB_TIMEOUT)
+    handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
         .await
         .unwrap();
 
@@ -376,7 +395,7 @@ async fn job_timeout_is_retryable() {
     let delivery = deliver(&queue, &review_job(repository_id, 1), 1).await;
     let runner = FakeRunner::new(Ok(()), Duration::from_secs(5));
 
-    handle_delivery(&queue, &runner, delivery, Duration::from_millis(100))
+    handle_delivery(&queue, runner.clone(), delivery, Duration::from_millis(100))
         .await
         .unwrap();
 
@@ -409,5 +428,37 @@ async fn heartbeat_visible_then_expires() {
         queue.live_workers().await.unwrap(),
         vec!["worker-b".to_string()]
     );
+    cleanup(&prefix).await;
+}
+
+#[tokio::test]
+async fn panicking_job_does_not_kill_worker() {
+    let (queue, prefix) = new_queue().await;
+    let shutdown = CancellationToken::new();
+    let worker = tokio::spawn(run_worker(
+        "test-worker".to_string(),
+        queue.clone(),
+        Arc::new(PanickingRunner),
+        JOB_TIMEOUT,
+        shutdown.clone(),
+    ));
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+
+    // Job kedua hanya dikerjakan jika worker selamat dari panic job pertama.
+    queue.enqueue(&review_job(first, 1)).await.unwrap();
+    queue.enqueue(&review_job(second, 1)).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while delayed(&prefix).await.len() < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "timed out");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    shutdown.cancel();
+    worker.await.unwrap();
+
+    let attempts: Vec<u32> = delayed(&prefix).await.iter().map(|d| d.0).collect();
+    assert_eq!(attempts, vec![2, 2]);
+    assert!(!lock_exists(&prefix, first, 1).await);
+    assert!(!lock_exists(&prefix, second, 1).await);
     cleanup(&prefix).await;
 }

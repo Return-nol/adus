@@ -527,3 +527,22 @@ async fn nothing_to_review_posts_nothing(pool: PgPool) {
     assert_eq!(s.git.state().reviews.len(), 1, "only the first review");
     assert_eq!(s.chat.calls().len(), 1);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn slow_review_times_out_and_is_marked_failed(pool: PgPool) {
+    let mut s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_234)]),
+    )
+    .await;
+    s.git.state().get_pr_delay = Duration::from_secs(5);
+    s.engine.review_timeout = Duration::from_millis(100);
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert_eq!(err, EngineError::Retryable("review timed out".into(), None));
+    let row = latest(&pool).await;
+    assert_eq!(row.status, ReviewStatus::Failed);
+    assert_eq!(row.error.as_deref(), Some("review timed out"));
+    assert!(row.finished_at.is_some());
+}

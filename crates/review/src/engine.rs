@@ -25,12 +25,17 @@ use crate::{
 };
 
 const MAX_OUTPUT_TOKENS: u32 = 4096;
+/// Batas waktu bawaan satu review (`Engine::review_timeout`).
+pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(12 * 60);
 
 pub struct Engine {
     pub db: PgPool,
     pub cipher: Arc<Cipher>,
     pub git: Arc<dyn GitProviderFactory>,
     pub chat: Arc<dyn ChatService>,
+    /// Review yang lebih lama dari ini dihentikan dan dicatat gagal (Retryable). Produksi:
+    /// `REVIEW_TIMEOUT`; test memakai nilai pendek.
+    pub review_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -80,22 +85,27 @@ impl Engine {
         };
         let review_id = reviews::insert(&self.db, new).await.map_err(db_error)?.id;
 
-        let (status, posted, skip_reason) =
-            match self.run(&repo, review_id, pr_number, trigger).await {
-                Ok(Outcome::Done { posted }) => (ReviewStatus::Done, posted, None),
-                Ok(Outcome::Skipped(reason)) => (ReviewStatus::Skipped, 0, Some(reason)),
-                Err(err) => {
-                    let message = err.to_string();
-                    let failed = ReviewStatus::Failed;
-                    let finished =
-                        reviews::finish(&self.db, review_id, failed, 0, Some(&message), None);
-                    // Error aslinya yang dikembalikan; gagal mencatat cukup di-log.
-                    if let Err(db_err) = finished.await {
-                        tracing::warn!(%review_id, error = %db_err, "could not mark review failed");
-                    }
-                    return Err(err);
+        // Timeout di sini, bukan di worker, supaya baris review tetap dicatat gagal.
+        let run = self.run(&repo, review_id, pr_number, trigger);
+        let outcome = match tokio::time::timeout(self.review_timeout, run).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(EngineError::Retryable("review timed out".into(), None)),
+        };
+        let (status, posted, skip_reason) = match outcome {
+            Ok(Outcome::Done { posted }) => (ReviewStatus::Done, posted, None),
+            Ok(Outcome::Skipped(reason)) => (ReviewStatus::Skipped, 0, Some(reason)),
+            Err(err) => {
+                let message = err.to_string();
+                let failed = ReviewStatus::Failed;
+                let finished =
+                    reviews::finish(&self.db, review_id, failed, 0, Some(&message), None);
+                // Error aslinya yang dikembalikan; gagal mencatat cukup di-log.
+                if let Err(db_err) = finished.await {
+                    tracing::warn!(%review_id, error = %db_err, "could not mark review failed");
                 }
-            };
+                return Err(err);
+            }
+        };
         let posted = i32::try_from(posted).unwrap_or(i32::MAX);
         // Review mungkin sudah terposting: jangan jadikan Retryable (akan posting dua kali).
         let finished = reviews::finish(&self.db, review_id, status, posted, None, skip_reason);
