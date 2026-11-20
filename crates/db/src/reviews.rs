@@ -160,7 +160,8 @@ pub struct HistoryFilter {
 
 const HISTORY_WHERE: &str = "WHERE ($1::uuid IS NULL OR r.repository_id = $1) AND ($2::review_status IS NULL OR r.status = $2)";
 
-/// Satu halaman riwayat (yang mulai terakhir dulu, belum mulai di akhir) dan jumlah total baris.
+/// Satu halaman riwayat (terbaru dulu: `started_at`, atau `created_at` jika belum mulai) dan jumlah
+/// total baris.
 /// `page` mulai dari 1. Token dijumlah dalam satu query (lateral subquery), bukan per baris.
 pub async fn history(
     pool: &PgPool,
@@ -183,7 +184,7 @@ pub async fn history(
              FROM llm_usage WHERE review_id = r.id \
          ) u ON true \
          {HISTORY_WHERE} \
-         ORDER BY r.started_at DESC NULLS LAST, r.id DESC LIMIT $3 OFFSET $4"
+         ORDER BY COALESCE(r.started_at, r.created_at) DESC, r.id DESC LIMIT $3 OFFSET $4"
     ))
     .bind(filter.repository_id)
     .bind(filter.status)

@@ -91,8 +91,10 @@
 	}
 
 	// Only the newest request may write results, so a slow response for a previous filter is dropped.
-	// Background refreshes fail quietly (no toast) and recover on the next tick.
+	// A failed background refresh keeps the current rows and toasts once until a refresh succeeds;
+	// only a foreground failure swaps the table for the error card.
 	let seq = 0;
+	let refreshFailing = false;
 	async function load(background = false) {
 		const mine = ++seq;
 		const params = new URLSearchParams({ page: String(page), per_page: String(PER_PAGE) });
@@ -104,12 +106,18 @@
 			items = res.items;
 			total = res.total;
 			loadError = false;
+			refreshFailing = false;
 			// The list shrank under us (e.g. filtered by `running`): jump to the last page.
 			if (page > pages && total > 0) page = pages;
 		} catch (e) {
 			if (mine !== seq) return;
-			loadError = true;
-			if (!background) fail(e);
+			if (!background) {
+				loadError = true;
+				fail(e);
+			} else if (!refreshFailing) {
+				refreshFailing = true;
+				fail(e);
+			}
 		}
 		loaded = true;
 	}

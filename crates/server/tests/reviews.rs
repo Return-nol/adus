@@ -124,17 +124,18 @@ async fn reviews_list_includes_token_sums_and_pagination(pool: PgPool) {
     .await
     .unwrap();
 
-    // Semua repo: terbaru dulu, yang belum mulai (queued) di akhir.
+    // Semua repo: terbaru dulu. Yang belum mulai diurutkan menurut `created_at` (sekarang),
+    // jadi review queued yang baru masuk tampil paling atas, bukan tenggelam di halaman terakhir.
     let reply = send(&app, get("/api/v1/reviews", Some(&admin))).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body["total"], 4);
     assert_eq!(
         ids(&reply.body),
-        [&other, &new, &old, &queued].map(Uuid::to_string)
+        [&queued, &other, &new, &old].map(Uuid::to_string)
     );
 
-    // Filter repo + halaman.
-    let uri = format!("/api/v1/reviews?repository_id={api}&page=2&per_page=1");
+    // Filter repo + halaman (urutan repo api: queued, new, old).
+    let uri = format!("/api/v1/reviews?repository_id={api}&page=3&per_page=1");
     let reply = send(&app, get(&uri, Some(&admin))).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body["total"], 3);
@@ -155,6 +156,11 @@ async fn reviews_list_includes_token_sums_and_pagination(pool: PgPool) {
     assert_eq!(item["finished_at"], Value::Null);
 
     let uri = format!("/api/v1/reviews?repository_id={api}&page=1&per_page=1");
+    let top = &send(&app, get(&uri, Some(&admin))).await.body["items"][0];
+    assert_eq!(top["id"], queued.to_string());
+    assert_eq!(top["started_at"], Value::Null);
+
+    let uri = format!("/api/v1/reviews?repository_id={api}&page=2&per_page=1");
     let first = &send(&app, get(&uri, Some(&admin))).await.body["items"][0];
     assert_eq!(first["id"], new.to_string());
     assert_eq!(first["error"], "boom");
@@ -229,6 +235,30 @@ async fn soft_deleted_repo_still_listed_with_pr_url(pool: PgPool) {
     assert_eq!(
         item["pr_url"],
         format!("https://dev.azure.com/fabrikam/{guid}/_git/Fab/pullrequest/5")
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn azure_repo_name_with_space_is_percent_encoded(pool: PgPool) {
+    let app = app(pool.clone()).await;
+    let admin = setup_admin(&app).await;
+    let guid = "6ce954b1-ce1f-45d1-b94d-e6bf2464ba2c";
+    let repo = add_repo(
+        &pool,
+        ConnectionKind::AzureDevops,
+        "fabrikam",
+        Some(guid),
+        "My Repo",
+    )
+    .await;
+    add_review(&pool, repo, 7, "done", Some("2026-01-01T10:00:00Z")).await;
+
+    let reply = send(&app, get("/api/v1/reviews", Some(&admin))).await;
+    let item = &reply.body["items"][0];
+    assert_eq!(item["repository"]["name"], "fabrikam/My Repo");
+    assert_eq!(
+        item["pr_url"],
+        format!("https://dev.azure.com/fabrikam/{guid}/_git/My%20Repo/pullrequest/7")
     );
 }
 
