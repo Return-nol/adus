@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use adus_core::job::{CommentAuthor, Job, Trigger};
-use adus_queue::{Queue, backoff};
+use adus_queue::{MAX_ATTEMPTS, Queue, backoff};
 use redis::AsyncCommands;
 use uuid::Uuid;
 
@@ -240,31 +240,86 @@ async fn malformed_entry_is_dead_lettered_and_queue_continues() {
     cleanup(&prefix).await;
 }
 
+/// Pura-pura pemilik entri mati 16 menit lalu: XCLAIM dengan IDLE mengatur waktu idle entri.
+/// JUSTID membuat XCLAIM tidak menaikkan hitungan delivery; RETRYCOUNT menimpanya.
+async fn make_stale(prefix: &str, entry_id: &str, retry_count: Option<u32>) {
+    let mut conn = raw_connection().await;
+    let mut cmd = redis::cmd("XCLAIM");
+    cmd.arg(format!("{prefix}:jobs"))
+        .arg("adus-workers")
+        .arg("worker-1")
+        .arg(0)
+        .arg(entry_id)
+        .arg("IDLE")
+        .arg(16 * 60 * 1000);
+    if let Some(count) = retry_count {
+        cmd.arg("RETRYCOUNT").arg(count);
+    }
+    cmd.arg("JUSTID");
+    let _: redis::Value = cmd.query_async(&mut conn).await.unwrap();
+}
+
 #[tokio::test]
 async fn stale_delivery_is_reclaimed_by_another_consumer() {
     let (queue, prefix) = new_queue().await;
     let job = review_job(8);
     queue.enqueue(&job).await.unwrap();
     let first = queue.next("worker-1", SHORT_BLOCK).await.unwrap().unwrap();
+    assert_eq!(first.attempt, 1);
 
-    // Pura-pura worker-1 mati 16 menit lalu: XCLAIM dengan IDLE mengatur waktu idle entri.
-    let mut conn = raw_connection().await;
-    let _: redis::Value = redis::cmd("XCLAIM")
-        .arg(format!("{prefix}:jobs"))
-        .arg("adus-workers")
-        .arg("worker-1")
-        .arg(0)
-        .arg(&first.id)
-        .arg("IDLE")
-        .arg(16 * 60 * 1000)
-        .query_async(&mut conn)
-        .await
-        .unwrap();
+    make_stale(&prefix, &first.id, None).await;
 
+    // Worker-1 mati di tengah percobaan 1, jadi pengambilalihan dihitung percobaan 2.
     let second = queue.next("worker-2", SHORT_BLOCK).await.unwrap().unwrap();
     assert_eq!(second.id, first.id);
     assert_eq!(second.job, job);
-    assert_eq!(second.attempt, 1);
+    assert_eq!(second.attempt, 2);
+
+    cleanup(&prefix).await;
+}
+
+#[tokio::test]
+async fn job_that_keeps_killing_workers_is_dead_lettered() {
+    let (queue, prefix) = new_queue().await;
+    let job = review_job(9);
+    queue.enqueue(&job).await.unwrap();
+    let first = queue.next("worker-1", SHORT_BLOCK).await.unwrap().unwrap();
+
+    // Sudah dikirim 5 kali; pengambilalihan berikutnya akan menjadi percobaan 6.
+    make_stale(&prefix, &first.id, Some(5)).await;
+
+    assert!(queue.next("worker-2", SHORT_BLOCK).await.unwrap().is_none());
+    let dead = stream_entries(&format!("{prefix}:jobs:dead")).await;
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].1["job"], serde_json::to_string(&job).unwrap());
+    assert_eq!(dead[0].1["attempt"], "6");
+    assert_eq!(dead[0].1["error"], "exceeded max deliveries (worker died)");
+    assert!(stream_entries(&format!("{prefix}:jobs")).await.is_empty());
+
+    cleanup(&prefix).await;
+}
+
+#[tokio::test]
+async fn retry_moves_delivery_to_delayed_set_atomically() {
+    let (queue, prefix) = new_queue().await;
+    let job = review_job(10);
+    queue.enqueue(&job).await.unwrap();
+    let delivery = queue.next("worker-1", SHORT_BLOCK).await.unwrap().unwrap();
+
+    queue.retry(&delivery, 2, Duration::ZERO).await.unwrap();
+
+    // Sudah di-ack dan dihapus dari stream, dan menunggu di delayed set.
+    assert!(stream_entries(&format!("{prefix}:jobs")).await.is_empty());
+    let mut conn = raw_connection().await;
+    let delayed: u64 = conn.zcard(format!("{prefix}:delayed")).await.unwrap();
+    assert_eq!(delayed, 1);
+    assert!(queue.next("worker-1", SHORT_BLOCK).await.unwrap().is_none());
+
+    assert_eq!(queue.promote_due().await.unwrap(), 1);
+    let again = queue.next("worker-1", SHORT_BLOCK).await.unwrap().unwrap();
+    assert_eq!(again.job, job);
+    assert_eq!(again.attempt, 2);
+    assert_ne!(again.id, delivery.id);
 
     cleanup(&prefix).await;
 }
@@ -302,4 +357,5 @@ fn backoff_values() {
     // Di luar 1..=5 dijepit.
     assert_eq!(backoff(0), Duration::from_secs(10));
     assert_eq!(backoff(9), Duration::from_secs(160));
+    assert_eq!(backoff(MAX_ATTEMPTS), Duration::from_secs(160));
 }

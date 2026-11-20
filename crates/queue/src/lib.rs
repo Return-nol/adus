@@ -9,6 +9,7 @@
 //!
 //! Tiap entri stream punya field `job` (JSON) dan `attempt` (angka desimal, default 1).
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use adus_core::job::Job;
@@ -17,6 +18,9 @@ use redis::streams::{StreamAutoClaimReply, StreamId, StreamReadReply};
 use redis::{AsyncConnectionConfig, Client, Script};
 use serde::Serialize;
 use uuid::Uuid;
+
+/// Batas percobaan sebuah job; setelah itu job masuk `{prefix}:jobs:dead`.
+pub const MAX_ATTEMPTS: u32 = 5;
 
 const GROUP: &str = "adus-workers";
 /// Entri yang belum di-ack selama ini dianggap milik worker yang mati, lalu diambil alih.
@@ -29,7 +33,9 @@ const PROMOTE_BATCH: u32 = 100;
 /// berhasil, supaya dua scheduler yang jalan bersamaan tidak menggandakan job.
 /// Field `job` di member sudah berupa string JSON, jadi diteruskan apa adanya
 /// (decode+encode ulang oleh cjson bisa mengubah angka besar seperti `pr_number`).
-const PROMOTE_SCRIPT: &str = r"
+static PROMOTE_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
 local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
 local moved = 0
 for _, member in ipairs(members) do
@@ -40,15 +46,21 @@ for _, member in ipairs(members) do
   end
 end
 return moved
-";
+",
+    )
+});
 
 /// Hapus lock hanya jika tokennya masih milik pemanggil.
-const UNLOCK_SCRIPT: &str = r"
+static UNLOCK_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
+    Script::new(
+        r"
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('DEL', KEYS[1])
 end
 return 0
-";
+",
+    )
+});
 
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
@@ -143,16 +155,10 @@ impl Queue {
         attempt: u32,
         delay: Duration,
     ) -> Result<(), QueueError> {
-        let entry = DelayedEntry {
-            id: Uuid::new_v4(),
-            job: serde_json::to_string(job)?,
-            attempt,
-        };
-        let due_ms = now_ms() + delay.as_millis() as i64;
         let _added: i64 = redis::cmd("ZADD")
             .arg(self.delayed_key())
-            .arg(due_ms)
-            .arg(serde_json::to_string(&entry)?)
+            .arg(due_ms(delay))
+            .arg(delayed_member(job, attempt)?)
             .query_async(&mut self.conn.clone())
             .await?;
         Ok(())
@@ -160,7 +166,7 @@ impl Queue {
 
     /// Pindahkan maksimal 100 job delayed yang sudah jatuh tempo ke stream; kembalikan jumlahnya.
     pub async fn promote_due(&self) -> Result<usize, QueueError> {
-        let moved: usize = Script::new(PROMOTE_SCRIPT)
+        let moved: usize = PROMOTE_SCRIPT
             .key(self.delayed_key())
             .key(self.jobs_key())
             .arg(now_ms())
@@ -171,31 +177,74 @@ impl Queue {
     }
 
     /// Ambil job berikutnya untuk `consumer`, menunggu paling lama `block`.
-    /// Entri milik worker lain yang idle lebih dari 15 menit diambil alih lebih dulu.
-    /// Entri dengan JSON rusak dipindah ke stream dead lalu dilewati.
+    ///
+    /// Entri yang belum di-ack lebih dari 15 menit dianggap milik worker yang mati dan
+    /// diambil alih lebih dulu. Tiap pengambilalihan menambah `attempt` satu; lewat dari
+    /// `MAX_ATTEMPTS` job masuk stream dead. Artinya job wajib di-`ack`, di-`retry` atau
+    /// di-`dead_letter` dalam 15 menit (TTL lock juga diukur di bawah batas itu), kalau
+    /// tidak worker lain ikut mengerjakannya.
+    ///
+    /// Jika future ini dibatalkan tepat saat Redis sudah mengirim entri, entri itu tetap di
+    /// daftar pending (PEL) dan diambil alih setelah 15 menit. Entri dengan JSON rusak
+    /// dipindah ke stream dead lalu dilewati.
     pub async fn next(
         &self,
         consumer: &str,
         block: Duration,
     ) -> Result<Option<Delivery>, QueueError> {
         loop {
-            let entry = match self.reclaim_stale(consumer).await? {
-                Some(entry) => entry,
-                None => match self.read_new(consumer, block).await? {
-                    Some(entry) => entry,
-                    None => return Ok(None),
-                },
+            if let Some(entry) = self.reclaim_stale(consumer).await? {
+                // XAUTOCLAIM menaikkan hitungan delivery. Tiap delivery sesudah yang pertama
+                // berarti satu worker mati di tengah percobaan.
+                let deaths = self.times_delivered(&entry.id).await?.saturating_sub(1);
+                if let Some(delivery) = self.to_delivery(entry, deaths).await? {
+                    return Ok(Some(delivery));
+                }
+                continue;
+            }
+            let Some(entry) = self.read_new(consumer, block).await? else {
+                return Ok(None);
             };
-            if let Some(delivery) = self.to_delivery(entry).await? {
+            if let Some(delivery) = self.to_delivery(entry, 0).await? {
                 return Ok(Some(delivery));
             }
         }
     }
 
-    /// Tandai job selesai dan hapus dari stream.
+    /// Tandai job selesai dan hapus dari stream. Harus dalam 15 menit sejak `next`
+    /// (lihat `next`), kalau tidak job sudah bisa diambil alih worker lain.
     pub async fn ack(&self, delivery: &Delivery) -> Result<(), QueueError> {
         let _: () = redis::pipe()
             .atomic()
+            .cmd("XACK")
+            .arg(self.jobs_key())
+            .arg(GROUP)
+            .arg(&delivery.id)
+            .ignore()
+            .cmd("XDEL")
+            .arg(self.jobs_key())
+            .arg(&delivery.id)
+            .ignore()
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Jadwalkan ulang job sebagai percobaan `attempt` setelah `delay`, lalu ack entri ini.
+    /// ZADD + XACK + XDEL dalam satu transaksi, jadi crash tidak menggandakan atau menghilangkan job.
+    pub async fn retry(
+        &self,
+        delivery: &Delivery,
+        attempt: u32,
+        delay: Duration,
+    ) -> Result<(), QueueError> {
+        let _: () = redis::pipe()
+            .atomic()
+            .cmd("ZADD")
+            .arg(self.delayed_key())
+            .arg(due_ms(delay))
+            .arg(delayed_member(&delivery.job, attempt)?)
+            .ignore()
             .cmd("XACK")
             .arg(self.jobs_key())
             .arg(GROUP)
@@ -225,7 +274,7 @@ impl Queue {
             .arg(&token)
             .arg("NX")
             .arg("PX")
-            .arg(ttl.as_millis() as u64)
+            .arg(ttl.as_millis().max(1) as u64) // PX 0 ditolak Redis
             .query_async(&mut self.conn.clone())
             .await?;
         Ok(reply.map(|_| token))
@@ -233,7 +282,7 @@ impl Queue {
 
     /// Lepas lock, tapi hanya jika `token` masih cocok (lock kedaluwarsa bisa sudah dipegang orang lain).
     pub async fn unlock(&self, key: &str, token: &str) -> Result<(), QueueError> {
-        let _deleted: i64 = Script::new(UNLOCK_SCRIPT)
+        let _deleted: i64 = UNLOCK_SCRIPT
             .key(self.lock_key(key))
             .arg(token)
             .invoke_async(&mut self.conn.clone())
@@ -254,6 +303,20 @@ impl Queue {
             .query_async(&mut self.conn.clone())
             .await?;
         Ok(reply.claimed.into_iter().next())
+    }
+
+    /// Berapa kali entri ini sudah dikirim ke worker (XPENDING).
+    async fn times_delivered(&self, id: &str) -> Result<u32, QueueError> {
+        // Tiap baris: (id, consumer, idle ms, jumlah delivery).
+        let rows: Vec<(String, String, u64, u32)> = redis::cmd("XPENDING")
+            .arg(self.jobs_key())
+            .arg(GROUP)
+            .arg(id)
+            .arg(id)
+            .arg(1)
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(rows.first().map(|row| row.3).unwrap_or(1))
     }
 
     /// XREADGROUP satu entri baru, menunggu paling lama `block`.
@@ -291,15 +354,28 @@ impl Queue {
         Ok(entry)
     }
 
-    /// Ubah entri stream menjadi `Delivery`. Entri yang JSON-nya tidak terbaca dipindah ke
-    /// stream dead (payload mentah + error) dan di-ack, supaya tidak menyumbat antrian.
-    async fn to_delivery(&self, entry: StreamId) -> Result<Option<Delivery>, QueueError> {
-        let attempt = entry
+    /// Ubah entri stream menjadi `Delivery`; `deaths` = worker yang mati saat memegang entri ini.
+    /// Entri yang JSON-nya tidak terbaca, atau yang sudah melewati `MAX_ATTEMPTS` karena worker
+    /// terus mati, dipindah ke stream dead dan di-ack, supaya tidak menyumbat antrian.
+    async fn to_delivery(
+        &self,
+        entry: StreamId,
+        deaths: u32,
+    ) -> Result<Option<Delivery>, QueueError> {
+        let stored_attempt: u32 = entry
             .get::<String>("attempt")
             .and_then(|attempt| attempt.parse().ok())
             .unwrap_or(1);
+        let attempt = stored_attempt.saturating_add(deaths);
         let job_json = entry.get::<String>("job").unwrap_or_default();
         match serde_json::from_str::<Job>(&job_json) {
+            Ok(_) if deaths > 0 && attempt > MAX_ATTEMPTS => {
+                let error = "exceeded max deliveries (worker died)";
+                tracing::error!(entry_id = %entry.id, attempt, "{error}; moved to dead stream");
+                self.move_to_dead(&entry.id, &job_json, attempt, error)
+                    .await?;
+                Ok(None)
+            }
             Ok(job) => Ok(Some(Delivery {
                 id: entry.id,
                 job,
@@ -365,8 +441,23 @@ impl Queue {
 
 /// Jeda sebelum percobaan berikutnya: 10 dtk × 2^(attempt-1); attempt dijepit ke 1..=5.
 pub fn backoff(attempt: u32) -> Duration {
-    let attempt = attempt.clamp(1, 5);
+    let attempt = attempt.clamp(1, MAX_ATTEMPTS);
     Duration::from_secs(10 * 2u64.pow(attempt - 1))
+}
+
+/// Member sorted set delayed untuk `job` sebagai percobaan `attempt`.
+fn delayed_member(job: &Job, attempt: u32) -> Result<String, QueueError> {
+    let entry = DelayedEntry {
+        id: Uuid::new_v4(),
+        job: serde_json::to_string(job)?,
+        attempt,
+    };
+    Ok(serde_json::to_string(&entry)?)
+}
+
+/// Waktu jatuh tempo (unix ms) `delay` dari sekarang; dipakai sebagai score sorted set.
+fn due_ms(delay: Duration) -> i64 {
+    now_ms() + delay.as_millis() as i64
 }
 
 fn now_ms() -> i64 {
