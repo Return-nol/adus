@@ -224,6 +224,9 @@ pub fn parse_github(event: &str, body: &Value, repo_id: Uuid) -> Option<Job> {
                 "opened" | "ready_for_review" => Trigger::Opened,
                 // Reopen: engine melewatinya jika head-nya sudah pernah direview.
                 "reopened" | "synchronize" => Trigger::Updated,
+                // Judul diubah: kata kunci judul yang diabaikan mungkin baru dihapus. Edit lain
+                // (mis. deskripsi saja) diabaikan; head yang sama tetap dilewati engine.
+                "edited" if !body["changes"]["title"].is_null() => Trigger::Updated,
                 _ => return None,
             };
             Some(Job::ReviewPr {
@@ -418,6 +421,15 @@ mod tests {
                 "{action}"
             );
         }
+        body["action"] = json!("edited");
+        body["changes"] = json!({ "body": { "from": "old description" } });
+        assert_eq!(parse_github("pull_request", &body, id), None);
+        body["changes"] = json!({ "title": { "from": "WIP: old title" } });
+        assert_eq!(
+            parse_github("pull_request", &body, id),
+            review(2, Trigger::Updated)
+        );
+        body["changes"] = Value::Null;
         body["action"] = json!("opened");
         body["pull_request"]["number"] = json!(-1);
         assert_eq!(parse_github("pull_request", &body, id), None);
