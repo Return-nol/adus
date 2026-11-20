@@ -4,3 +4,4 @@
 node_modules/
 web/build/
 web/.svelte-kit/
+.github/context-mode/
