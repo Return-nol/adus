@@ -1,0 +1,3 @@
+{$ADUS_DOMAIN} {
+	reverse_proxy adus:8080
+}

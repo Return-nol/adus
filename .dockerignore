@@ -1,0 +1,10 @@
+.git
+.github
+.codegraph
+.superpowers
+.env
+target
+docs
+web/node_modules
+web/build
+web/.svelte-kit
