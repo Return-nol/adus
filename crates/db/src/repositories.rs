@@ -125,14 +125,15 @@ pub async fn set_webhook_ids(pool: &PgPool, id: Uuid, ids: &[String]) -> Result<
 /// Label untuk pengguna: Azure `project/repo` (fallback `org/repo` sebelum di-backfill),
 /// GitHub `owner/repo`.
 pub fn display_name(repo: &Repository) -> String {
-    format!(
-        "{}/{}",
-        repo.project_name.as_deref().unwrap_or(&repo.owner),
-        repo.name
-    )
+    label(repo.project_name.as_deref(), &repo.owner, &repo.name)
 }
 
-/// Aturan label yang sama dengan `display_name`, sebagai ekspresi SQL untuk tabel `repositories`
+/// Satu-satunya aturan label di Rust: `project_name` (atau `owner` jika kosong) + `/` + `name`.
+pub fn label(project_name: Option<&str>, owner: &str, name: &str) -> String {
+    format!("{}/{name}", project_name.unwrap_or(owner))
+}
+
+/// Aturan `label` yang sama (jaga agar tetap sinkron), sebagai ekspresi SQL untuk tabel `repositories`
 /// dengan alias `alias` (alias berasal dari kode, bukan input pengguna).
 pub fn display_name_sql(alias: &str) -> String {
     format!("COALESCE({alias}.project_name, {alias}.owner) || '/' || {alias}.name")
@@ -284,6 +285,12 @@ mod tests {
             review_model: None,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn label_rule() {
+        assert_eq!(label(Some("myvalue"), "ovalteam", "api"), "myvalue/api");
+        assert_eq!(label(None, "ovalteam", "api"), "ovalteam/api");
     }
 
     #[test]

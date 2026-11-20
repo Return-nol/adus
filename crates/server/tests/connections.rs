@@ -526,7 +526,7 @@ async fn user_role_cannot_create_connection_403(pool: PgPool) {
     assert_eq!(unauth.status, StatusCode::UNAUTHORIZED);
 }
 
-fn azure_repo(project_name: &str) -> RemoteRepo {
+fn azure_repo(project_name: Option<&str>) -> RemoteRepo {
     RemoteRepo {
         r#ref: RepoRef {
             external_id: "repo-guid".into(),
@@ -535,7 +535,7 @@ fn azure_repo(project_name: &str) -> RemoteRepo {
             name: "api".into(),
         },
         default_branch: None,
-        project_name: Some(project_name.into()),
+        project_name: project_name.map(String::from),
     }
 }
 
@@ -546,7 +546,7 @@ async fn legacy_azure_repo(
     admin: &str,
     git: &FakeGitFactory,
 ) -> String {
-    git.with(|s| s.repos = vec![azure_repo("myvalue")]);
+    git.with(|s| s.repos = vec![azure_repo(Some("myvalue"))]);
     let body = json!({
         "kind": "azure_devops", "name": "Az", "org_or_owner": "ovalteam", "token": PAT
     });
@@ -628,4 +628,73 @@ async fn github_display_name_is_owner_name(pool: PgPool) {
     let added = add_repo(&app, &admin, &conn, "1").await;
     assert_eq!(added.body["display_name"], "acme/api");
     assert_eq!(added.body["project_name"], Value::Null);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn remote_repos_display_name_falls_back_to_org_without_project_name(pool: PgPool) {
+    let (app, git, admin) = setup(pool).await;
+    git.with(|s| s.repos = vec![azure_repo(None)]);
+    let body = json!({
+        "kind": "azure_devops", "name": "Az", "org_or_owner": "ovalteam", "token": PAT
+    });
+    let conn = send(&app, post_json("/api/v1/connections", &body, Some(&admin))).await;
+    let conn = conn.body["id"].as_str().unwrap();
+
+    let remote = send(
+        &app,
+        get(
+            &format!("/api/v1/connections/{conn}/remote-repos"),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(remote.status, StatusCode::OK);
+    assert_eq!(remote.body[0]["display_name"], "ovalteam/api");
+    assert_eq!(remote.body[0]["added"], false);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn resync_continues_when_list_repos_fails(pool: PgPool) {
+    let (app, git, admin) = setup(pool.clone()).await;
+    let conn = legacy_azure_repo(&pool, &app, &admin, &git).await;
+    git.with(|s| s.list_error = Some(GitError::Http("down".into())));
+
+    let reply = send(
+        &app,
+        post_empty(
+            &format!("/api/v1/connections/{conn}/resync-webhooks"),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["synced"], 1);
+    let name: Option<String> = sqlx::query_scalar("SELECT project_name FROM repositories")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn github_resync_does_not_list_remote_repos(pool: PgPool) {
+    let (app, git, admin) = setup(pool).await;
+    let conn = connection_with_token(&app, &admin).await;
+    assert_eq!(
+        add_repo(&app, &admin, &conn, "1").await.status,
+        StatusCode::CREATED
+    );
+    let before = git.with(|s| s.list_calls);
+
+    let reply = send(
+        &app,
+        post_empty(
+            &format!("/api/v1/connections/{conn}/resync-webhooks"),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["synced"], 1);
+    assert_eq!(git.with(|s| s.list_calls), before);
 }

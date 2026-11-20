@@ -196,15 +196,21 @@ async fn sync_webhooks(
     Ok((synced, errors))
 }
 
-/// Mengisi `project_name` repo aktif yang masih NULL (repo Azure yang ditambahkan sebelum kolom ada).
+/// Mengisi `project_name` repo aktif milik connection ini yang berbeda dari data provider
+/// (repo Azure yang ditambahkan sebelum kolom ada). Repo yang belum ditambahkan tidak disentuh.
 async fn backfill_project_names(
     state: &AppState,
     connection_id: Uuid,
+    active: &[Repository],
     remote: &[RemoteRepo],
 ) -> Result<(), ApiError> {
-    for repo in remote {
-        if let Some(name) = &repo.project_name {
-            repositories::set_project_name(&state.db, connection_id, &repo.r#ref.external_id, name)
+    for repo in active {
+        let known = remote
+            .iter()
+            .find(|r| r.r#ref.external_id == repo.external_id)
+            .and_then(|r| r.project_name.as_deref());
+        if let Some(name) = known.filter(|n| repo.project_name.as_deref() != Some(n)) {
+            repositories::set_project_name(&state.db, connection_id, &repo.external_id, name)
                 .await?;
         }
     }
@@ -338,7 +344,10 @@ async fn resync_webhooks(
     // Repo Azure lama belum punya nama project; tanpa list_repos yang berhasil, lewati saja.
     if c.kind == ConnectionKind::AzureDevops {
         match provider.list_repos().await {
-            Ok(remote) => backfill_project_names(&state, id, &remote).await?,
+            Ok(remote) => {
+                let active = repositories::list(&state.db, Some(id)).await?;
+                backfill_project_names(&state, id, &active, &remote).await?;
+            }
             Err(err) => tracing::warn!("project name backfill skipped: {err}"),
         }
     }
@@ -363,21 +372,18 @@ async fn remote_repos(
             return Err(git_error(&err));
         }
     };
-    backfill_project_names(&state, id, &remote).await?;
-    let added: HashSet<String> = repositories::list(&state.db, Some(id))
-        .await?
-        .into_iter()
-        .map(|r| r.external_id)
-        .collect();
+    let active = repositories::list(&state.db, Some(id)).await?;
+    backfill_project_names(&state, id, &active, &remote).await?;
+    let added: HashSet<&str> = active.iter().map(|r| r.external_id.as_str()).collect();
     Ok(Json(
         remote
             .into_iter()
             .map(|repo| RemoteRepoJson {
-                added: added.contains(&repo.r#ref.external_id),
-                display_name: format!(
-                    "{}/{}",
-                    repo.project_name.as_deref().unwrap_or(&repo.r#ref.owner),
-                    repo.r#ref.name
+                added: added.contains(repo.r#ref.external_id.as_str()),
+                display_name: repositories::label(
+                    repo.project_name.as_deref(),
+                    &repo.r#ref.owner,
+                    &repo.r#ref.name,
                 ),
                 repo,
             })

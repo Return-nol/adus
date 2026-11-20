@@ -140,6 +140,10 @@ pub struct FakeGitState {
     pub verify_error: Option<GitError>,
     pub owner: PatOwner,
     pub repos: Vec<RemoteRepo>,
+    /// Jika diisi, `list_repos` gagal dengan error ini (setelah cek `bad_tokens`).
+    pub list_error: Option<GitError>,
+    /// Jumlah panggilan `list_repos`.
+    pub list_calls: usize,
     /// `ensure_webhooks` gagal untuk repo dengan external_id ini.
     pub ensure_errors: HashMap<String, GitError>,
     pub delete_error: Option<GitError>,
@@ -162,6 +166,8 @@ impl Default for FakeGitState {
                 email: None,
             },
             repos: Vec::new(),
+            list_error: None,
+            list_calls: 0,
             ensure_errors: HashMap::new(),
             delete_error: None,
             missing_webhooks: HashSet::new(),
@@ -228,8 +234,12 @@ impl GitProvider for FakeGit {
     }
 
     async fn list_repos(&self) -> Result<Vec<RemoteRepo>, GitError> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         self.check_token(&state)?;
+        state.list_calls += 1;
+        if let Some(err) = &state.list_error {
+            return Err(err.clone());
+        }
         Ok(state.repos.clone())
     }
 
