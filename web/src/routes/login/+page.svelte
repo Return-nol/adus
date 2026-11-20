@@ -34,7 +34,9 @@
 <div class="flex min-h-screen items-center justify-center p-4">
 	<Card.Root class="w-full max-w-md">
 		<Card.Header>
-			<p class="font-display text-xs font-medium tracking-[0.12em] text-primary uppercase">Adus 🛀</p>
+			<p class="font-display text-xs font-medium tracking-[0.12em] text-primary uppercase">
+				Adus 🛀
+			</p>
 			<Card.Title class="font-display text-2xl font-medium tracking-tight">
 				Dashboard Log in
 			</Card.Title>
