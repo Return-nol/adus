@@ -277,6 +277,38 @@ async fn ensure_webhooks_recreates_only_missing() {
 }
 
 #[tokio::test]
+async fn webhooks_exist_false_when_one_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/acme/_apis/hooks/subscriptions/a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(healthy_sub(
+            "a",
+            "git.pullrequest.created",
+            "u",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/acme/_apis/hooks/subscriptions/b"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    assert!(p.webhooks_exist(&repo(), &["a".to_string()]).await.unwrap());
+    assert!(
+        !p.webhooks_exist(&repo(), &["a".to_string(), "b".into()])
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn delete_webhooks_treats_404_as_success() {
     let server = MockServer::start().await;
     Mock::given(method("DELETE"))

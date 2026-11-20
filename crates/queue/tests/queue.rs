@@ -215,8 +215,10 @@ async fn dead_letter_lands_in_dead_stream() {
     let job = review_job(5);
     queue.enqueue(&job).await.unwrap();
     let delivery = queue.next("worker-1", SHORT_BLOCK).await.unwrap().unwrap();
+    assert_eq!(queue.dead_count().await.unwrap(), 0);
 
     queue.dead_letter(&delivery, "boom").await.unwrap();
+    assert_eq!(queue.dead_count().await.unwrap(), 1);
 
     let dead = stream_entries(&format!("{prefix}:jobs:dead")).await;
     assert_eq!(dead.len(), 1);

@@ -101,7 +101,7 @@ async fn connection_json(state: &AppState, c: Connection) -> Result<ConnectionJs
 }
 
 /// Teks aman untuk klien: dibuat dari jenis error, bukan dari pesan mentah provider.
-pub(super) fn describe(err: &GitError) -> &'static str {
+pub(crate) fn describe(err: &GitError) -> &'static str {
     match err {
         GitError::Unauthorized => "the provider rejected the token",
         GitError::NotFound => "not found at the provider",

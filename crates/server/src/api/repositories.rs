@@ -96,7 +96,7 @@ impl From<Repository> for RepositoryJson {
 }
 
 /// Rujukan repo untuk `GitProvider`. GitHub: `project` kosong. Azure: `project` = GUID project.
-pub(super) fn repo_ref(repo: &Repository) -> RepoRef {
+pub(crate) fn repo_ref(repo: &Repository) -> RepoRef {
     RepoRef {
         external_id: repo.external_id.clone(),
         owner: repo.owner.clone(),

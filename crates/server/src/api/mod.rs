@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod ai;
 pub mod connections;
 pub mod memories;
@@ -15,6 +16,7 @@ use crate::state::AppState;
 /// Semua route dashboard di bawah `/api/v1` (selain auth).
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(admin::routes())
         .merge(users::routes())
         .merge(ai::routes())
         .merge(settings::routes())

@@ -363,6 +363,15 @@ impl Queue {
         Ok(workers)
     }
 
+    /// Jumlah job di `{prefix}:jobs:dead` (XLEN; 0 jika stream belum ada).
+    pub async fn dead_count(&self) -> Result<u64, QueueError> {
+        let count: u64 = redis::cmd("XLEN")
+            .arg(format!("{}:dead", self.jobs_key()))
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(count)
+    }
+
     /// XAUTOCLAIM satu entri yang idle lebih dari 15 menit.
     async fn reclaim_stale(&self, consumer: &str) -> Result<Option<StreamId>, QueueError> {
         let reply: StreamAutoClaimReply = redis::cmd("XAUTOCLAIM")

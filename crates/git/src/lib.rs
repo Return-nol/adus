@@ -27,6 +27,8 @@ pub trait GitProvider: Send + Sync {
         existing: &[String],
     ) -> Result<Vec<String>, GitError>;
     async fn delete_webhooks(&self, repo: &RepoRef, ids: &[String]) -> Result<(), GitError>;
+    /// Read-only: GET tiap id. `true` hanya jika semua masih ada (404 = hilang → `false`).
+    async fn webhooks_exist(&self, repo: &RepoRef, ids: &[String]) -> Result<bool, GitError>;
     async fn get_pr(&self, repo: &RepoRef, number: i64) -> Result<PullRequest, GitError>;
     async fn pr_diff(&self, repo: &RepoRef, pr: &PullRequest) -> Result<Vec<FileDiff>, GitError>;
     async fn diff_between(

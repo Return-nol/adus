@@ -305,6 +305,20 @@ impl GitProvider for GithubProvider {
         Ok(())
     }
 
+    async fn webhooks_exist(&self, repo: &RepoRef, ids: &[String]) -> Result<bool, GitError> {
+        for id in ids {
+            match self
+                .get_json::<GhHook>(&self.repo_url(repo, &format!("/hooks/{id}")))
+                .await
+            {
+                Ok(_) => {}
+                Err(GitError::NotFound) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
     async fn get_pr(&self, repo: &RepoRef, number: i64) -> Result<PullRequest, GitError> {
         let pull: GhPull = self
             .get_json(&self.repo_url(repo, &format!("/pulls/{number}")))

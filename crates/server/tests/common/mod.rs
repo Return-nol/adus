@@ -68,10 +68,15 @@ pub async fn cleanup_queue(prefix: &str) {
     }
 }
 
-fn build_app(pool: PgPool, public_url: &str, git: Arc<FakeGitFactory>, queue: Queue) -> Router {
+pub fn app_state(
+    pool: PgPool,
+    public_url: &str,
+    git: Arc<FakeGitFactory>,
+    queue: Queue,
+) -> AppState {
     let cipher = Arc::new(test_cipher());
     let http = reqwest::Client::new();
-    router(AppState {
+    AppState {
         chat: Arc::new(LlmRouter::new(pool.clone(), cipher.clone(), http.clone())),
         db: pool,
         cipher,
@@ -79,7 +84,11 @@ fn build_app(pool: PgPool, public_url: &str, git: Arc<FakeGitFactory>, queue: Qu
         git,
         http,
         queue,
-    })
+    }
+}
+
+fn build_app(pool: PgPool, public_url: &str, git: Arc<FakeGitFactory>, queue: Queue) -> Router {
+    router(app_state(pool, public_url, git, queue))
 }
 
 pub async fn app_with_url(pool: PgPool, public_url: &str) -> Router {
@@ -134,6 +143,8 @@ pub struct FakeGitState {
     /// `ensure_webhooks` gagal untuk repo dengan external_id ini.
     pub ensure_errors: HashMap<String, GitError>,
     pub delete_error: Option<GitError>,
+    /// `webhooks_exist` memberi `false` untuk repo dengan external_id ini.
+    pub missing_webhooks: HashSet<String>,
     pub ensure_calls: Vec<EnsureCall>,
     pub delete_calls: Vec<DeleteCall>,
 }
@@ -151,6 +162,7 @@ impl Default for FakeGitState {
             repos: Vec::new(),
             ensure_errors: HashMap::new(),
             delete_error: None,
+            missing_webhooks: HashSet::new(),
             ensure_calls: Vec::new(),
             delete_calls: Vec::new(),
         }
@@ -253,6 +265,12 @@ impl GitProvider for FakeGit {
             Some(err) => Err(err.clone()),
             None => Ok(()),
         }
+    }
+
+    async fn webhooks_exist(&self, repo: &RepoRef, _ids: &[String]) -> Result<bool, GitError> {
+        let state = self.state.lock().unwrap();
+        self.check_token(&state)?;
+        Ok(!state.missing_webhooks.contains(&repo.external_id))
     }
 
     async fn get_pr(&self, _repo: &RepoRef, _number: i64) -> Result<PullRequest, GitError> {

@@ -127,6 +127,10 @@ impl GitProvider for FakeGit {
         unimplemented!("not used by the engine")
     }
 
+    async fn webhooks_exist(&self, _repo: &RepoRef, _ids: &[String]) -> Result<bool, GitError> {
+        unimplemented!("not used by the engine")
+    }
+
     async fn get_pr(&self, _repo: &RepoRef, _number: i64) -> Result<PullRequest, GitError> {
         let delay = self.state().get_pr_delay;
         tokio::time::sleep(delay).await;

@@ -22,6 +22,11 @@ pub enum CryptoError {
     InvalidUtf8,
 }
 
+/// Nilai baru untuk `ADUS_SECRET_KEY`: base64 dari 32 byte acak (`adus gen-secret`).
+pub fn generate_secret_key() -> String {
+    STANDARD.encode(Aes256Gcm::generate_key(OsRng))
+}
+
 /// Mengenkripsi/mendekripsi rahasia (PAT, API key) dengan AES-256-GCM.
 pub struct Cipher {
     inner: Aes256Gcm,
@@ -87,6 +92,13 @@ mod tests {
 
     fn cipher(key: &str) -> Cipher {
         Cipher::from_base64_key(key).unwrap()
+    }
+
+    #[test]
+    fn generated_secret_key_is_usable_and_unique() {
+        let key = generate_secret_key();
+        assert!(Cipher::from_base64_key(&key).is_ok());
+        assert_ne!(key, generate_secret_key());
     }
 
     #[test]

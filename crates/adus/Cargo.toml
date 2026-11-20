@@ -21,6 +21,7 @@ adus-review.workspace = true
 adus-server.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+clap.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

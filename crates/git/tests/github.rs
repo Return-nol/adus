@@ -192,6 +192,38 @@ async fn ensure_webhooks_keeps_existing() {
 }
 
 #[tokio::test]
+async fn webhooks_exist_false_when_one_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/hooks/55"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 55 })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/hooks/56"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    assert!(
+        p.webhooks_exist(&repo(), &["55".to_string()])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !p.webhooks_exist(&repo(), &["55".to_string(), "56".into()])
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn delete_webhooks_treats_404_as_success() {
     let server = MockServer::start().await;
     Mock::given(method("DELETE"))

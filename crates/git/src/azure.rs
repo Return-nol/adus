@@ -393,11 +393,14 @@ impl AzSubscription {
     /// Sehat = aktif dan mengarah ke `url` yang diminta. `disabledBySystem`/`disabledByUser`
     /// atau URL lain dianggap hilang.
     fn is_healthy(&self, url: &str) -> bool {
-        let active = self.status.as_deref().is_some_and(|s| {
-            s.eq_ignore_ascii_case("enabled") || s.eq_ignore_ascii_case("onProbation")
-        });
         let same_url = self.consumer_inputs.as_ref().and_then(|c| c.url.as_deref()) == Some(url);
-        active && same_url
+        self.is_active() && same_url
+    }
+
+    fn is_active(&self) -> bool {
+        self.status.as_deref().is_some_and(|s| {
+            s.eq_ignore_ascii_case("enabled") || s.eq_ignore_ascii_case("onProbation")
+        })
     }
 }
 
@@ -496,6 +499,21 @@ impl GitProvider for AzureProvider {
             }
         }
         Ok(())
+    }
+
+    async fn webhooks_exist(&self, _repo: &RepoRef, ids: &[String]) -> Result<bool, GitError> {
+        for id in ids {
+            match self
+                .get_json::<AzSubscription>(&self.org_url(&format!("/hooks/subscriptions/{id}")))
+                .await
+            {
+                Ok(sub) if sub.is_active() => {}
+                // Nonaktif sama saja dengan hilang: Azure tidak mengirim event darinya.
+                Ok(_) | Err(GitError::NotFound) => return Ok(false),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
     }
 
     async fn get_pr(&self, repo: &RepoRef, number: i64) -> Result<PullRequest, GitError> {
