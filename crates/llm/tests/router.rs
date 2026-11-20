@@ -383,7 +383,7 @@ async fn invalid_request_stops_without_trying_other_keys(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn undecryptable_key_marked_invalid_and_next_key_used(pool: PgPool) {
+async fn undecryptable_key_skipped_not_invalidated_and_next_key_used(pool: PgPool) {
     let s = setup(&pool, ProviderKind::Openai, 2).await;
     sqlx::query("UPDATE ai_keys SET encrypted_key = 'not-valid-ciphertext' WHERE id = $1")
         .bind(s.keys[0].id)
@@ -397,13 +397,40 @@ async fn undecryptable_key_marked_invalid_and_next_key_used(pool: PgPool) {
     chat(&s).await.unwrap();
     // key-0 tidak pernah sampai ke client.
     assert_eq!(s.fake.calls(), ["key-1"]);
-    assert_eq!(key_state(&pool, &s, 0).await.status, AiKeyStatus::Invalid);
+    // Salah ADUS_SECRET_KEY bukan salah key-nya: statusnya tidak diubah.
+    assert_eq!(key_state(&pool, &s, 0).await.status, AiKeyStatus::Ok);
     let kinds: Vec<Option<String>> =
         sqlx::query_scalar("SELECT error_kind FROM llm_usage WHERE success = false")
             .fetch_all(&pool)
             .await
             .unwrap();
     assert_eq!(kinds, [Some("decrypt".to_string())]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_decryptable_key_is_internal_error(pool: PgPool) {
+    let s = setup(&pool, ProviderKind::Openai, 2).await;
+    sqlx::query("UPDATE ai_keys SET encrypted_key = 'not-valid-ciphertext'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = chat(&s).await.unwrap_err();
+
+    assert_eq!(
+        err,
+        ChatError::Internal("cannot decrypt API keys — check ADUS_SECRET_KEY".into())
+    );
+    assert!(s.fake.calls().is_empty());
+    for index in 0..2 {
+        assert_eq!(key_state(&pool, &s, index).await.status, AiKeyStatus::Ok);
+    }
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM llm_usage WHERE error_kind = 'decrypt'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 2);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

@@ -159,15 +159,17 @@ impl ChatService for LlmRouter {
 
         // Cooldown terpendek di antara key yang kena rate limit pada panggilan ini.
         let mut soonest: Option<Duration> = None;
+        let mut decrypted_any = false;
         // Tiap key dicoba maksimal sekali.
         for key in keys {
             let Ok(api_key) = self.cipher.decrypt(&key.encrypted_key) else {
-                // Salah `ADUS_SECRET_KEY` atau data rusak: key ini tidak akan pernah bisa dipakai.
-                warn_on_error("mark key invalid", ai::mark_invalid(&self.db, key.id).await);
+                // Biasanya `ADUS_SECRET_KEY` salah, bukan key-nya: status key tidak diubah,
+                // supaya semua key kembali jalan setelah secret-nya dibetulkan.
                 self.log_usage(&ctx, &key, &req, 0, None, Some("decrypt"))
                     .await;
                 continue;
             };
+            decrypted_any = true;
 
             let started = Instant::now();
             let result = client.chat(&api_key, &req).await;
@@ -210,6 +212,11 @@ impl ChatService for LlmRouter {
                     return Err(ChatError::Invalid(message));
                 }
             }
+        }
+        if !decrypted_any {
+            return Err(ChatError::Internal(
+                "cannot decrypt API keys — check ADUS_SECRET_KEY".into(),
+            ));
         }
         Err(ChatError::AllKeysFailed {
             retry_after: soonest,
