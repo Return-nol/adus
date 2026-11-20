@@ -126,17 +126,10 @@ pub fn format_issues(issues: &[ConfigIssue]) -> String {
             Level::Error => "ERROR",
             Level::Warn => "WARN",
         };
-        out.push_str(&format!(
-            "{tag} {}: {}
-",
-            i.var, i.message
-        ));
+        out.push_str(&format!("{tag} {}: {}\n", i.var, i.message));
     }
     if !issues.iter().any(|i| i.level == Level::Error) {
-        out.push_str(
-            "config OK
-",
-        );
+        out.push_str("config OK\n");
     }
     out
 }
@@ -228,17 +221,10 @@ mod tests {
 
     #[test]
     fn check_config_ok_prints_config_ok() {
-        assert_eq!(
-            format_issues(&check(&good(&[]))),
-            "config OK
-"
-        );
+        assert_eq!(format_issues(&check(&good(&[]))), "config OK\n");
         let warn_only = format_issues(&check(&good(&[("ADUS_PUBLIC_URL", "http://adus.test")])));
         assert!(warn_only.starts_with("WARN ADUS_PUBLIC_URL: "));
-        assert!(warn_only.ends_with(
-            "config OK
-"
-        ));
+        assert!(warn_only.ends_with("config OK\n"));
         let bad = format_issues(&check(&HashMap::new()));
         assert!(bad.contains("ERROR DATABASE_URL: "));
         assert!(!bad.contains("config OK"));

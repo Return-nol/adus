@@ -2,6 +2,8 @@
 //!
 //! Hanya membaca. Tidak memanggil `ensure_webhooks`, tidak menulis status connection, dan
 //! tidak pernah memuat rahasia: yang muncul hanya nama connection, repo, dan provider.
+//! Satu-satunya tulisan ke luar adalah `XGROUP CREATE ... MKSTREAM` yang idempoten di
+//! `Queue::connect` (saat CLI membangun state); `run` sendiri tidak menulis apa pun.
 
 use std::time::Duration;
 
@@ -150,8 +152,8 @@ async fn check_settings(state: &AppState, out: &mut Vec<Check>) {
         ));
         return;
     };
-    let (Some(provider_id), Some(model)) = (settings.default_provider_id, settings.default_model)
-    else {
+    let model = settings.default_model.filter(|m| !m.trim().is_empty());
+    let (Some(provider_id), Some(model)) = (settings.default_provider_id, model) else {
         out.push(Check::problem(
             Status::Fail,
             "Default model",
@@ -220,10 +222,16 @@ async fn check_redis(state: &AppState, core: &mut Vec<Check>, extra: &mut Vec<Ch
 
 /// Token tiap connection dan webhook tiap repo aktif, lewat panggilan baca-saja ke provider.
 async fn check_git(state: &AppState, out: &mut Vec<Check>) {
-    let Ok(conns) = connections::list(&state.db).await else {
-        return;
-    };
-    let Ok(repos) = repositories::list(&state.db, None).await else {
+    let (Ok(conns), Ok(repos)) = (
+        connections::list(&state.db).await,
+        repositories::list(&state.db, None).await,
+    ) else {
+        out.push(Check::problem(
+            Status::Fail,
+            "Connections and repositories",
+            "The connections and repositories cannot be read, so their tokens and webhooks were not checked",
+            "Check the database and run the checks again",
+        ));
         return;
     };
     // ponytail: berurutan; N connection + M repo × maks 15 dtk. Batasi concurrency jika daftarnya panjang.

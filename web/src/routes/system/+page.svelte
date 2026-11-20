@@ -105,7 +105,8 @@
 
 	<Card.Root>
 		<Card.Content class="divide-y divide-border p-0">
-			{#each checks as check (check.name)}
+			<!-- Names are not unique (two connections can share a name), and the list is replaced wholesale. -->
+			{#each checks as check, i (i)}
 				<div class="flex gap-3 px-6 py-4">
 					<span class={`mt-0.5 shrink-0 ${statusClass[check.status]}`}>
 						{#if check.status === 'ok'}

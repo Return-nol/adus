@@ -309,6 +309,28 @@ async fn webhooks_exist_false_when_one_missing() {
 }
 
 #[tokio::test]
+async fn webhooks_exist_false_when_subscription_disabled() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/acme/_apis/hooks/subscriptions/off"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "off",
+            "eventType": "git.pullrequest.created",
+            "status": "disabledByUser",
+            "consumerInputs": { "url": "u" },
+        })))
+        .mount(&server)
+        .await;
+
+    assert!(
+        !provider(&server)
+            .webhooks_exist(&repo(), &["off".to_string()])
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn delete_webhooks_treats_404_as_success() {
     let server = MockServer::start().await;
     Mock::given(method("DELETE"))

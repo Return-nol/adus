@@ -131,6 +131,19 @@ async fn doctor_not_running_without_worker_heartbeat(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn doctor_not_running_with_blank_default_model(pool: PgPool) {
+    let w = healthy_world(pool.clone()).await;
+    sqlx::query("UPDATE settings SET default_model = '   '")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let report = doctor::run(&w.state).await;
+    assert_eq!(report.verdict, Verdict::NotRunning);
+    assert_eq!(fails(&report), vec!["Default model"]);
+    cleanup_queue(&w.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn doctor_not_running_without_default_model(pool: PgPool) {
     let w = healthy_world(pool.clone()).await;
     let current = settings::get(&pool).await.unwrap();
@@ -184,7 +197,7 @@ async fn doctor_not_running_when_migration_missing(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn doctor_degraded_when_connection_token_invalid(pool: PgPool) {
-    let w = healthy_world(pool).await;
+    let w = healthy_world(pool.clone()).await;
     w.git.with(|s| {
         s.bad_tokens.insert(PAT.to_string());
     });
@@ -193,6 +206,9 @@ async fn doctor_degraded_when_connection_token_invalid(pool: PgPool) {
     assert_eq!(report.verdict, Verdict::Degraded);
     // Repo milik connection itu tidak diperiksa lagi, supaya tidak jadi kegagalan ganda.
     assert_eq!(fails(&report), vec!["Connection: Acme"]);
+    // Doctor never writes the status: the connection stays `ok`.
+    let conns = connections::list(&pool).await.unwrap();
+    assert_eq!(conns[0].status, ConnectionStatus::Ok);
     cleanup_queue(&w.prefix).await;
 }
 
