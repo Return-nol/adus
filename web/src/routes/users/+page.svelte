@@ -10,9 +10,11 @@
 	import * as Card from '#lib/components/ui/card/index.js';
 	import { Switch } from '#lib/components/ui/switch/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
+	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 
 	let users = $state<User[]>([]);
 	let forbidden = $state(false);
+	let loaded = $state(false);
 	let formOpen = $state(false);
 	let resetOpen = $state(false);
 	let selected = $state<User | null>(null);
@@ -24,6 +26,7 @@
 			if (e instanceof ApiError && e.status === 403) forbidden = true;
 			else toast.error(e instanceof ApiError ? e.message : 'Could not reach the server');
 		}
+		loaded = true;
 	}
 
 	onMount(load);
@@ -51,7 +54,7 @@
 
 <div class="mb-6 flex items-center justify-between">
 	<h1 class="font-display text-3xl font-medium tracking-[0.01em] text-foreground">Users</h1>
-	{#if !forbidden}<Button onclick={() => openForm(null)}>Add user</Button>{/if}
+	{#if !forbidden}<Button disabled={!loaded} onclick={() => openForm(null)}>Add user</Button>{/if}
 </div>
 
 {#if forbidden}
@@ -60,6 +63,8 @@
 	>
 		Only admins can manage users.
 	</div>
+{:else if !loaded}
+	<TableSkeleton card headers={['Email', 'Role', 'GitHub login', 'Active', 'Actions']} />
 {:else}
 	<Card.Root class="py-0">
 		<Card.Content class="px-0">

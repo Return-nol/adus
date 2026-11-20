@@ -15,14 +15,14 @@
 
 	// Already logged in (or just logged in): go to the app.
 	$effect(() => {
-		if (session.user) goto('/repositories', { replaceState: true });
+		if (session.user) goto('/repositories', { replace: true });
 	});
 
 	// Setup only exists until the first admin is created.
 	onMount(async () => {
 		try {
 			const status = await api<{ needs_setup: boolean }>('GET', '/auth/status');
-			if (!status.needs_setup) await goto('/login', { replaceState: true });
+			if (!status.needs_setup) await goto('/login', { replace: true });
 		} catch {
 			// Server unreachable: the form's own error message covers it on submit.
 		}

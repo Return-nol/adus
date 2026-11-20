@@ -5,6 +5,7 @@
 	import { session } from '#lib/session.svelte.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
+	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
 	import RiCheckLine from 'remixicon-svelte/icons/check-line';
 	import RiCloseCircleLine from 'remixicon-svelte/icons/close-circle-line';
 	import RiErrorWarningLine from 'remixicon-svelte/icons/error-warning-line';
@@ -90,7 +91,27 @@
 		Could not run the checks.
 		<Button variant="outline" size="sm" class="ml-2" disabled={busy} onclick={run}>Retry</Button>
 	</div>
-{:else if report}
+{:else if !report}
+	<div aria-busy="true">
+		<span class="sr-only" role="status">Running checks…</span>
+		<Card.Root class="mb-6">
+			<Card.Content class="flex flex-wrap items-center gap-4">
+				<Skeleton class="h-12 w-64 rounded-full" />
+				<Skeleton class="h-4 w-80" />
+			</Card.Content>
+		</Card.Root>
+		<Card.Root>
+			<Card.Content class="divide-y divide-border p-0">
+				{#each ['w-40', 'w-32', 'w-48', 'w-24', 'w-36'] as w, i (i)}
+					<div class="flex items-center gap-3 px-6 py-4">
+						<Skeleton class="size-5 shrink-0 rounded-full" />
+						<Skeleton class={`h-4 ${w}`} />
+					</div>
+				{/each}
+			</Card.Content>
+		</Card.Root>
+	</div>
+{:else}
 	{@const meta = verdictMeta[report.verdict]}
 	<Card.Root class="mb-6">
 		<Card.Content class="flex flex-wrap items-center gap-4">

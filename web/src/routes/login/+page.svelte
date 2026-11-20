@@ -14,7 +14,7 @@
 
 	// Already logged in (or just logged in): go to the app.
 	$effect(() => {
-		if (session.user) goto('/repositories', { replaceState: true });
+		if (session.user) goto('/repositories', { replace: true });
 	});
 
 	async function submit(event: SubmitEvent) {
