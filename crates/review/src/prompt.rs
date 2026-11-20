@@ -88,9 +88,25 @@ pub fn build_prompt(
 /// Bungkus data tak tepercaya dalam `<tag>...</tag>`. Tag penutup yang sama di dalam data
 /// dinetralkan supaya isi tidak bisa "keluar" dari bagiannya.
 fn wrap(tag: &str, content: &str) -> String {
-    let close = format!("</{tag}>");
-    let safe = content.replace(&close, &format!("<\\/{tag}>"));
-    format!("<{tag}>\n{safe}\n{close}")
+    format!("<{tag}>\n{}\n</{tag}>", neutralize_close_tag(content, tag))
+}
+
+/// Ganti `</` menjadi `<\/` bila diikuti (spasi opsional dan) nama `tag`, tanpa peduli huruf
+/// besar/kecil: `</patch>`, `</PATCH>`, `</ patch>`, `</patch >` semuanya dinetralkan.
+fn neutralize_close_tag(content: &str, tag: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(i) = rest.find("</") {
+        let after = rest[i + 2..].trim_start();
+        let closes = after
+            .get(..tag.len())
+            .is_some_and(|name| name.eq_ignore_ascii_case(tag));
+        out.push_str(&rest[..i]);
+        out.push_str(if closes { "<\\/" } else { "</" });
+        rest = &rest[i + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn or_none(text: String) -> String {
@@ -156,15 +172,18 @@ fn severity_label(severity: Severity) -> &'static str {
 
 /// Isi komentar inline untuk satu temuan.
 pub fn format_inline(s: &Suggestion) -> String {
+    // Judul harus satu baris supaya tetap di dalam label tebal.
+    let title = s.title.lines().collect::<Vec<_>>().join(" ");
     let mut out = format!(
-        "{MARKER}\n**{}:** {}\n\n{}",
+        "{MARKER}\n**{}:** {title}\n\n{}",
         severity_label(s.severity),
-        s.title,
         s.body
     );
     if let Some(code) = &s.suggestion {
-        // Fence lebih panjang jika kodenya sendiri memuat ``` supaya blok tidak terputus.
-        let fence = if code.contains("```") { "````" } else { "```" };
+        let code = code.trim_end_matches(['\n', '\r']);
+        // Fence satu backtick lebih panjang dari deretan backtick terpanjang di kode (minimal 3).
+        let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat((longest + 1).max(3));
         out.push_str(&format!("\n\n{fence}suggestion\n{code}\n{fence}"));
     }
     out
@@ -215,7 +234,9 @@ mod tests {
     use adus_db::memories::MemorySource;
     use adus_db::rules::KnowledgeScope;
     use adus_git::FileStatus;
+    use adus_git::diff::commentable_lines;
     use chrono::Utc;
+    use std::collections::BTreeSet;
     use uuid::Uuid;
 
     fn rule(title: &str, glob: Option<&str>) -> Rule {
@@ -323,6 +344,20 @@ mod tests {
     }
 
     #[test]
+    fn close_tag_escape_is_case_and_space_insensitive() {
+        let wrapped = wrap(
+            "patch",
+            "a</PATCH>b</ patch>c</patch >d</patchx>e</pr_title>f",
+        );
+        assert_eq!(
+            wrapped,
+            "<patch>\na<\\/PATCH>b<\\/ patch>c<\\/patch >d<\\/patchx>e</pr_title>f\n</patch>"
+        );
+        assert_eq!(neutralize_close_tag("x</", "patch"), "x</");
+        assert_eq!(neutralize_close_tag("</é", "patch"), "</é");
+    }
+
+    #[test]
     fn annotate_patch_numbers_new_lines() {
         let patch = "diff --git a/x b/x\n@@ -1,3 +1,4 @@\n a\n-b\n+B\n+C\n\n\\ No newline at end of file\n@@ -10,2 +11,2 @@\n x\n+y";
         let expected = "diff --git a/x b/x\n\
@@ -388,15 +423,35 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_with_backticks_uses_longer_fence() {
+    fn suggestion_fence_title_and_trailing_newlines() {
         let s = Suggestion {
             file: "a.md".into(),
             line: 1,
             severity: Severity::Info,
-            title: "t".into(),
+            title: "first\nsecond\r\nthird".into(),
             body: "b".into(),
-            suggestion: Some("```rust\nx\n```".into()),
+            suggestion: Some("````rust\nx\n```\n\n".into()),
         };
-        assert!(format_inline(&s).ends_with("````suggestion\n```rust\nx\n```\n````"));
+        let out = format_inline(&s);
+        assert!(out.contains("**ℹ️ Info:** first second third\n"));
+        assert!(out.ends_with("`````suggestion\n````rust\nx\n```\n`````"));
+
+        let plain = format_inline(&Suggestion {
+            suggestion: Some("let x = `y`;\n".into()),
+            ..s
+        });
+        assert!(plain.ends_with("\n```suggestion\nlet x = `y`;\n```"));
+    }
+
+    #[test]
+    fn annotate_patch_agrees_with_commentable_lines() {
+        let p = "--- a/x\r\n+++ b/x\r\n@@ -1 +1 @@\r\n-a\r\n+A\r\n@@ -5,3 +5,4 @@\r\n ctx\r\n\r\n+new\r\n-old\r\n+last\r\n\\ No newline at end of file\r\n";
+        let plus_rows: BTreeSet<u32> = annotate_patch(p)
+            .lines()
+            .filter(|row| row.get(5..8) == Some(" + "))
+            .filter_map(|row| row.get(..5)?.trim().parse().ok())
+            .collect();
+        assert_eq!(plus_rows, commentable_lines(p));
+        assert_eq!(plus_rows, BTreeSet::from([1, 7, 8]));
     }
 }

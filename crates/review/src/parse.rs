@@ -30,16 +30,24 @@ pub fn parse_suggestions(raw: &str) -> Result<Vec<Suggestion>, ParseError> {
     Ok(items.iter().filter_map(to_suggestion).collect())
 }
 
-/// Coba parse dari setiap `[` sampai ketemu array yang semua elemennya objek (atau kosong).
-/// Teks setelah array diabaikan. Syarat "semua objek" mencegah `[1]` di prosa ikut terambil.
+/// Coba parse dari setiap `[`: ambil array objek pertama yang TIDAK kosong. Array kosong hanya
+/// dipakai jika tidak ada yang berisi, supaya `String[] args` atau `- [ ]` di prosa pembuka tidak
+/// menelan array temuan yang asli. Teks setelah array diabaikan. Syarat "semua elemen objek"
+/// mencegah `[1]` di prosa ikut terambil.
 // ponytail: O(n²) di teks dengan banyak `[` yang bukan JSON; jawaban LLM kecil, jadi aman.
 fn first_json_array(raw: &str) -> Option<Vec<Map<String, Value>>> {
-    raw.match_indices('[').find_map(|(start, _)| {
-        serde_json::Deserializer::from_str(&raw[start..])
+    let mut saw_empty = false;
+    for (start, _) in raw.match_indices('[') {
+        let parsed = serde_json::Deserializer::from_str(&raw[start..])
             .into_iter::<Vec<Map<String, Value>>>()
-            .next()?
-            .ok()
-    })
+            .next();
+        match parsed {
+            Some(Ok(items)) if !items.is_empty() => return Some(items),
+            Some(Ok(_)) => saw_empty = true,
+            _ => {}
+        }
+    }
+    saw_empty.then(Vec::new)
 }
 
 fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
@@ -142,6 +150,21 @@ mod tests {
         assert_eq!(got[0].line, 7, "numeric string line is accepted");
         assert_eq!(got[0].severity, Severity::Warning);
         assert_eq!(got[0].suggestion, None);
+    }
+
+    #[test]
+    fn empty_bracket_in_prose_does_not_hide_findings() {
+        let raw = "Found 1 issue in `main(String[] args)`:
+                   [{\"file\":\"a.rs\",\"line\":2,\"title\":\"T\",\"body\":\"B\"}]";
+        assert_eq!(parse_suggestions(raw).unwrap().len(), 1);
+        assert_eq!(
+            parse_suggestions(
+                "- [ ] todo
+[]"
+            )
+            .unwrap(),
+            vec![]
+        );
     }
 
     #[test]
