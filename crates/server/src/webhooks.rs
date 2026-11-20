@@ -221,8 +221,9 @@ pub fn parse_github(event: &str, body: &Value, repo_id: Uuid) -> Option<Job> {
     match event {
         "pull_request" => {
             let trigger = match action {
-                "opened" | "reopened" | "ready_for_review" => Trigger::Opened,
-                "synchronize" => Trigger::Updated,
+                "opened" | "ready_for_review" => Trigger::Opened,
+                // Reopen: engine melewatinya jika head-nya sudah pernah direview.
+                "reopened" | "synchronize" => Trigger::Updated,
                 _ => return None,
             };
             Some(Job::ReviewPr {
@@ -403,7 +404,7 @@ mod tests {
             review(2, Trigger::Opened)
         );
         for (action, expected) in [
-            ("reopened", review(2, Trigger::Opened)),
+            ("reopened", review(2, Trigger::Updated)),
             ("ready_for_review", review(2, Trigger::Opened)),
             ("synchronize", review(2, Trigger::Updated)),
             ("closed", None),
