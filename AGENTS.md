@@ -10,13 +10,13 @@ Repo: https://github.com/Return-nol/adus. The GHCR image name is `ghcr.io/return
 - **Web visual design (binding for `web/`):** `DESIGN.md` — warm cream/coffee palette, `#ff4f00` orange CTA accent, shapes, and component chrome (applied across light and dark themes).
 - **Implementation plan v1 (27 tasks, 6 milestones, complete):** `docs/superpowers/plans/2026-11-19-adus-v1.md`
 - **Follow-up design + plan (in progress):** `docs/superpowers/specs/2026-11-20-ignored-files-and-azure-project-design.md` and `docs/superpowers/plans/2026-11-20-ignored-files-and-azure-project.md` (7 tasks)
-- **Execution ledgers:** `.superpowers/sdd/2026-11-19-adus-v1/progress.md` (v1) and `.superpowers/sdd/2026-11-20-ignored-files-and-azure-project/progress.md` (follow-up). These folders are git-ignored and local only. They record which tasks are done, every ruling, deferred minor findings, and the briefs, reports and review diffs for each task.
+- **Backlog of deferred minor findings:** `docs/superpowers/backlog.md`. (The local SDD ledgers used during execution were deleted after both plans finished; git history is the record.)
 
-If the spec and the plan conflict, the spec wins. Record any new decision in the ledger as `Ruling: <what> — <why> — <cost if wrong>`.
+If the spec and the plan conflict, the spec wins. For new work, start with superpowers `brainstorming`, then `writing-plans`, then `subagent-driven-development`.
 
 ## Status (as of 2026-11-20)
 
-**v1 plan: all 27 tasks done.** The final whole-branch review found 1 Critical and 4 Important issues. All five were fixed in one wave (commits `7533f1b`..`c819e33`), and a re-review came back clean. The v1 branch has not been finished yet: there is no merge or PR, and the v1 SDD workspace has not been deleted. The rulings list for the user lives in the v1 ledger.
+**v1 plan: all 27 tasks done.** The final whole-branch review found 1 Critical and 4 Important issues; all were fixed (`7533f1b`..`c819e33`) and re-reviewed clean.
 
 **Follow-up plan (ignored files + Azure project names), 7 tasks:**
 
@@ -32,7 +32,7 @@ If the spec and the plan conflict, the spec wins. Record any new decision in the
 
 Final review fix wave done (`6f74044`..`f8248f1`): doctor webhook label uses `display_name`, ignore patterns drop a leading `/` and the whole list is compiled on save (`invalid_glob` 422 if too complex), `STALE_AFTER` bound into `fail_stale`, GitHub `edited` with a title change re-triggers a review, installers build the `adus` image when it cannot be pulled (`--build` / `-Build`), README upgrading note.
 
-To resume the follow-up, run `subagent-driven-development` on the follow-up plan. It reads that plan's ledger. Tasks 5 and 7 use Opus high, the rest Sonnet high.
+**Follow-up plan complete.** Its final review was fixed in `6f74044`..`75c2bfa` (incl. the installer `--build` / `-Build` flag) and re-reviewed clean. Nothing is pushed yet.
 
 ### v1 task table (historical)
 
@@ -59,7 +59,7 @@ Work is on branch `feat/adus-v1`. Nothing has been pushed.
 | 18–24 | Redis Streams queue, webhooks, prompt/parser, review engine (migration 0005), `@adudu` commands, worker, Reviews page | done (Opus high) |
 | 25–27 | CLI (`gen-secret`, `check-config`, `doctor`, `healthcheck`) + System status page, Docker/compose/installers, CI + GHCR release | done |
 
-To resume, run superpowers `subagent-driven-development` on the plan. It reads the ledger and continues from the first unfinished task. Implementers have been run on Sonnet at high effort, as the user asked. Deferred minor findings for the final whole-branch review are listed in the ledger (`Task N: minor (deferred)` lines), and so are notes aimed at later tasks (`Note for Task N`).
+Implementers ran on Sonnet high (Opus high for the queue/webhook/engine/worker tasks), with a reviewer per task and a whole-branch review at the end.
 
 ## Layout
 
