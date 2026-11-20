@@ -21,6 +21,7 @@ pub const JOB_TIMEOUT: Duration = Duration::from_secs(13 * 60);
 const LOCK_TTL: Duration = Duration::from_secs(15 * 60);
 const _: () = assert!(REVIEW_TIMEOUT.as_secs() < JOB_TIMEOUT.as_secs());
 const _: () = assert!(JOB_TIMEOUT.as_secs() < LOCK_TTL.as_secs());
+const _: () = assert!(JOB_TIMEOUT.as_secs() < reviews::STALE_AFTER.as_secs());
 /// Jeda sebelum mencoba lagi job yang PR-nya sedang dikerjakan worker lain.
 const LOCK_BUSY_DELAY: Duration = Duration::from_secs(30);
 const NEXT_BLOCK: Duration = Duration::from_secs(5);

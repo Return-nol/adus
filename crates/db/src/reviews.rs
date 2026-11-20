@@ -1,4 +1,6 @@
 use adus_core::{job::Trigger, types::ConnectionKind};
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -121,15 +123,21 @@ pub async fn insert_failed(pool: &PgPool, new: NewReview, error: &str) -> Result
     Ok(inserted.rows_affected() == 1)
 }
 
-/// Saat proses mulai: review `queued`/`running` yang sudah lebih dari 15 menit (lebih lama dari
-/// lock PR) tidak sedang dikerjakan siapa pun, jadi ditandai gagal. Return jumlah barisnya.
+/// Review `queued`/`running` tanpa kemajuan selama ini dianggap tidak dikerjakan siapa pun.
+/// Harus lebih lama dari `JOB_TIMEOUT` worker (dicek saat kompilasi di `adus::worker`).
+pub const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// Saat proses mulai dan berkala dari scheduler: review `queued`/`running` yang sudah lebih lama
+/// dari `STALE_AFTER` ditandai gagal. Return jumlah barisnya.
 pub async fn fail_stale(pool: &PgPool) -> Result<u64> {
     let updated = sqlx::query(
-        "UPDATE reviews SET status = 'failed', error = 'interrupted (worker stopped)', \
-         finished_at = now() \
-         WHERE status IN ('queued', 'running') \
-         AND COALESCE(started_at, created_at) < now() - interval '15 minutes'",
+        "UPDATE reviews SET status = 'failed', error = $2, finished_at = now()          WHERE status IN ('queued', 'running')          AND COALESCE(started_at, created_at) < now() - make_interval(secs => $1)",
     )
+    .bind(STALE_AFTER.as_secs_f64())
+    .bind(format!(
+        "interrupted (no progress for {} min)",
+        STALE_AFTER.as_secs() / 60
+    ))
     .execute(pool)
     .await?;
     Ok(updated.rows_affected())
@@ -394,7 +402,10 @@ mod tests {
         for id in [old_queued.id, old_running.id] {
             let row = status(id);
             assert_eq!(row.status, ReviewStatus::Failed);
-            assert_eq!(row.error.as_deref(), Some("interrupted (worker stopped)"));
+            assert_eq!(
+                row.error.as_deref(),
+                Some("interrupted (no progress for 15 min)")
+            );
             assert!(row.finished_at.is_some());
         }
         assert_eq!(status(old_done.id).status, ReviewStatus::Done);
