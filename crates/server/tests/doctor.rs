@@ -56,6 +56,8 @@ async fn healthy_world(pool: PgPool) -> World {
             default_model: Some("gpt-x".into()),
             max_files_per_review: 50,
             max_patch_lines_per_file: 2000,
+            ignore_paths: None,
+            ignored_title_keywords: vec![],
         },
     )
     .await

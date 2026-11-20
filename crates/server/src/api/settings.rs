@@ -79,11 +79,15 @@ async fn replace(
             return Err(ApiError::not_found());
         }
     }
+    // Daftar ignore belum bisa diubah lewat API ini; nilai yang ada dipertahankan.
+    let current = settings::get(&state.db).await?;
     let new = Settings {
         default_provider_id: body.default_provider_id,
         default_model: model,
         max_files_per_review: body.max_files_per_review,
         max_patch_lines_per_file: body.max_patch_lines_per_file,
+        ignore_paths: current.ignore_paths,
+        ignored_title_keywords: current.ignored_title_keywords,
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }

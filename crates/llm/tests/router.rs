@@ -624,6 +624,8 @@ async fn settings_row_exists_with_defaults(pool: PgPool) {
         default_model: Some("gemini-x".into()),
         max_files_per_review: 10,
         max_patch_lines_per_file: 500,
+        ignore_paths: Some(vec!["dist/**".into()]),
+        ignored_title_keywords: vec!["wip".into()],
     };
     assert_eq!(adus_db::settings::update(&pool, &new).await.unwrap(), new);
     // Hapus provider -> default_provider_id di-NULL-kan.

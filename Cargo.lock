@@ -50,6 +50,7 @@ dependencies = [
  "globset",
  "serde",
  "sqlx",
+ "thiserror",
  "tokio",
  "tracing",
  "uuid",

@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod connections;
+pub mod ignore;
 pub mod memories;
 pub mod repositories;
 pub mod reviews;

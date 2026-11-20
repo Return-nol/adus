@@ -11,6 +11,7 @@ workspace = true
 adus-core.workspace = true
 chrono.workspace = true
 globset.workspace = true
+thiserror.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 tracing.workspace = true
