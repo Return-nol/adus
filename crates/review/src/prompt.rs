@@ -232,7 +232,6 @@ fn skip_reason_label(reason: &str) -> &str {
         "file_limit" => "file limit reached",
         "unparseable" => "review output could not be parsed",
         "llm_error" => "LLM error",
-        "ignored_title" => "PR title matched an ignored keyword",
         other => other,
     }
 }
