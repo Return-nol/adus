@@ -16,6 +16,9 @@ pub enum IgnoreError {
     TooLong(String),
     #[error("more than {MAX_PATTERNS} patterns")]
     TooMany,
+    /// Tiap pola valid, tetapi gabungannya melewati batas ukuran regex `GlobSet`.
+    #[error("the ignore list is too large or complex to compile; use fewer or simpler patterns")]
+    TooComplex,
 }
 
 /// Daftar bawaan Kodus sebagai `Vec<String>`.
@@ -31,11 +34,12 @@ pub fn effective_ignore_paths(settings: &Settings) -> Vec<String> {
     }
 }
 
-/// Trim, buang entri kosong dan duplikat (urutan tetap), lalu validasi tiap pola.
+/// Trim, buang `/` di depan (path Adus tidak pernah diawali `/`), buang entri kosong dan duplikat
+/// (urutan tetap), lalu validasi tiap pola.
 pub fn normalize_patterns(raw: &[String]) -> Result<Vec<String>, IgnoreError> {
     let mut patterns: Vec<String> = Vec::new();
     for pattern in raw {
-        let pattern = pattern.trim();
+        let pattern = pattern.trim().trim_start_matches('/');
         if pattern.is_empty() || patterns.iter().any(|p| p == pattern) {
             continue;
         }
@@ -64,9 +68,7 @@ impl IgnoreMatcher {
             let glob = Glob::new(pattern).map_err(|_| IgnoreError::InvalidGlob(pattern.clone()))?;
             builder.add(glob);
         }
-        let set = builder
-            .build()
-            .map_err(|err| IgnoreError::InvalidGlob(err.to_string()))?;
+        let set = builder.build().map_err(|_| IgnoreError::TooComplex)?;
         Ok(Self {
             patterns: patterns.to_vec(),
             set,
@@ -157,6 +159,17 @@ mod tests {
     }
 
     #[test]
+    fn normalize_strips_leading_slash() {
+        let raw = strings(&["/dist/**", "dist/**", " /a/** ", "/"]);
+        assert_eq!(
+            normalize_patterns(&raw).unwrap(),
+            strings(&["dist/**", "a/**"])
+        );
+        let matcher = IgnoreMatcher::new(&normalize_patterns(&raw).unwrap()).unwrap();
+        assert!(matcher.is_ignored("dist/app.js"));
+    }
+
+    #[test]
     fn normalize_limits() {
         assert_eq!(
             normalize_patterns(&["a".repeat(501)]),
@@ -166,6 +179,19 @@ mod tests {
         let many: Vec<String> = (0..5001).map(|i| format!("dir{i}/**")).collect();
         assert_eq!(normalize_patterns(&many), Err(IgnoreError::TooMany));
         assert_eq!(normalize_patterns(&many[..5000]).unwrap().len(), 5000);
+    }
+
+    #[test]
+    fn matcher_rejects_list_too_complex_to_compile() {
+        // Tiap pola lolos validasi, tetapi GlobSet gabungannya melewati batas ukuran NFA.
+        let patterns: Vec<String> = (0..300)
+            .map(|i| format!("{}{i}", "?".repeat(490)))
+            .collect();
+        assert!(normalize_patterns(&patterns).is_ok());
+        assert_eq!(
+            IgnoreMatcher::new(&patterns).err(),
+            Some(IgnoreError::TooComplex)
+        );
     }
 
     #[test]

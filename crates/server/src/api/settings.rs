@@ -76,7 +76,7 @@ struct SettingsBody {
 impl From<IgnoreError> for ApiError {
     fn from(err: IgnoreError) -> ApiError {
         match err {
-            IgnoreError::InvalidGlob(_) => ApiError::new(
+            IgnoreError::InvalidGlob(_) | IgnoreError::TooComplex => ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_glob",
                 err.to_string(),
@@ -156,7 +156,12 @@ async fn replace(
     let ignore_paths = match &body.ignore_paths {
         None => current.ignore_paths,
         Some(None) => None,
-        Some(Some(raw)) => Some(ignore::normalize_patterns(raw)?),
+        Some(Some(raw)) => {
+            let patterns = ignore::normalize_patterns(raw)?;
+            // Kompilasi seluruh daftar sekarang, supaya engine tidak diam-diam kembali ke bawaan.
+            IgnoreMatcher::new(&patterns)?;
+            Some(patterns)
+        }
     };
     let ignored_title_keywords = match &body.ignored_title_keywords {
         None => current.ignored_title_keywords,

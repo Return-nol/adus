@@ -125,6 +125,43 @@ async fn put_with_one_bad_glob_saves_nothing(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn put_list_too_complex_to_compile_saves_nothing(pool: PgPool) {
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let before = read_settings(&app, &admin).await;
+
+    // Every pattern is a valid glob, but together they exceed the GlobSet size limit.
+    let list: Vec<String> = (0..300)
+        .map(|i| format!("{}{i}", "?".repeat(490)))
+        .collect();
+    let reply = put_settings(&app, &admin, json!({ "ignore_paths": list })).await;
+    assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(reply.body["error"]["code"], "invalid_glob");
+    assert!(
+        reply.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("too large or complex"),
+        "{}",
+        reply.body
+    );
+    assert_eq!(read_settings(&app, &admin).await, before);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn put_strips_leading_slash(pool: PgPool) {
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let saved = put_settings(
+        &app,
+        &admin,
+        json!({ "ignore_paths": ["/dist/**", "dist/**"] }),
+    )
+    .await;
+    assert_eq!(saved.body["ignore_paths"], json!(["dist/**"]));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn title_keyword_too_long_422(pool: PgPool) {
     let app = app(pool).await;
     let admin = setup_admin(&app).await;
