@@ -52,7 +52,9 @@
 		auto_review_off: 'auto review off',
 		draft: 'draft PR',
 		already_reviewed: 'already reviewed',
-		nothing_to_review: 'nothing to review'
+		nothing_to_review: 'nothing to review',
+		ignored_title: 'PR title matched an ignored keyword',
+		no_model: 'No AI model configured'
 	};
 	const dateFormat = new Intl.DateTimeFormat(undefined, {
 		dateStyle: 'medium',
