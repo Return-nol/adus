@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Penanda di setiap komentar yang diposting Adus. Komentar yang memuatnya diabaikan.
+pub const ADUDU_MARKER: &str = "<!-- adudu -->";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "connection_kind", rename_all = "snake_case")]

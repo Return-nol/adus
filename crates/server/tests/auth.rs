@@ -14,7 +14,7 @@ fn creds(email: &str, password: &str) -> serde_json::Value {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn status_needs_setup_when_no_users(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let reply = send(&app, get("/api/v1/auth/status", None)).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body, json!({ "needs_setup": true }));
@@ -27,7 +27,7 @@ async fn status_needs_setup_when_no_users(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn setup_creates_admin_and_sets_cookie(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let body = creds("  admin@example.com ", "correct horse");
     let reply = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
 
@@ -52,7 +52,7 @@ async fn setup_creates_admin_and_sets_cookie(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn cookie_is_secure_when_public_url_is_https(pool: PgPool) {
-    let app = app_with_url(pool, "https://adus.example.com");
+    let app = app_with_url(pool, "https://adus.example.com").await;
     let body = creds("admin@example.com", "correct horse");
     let reply = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
     assert!(set_cookie(&reply).contains("; Secure"));
@@ -60,7 +60,7 @@ async fn cookie_is_secure_when_public_url_is_https(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn setup_twice_is_409(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let body = creds("admin@example.com", "correct horse");
     let first = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
     assert_eq!(first.status, StatusCode::CREATED);
@@ -73,7 +73,7 @@ async fn setup_twice_is_409(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn concurrent_setup_creates_only_one_admin(pool: PgPool) {
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
     let a = creds("a@example.com", "correct horse");
     let b = creds("b@example.com", "correct horse");
     let (ra, rb) = tokio::join!(
@@ -89,7 +89,7 @@ async fn concurrent_setup_creates_only_one_admin(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn login_wrong_password_401_same_message_as_unknown_email(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let body = creds("admin@example.com", "correct horse");
     send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
 
@@ -107,7 +107,7 @@ async fn login_wrong_password_401_same_message_as_unknown_email(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn login_succeeds_with_correct_password_case_insensitive_email(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let body = creds("admin@example.com", "correct horse");
     send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
 
@@ -122,7 +122,7 @@ async fn login_succeeds_with_correct_password_case_insensitive_email(pool: PgPoo
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn disabled_user_cannot_login(pool: PgPool) {
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
     let body = creds("admin@example.com", "correct horse");
     let setup = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
     let id = setup.body["id"].as_str().unwrap().parse().unwrap();
@@ -139,7 +139,7 @@ async fn disabled_user_cannot_login(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn me_without_cookie_401(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let reply = send(&app, get("/api/v1/auth/me", None)).await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
     assert_eq!(reply.body["error"]["code"], "unauthenticated");
@@ -150,7 +150,7 @@ async fn me_without_cookie_401(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn logout_invalidates_session(pool: PgPool) {
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
     let body = creds("admin@example.com", "correct horse");
     let setup = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
     let cookie = cookie_pair(&setup);
@@ -172,7 +172,7 @@ async fn logout_invalidates_session(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn session_token_is_stored_hashed(pool: PgPool) {
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
     let body = creds("admin@example.com", "correct horse");
     let setup = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
     let token = cookie_pair(&setup)["adus_session=".len()..].to_string();
@@ -188,7 +188,7 @@ async fn session_token_is_stored_hashed(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn password_shorter_than_8_is_422(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let body = creds("admin@example.com", "short");
     let reply = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
     assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -200,7 +200,7 @@ async fn password_shorter_than_8_is_422(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn email_without_at_is_422(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let body = creds("  not-an-email ", "correct horse");
     let reply = send(&app, post_json("/api/v1/auth/setup", &body, None)).await;
     assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -209,7 +209,7 @@ async fn email_without_at_is_422(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn bad_json_bodies_use_api_error_format(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let raw = |body: &str, content_type: Option<&str>| {
         let mut req = Request::post("/api/v1/auth/login");
         if let Some(ct) = content_type {

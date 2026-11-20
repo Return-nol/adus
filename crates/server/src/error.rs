@@ -2,7 +2,7 @@ use axum::{
     Json,
     extract::{
         FromRequest, FromRequestParts,
-        rejection::{JsonRejection, PathRejection, QueryRejection},
+        rejection::{BytesRejection, JsonRejection, PathRejection, QueryRejection},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -130,5 +130,18 @@ impl From<QueryRejection> for ApiError {
             "bad_request",
             rejection.body_text(),
         )
+    }
+}
+
+/// Body mentah (`Bytes`) gagal dibaca, mis. melebihi `DefaultBodyLimit`.
+impl From<BytesRejection> for ApiError {
+    fn from(rejection: BytesRejection) -> ApiError {
+        let status = rejection.status();
+        let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            "payload_too_large"
+        } else {
+            "bad_request"
+        };
+        ApiError::new(status, code, rejection.body_text())
     }
 }

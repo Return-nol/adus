@@ -37,7 +37,11 @@ fn first_js(dir: &Path, root: &Path) -> Option<String> {
 #[sqlx::test(migrations = "../../migrations")]
 async fn unknown_client_route_serves_index_html(pool: PgPool) {
     build_dir();
-    let res = app(pool).oneshot(get("/repositories", None)).await.unwrap();
+    let res = app(pool)
+        .await
+        .oneshot(get("/repositories", None))
+        .await
+        .unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(res.headers()[header::CONTENT_TYPE], "text/html");
     assert_eq!(res.headers()[header::CACHE_CONTROL], "no-cache");
@@ -48,7 +52,7 @@ async fn unknown_client_route_serves_index_html(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn unknown_api_route_is_json_404(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     for uri in ["/api/v1/nope", "/webhooks/nope"] {
         let reply = send(&app, get(uri, None)).await;
         assert_eq!(reply.status, 404, "{uri}");
@@ -61,6 +65,7 @@ async fn asset_has_correct_content_type(pool: PgPool) {
     let dir = build_dir();
     let js = first_js(&dir.join("_app/immutable"), &dir).expect("no .js asset in web/build");
     let res = app(pool)
+        .await
         .oneshot(get(&format!("/{js}"), None))
         .await
         .unwrap();
@@ -75,7 +80,7 @@ async fn asset_has_correct_content_type(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn non_get_on_unknown_page_path_is_json_404(pool: PgPool) {
-    let reply = send(&app(pool), post_empty("/repositories", None)).await;
+    let reply = send(&app(pool).await, post_empty("/repositories", None)).await;
     assert_eq!(reply.status, 404);
     assert_eq!(reply.body["error"]["code"], "not_found");
 }

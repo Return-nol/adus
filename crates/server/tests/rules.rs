@@ -82,7 +82,7 @@ fn ids(body: &Value) -> Vec<&str> {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn rules_require_login(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     assert_eq!(
         send(&app, get("/api/v1/rules", None)).await.status,
         StatusCode::UNAUTHORIZED
@@ -98,7 +98,7 @@ async fn rules_require_login(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn user_role_can_create_rule(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let user = login_as_user(&app, &admin).await;
 
@@ -126,7 +126,7 @@ async fn user_role_can_create_rule(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn invalid_glob_422(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
 
     let body = json!({ "scope": "global", "title": "t", "body": "b", "path_glob": "src/[a" });
@@ -145,7 +145,7 @@ async fn invalid_glob_422(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn repo_scope_without_repository_id_422(pool: PgPool) {
     let repo = add_repo(&pool, "a").await;
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
 
     let body = json!({ "scope": "repo", "title": "t", "body": "b" });
@@ -163,7 +163,7 @@ async fn repo_scope_without_repository_id_422(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn unknown_or_deleted_repository_404(pool: PgPool) {
     let repo = add_repo(&pool, "a").await;
-    let app_router = app(pool.clone());
+    let app_router = app(pool.clone()).await;
     let admin = setup_admin(&app_router).await;
 
     let body = json!({
@@ -194,7 +194,7 @@ fn uuid_nil() -> &'static str {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn rule_text_validation_422(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
 
     let cases = [
@@ -219,7 +219,7 @@ async fn rule_text_validation_422(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_rules_by_scope(pool: PgPool) {
     let repo = add_repo(&pool, "a").await;
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
 
     let g = json!({ "scope": "global", "title": "g", "body": "b" });
@@ -243,7 +243,7 @@ async fn list_rules_by_scope(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn patch_rule_is_partial_and_can_clear_glob(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let body = json!({
         "scope": "global", "title": "t", "body": "b", "path_glob": "src/**", "severity": "info"
@@ -285,7 +285,7 @@ async fn patch_rule_is_partial_and_can_clear_glob(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn user_role_can_delete_rule(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let user = login_as_user(&app, &admin).await;
     let body = json!({ "scope": "global", "title": "t", "body": "b" });
@@ -307,7 +307,7 @@ async fn user_role_can_delete_rule(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn memory_create_sets_source_and_creator(pool: PgPool) {
     let repo = add_repo(&pool, "a").await;
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let user = login_as_user(&app, &admin).await;
     let me = send(&app, get("/api/v1/auth/me", Some(&user))).await;
@@ -331,7 +331,7 @@ async fn memory_create_sets_source_and_creator(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn memory_validation_422_and_scope_mismatch(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
 
     for body in [
@@ -358,7 +358,7 @@ async fn memory_validation_422_and_scope_mismatch(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn memory_list_patch_delete(pool: PgPool) {
     let repo = add_repo(&pool, "a").await;
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let user = login_as_user(&app, &admin).await;
 

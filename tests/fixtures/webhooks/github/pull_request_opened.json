@@ -1,0 +1,48 @@
+{
+  "action": "opened",
+  "number": 2,
+  "pull_request": {
+    "url": "https://api.github.com/repos/Codertocat/Hello-World/pulls/2",
+    "id": 279147437,
+    "html_url": "https://github.com/Codertocat/Hello-World/pull/2",
+    "number": 2,
+    "state": "open",
+    "locked": false,
+    "title": "Update the README with new information.",
+    "user": {
+      "login": "Codertocat",
+      "id": 21031067,
+      "type": "User"
+    },
+    "body": "This is a pretty simple change that we need to pull into master.",
+    "draft": false,
+    "head": {
+      "label": "Codertocat:changes",
+      "ref": "changes",
+      "sha": "ec26c3e57ca3a959ca5aad62de7213c562f8c821"
+    },
+    "base": {
+      "label": "Codertocat:master",
+      "ref": "master",
+      "sha": "f95f852bd8fca8fcc58a9a2d6c842781e32a215e"
+    },
+    "merged": false,
+    "commits": 1,
+    "additions": 1,
+    "deletions": 1,
+    "changed_files": 1
+  },
+  "repository": {
+    "id": 186853002,
+    "name": "Hello-World",
+    "full_name": "Codertocat/Hello-World",
+    "private": false,
+    "html_url": "https://github.com/Codertocat/Hello-World",
+    "default_branch": "master"
+  },
+  "sender": {
+    "login": "Codertocat",
+    "id": 21031067,
+    "type": "User"
+  }
+}

@@ -11,6 +11,7 @@ use adus_git::{
     ConnectionKind, FileDiff, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
     PullRequest, RemoteRepo, RepoRef,
 };
+use adus_queue::Queue;
 use adus_server::{AppState, router};
 use async_trait::async_trait;
 use axum::{
@@ -43,29 +44,64 @@ pub fn test_config(public_url: &str) -> Config {
     Config::from_map(&env).unwrap()
 }
 
-pub fn app_with_url(pool: PgPool, public_url: &str) -> Router {
-    app_with_git(pool, public_url, Arc::new(FakeGitFactory::default()))
+/// Prefix antrian untuk test yang tidak menyentuh antrian: satu stream kosong dipakai bersama.
+/// Test yang memakai antrian membuat prefix unik `test-{uuid}` sendiri (lihat `test_queue`).
+const SHARED_QUEUE_PREFIX: &str = "test-shared";
+
+pub fn redis_url() -> String {
+    std::env::var("REDIS_URL").expect("REDIS_URL must be set (see .cargo/config.toml)")
 }
 
-pub fn app_with_git(pool: PgPool, public_url: &str, git: Arc<FakeGitFactory>) -> Router {
+pub async fn test_queue(prefix: &str) -> Queue {
+    Queue::connect(&redis_url(), prefix).await.unwrap()
+}
+
+/// Hapus semua key Redis milik prefix test.
+pub async fn cleanup_queue(prefix: &str) {
+    use redis::AsyncCommands;
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let keys: Vec<String> = conn.keys(format!("{prefix}:*")).await.unwrap();
+    if !keys.is_empty() {
+        let _: () = conn.del(keys).await.unwrap();
+    }
+}
+
+fn build_app(pool: PgPool, public_url: &str, git: Arc<FakeGitFactory>, queue: Queue) -> Router {
     router(AppState {
         db: pool,
         cipher: Arc::new(test_cipher()),
         config: Arc::new(test_config(public_url)),
         git,
         http: reqwest::Client::new(),
+        queue,
     })
 }
 
-pub fn app(pool: PgPool) -> Router {
-    app_with_url(pool, "http://localhost:8080")
+pub async fn app_with_url(pool: PgPool, public_url: &str) -> Router {
+    app_with_git(pool, public_url, Arc::new(FakeGitFactory::default())).await
+}
+
+pub async fn app_with_git(pool: PgPool, public_url: &str, git: Arc<FakeGitFactory>) -> Router {
+    let queue = test_queue(SHARED_QUEUE_PREFIX).await;
+    build_app(pool, public_url, git, queue)
+}
+
+pub async fn app(pool: PgPool) -> Router {
+    app_with_url(pool, "http://localhost:8080").await
+}
+
+/// Router dengan antrian milik test (prefix unik), untuk test webhook.
+pub fn app_with_queue(pool: PgPool, queue: Queue) -> Router {
+    let git = Arc::new(FakeGitFactory::default());
+    build_app(pool, "http://localhost:8080", git, queue)
 }
 
 /// Router dengan `FakeGitFactory` yang bisa diatur dan diperiksa test.
-pub fn app_and_git(pool: PgPool) -> (Router, Arc<FakeGitFactory>) {
+pub async fn app_and_git(pool: PgPool) -> (Router, Arc<FakeGitFactory>) {
     let git = Arc::new(FakeGitFactory::default());
     (
-        app_with_git(pool, "http://localhost:8080", git.clone()),
+        app_with_git(pool, "http://localhost:8080", git.clone()).await,
         git,
     )
 }

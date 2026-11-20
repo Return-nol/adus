@@ -1,0 +1,26 @@
+{
+  "zen": "Keep it logically awesome.",
+  "hook_id": 109948940,
+  "hook": {
+    "type": "Repository",
+    "id": 109948940,
+    "name": "web",
+    "active": true,
+    "events": ["pull_request", "issue_comment", "pull_request_review_comment"],
+    "config": {
+      "content_type": "json",
+      "insecure_ssl": "0",
+      "url": "https://adus.example.com/webhooks/github/00000000-0000-0000-0000-000000000000"
+    }
+  },
+  "repository": {
+    "id": 186853002,
+    "name": "Hello-World",
+    "full_name": "Codertocat/Hello-World"
+  },
+  "sender": {
+    "login": "Codertocat",
+    "id": 21031067,
+    "type": "User"
+  }
+}

@@ -47,7 +47,7 @@ async fn status_of_me(app: &Router, cookie: &str) -> StatusCode {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn user_role_cannot_list_users_403(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let (_, user) = create_and_login(&app, &admin, "u@example.com", "user").await;
 
@@ -65,7 +65,7 @@ async fn user_role_cannot_list_users_403(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn admin_creates_user(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let body = json!({
         "email": " new@example.com ", "password": PASSWORD,
@@ -89,7 +89,7 @@ async fn admin_creates_user(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_user_validates_input(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     for body in [
         json!({ "email": "nope", "password": PASSWORD, "role": "user" }),
@@ -104,7 +104,7 @@ async fn create_user_validates_input(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn cannot_demote_last_active_admin_409(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let id = admin_id(&app, &admin).await;
 
@@ -122,7 +122,7 @@ async fn cannot_demote_last_active_admin_409(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn cannot_disable_last_active_admin_409(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let id = admin_id(&app, &admin).await;
 
@@ -141,7 +141,7 @@ async fn cannot_disable_last_active_admin_409(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn disabling_user_ends_their_sessions(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let (id, user) = create_and_login(&app, &admin, "u@example.com", "user").await;
 
@@ -159,7 +159,7 @@ async fn disabling_user_ends_their_sessions(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn patch_unknown_or_malformed_id_is_404(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let patch = json!({ "disabled": true });
     for id in ["00000000-0000-0000-0000-000000000000", "not-a-uuid"] {
@@ -171,7 +171,7 @@ async fn patch_unknown_or_malformed_id_is_404(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn github_login_unique_409(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let (b_id, b) = create_and_login(&app, &admin, "b@example.com", "user").await;
 
@@ -210,7 +210,7 @@ async fn github_login_unique_409(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn change_own_password_requires_current(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let (_, user) = create_and_login(&app, &admin, "u@example.com", "user").await;
     // Sesi kedua milik user yang sama.
@@ -243,7 +243,7 @@ async fn change_own_password_requires_current(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn admin_resetting_own_password_keeps_current_session(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let other = cookie_pair(&login(&app, "admin@example.com", PASSWORD).await);
     let id = admin_id(&app, &admin).await;
@@ -261,7 +261,7 @@ async fn admin_resetting_own_password_keeps_current_session(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn admin_resets_password_and_ends_sessions(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let (id, user) = create_and_login(&app, &admin, "u@example.com", "user").await;
     let uri = format!("/api/v1/users/{id}/password");

@@ -75,7 +75,7 @@ fn row<'a>(at: &'a str, provider: &'a str, key: &'a str, input: i32, output: i32
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn daily_usage_fills_missing_days_with_zero(pool: PgPool) {
-    let (app, _git) = app_and_git(pool.clone());
+    let (app, _git) = app_and_git(pool.clone()).await;
     let admin = setup_admin(&app).await;
     let (p, k) = provider_with_key(&app, &admin, "OpenAI", "main").await;
 
@@ -106,7 +106,7 @@ async fn daily_usage_fills_missing_days_with_zero(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn daily_range_defaults_and_limits(pool: PgPool) {
-    let (app, _git) = app_and_git(pool);
+    let (app, _git) = app_and_git(pool).await;
     let admin = setup_admin(&app).await;
     let daily = |q: &str| get(&format!("/api/v1/usage/daily{q}"), Some(&admin));
 
@@ -141,7 +141,7 @@ async fn daily_range_defaults_and_limits(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn breakdown_by_key_uses_label(pool: PgPool) {
-    let (app, _git) = app_and_git(pool.clone());
+    let (app, _git) = app_and_git(pool.clone()).await;
     let admin = setup_admin(&app).await;
     let (p1, k1) = provider_with_key(&app, &admin, "OpenAI", "primary").await;
     let (p2, k2) = provider_with_key(&app, &admin, "Backup AI", "backup").await;
@@ -222,7 +222,7 @@ async fn breakdown_by_key_uses_label(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn breakdown_by_repository_uses_owner_name(pool: PgPool) {
-    let (app, git) = app_and_git(pool.clone());
+    let (app, git) = app_and_git(pool.clone()).await;
     let admin = setup_admin(&app).await;
     git.with(|s| {
         s.repos = vec![RemoteRepo {
@@ -264,7 +264,7 @@ async fn breakdown_by_repository_uses_owner_name(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn user_role_can_read_usage_but_not_edit_keys(pool: PgPool) {
-    let (app, _git) = app_and_git(pool);
+    let (app, _git) = app_and_git(pool).await;
     let admin = setup_admin(&app).await;
     let (provider, key) = provider_with_key(&app, &admin, "OpenAI", "main").await;
     let body = json!({ "email": "u@example.com", "password": PASSWORD, "role": "user" });

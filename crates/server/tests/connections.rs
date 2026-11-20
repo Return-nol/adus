@@ -36,7 +36,7 @@ fn github_repo(id: &str, name: &str) -> RemoteRepo {
 
 /// App + admin cookie + fake dengan dua repo GitHub yang bisa dilihat.
 async fn setup(pool: PgPool) -> (Router, Arc<FakeGitFactory>, String) {
-    let (app, git) = app_and_git(pool);
+    let (app, git) = app_and_git(pool).await;
     let admin = setup_admin(&app).await;
     git.with(|s| s.repos = vec![github_repo("1", "api"), github_repo("2", "web")]);
     (app, git, admin)

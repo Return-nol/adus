@@ -43,7 +43,7 @@ async fn call(app: &Router, method: &str, uri: &str, body: &Value, cookie: &str)
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn key_never_returned(pool: PgPool) {
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
     let admin = setup_admin(&app).await;
     let provider = openai_provider(&app, &admin).await;
 
@@ -86,7 +86,7 @@ async fn key_never_returned(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn compatible_without_base_url_422(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
 
     for body in [
@@ -145,7 +145,7 @@ async fn test_key(app: &Router, admin: &str, key: &str) -> common::Reply {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_key_reports_failure_without_marking_invalid(pool: PgPool) {
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
     let admin = setup_admin(&app).await;
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -209,7 +209,7 @@ async fn test_key_reports_failure_without_marking_invalid(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_key_success_sends_ping_and_records_tokens(pool: PgPool) {
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
     let admin = setup_admin(&app).await;
     let server = MockServer::start().await;
     let completion = json!({
@@ -247,7 +247,7 @@ async fn test_key_success_sends_ping_and_records_tokens(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn replacing_key_restores_status_and_validates(pool: PgPool) {
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
     let admin = setup_admin(&app).await;
     let provider = openai_provider(&app, &admin).await;
     let key = add_key(&app, &admin, &provider, SECRET).await.body["id"]
@@ -295,7 +295,7 @@ async fn replacing_key_restores_status_and_validates(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn delete_provider_in_use_409(pool: PgPool) {
-    let (app, git) = app_and_git(pool.clone());
+    let (app, git) = app_and_git(pool.clone()).await;
     let admin = setup_admin(&app).await;
     git.with(|s| {
         s.repos = vec![RemoteRepo {
@@ -385,7 +385,7 @@ async fn delete_provider_in_use_409(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn settings_roundtrip_and_validation(pool: PgPool) {
-    let app = app(pool);
+    let app = app(pool).await;
     let admin = setup_admin(&app).await;
     let provider = openai_provider(&app, &admin).await;
 
