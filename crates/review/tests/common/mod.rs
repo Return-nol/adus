@@ -38,8 +38,14 @@ pub struct GitState {
     pub incremental: Vec<FileDiff>,
     /// Jika diisi, `get_pr` gagal dengan error ini.
     pub get_pr_error: Option<GitError>,
+    /// Jika diisi, `pr_diff` gagal dengan error ini.
+    pub pr_diff_error: Option<GitError>,
+    /// Jika diisi, `diff_between` gagal dengan error ini.
+    pub diff_between_error: Option<GitError>,
     /// Jika diisi, `post_review` gagal dengan error ini.
     pub post_error: Option<GitError>,
+    /// Jika diisi, `post_comment` gagal dengan error ini.
+    pub comment_error: Option<GitError>,
     /// `(kind, org_or_owner, token)` tiap `create`.
     pub created: Vec<(ConnectionKind, String, String)>,
     /// `(base, head)` tiap `diff_between`.
@@ -62,7 +68,10 @@ impl FakeGit {
                 full,
                 incremental: Vec::new(),
                 get_pr_error: None,
+                pr_diff_error: None,
+                diff_between_error: None,
                 post_error: None,
+                comment_error: None,
                 created: Vec::new(),
                 diff_between_calls: Vec::new(),
                 reviews: Vec::new(),
@@ -123,7 +132,11 @@ impl GitProvider for FakeGit {
     }
 
     async fn pr_diff(&self, _repo: &RepoRef, _pr: &PullRequest) -> Result<Vec<FileDiff>, GitError> {
-        Ok(self.state().full.clone())
+        let state = self.state();
+        match &state.pr_diff_error {
+            Some(err) => Err(err.clone()),
+            None => Ok(state.full.clone()),
+        }
     }
 
     async fn diff_between(
@@ -136,7 +149,10 @@ impl GitProvider for FakeGit {
         state
             .diff_between_calls
             .push((base_sha.to_string(), head_sha.to_string()));
-        Ok(state.incremental.clone())
+        match &state.diff_between_error {
+            Some(err) => Err(err.clone()),
+            None => Ok(state.incremental.clone()),
+        }
     }
 
     async fn post_review(
@@ -163,7 +179,11 @@ impl GitProvider for FakeGit {
         _pr_number: i64,
         body: &str,
     ) -> Result<(), GitError> {
-        self.state().comments.push(body.to_string());
+        let mut state = self.state();
+        if let Some(err) = &state.comment_error {
+            return Err(err.clone());
+        }
+        state.comments.push(body.to_string());
         Ok(())
     }
 }

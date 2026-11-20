@@ -26,3 +26,5 @@ CREATE INDEX reviews_created_idx ON reviews (created_at);
 ALTER TABLE llm_usage
     ADD CONSTRAINT llm_usage_review_fk
     FOREIGN KEY (review_id) REFERENCES reviews (id) ON DELETE SET NULL;
+
+CREATE INDEX llm_usage_review_idx ON llm_usage (review_id);

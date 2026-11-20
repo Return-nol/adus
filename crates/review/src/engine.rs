@@ -12,10 +12,7 @@ use adus_db::repositories::{self, Repository};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::{memories, rules, settings};
 use adus_git::diff::{added_line_count, commentable_lines};
-use adus_git::{
-    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PullRequest,
-    RepoRef,
-};
+use adus_git::{FileDiff, FileStatus, GitError, GitProviderFactory, InlineComment, RepoRef};
 use adus_llm::ChatRequest;
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use sqlx::PgPool;
@@ -60,19 +57,19 @@ struct Target {
 }
 
 impl Engine {
-    /// Review satu PR. Return id baris `reviews`, atau `Uuid::nil()` jika repo tidak ada
+    /// Review satu PR. Return id baris `reviews`, atau `None` jika repo tidak ada / sudah dihapus
     /// (tidak ada repo untuk dicatat). Setiap hasil lain — selesai, dilewati, gagal — punya baris.
     pub async fn review_pr(
         &self,
         repository_id: Uuid,
         pr_number: i64,
         trigger: Trigger,
-    ) -> Result<Uuid, EngineError> {
+    ) -> Result<Option<Uuid>, EngineError> {
         let Some(repo) = repositories::get(&self.db, repository_id)
             .await
             .map_err(db_error)?
         else {
-            return Ok(Uuid::nil());
+            return Ok(None);
         };
         let new = NewReview {
             repository_id,
@@ -87,24 +84,23 @@ impl Engine {
                 Ok(Outcome::Skipped(reason)) => (ReviewStatus::Skipped, 0, Some(reason)),
                 Err(err) => {
                     let message = err.to_string();
-                    // Error aslinya lebih penting daripada gagal mencatat; baris tetap queued/running.
-                    let _ = reviews::finish(
-                        &self.db,
-                        review_id,
-                        ReviewStatus::Failed,
-                        0,
-                        Some(&message),
-                        None,
-                    )
-                    .await;
+                    let failed = ReviewStatus::Failed;
+                    let finished =
+                        reviews::finish(&self.db, review_id, failed, 0, Some(&message), None);
+                    // Error aslinya yang dikembalikan; gagal mencatat cukup di-log.
+                    if let Err(db_err) = finished.await {
+                        tracing::warn!(%review_id, error = %db_err, "could not mark review failed");
+                    }
                     return Err(err);
                 }
             };
         let posted = i32::try_from(posted).unwrap_or(i32::MAX);
-        reviews::finish(&self.db, review_id, status, posted, None, skip_reason)
-            .await
-            .map_err(db_error)?;
-        Ok(review_id)
+        // Review mungkin sudah terposting: jangan jadikan Retryable (akan posting dua kali).
+        let finished = reviews::finish(&self.db, review_id, status, posted, None, skip_reason);
+        if let Err(db_err) = finished.await {
+            tracing::warn!(%review_id, error = %db_err, "could not record review result");
+        }
+        Ok(Some(review_id))
     }
 
     async fn run(
@@ -164,7 +160,15 @@ impl Engine {
                  An admin can set one under Settings."
             );
             // Gagal posting tidak mengubah hasilnya: review tetap tidak bisa jalan.
-            let _ = git.post_comment(&repo_ref, pr_number, &body).await;
+            match git.post_comment(&repo_ref, pr_number, &body).await {
+                Ok(()) => {}
+                Err(GitError::Unauthorized) => {
+                    self.unauthorized(&conn).await;
+                }
+                Err(err) => {
+                    tracing::warn!(%review_id, error = %err, "could not post no-model comment")
+                }
+            }
             return Err(EngineError::Fatal("no review model configured".into()));
         };
 
@@ -179,20 +183,21 @@ impl Engine {
         if last.as_deref() == Some(pr.head_sha.as_str()) {
             return Ok(Outcome::Skipped("already_reviewed"));
         }
+        let full = match git.pr_diff(&repo_ref, &pr).await {
+            Ok(files) => files,
+            Err(err) => return Err(self.fetch_error(&conn, err).await),
+        };
         let candidates = match last {
-            Some(last_head) => {
-                self.incremental(&*git, &conn, &repo_ref, &pr, &last_head)
-                    .await?
-            }
-            None => self
-                .fetch(&conn, git.pr_diff(&repo_ref, &pr).await)
-                .await?
-                .into_iter()
-                .map(|file| {
-                    let allowed = commentable_lines(file.patch.as_deref().unwrap_or(""));
-                    Target { file, allowed }
-                })
-                .collect(),
+            None => full_targets(full),
+            Some(last_head) => match git.diff_between(&repo_ref, &last_head, &pr.head_sha).await {
+                Ok(changed) => incremental_targets(changed, full),
+                // Setelah force-push commit lama bisa hilang; review penuh saja daripada gagal terus.
+                Err(GitError::NotFound) => {
+                    tracing::warn!(%review_id, "previous head not found, falling back to a full review");
+                    full_targets(full)
+                }
+                Err(err) => return Err(self.fetch_error(&conn, err).await),
+            },
         };
 
         let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
@@ -217,6 +222,10 @@ impl Engine {
             } else {
                 targets.push(target);
             }
+        }
+
+        if targets.is_empty() && skipped.is_empty() {
+            return Ok(Outcome::Skipped("nothing_to_review"));
         }
 
         let rules = rules::applicable(&self.db, repo.id)
@@ -278,53 +287,6 @@ impl Engine {
         }
     }
 
-    /// File dari commit baru yang masih ada di diff PR penuh. Baris yang boleh dikomentari harus
-    /// baru di commit ini DAN masih berubah di PR (supaya posisinya valid untuk provider).
-    async fn incremental(
-        &self,
-        git: &dyn GitProvider,
-        conn: &Connection,
-        repo_ref: &RepoRef,
-        pr: &PullRequest,
-        last_head: &str,
-    ) -> Result<Vec<Target>, EngineError> {
-        let changed = self
-            .fetch(
-                conn,
-                git.diff_between(repo_ref, last_head, &pr.head_sha).await,
-            )
-            .await?;
-        let full = self.fetch(conn, git.pr_diff(repo_ref, pr).await).await?;
-        let full_lines: HashMap<String, BTreeSet<u32>> = full
-            .into_iter()
-            .map(|file| {
-                let lines = commentable_lines(file.patch.as_deref().unwrap_or(""));
-                (file.path, lines)
-            })
-            .collect();
-        Ok(changed
-            .into_iter()
-            .filter_map(|file| {
-                let in_pr = full_lines.get(&file.path)?;
-                let new_lines = commentable_lines(file.patch.as_deref().unwrap_or(""));
-                let allowed = new_lines.intersection(in_pr).copied().collect();
-                Some(Target { file, allowed })
-            })
-            .collect())
-    }
-
-    /// Hasil pengambilan data dari provider git; error dipetakan oleh `fetch_error`.
-    async fn fetch<T>(
-        &self,
-        conn: &Connection,
-        result: Result<T, GitError>,
-    ) -> Result<T, EngineError> {
-        match result {
-            Ok(value) => Ok(value),
-            Err(err) => Err(self.fetch_error(conn, err).await),
-        }
-    }
-
     /// Saat mengambil data, semua error selain token ditolak dianggap sementara.
     async fn fetch_error(&self, conn: &Connection, err: GitError) -> EngineError {
         match err {
@@ -358,6 +320,37 @@ impl Engine {
             conn.name
         ))
     }
+}
+
+/// Review penuh: semua baris `+` di patch PR boleh dikomentari.
+fn full_targets(full: Vec<FileDiff>) -> Vec<Target> {
+    full.into_iter()
+        .map(|file| {
+            let allowed = commentable_lines(file.patch.as_deref().unwrap_or(""));
+            Target { file, allowed }
+        })
+        .collect()
+}
+
+/// File dari commit baru yang masih ada di diff PR penuh. Baris yang boleh dikomentari harus
+/// baru di commit ini DAN masih berubah di PR (supaya posisinya valid untuk provider).
+fn incremental_targets(changed: Vec<FileDiff>, full: Vec<FileDiff>) -> Vec<Target> {
+    let full_lines: HashMap<String, BTreeSet<u32>> = full
+        .into_iter()
+        .map(|file| {
+            let lines = commentable_lines(file.patch.as_deref().unwrap_or(""));
+            (file.path, lines)
+        })
+        .collect();
+    changed
+        .into_iter()
+        .filter_map(|file| {
+            let in_pr = full_lines.get(&file.path)?;
+            let new_lines = commentable_lines(file.patch.as_deref().unwrap_or(""));
+            let allowed = new_lines.intersection(in_pr).copied().collect();
+            Some(Target { file, allowed })
+        })
+        .collect()
 }
 
 fn db_error(err: sqlx::Error) -> EngineError {

@@ -37,8 +37,14 @@ async fn set_limits(pool: &PgPool, max_files: i32, max_lines: i32) {
     settings::update(pool, &current).await.unwrap();
 }
 
+/// Review PR 7 di repo hasil `setup`; repo itu ada, jadi selalu ada baris review.
 async fn run(s: &Setup, trigger: Trigger) -> Result<Uuid, EngineError> {
-    s.engine.review_pr(s.repository_id, 7, trigger).await
+    let result = s.engine.review_pr(s.repository_id, 7, trigger).await;
+    result.map(|id| id.expect("review row"))
+}
+
+async fn latest(pool: &PgPool) -> Review {
+    reviews::list(pool, None, 1, 1).await.unwrap().remove(0)
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -160,7 +166,7 @@ async fn disabled_or_missing_repo_is_skipped(pool: PgPool) {
         .engine
         .review_pr(Uuid::new_v4(), 7, Trigger::Command)
         .await;
-    assert_eq!(missing, Ok(Uuid::nil()));
+    assert_eq!(missing, Ok(None));
     assert!(s.git.state().created.is_empty());
 }
 
@@ -409,6 +415,9 @@ async fn post_error_retryable_on_github_fatal_on_azure(pool: PgPool) {
         run(&s, Trigger::Opened).await,
         Err(EngineError::Retryable(_, None))
     ));
+    let row = latest(&pool).await;
+    assert_eq!(row.status, ReviewStatus::Failed);
+    assert!(row.error.unwrap().contains("posting the review failed"));
 
     sqlx::query("UPDATE connections SET kind = 'azure_devops'")
         .execute(&pool)
@@ -430,4 +439,91 @@ async fn usage_context_carries_review_id(pool: PgPool) {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].ctx.review_id, Some(id));
     assert_eq!(calls[0].ctx.repository_id, Some(s.repository_id));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_model_comment_unauthorized_marks_connection_invalid(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    let mut current = settings::get(&pool).await.unwrap();
+    current.default_provider_id = None;
+    settings::update(&pool, &current).await.unwrap();
+    s.git.state().comment_error = Some(GitError::Unauthorized);
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert_eq!(
+        err,
+        EngineError::Fatal("no review model configured".to_string())
+    );
+    let conn = connections::get(&pool, s.connection_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conn.status, ConnectionStatus::Invalid);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn missing_previous_head_falls_back_to_full_review(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    run(&s, Trigger::Opened).await.unwrap();
+    {
+        let mut git = s.git.state();
+        git.pr = pr("h2"); // force-push: h1 sudah tidak ada di provider
+        git.full = vec![file("a.rs", PATCH_234)];
+        git.diff_between_error = Some(GitError::NotFound);
+    }
+    s.chat.push(Ok(&finding("a.rs", 2, "Full again")));
+
+    let id = run(&s, Trigger::Updated).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    let git = s.git.state();
+    assert_eq!(git.diff_between_calls.len(), 1);
+    let comments = &git.reviews[1].comments;
+    assert_eq!(comments.len(), 1);
+    assert_eq!(
+        comments[0].line, 2,
+        "line 2 is only commentable in the full diff"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn fetch_error_after_get_pr_is_retryable_and_fails_row(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.git.state().pr_diff_error = Some(GitError::Http("503".into()));
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert!(matches!(err, EngineError::Retryable(_, None)));
+    let row = latest(&pool).await;
+    assert_eq!(row.status, ReviewStatus::Failed);
+    assert_eq!(row.head_sha.as_deref(), Some("h1"));
+    assert!(row.error.is_some());
+    assert!(s.git.state().reviews.is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn nothing_to_review_posts_nothing(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    run(&s, Trigger::Opened).await.unwrap();
+    {
+        let mut git = s.git.state();
+        git.pr = pr("h2");
+        // Commit baru hanya menghapus baris.
+        git.incremental = vec![file(
+            "a.rs",
+            "@@ -1,2 +1,1 @@
+ a
+-b
+",
+        )];
+    }
+
+    let id = run(&s, Trigger::Updated).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Skipped);
+    assert_eq!(row.skip_reason.as_deref(), Some("nothing_to_review"));
+    assert_eq!(s.git.state().reviews.len(), 1, "only the first review");
+    assert_eq!(s.chat.calls().len(), 1);
 }
