@@ -17,6 +17,7 @@
 	import * as Table from '#lib/components/ui/table/index.js';
 	import * as Tabs from '#lib/components/ui/tabs/index.js';
 	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
+	import { safeHttpUrl } from '#lib/utils.js';
 
 	type Repo = { id: string; owner: string; name: string };
 
@@ -33,6 +34,7 @@
 	let rules = $state<Rule[]>([]);
 	let memories = $state<Memory[]>([]);
 	let loaded = $state(false);
+	let loadError = $state(false);
 	// Ids (rule, memory) with a request in flight; their controls are disabled.
 	const busy = new SvelteSet<string>();
 
@@ -57,6 +59,7 @@
 	let seq = 0;
 	async function load() {
 		const mine = ++seq;
+		loadError = false;
 		const q = repositoryId ? `?repository_id=${repositoryId}` : '';
 		try {
 			const [r, m] = await Promise.all([
@@ -67,7 +70,10 @@
 			rules = r;
 			memories = m;
 		} catch (e) {
-			if (mine === seq) fail(e);
+			if (mine === seq) {
+				loadError = true;
+				fail(e);
+			}
 		}
 		if (mine === seq) loaded = true;
 	}
@@ -125,6 +131,15 @@
 	</Select.Root>
 </div>
 
+{#snippet loadFailed()}
+	<div
+		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
+	>
+		Could not load this scope.
+		<Button variant="outline" size="sm" class="ml-2" onclick={load}>Retry</Button>
+	</div>
+{/snippet}
+
 <Tabs.Root value="rules">
 	<Tabs.List>
 		<Tabs.Trigger value="rules">Rules</Tabs.Trigger>
@@ -142,7 +157,9 @@
 				Add rule
 			</Button>
 		</div>
-		{#if loaded && rules.length === 0}
+		{#if loadError}
+			{@render loadFailed()}
+		{:else if loaded && rules.length === 0}
 			<div
 				class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 			>
@@ -220,7 +237,9 @@
 				Add memory
 			</Button>
 		</div>
-		{#if loaded && memories.length === 0}
+		{#if loadError}
+			{@render loadFailed()}
+		{:else if loaded && memories.length === 0}
 			<div
 				class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 			>
@@ -244,7 +263,7 @@
 							<Table.Cell class="max-w-md whitespace-normal">
 								{#if m.content.length > MEMORY_PREVIEW}
 									<Tooltip.Root>
-										<Tooltip.Trigger class="text-left">
+										<Tooltip.Trigger class="text-left" title={m.content}>
 											{m.content.slice(0, MEMORY_PREVIEW)}…
 										</Tooltip.Trigger>
 										<Tooltip.Content class="max-w-sm whitespace-pre-wrap">
@@ -257,9 +276,9 @@
 							</Table.Cell>
 							<Table.Cell>
 								<Badge variant="secondary">{m.source === 'manual' ? 'manual' : 'PR comment'}</Badge>
-								{#if m.source_url}
+								{#if safeHttpUrl(m.source_url)}
 									<a
-										href={m.source_url}
+										href={safeHttpUrl(m.source_url)}
 										target="_blank"
 										rel="noopener noreferrer"
 										class="ml-1 text-sm text-primary underline-offset-4 hover:underline"
