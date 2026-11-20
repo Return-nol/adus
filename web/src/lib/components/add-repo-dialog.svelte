@@ -4,11 +4,13 @@
 	import type { Connection } from '#lib/components/connection-dialog.svelte';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Dialog from '#lib/components/ui/dialog/index.js';
+	import { Input } from '#lib/components/ui/input/index.js';
 
 	type RemoteRepo = {
 		ref: { external_id: string; owner: string; project: string | null; name: string };
 		default_branch: string | null;
 		added: boolean;
+		display_name: string;
 	};
 
 	let {
@@ -22,7 +24,14 @@
 	let loading = $state(false);
 	let busy = $state(false);
 	let loadError = $state('');
+	let query = $state('');
 	let failures = $state<string[]>([]);
+
+	// Only the view is filtered; `picked` keeps checked repos that scroll out of the results.
+	const sorted = $derived([...remote].sort((a, b) => a.display_name.localeCompare(b.display_name)));
+	const shown = $derived(
+		sorted.filter((r) => r.display_name.toLowerCase().includes(query.trim().toLowerCase()))
+	);
 
 	async function loadRemote() {
 		if (!connection) return;
@@ -42,6 +51,7 @@
 		if (!open) return;
 		picked = [];
 		failures = [];
+		query = '';
 		loadRemote();
 	});
 
@@ -58,7 +68,7 @@
 				added++;
 			} catch (e) {
 				const why = e instanceof ApiError ? e.message : 'Could not reach the server';
-				failures.push(`${repo?.ref.name ?? id}: ${why}`);
+				failures.push(`${repo?.display_name ?? id}: ${why}`);
 			}
 		}
 		busy = false;
@@ -83,8 +93,12 @@
 		{:else if loadError}
 			<p class="text-sm text-destructive" role="alert">{loadError}</p>
 		{:else}
+			<Input type="search" placeholder="Search repositories" bind:value={query} />
+			<p class="text-sm text-muted-foreground">
+				{shown.length} of {remote.length} repositories
+			</p>
 			<ul class="max-h-72 space-y-2 overflow-y-auto">
-				{#each remote as repo (repo.ref.external_id)}
+				{#each shown as repo (repo.ref.external_id)}
 					<li>
 						<label class="flex items-center gap-2 text-sm">
 							<input
@@ -95,12 +109,14 @@
 								bind:group={picked}
 							/>
 							<span class={repo.added ? 'text-muted-foreground' : ''}>
-								{repo.ref.owner}/{repo.ref.name}{repo.added ? ' (added)' : ''}
+								{repo.display_name}{repo.added ? ' (added)' : ''}
 							</span>
 						</label>
 					</li>
 				{:else}
-					<li class="text-sm text-muted-foreground">No repositories visible to this token.</li>
+					<li class="text-sm text-muted-foreground">
+						{remote.length ? 'No repositories match' : 'No repositories visible to this token.'}
+					</li>
 				{/each}
 			</ul>
 		{/if}

@@ -18,7 +18,7 @@
 	type Repo = {
 		id: string;
 		connection_id: string;
-		owner: string;
+		display_name: string;
 		name: string;
 		enabled: boolean;
 		auto_review: boolean;
@@ -62,7 +62,7 @@
 		if (errors.length === 0) return;
 		const lines = errors.map((w) => {
 			const repo = repos.find((r) => r.id === w.repository_id);
-			return `${repo ? `${repo.owner}/${repo.name}` : w.repository_id}: ${w.message}`;
+			return `${repo ? repo.display_name : w.repository_id}: ${w.message}`;
 		});
 		toast.warning('Some webhooks could not be synced', { description: lines.join('\n') });
 	}
@@ -201,17 +201,17 @@
 					<Table.Body>
 						{#each connRepos as repo (repo.id)}
 							<Table.Row>
-								<Table.Cell>{repo.owner}/{repo.name}</Table.Cell>
+								<Table.Cell>{repo.display_name}</Table.Cell>
 								<Table.Cell>
 									<Switch
-										aria-label={`Enabled: ${repo.name}`}
+										aria-label={`Enabled: ${repo.display_name}`}
 										disabled={!isAdmin}
 										bind:checked={() => repo.enabled, (v) => patchRepo(repo, { enabled: v })}
 									/>
 								</Table.Cell>
 								<Table.Cell>
 									<Switch
-										aria-label={`Auto review: ${repo.name}`}
+										aria-label={`Auto review: ${repo.display_name}`}
 										disabled={!isAdmin}
 										bind:checked={
 											() => repo.auto_review, (v) => patchRepo(repo, { auto_review: v })
@@ -228,7 +228,7 @@
 											size="sm"
 											onclick={() =>
 												askDelete(
-													`Remove ${repo.owner}/${repo.name}?`,
+													`Remove ${repo.display_name}?`,
 													'Its webhooks are deleted from the provider.',
 													`/repositories/${repo.id}`
 												)}

@@ -19,7 +19,7 @@
 	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
 	import { safeHttpUrl } from '#lib/utils.js';
 
-	type Repo = { id: string; owner: string; name: string };
+	type Repo = { id: string; display_name: string };
 
 	const GLOBAL = 'global';
 	const MEMORY_PREVIEW = 120;
@@ -48,7 +48,7 @@
 	const repositoryId = $derived(scope === GLOBAL ? null : scope);
 	const scopeLabel = $derived.by(() => {
 		const r = repos.find((r) => r.id === scope);
-		return r ? `${r.owner}/${r.name}` : 'Global';
+		return r ? r.display_name : 'Global';
 	});
 
 	function fail(e: unknown) {
@@ -125,7 +125,7 @@
 		<Select.Content>
 			<Select.Item value={GLOBAL} label="Global">Global</Select.Item>
 			{#each repos as r (r.id)}
-				<Select.Item value={r.id} label={`${r.owner}/${r.name}`}>{r.owner}/{r.name}</Select.Item>
+				<Select.Item value={r.id} label={r.display_name}>{r.display_name}</Select.Item>
 			{/each}
 		</Select.Content>
 	</Select.Root>
