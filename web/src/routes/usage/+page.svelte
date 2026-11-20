@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { toast } from 'svelte-sonner';
 	import { BarChart } from 'layerchart';
-	import { DateFormatter, today } from '@internationalized/date';
+	import { DateFormatter, endOfMonth, startOfMonth, today } from '@internationalized/date';
 	import type { DateRange } from 'bits-ui';
 	import RiCalendarLine from 'remixicon-svelte/icons/calendar-line';
 	import { api, ApiError } from '#lib/api.js';
@@ -29,9 +29,9 @@
 		calls: number;
 	};
 
-	// The server counts days in UTC, so the default range is too: last 30 days ending today.
-	const defaultEnd = today('UTC');
-	const defaultStart = defaultEnd.subtract({ days: 29 });
+	const now = today('UTC');
+	const defaultStart = startOfMonth(now);
+	const defaultEnd = endOfMonth(now);
 	const df = new DateFormatter('en-US', { dateStyle: 'medium', timeZone: 'UTC' });
 
 	let range = $state<DateRange | undefined>({
