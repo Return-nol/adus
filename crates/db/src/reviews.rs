@@ -1,4 +1,4 @@
-use adus_core::job::Trigger;
+use adus_core::{job::Trigger, types::ConnectionKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -128,11 +128,81 @@ pub async fn list(
     .await
 }
 
+/// Satu baris riwayat untuk dashboard: review + repo (juga yang soft-deleted) + total token.
+#[derive(Debug, Clone, FromRow)]
+pub struct HistoryRow {
+    pub id: Uuid,
+    pub repository_id: Uuid,
+    pub repo_owner: String,
+    /// Azure: GUID project. GitHub: NULL.
+    pub repo_project: Option<String>,
+    pub repo_name: String,
+    pub connection_kind: ConnectionKind,
+    pub pr_number: i64,
+    pub trigger: Trigger,
+    pub status: ReviewStatus,
+    pub error: Option<String>,
+    pub skip_reason: Option<String>,
+    pub head_sha: Option<String>,
+    pub comments_posted: i32,
+    /// SUM `llm_usage` milik review ini; 0 jika tidak ada panggilan.
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Filter `history`; `None` = semua.
+pub struct HistoryFilter {
+    pub repository_id: Option<Uuid>,
+    pub status: Option<ReviewStatus>,
+}
+
+const HISTORY_WHERE: &str = "WHERE ($1::uuid IS NULL OR r.repository_id = $1) AND ($2::review_status IS NULL OR r.status = $2)";
+
+/// Satu halaman riwayat (yang mulai terakhir dulu, belum mulai di akhir) dan jumlah total baris.
+/// `page` mulai dari 1. Token dijumlah dalam satu query (lateral subquery), bukan per baris.
+pub async fn history(
+    pool: &PgPool,
+    filter: &HistoryFilter,
+    page: i64,
+    per_page: i64,
+) -> Result<(Vec<HistoryRow>, i64)> {
+    let rows = sqlx::query_as(&format!(
+        "SELECT r.id, r.repository_id, p.owner AS repo_owner, p.project AS repo_project, \
+         p.name AS repo_name, c.kind AS connection_kind, r.pr_number, r.trigger, r.status, \
+         r.error, r.skip_reason, r.head_sha, r.comments_posted, \
+         COALESCE(u.input_tokens, 0) AS input_tokens, COALESCE(u.output_tokens, 0) AS output_tokens, \
+         r.started_at, r.finished_at \
+         FROM reviews r \
+         JOIN repositories p ON p.id = r.repository_id \
+         JOIN connections c ON c.id = p.connection_id \
+         LEFT JOIN LATERAL ( \
+             SELECT SUM(input_tokens)::bigint AS input_tokens, \
+                    SUM(output_tokens)::bigint AS output_tokens \
+             FROM llm_usage WHERE review_id = r.id \
+         ) u ON true \
+         {HISTORY_WHERE} \
+         ORDER BY r.started_at DESC NULLS LAST, r.id DESC LIMIT $3 OFFSET $4"
+    ))
+    .bind(filter.repository_id)
+    .bind(filter.status)
+    .bind(per_page)
+    .bind((page.max(1) - 1) * per_page)
+    .fetch_all(pool)
+    .await?;
+    let total = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM reviews r {HISTORY_WHERE}"))
+        .bind(filter.repository_id)
+        .bind(filter.status)
+        .fetch_one(pool)
+        .await?;
+    Ok((rows, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{connections, repositories};
-    use adus_core::types::ConnectionKind;
 
     async fn repo(pool: &PgPool, external_id: &str) -> Uuid {
         let conn =

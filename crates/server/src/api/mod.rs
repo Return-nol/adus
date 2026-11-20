@@ -2,6 +2,7 @@ pub mod ai;
 pub mod connections;
 pub mod memories;
 pub mod repositories;
+pub mod reviews;
 pub mod rules;
 pub mod settings;
 pub mod usage;
@@ -22,4 +23,5 @@ pub fn routes() -> Router<AppState> {
         .merge(repositories::routes())
         .merge(rules::routes())
         .merge(memories::routes())
+        .merge(reviews::routes())
 }
