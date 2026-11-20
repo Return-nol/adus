@@ -17,17 +17,17 @@
 	// Semantic tokens only: ok = primary, degraded = outlined primary, not running = destructive.
 	const verdictMeta: Record<Verdict, { label: string; hint: string; class: string }> = {
 		ok: {
-			label: 'OK',
+			label: 'Reviews: OK',
 			hint: 'Everything needed to review pull requests is working.',
 			class: 'border-transparent bg-primary text-primary-foreground'
 		},
 		degraded: {
-			label: 'Service Degraded',
+			label: 'Reviews: Degraded',
 			hint: 'Reviews run, but some repositories or connections have a problem.',
 			class: 'border-primary bg-secondary text-foreground'
 		},
 		not_running: {
-			label: 'Issues Found',
+			label: 'Reviews: Not running',
 			hint: 'No review can run until the failed checks below are fixed.',
 			class: 'border-transparent bg-destructive/10 text-destructive dark:bg-destructive/15'
 		}
