@@ -338,7 +338,14 @@
 		</AlertDialog.Header>
 		<AlertDialog.Footer>
 			<AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
-			<AlertDialog.Action onclick={() => confirm?.run()}>Delete</AlertDialog.Action>
+			<AlertDialog.Action
+				onclick={() => {
+					confirmOpen = false;
+					confirm?.run();
+				}}
+			>
+				Delete
+			</AlertDialog.Action>
 		</AlertDialog.Footer>
 	</AlertDialog.Content>
 </AlertDialog.Root>
