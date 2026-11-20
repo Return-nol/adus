@@ -2,6 +2,7 @@
 # One-command installer for Adus: creates .env, generates secrets, starts the stack.
 # Safe to run again: values already in .env are never overwritten.
 set -euo pipefail
+umask 077 # .env holds secrets: files this script writes are private to the owner
 
 cd "$(dirname "$0")/.."
 
@@ -10,23 +11,33 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # Print the value of KEY from .env (empty if missing).
 get() { grep -m1 "^$1=" .env | cut -d= -f2- | tr -d '\r' || true; }
 
-# Set KEY=VALUE in .env, replacing the existing line for KEY.
+# Set KEY=VALUE in .env: replace the line for KEY, or append it if there is none.
 set_var() {
   K="$1" V="$2" awk 'BEGIN { k = ENVIRON["K"] "="; v = ENVIRON["V"] }
-    index($0, k) == 1 { print k v; next } { print }' .env > .env.tmp && mv .env.tmp .env
+    index($0, k) == 1 { print k v; found = 1; next } { print }
+    END { if (!found) print k v }' .env > .env.tmp && mv .env.tmp .env
 }
 
 # 1. Docker
 docker info >/dev/null 2>&1 \
   || die "Docker is not installed or not running. Install it from https://docs.docker.com/get-docker/ and start it."
-docker compose version >/dev/null 2>&1 \
+compose_version=$(docker compose version --short 2>/dev/null) \
   || die "Docker Compose v2 is missing. See https://docs.docker.com/compose/install/"
+compose_version=${compose_version#v}
+compose_major=${compose_version%%.*}
+compose_minor=${compose_version#*.}
+compose_minor=${compose_minor%%.*}
+if [ "$compose_major" -lt 2 ] || { [ "$compose_major" -eq 2 ] && [ "$compose_minor" -lt 20 ]; }; then
+  die "Docker Compose 2.20 or newer is required (found $compose_version). See https://docs.docker.com/compose/install/"
+fi
+command -v curl >/dev/null 2>&1 || die "curl is required (used to wait for Adus to become healthy). Please install it."
 
 # 2. .env
 if [ ! -f .env ]; then
   cp .env.example .env
   echo "Created .env from .env.example"
 fi
+chmod 600 .env
 
 # 3. Secrets (only when empty)
 gen_secret() {
@@ -73,7 +84,7 @@ fi
 echo "$check" | grep '^WARN' || true
 
 # 6. Start
-docker compose pull || echo "(pull failed; using a locally built image)"
+docker compose pull || echo "Could not pull some images; continuing with local images / build"
 docker compose up -d
 
 # 7. Wait for /healthz

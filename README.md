@@ -6,7 +6,7 @@ One installation is one organization. It runs as three containers: `adus` (a sin
 
 ## Quick start
 
-You need Docker with Compose v2. Then, from a clone of this repository:
+You need Docker with Compose 2.20 or newer (and `curl` on Linux/macOS). Then, from a clone of this repository:
 
 ```sh
 ./scripts/install.sh        # Linux, macOS, Git Bash
@@ -59,6 +59,8 @@ GitHub and Azure DevOps must be able to reach `ADUS_PUBLIC_URL` to deliver webho
   and run `docker compose up -d`. Caddy gets and renews the certificate automatically.
 - **Local testing:** run a tunnel, for example `cloudflared tunnel --url http://localhost:8080`, put the printed `https://...` address in `ADUS_PUBLIC_URL`, and run `docker compose up -d`.
 - **Another reverse proxy:** forward to `localhost:${ADUS_PORT}` and set `ADUS_PUBLIC_URL` to the public address.
+
+With the `https` profile, `ADUS_PORT` is still published on all interfaces, so Adus stays reachable over plain HTTP. When Caddy is in front, bind it to localhost with a `docker-compose.override.yml` (`services: adus: ports: !override ["127.0.0.1:8080:8080"]`) or block the port with a firewall.
 
 After changing `ADUS_PUBLIC_URL`, open the connection in the dashboard and use "Resync webhooks".
 

@@ -20,14 +20,22 @@ function Get-EnvValue($key) {
 
 # Set KEY=VALUE in .env, replacing the existing line for KEY. UTF-8 without BOM, LF endings.
 function Set-EnvValue($key, $value) {
-    $lines = Get-Content .env | ForEach-Object { if ($_.StartsWith("$key=")) { "$key=$value" } else { $_ } }
+    $found = $false
+    $lines = @(Get-Content .env | ForEach-Object {
+        if ($_.StartsWith("$key=")) { $found = $true; "$key=$value" } else { $_ }
+    })
+    if (-not $found) { $lines += "$key=$value" }
     [IO.File]::WriteAllText("$PWD/.env", (($lines -join "`n") + "`n"))
 }
 
 # Run `adus <args>` in a throwaway container; returns the output lines (stdout only).
 function Invoke-Adus($adusArgs) {
-    $lines = docker compose run --rm --no-deps -T adus @adusArgs 2>$null
-    if ($LASTEXITCODE -ne 0) { Fail "could not run 'adus $adusArgs'" }
+    $lines = docker compose run --rm --no-deps -T adus @adusArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $lines | ForEach-Object { [Console]::Error.WriteLine($_) }
+        Fail "could not run 'adus $adusArgs'"
+    }
+    $lines = $lines | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }
     return ($lines | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1)
 }
 
@@ -36,8 +44,11 @@ docker info *> $null
 if ($LASTEXITCODE -ne 0) {
     Fail 'Docker is not installed or not running. Install it from https://docs.docker.com/get-docker/ and start it.'
 }
-docker compose version *> $null
+$composeVersion = docker compose version --short 2>$null
 if ($LASTEXITCODE -ne 0) { Fail 'Docker Compose v2 is missing. See https://docs.docker.com/compose/install/' }
+if ([version]($composeVersion -replace '^v', '' -replace '[-+].*$', '') -lt [version]'2.20') {
+    Fail "Docker Compose 2.20 or newer is required (found $composeVersion). See https://docs.docker.com/compose/install/"
+}
 
 # 2. .env
 if (-not (Test-Path .env)) {
@@ -85,7 +96,7 @@ $check | Where-Object { "$_" -like 'WARN*' } | ForEach-Object { Write-Host $_ }
 
 # 6. Start
 docker compose pull
-if ($LASTEXITCODE -ne 0) { Write-Host '(pull failed; using a locally built image)' }
+if ($LASTEXITCODE -ne 0) { Write-Host 'Could not pull some images; continuing with local images / build' }
 docker compose up -d
 if ($LASTEXITCODE -ne 0) { Fail 'docker compose up failed' }
 
