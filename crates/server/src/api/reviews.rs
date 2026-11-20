@@ -65,7 +65,7 @@ impl From<HistoryRow> for ReviewJson {
             pr_url: pr_url(&r),
             repository: RepoSummary {
                 id: r.repository_id,
-                name: format!("{}/{}", r.repo_owner, r.repo_name),
+                name: r.repo_display_name,
                 kind: r.connection_kind,
             },
             id: r.id,

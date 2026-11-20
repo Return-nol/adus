@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::Result;
+use crate::{Result, repositories};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "review_status", rename_all = "snake_case")]
@@ -179,6 +179,8 @@ pub struct HistoryRow {
     /// Azure: GUID project. GitHub: NULL.
     pub repo_project: Option<String>,
     pub repo_name: String,
+    /// Label untuk pengguna (`repositories::display_name_sql`): Azure `project/repo`.
+    pub repo_display_name: String,
     pub connection_kind: ConnectionKind,
     pub pr_number: i64,
     pub trigger: Trigger,
@@ -213,7 +215,8 @@ pub async fn history(
 ) -> Result<(Vec<HistoryRow>, i64)> {
     let rows = sqlx::query_as(&format!(
         "SELECT r.id, r.repository_id, p.owner AS repo_owner, p.project AS repo_project, \
-         p.name AS repo_name, c.kind AS connection_kind, r.pr_number, r.trigger, r.status, \
+         p.name AS repo_name, {display_name} AS repo_display_name, c.kind AS connection_kind, \
+         r.pr_number, r.trigger, r.status, \
          r.error, r.skip_reason, r.head_sha, r.comments_posted, \
          COALESCE(u.input_tokens, 0) AS input_tokens, COALESCE(u.output_tokens, 0) AS output_tokens, \
          r.started_at, r.finished_at \
@@ -226,7 +229,8 @@ pub async fn history(
              FROM llm_usage WHERE review_id = r.id \
          ) u ON true \
          {HISTORY_WHERE} \
-         ORDER BY COALESCE(r.started_at, r.created_at) DESC, r.id DESC LIMIT $3 OFFSET $4"
+         ORDER BY COALESCE(r.started_at, r.created_at) DESC, r.id DESC LIMIT $3 OFFSET $4",
+        display_name = repositories::display_name_sql("p"),
     ))
     .bind(filter.repository_id)
     .bind(filter.status)
@@ -259,6 +263,7 @@ mod tests {
                 external_id,
                 owner: "acme",
                 project: None,
+                project_name: None,
                 name: "api",
                 default_branch: None,
                 webhook_token: "t",

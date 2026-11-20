@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::Result;
+use crate::{Result, repositories};
 
 /// Satu baris per percobaan panggilan LLM (sukses maupun gagal).
 pub struct NewUsage<'a> {
@@ -107,20 +107,23 @@ pub async fn breakdown(
     let (id, label, join) = match by {
         BreakdownBy::Repository => (
             "u.repository_id",
-            "COALESCE(r.owner || '/' || r.name, '(deleted)')",
+            format!(
+                "COALESCE({}, '(deleted)')",
+                repositories::display_name_sql("r")
+            ),
             "LEFT JOIN repositories r ON r.id = u.repository_id",
         ),
         BreakdownBy::Provider => (
             "u.provider_id",
-            "COALESCE(p.name, '(deleted)')",
+            "COALESCE(p.name, '(deleted)')".to_string(),
             "LEFT JOIN ai_providers p ON p.id = u.provider_id",
         ),
         BreakdownBy::Key => (
             "u.key_id",
-            "COALESCE(k.label, '(deleted)')",
+            "COALESCE(k.label, '(deleted)')".to_string(),
             "LEFT JOIN ai_keys k ON k.id = u.key_id",
         ),
-        BreakdownBy::Model => ("NULL::uuid", "u.model", ""),
+        BreakdownBy::Model => ("NULL::uuid", "u.model".to_string(), ""),
     };
     sqlx::query_as(&format!(
         "SELECT {id} AS id, {label} AS label, \

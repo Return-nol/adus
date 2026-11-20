@@ -306,6 +306,7 @@ async fn delete_provider_in_use_409(pool: PgPool) {
                 name: "api".into(),
             },
             default_branch: Some("main".into()),
+            project_name: None,
         }]
     });
     let by_settings = openai_provider(&app, &admin).await;

@@ -222,6 +222,7 @@ async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool)
         external_id: "42",
         owner: "acme",
         project: None,
+        project_name: None,
         name: "api",
         default_branch: Some("main"),
         webhook_token: "t",

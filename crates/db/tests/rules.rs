@@ -70,6 +70,7 @@ async fn add_repo(pool: &PgPool, external_id: &str) -> Uuid {
             external_id,
             owner: "acme",
             project: None,
+            project_name: None,
             name: external_id,
             default_branch: None,
             webhook_token: "t",

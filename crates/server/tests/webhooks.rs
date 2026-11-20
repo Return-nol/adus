@@ -61,6 +61,7 @@ async fn setup(pool: PgPool, kind: ConnectionKind) -> Hook {
             external_id: "4bc14d40-c903-45e2-872e-0462c7748079",
             owner: "org",
             project: None,
+            project_name: None,
             name: "Hello-World",
             default_branch: None,
             webhook_token: TOKEN,

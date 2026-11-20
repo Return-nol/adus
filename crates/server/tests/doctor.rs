@@ -80,6 +80,7 @@ async fn healthy_world(pool: PgPool) -> World {
             external_id: "r1",
             owner: "acme",
             project: None,
+            project_name: None,
             name: "api",
             default_branch: None,
             webhook_token: "wh",

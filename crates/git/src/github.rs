@@ -271,6 +271,7 @@ impl GitProvider for GithubProvider {
                     name: r.name,
                 },
                 default_branch: r.default_branch,
+                project_name: None,
             })
             .collect())
     }

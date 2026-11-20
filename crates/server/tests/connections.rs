@@ -31,6 +31,7 @@ fn github_repo(id: &str, name: &str) -> RemoteRepo {
             name: name.into(),
         },
         default_branch: Some("main".into()),
+        project_name: None,
     }
 }
 
@@ -309,6 +310,7 @@ async fn azure_repo_webhook_url_carries_token(pool: PgPool) {
                 name: "svc".into(),
             },
             default_branch: None,
+            project_name: None,
         }]
     });
     let body =
@@ -522,4 +524,108 @@ async fn user_role_cannot_create_connection_403(pool: PgPool) {
     assert_eq!(added.status, StatusCode::FORBIDDEN);
     let unauth = send(&app, get("/api/v1/connections", None)).await;
     assert_eq!(unauth.status, StatusCode::UNAUTHORIZED);
+}
+
+fn azure_repo(project_name: &str) -> RemoteRepo {
+    RemoteRepo {
+        r#ref: RepoRef {
+            external_id: "repo-guid".into(),
+            owner: "ovalteam".into(),
+            project: Some("project-guid".into()),
+            name: "api".into(),
+        },
+        default_branch: None,
+        project_name: Some(project_name.into()),
+    }
+}
+
+/// Azure connection plus a repo row that predates `project_name` (NULL).
+async fn legacy_azure_repo(
+    pool: &PgPool,
+    app: &Router,
+    admin: &str,
+    git: &FakeGitFactory,
+) -> String {
+    git.with(|s| s.repos = vec![azure_repo("myvalue")]);
+    let body = json!({
+        "kind": "azure_devops", "name": "Az", "org_or_owner": "ovalteam", "token": PAT
+    });
+    let conn = send(app, post_json("/api/v1/connections", &body, Some(admin))).await;
+    let conn = conn.body["id"].as_str().unwrap().to_string();
+    let reply = add_repo(app, admin, &conn, "repo-guid").await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    assert_eq!(reply.body["display_name"], "myvalue/api");
+    sqlx::query("UPDATE repositories SET project_name = NULL")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let list = send(app, get("/api/v1/repositories", Some(admin))).await;
+    assert_eq!(list.body[0]["display_name"], "ovalteam/api");
+    conn
+}
+
+async fn assert_backfilled(pool: &PgPool, app: &Router, admin: &str) {
+    let name: Option<String> = sqlx::query_scalar("SELECT project_name FROM repositories")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(name.as_deref(), Some("myvalue"));
+    let list = send(app, get("/api/v1/repositories", Some(admin))).await;
+    assert_eq!(list.body[0]["project_name"], "myvalue");
+    assert_eq!(list.body[0]["display_name"], "myvalue/api");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn remote_repos_backfills_project_name(pool: PgPool) {
+    let (app, git, admin) = setup(pool.clone()).await;
+    let conn = legacy_azure_repo(&pool, &app, &admin, &git).await;
+
+    let remote = send(
+        &app,
+        get(
+            &format!("/api/v1/connections/{conn}/remote-repos"),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(remote.status, StatusCode::OK);
+    assert_eq!(remote.body[0]["display_name"], "myvalue/api");
+    assert_backfilled(&pool, &app, &admin).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn resync_backfills_project_name(pool: PgPool) {
+    let (app, git, admin) = setup(pool.clone()).await;
+    let conn = legacy_azure_repo(&pool, &app, &admin, &git).await;
+
+    let reply = send(
+        &app,
+        post_empty(
+            &format!("/api/v1/connections/{conn}/resync-webhooks"),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["synced"], 1);
+    assert_backfilled(&pool, &app, &admin).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn github_display_name_is_owner_name(pool: PgPool) {
+    let (app, _git, admin) = setup(pool).await;
+    let conn = connection_with_token(&app, &admin).await;
+    let remote = send(
+        &app,
+        get(
+            &format!("/api/v1/connections/{conn}/remote-repos"),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(remote.body[0]["display_name"], "acme/api");
+    let added = add_repo(&app, &admin, &conn, "1").await;
+    assert_eq!(added.body["display_name"], "acme/api");
+    assert_eq!(added.body["project_name"], Value::Null);
 }

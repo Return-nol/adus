@@ -295,6 +295,7 @@ struct AzRepo {
 #[derive(Deserialize)]
 struct AzProject {
     id: String,
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -425,6 +426,7 @@ impl GitProvider for AzureProvider {
             .value
             .into_iter()
             .map(|r| RemoteRepo {
+                project_name: Some(r.project.name),
                 r#ref: RepoRef {
                     external_id: r.id,
                     owner: self.organization.clone(),

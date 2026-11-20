@@ -314,6 +314,7 @@ pub async fn setup(pool: &PgPool, git: FakeGit) -> Setup {
         external_id: "42",
         owner: "acme",
         project: None,
+        project_name: None,
         name: "api",
         default_branch: Some("main"),
         webhook_token: "t",

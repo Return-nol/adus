@@ -48,6 +48,7 @@ async fn add_repo(
             external_id: name,
             owner,
             project,
+            project_name: None,
             name,
             default_branch: None,
             webhook_token: "t",
@@ -259,6 +260,39 @@ async fn azure_repo_name_with_space_is_percent_encoded(pool: PgPool) {
     assert_eq!(
         item["pr_url"],
         format!("https://dev.azure.com/fabrikam/{guid}/_git/My%20Repo/pullrequest/7")
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn azure_review_label_uses_project_name_with_org_fallback(pool: PgPool) {
+    let app = app(pool.clone()).await;
+    let admin = setup_admin(&app).await;
+    let guid = "6ce954b1-ce1f-45d1-b94d-e6bf2464ba2c";
+    let repo = add_repo(
+        &pool,
+        ConnectionKind::AzureDevops,
+        "ovalteam",
+        Some(guid),
+        "api",
+    )
+    .await;
+    add_review(&pool, repo, 1, "done", Some("2026-01-01T10:00:00Z")).await;
+
+    let reply = send(&app, get("/api/v1/reviews", Some(&admin))).await;
+    assert_eq!(reply.body["items"][0]["repository"]["name"], "ovalteam/api");
+
+    sqlx::query("UPDATE repositories SET project_name = 'myvalue' WHERE id = $1")
+        .bind(repo)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reply = send(&app, get("/api/v1/reviews", Some(&admin))).await;
+    let item = &reply.body["items"][0];
+    assert_eq!(item["repository"]["name"], "myvalue/api");
+    // The PR link still uses the organization and project GUID.
+    assert_eq!(
+        item["pr_url"],
+        format!("https://dev.azure.com/ovalteam/{guid}/_git/api/pullrequest/1")
     );
 }
 

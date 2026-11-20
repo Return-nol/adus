@@ -233,6 +233,7 @@ async fn breakdown_by_repository_uses_owner_name(pool: PgPool) {
                 name: "api".into(),
             },
             default_branch: Some("main".into()),
+            project_name: None,
         }]
     });
     let conn =
@@ -259,6 +260,45 @@ async fn breakdown_by_repository_uses_owner_name(pool: PgPool) {
             { "id": repo_id, "label": "acme/api", "input_tokens": 30, "output_tokens": 3, "calls": 1 },
             { "label": "(deleted)", "input_tokens": 1, "output_tokens": 1, "calls": 1 },
         ])
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn breakdown_by_repository_uses_azure_project_name(pool: PgPool) {
+    let (app, git) = app_and_git(pool.clone()).await;
+    let admin = setup_admin(&app).await;
+    git.with(|s| {
+        s.repos = vec![RemoteRepo {
+            r#ref: RepoRef {
+                external_id: "1".into(),
+                owner: "ovalteam".into(),
+                project: Some("project-guid".into()),
+                name: "api".into(),
+            },
+            default_branch: None,
+            project_name: Some("myvalue".into()),
+        }]
+    });
+    let conn = json!({
+        "kind": "azure_devops", "name": "Az", "org_or_owner": "ovalteam", "token": "pat-x1111"
+    });
+    let conn = send(&app, post_json("/api/v1/connections", &conn, Some(&admin))).await;
+    let add = json!({ "connection_id": conn.body["id"], "external_id": "1" });
+    let repo = send(&app, post_json("/api/v1/repositories", &add, Some(&admin))).await;
+    let repo_id = repo.body["id"].as_str().unwrap().to_string();
+    let (p, k) = provider_with_key(&app, &admin, "OpenAI", "main").await;
+
+    let with_repo = Row {
+        repo: Some(&repo_id),
+        ..row("2026-03-01T10:00:00Z", &p, &k, 30, 3)
+    };
+    insert_usage(&pool, with_repo).await;
+
+    let uri = "/api/v1/usage/breakdown?by=repository&from=2026-03-01&to=2026-03-01";
+    let reply = send(&app, get(uri, Some(&admin))).await;
+    assert_eq!(
+        reply.body,
+        json!([{ "id": repo_id, "label": "myvalue/api", "input_tokens": 30, "output_tokens": 3, "calls": 1 }])
     );
 }
 

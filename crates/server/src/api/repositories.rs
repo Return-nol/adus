@@ -65,6 +65,9 @@ struct RepositoryJson {
     external_id: String,
     owner: String,
     project: Option<String>,
+    project_name: Option<String>,
+    /// Azure `project/repo`, GitHub `owner/repo`.
+    display_name: String,
     name: String,
     default_branch: Option<String>,
     enabled: bool,
@@ -78,11 +81,13 @@ struct RepositoryJson {
 impl From<Repository> for RepositoryJson {
     fn from(r: Repository) -> RepositoryJson {
         RepositoryJson {
+            display_name: repositories::display_name(&r),
             id: r.id,
             connection_id: r.connection_id,
             external_id: r.external_id,
             owner: r.owner,
             project: r.project,
+            project_name: r.project_name,
             name: r.name,
             default_branch: r.default_branch,
             enabled: r.enabled,
@@ -157,6 +162,7 @@ async fn create(
             external_id: &r.external_id,
             owner: &r.owner,
             project: r.project.as_deref(),
+            project_name: remote.project_name.as_deref(),
             name: &r.name,
             default_branch: remote.default_branch.as_deref(),
             webhook_token: &token,

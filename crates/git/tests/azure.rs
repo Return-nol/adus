@@ -149,6 +149,22 @@ async fn error_statuses_map_without_leaking_token() {
 }
 
 #[tokio::test]
+async fn list_repos_reads_project_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/acme/_apis/git/repositories"))
+        .respond_with(json_body("repositories.json"))
+        .mount(&server)
+        .await;
+
+    let repos = provider(&server).list_repos().await.unwrap();
+    assert_eq!(repos[0].project_name.as_deref(), Some("Shop"));
+    assert_eq!(repos[1].project_name.as_deref(), Some("Shop"));
+    // `project` tetap GUID untuk URL API.
+    assert_eq!(repos[0].r#ref.project.as_deref(), Some(PROJECT));
+}
+
+#[tokio::test]
 async fn list_repos_uses_guids_and_strips_branch_prefix() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

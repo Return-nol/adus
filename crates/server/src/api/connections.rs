@@ -83,6 +83,8 @@ struct RemoteRepoJson {
     repo: RemoteRepo,
     /// Sudah ditambahkan (aktif) di Adus.
     added: bool,
+    /// Azure `project/repo`, GitHub `owner/repo`.
+    display_name: String,
 }
 
 async fn connection_json(state: &AppState, c: Connection) -> Result<ConnectionJson, ApiError> {
@@ -192,6 +194,21 @@ async fn sync_webhooks(
         }
     }
     Ok((synced, errors))
+}
+
+/// Mengisi `project_name` repo aktif yang masih NULL (repo Azure yang ditambahkan sebelum kolom ada).
+async fn backfill_project_names(
+    state: &AppState,
+    connection_id: Uuid,
+    remote: &[RemoteRepo],
+) -> Result<(), ApiError> {
+    for repo in remote {
+        if let Some(name) = &repo.project_name {
+            repositories::set_project_name(&state.db, connection_id, &repo.r#ref.external_id, name)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn list(
@@ -318,6 +335,13 @@ async fn resync_webhooks(
 ) -> Result<Json<ResyncReply>, ApiError> {
     let c = find(&state, id).await?;
     let provider = provider_for(&state, &c)?;
+    // Repo Azure lama belum punya nama project; tanpa list_repos yang berhasil, lewati saja.
+    if c.kind == ConnectionKind::AzureDevops {
+        match provider.list_repos().await {
+            Ok(remote) => backfill_project_names(&state, id, &remote).await?,
+            Err(err) => tracing::warn!("project name backfill skipped: {err}"),
+        }
+    }
     let (synced, webhook_errors) = sync_webhooks(&state, &c, provider.as_ref()).await?;
     Ok(Json(ResyncReply {
         synced,
@@ -339,6 +363,7 @@ async fn remote_repos(
             return Err(git_error(&err));
         }
     };
+    backfill_project_names(&state, id, &remote).await?;
     let added: HashSet<String> = repositories::list(&state.db, Some(id))
         .await?
         .into_iter()
@@ -349,6 +374,11 @@ async fn remote_repos(
             .into_iter()
             .map(|repo| RemoteRepoJson {
                 added: added.contains(&repo.r#ref.external_id),
+                display_name: format!(
+                    "{}/{}",
+                    repo.project_name.as_deref().unwrap_or(&repo.r#ref.owner),
+                    repo.r#ref.name
+                ),
                 repo,
             })
             .collect(),

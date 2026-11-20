@@ -492,6 +492,7 @@ async fn seed_review(pool: &PgPool) -> uuid::Uuid {
         external_id: "1",
         owner: "acme",
         project: None,
+        project_name: None,
         name: "api",
         default_branch: None,
         webhook_token: "t",

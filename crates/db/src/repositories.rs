@@ -12,6 +12,8 @@ pub struct Repository {
     pub external_id: String,
     pub owner: String,
     pub project: Option<String>,
+    /// Azure: nama project; NULL untuk GitHub dan repo Azure lama yang belum di-backfill.
+    pub project_name: Option<String>,
     pub name: String,
     pub default_branch: Option<String>,
     pub enabled: bool,
@@ -28,6 +30,7 @@ pub struct NewRepository<'a> {
     pub external_id: &'a str,
     pub owner: &'a str,
     pub project: Option<&'a str>,
+    pub project_name: Option<&'a str>,
     pub name: &'a str,
     pub default_branch: Option<&'a str>,
     pub webhook_token: &'a str,
@@ -43,7 +46,7 @@ pub struct RepoPatch {
 }
 
 // Semua query di bawah hanya melihat repo aktif (`deleted_at IS NULL`).
-const COLUMNS: &str = "id, connection_id, external_id, owner, project, name, default_branch, \
+const COLUMNS: &str = "id, connection_id, external_id, owner, project, project_name, name, default_branch, \
                        enabled, auto_review, webhook_external_ids, webhook_token, \
                        review_provider_id, review_model, created_at";
 
@@ -51,8 +54,9 @@ const COLUMNS: &str = "id, connection_id, external_id, owner, project, name, def
 pub async fn insert(pool: &PgPool, new: NewRepository<'_>) -> Result<Option<Repository>> {
     sqlx::query_as(&format!(
         "INSERT INTO repositories \
-         (connection_id, external_id, owner, project, name, default_branch, webhook_token) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         (connection_id, external_id, owner, project, project_name, name, default_branch, \
+          webhook_token) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (connection_id, external_id) WHERE deleted_at IS NULL DO NOTHING \
          RETURNING {COLUMNS}"
     ))
@@ -60,6 +64,7 @@ pub async fn insert(pool: &PgPool, new: NewRepository<'_>) -> Result<Option<Repo
     .bind(new.external_id)
     .bind(new.owner)
     .bind(new.project)
+    .bind(new.project_name)
     .bind(new.name)
     .bind(new.default_branch)
     .bind(new.webhook_token)
@@ -114,6 +119,42 @@ pub async fn set_webhook_ids(pool: &PgPool, id: Uuid, ids: &[String]) -> Result<
         .bind(ids)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Label untuk pengguna: Azure `project/repo` (fallback `org/repo` sebelum di-backfill),
+/// GitHub `owner/repo`.
+pub fn display_name(repo: &Repository) -> String {
+    format!(
+        "{}/{}",
+        repo.project_name.as_deref().unwrap_or(&repo.owner),
+        repo.name
+    )
+}
+
+/// Aturan label yang sama dengan `display_name`, sebagai ekspresi SQL untuk tabel `repositories`
+/// dengan alias `alias` (alias berasal dari kode, bukan input pengguna).
+pub fn display_name_sql(alias: &str) -> String {
+    format!("COALESCE({alias}.project_name, {alias}.owner) || '/' || {alias}.name")
+}
+
+/// Isi `project_name` repo aktif; tidak mengubah baris jika nilainya sudah sama.
+pub async fn set_project_name(
+    pool: &PgPool,
+    connection_id: Uuid,
+    external_id: &str,
+    project_name: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE repositories SET project_name = $3 \
+         WHERE connection_id = $1 AND external_id = $2 AND deleted_at IS NULL \
+           AND project_name IS DISTINCT FROM $3",
+    )
+    .bind(connection_id)
+    .bind(external_id)
+    .bind(project_name)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -185,6 +226,7 @@ mod tests {
             external_id: "7",
             owner: "acme",
             project: None,
+            project_name: None,
             name: "api",
             default_branch: Some("main"),
             webhook_token: "t",
@@ -224,6 +266,70 @@ mod tests {
         assert_eq!(list(&pool, Some(conn)).await.unwrap().len(), 1);
     }
 
+    fn repo_with(owner: &str, project_name: Option<&str>, name: &str) -> Repository {
+        Repository {
+            id: Uuid::nil(),
+            connection_id: Uuid::nil(),
+            external_id: "1".into(),
+            owner: owner.into(),
+            project: None,
+            project_name: project_name.map(String::from),
+            name: name.into(),
+            default_branch: None,
+            enabled: true,
+            auto_review: true,
+            webhook_external_ids: vec![],
+            webhook_token: None,
+            review_provider_id: None,
+            review_model: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn display_name_rules() {
+        let azure = repo_with("ovalteam", Some("myvalue"), "api");
+        assert_eq!(display_name(&azure), "myvalue/api");
+        // Azure lama yang belum di-backfill jatuh ke organisasi.
+        let legacy = repo_with("ovalteam", None, "api");
+        assert_eq!(display_name(&legacy), "ovalteam/api");
+        let github = repo_with("octo", None, "hello");
+        assert_eq!(display_name(&github), "octo/hello");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn set_project_name_updates_active_row_and_sql_label_matches(pool: PgPool) {
+        let conn = connection(&pool).await;
+        let repo = insert(&pool, new_repo(conn)).await.unwrap().unwrap();
+        assert_eq!(repo.project_name, None);
+
+        set_project_name(&pool, conn, "7", "myvalue").await.unwrap();
+        let repo = get(&pool, repo.id).await.unwrap().unwrap();
+        assert_eq!(repo.project_name.as_deref(), Some("myvalue"));
+
+        let label: String = sqlx::query_scalar(&format!(
+            "SELECT {} FROM repositories r WHERE r.id = $1",
+            display_name_sql("r")
+        ))
+        .bind(repo.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(label, display_name(&repo));
+        assert_eq!(label, "myvalue/api");
+
+        // Soft-deleted rows are left alone.
+        assert!(soft_delete(&pool, repo.id).await.unwrap());
+        set_project_name(&pool, conn, "7", "other").await.unwrap();
+        let name: Option<String> =
+            sqlx::query_scalar("SELECT project_name FROM repositories WHERE id = $1")
+                .bind(repo.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(name.as_deref(), Some("myvalue"));
+    }
+
     #[test]
     fn webhook_url_per_kind() {
         let repo = Repository {
@@ -232,6 +338,7 @@ mod tests {
             external_id: "1".into(),
             owner: "o".into(),
             project: None,
+            project_name: None,
             name: "n".into(),
             default_branch: None,
             enabled: true,

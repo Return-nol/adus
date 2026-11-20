@@ -23,6 +23,8 @@ pub struct RepoRef {
 pub struct RemoteRepo {
     pub r#ref: RepoRef,
     pub default_branch: Option<String>,
+    /// Azure: nama project (untuk label `project/repo`). GitHub: `None`.
+    pub project_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
