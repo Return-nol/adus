@@ -20,9 +20,10 @@ pub enum Job {
     },
 }
 
-/// Apa yang memicu review PR.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Apa yang memicu review PR. Juga disimpan di `reviews.trigger`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "review_trigger", rename_all = "snake_case")]
 pub enum Trigger {
     Opened,
     Updated,

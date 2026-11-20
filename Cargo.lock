@@ -106,9 +106,12 @@ dependencies = [
  "adus-git",
  "adus-llm",
  "adus-queue",
+ "async-trait",
  "chrono",
  "serde_json",
+ "sqlx",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 

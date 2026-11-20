@@ -453,10 +453,35 @@ async fn every_attempt_writes_usage_row(pool: PgPool) {
     }
 }
 
+/// `llm_usage.review_id` punya FK ke `reviews`, jadi buat connection, repo, dan review sungguhan.
+async fn seed_review(pool: &PgPool) -> uuid::Uuid {
+    use adus_core::types::ConnectionKind;
+    use adus_db::{connections, repositories, reviews};
+    let conn = connections::insert(pool, ConnectionKind::Github, "c", "acme", "e", "1234", "me")
+        .await
+        .unwrap();
+    let repo = repositories::NewRepository {
+        connection_id: conn.id,
+        external_id: "1",
+        owner: "acme",
+        project: None,
+        name: "api",
+        default_branch: None,
+        webhook_token: "t",
+    };
+    let repo = repositories::insert(pool, repo).await.unwrap().unwrap();
+    let new = reviews::NewReview {
+        repository_id: repo.id,
+        pr_number: 1,
+        trigger: adus_core::job::Trigger::Opened,
+    };
+    reviews::insert(pool, new).await.unwrap().id
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn usage_row_carries_review_and_repository_context(pool: PgPool) {
     let s = setup(&pool, ProviderKind::Openai, 1).await;
-    let review_id = uuid::Uuid::new_v4();
+    let review_id = seed_review(&pool).await;
     let ctx = UsageContext {
         review_id: Some(review_id),
         repository_id: None,

@@ -4,6 +4,7 @@ pub mod ai;
 pub mod connections;
 pub mod memories;
 pub mod repositories;
+pub mod reviews;
 pub mod rules;
 pub mod sessions;
 pub mod settings;
