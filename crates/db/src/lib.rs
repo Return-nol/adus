@@ -2,7 +2,9 @@
 
 pub mod ai;
 pub mod connections;
+pub mod memories;
 pub mod repositories;
+pub mod rules;
 pub mod sessions;
 pub mod settings;
 pub mod usage;
