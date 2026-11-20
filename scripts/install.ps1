@@ -128,7 +128,8 @@ Adus is running.
 Next steps:
   1. Open $publicUrl/setup and create the first admin account.
   2. Add an AI provider (AI Providers page) with at least one API key.
-  3. Add a connection (GitHub or Azure DevOps PAT) and pick repositories.
+  3. Choose a default model in Settings.
+  4. Add a connection (GitHub or Azure DevOps PAT) and pick repositories.
 
 Check that reviews can run:  docker compose exec adus adus doctor
 "@

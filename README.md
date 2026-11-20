@@ -19,10 +19,11 @@ Then:
 
 1. Open `<your URL>/setup` and create the first admin account.
 2. Add an AI provider with at least one API key.
-3. Add a connection (a GitHub or Azure DevOps PAT) and pick the repositories to review.
-4. Check that reviews can run: `docker compose exec adus adus doctor`.
+3. Choose a default model in Settings.
+4. Add a connection (a GitHub or Azure DevOps PAT) and pick the repositories to review.
+5. Check that reviews can run: `docker compose exec adus adus doctor`.
 
-Back up `.env`, especially `ADUS_SECRET_KEY`. If it changes, every stored PAT and LLM key becomes undecryptable and is marked invalid.
+Back up `.env`, especially `ADUS_SECRET_KEY`. If it changes, stored PATs and LLM keys can no longer be decrypted until the original key is restored.
 
 ## Configuration
 
