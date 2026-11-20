@@ -21,7 +21,10 @@ pub enum ProviderKind {
     OpenaiCompatible,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+/// Urutan deklarasi = urutan keparahan (`Info < Warning < Critical`), dipakai sebagai kunci `BTreeMap`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, sqlx::Type,
+)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "severity", rename_all = "snake_case")]
 pub enum Severity {

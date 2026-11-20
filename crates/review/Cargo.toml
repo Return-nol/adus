@@ -13,3 +13,9 @@ adus-db.workspace = true
 adus-git.workspace = true
 adus-llm.workspace = true
 adus-queue.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+uuid.workspace = true

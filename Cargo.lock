@@ -106,6 +106,10 @@ dependencies = [
  "adus-git",
  "adus-llm",
  "adus-queue",
+ "chrono",
+ "serde_json",
+ "thiserror",
+ "uuid",
 ]
 
 [[package]]

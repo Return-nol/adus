@@ -48,7 +48,7 @@ pub fn unified_patch(old: &str, new: &str) -> String {
 }
 
 /// Ambil nomor baris awal sisi kanan dari `@@ -a,b +c,d @@`.
-fn hunk_right_start(line: &str) -> Option<u32> {
+pub fn hunk_right_start(line: &str) -> Option<u32> {
     let rest = line.strip_prefix("@@ ")?;
     let plus = rest.split_whitespace().find(|part| part.starts_with('+'))?;
     plus[1..].split(',').next()?.parse().ok()
