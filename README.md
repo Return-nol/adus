@@ -117,6 +117,11 @@ To update to the latest source instead, pull the repository and rebuild: `git pu
 
 Migrations run automatically at start. Stopping waits up to 35 s for running reviews to finish.
 
+**Upgrading.**
+
+- Back up the database first (`pg_dump`, see Backup above). Migrations only go forward: once a newer version has migrated the database, rolling back to an older image fails at start. To go back, restore the backup taken before the upgrade.
+- Adus now skips files on a default ignore list (the Kodus defaults) before review. It covers many file types, including `**/*.json`, `**/*.xml` and `**/doc/**`. After upgrading, review it under Settings → Ignored files and remove anything you want reviewed.
+
 **Troubleshooting.** Start with the doctor. It is read-only and tells you whether reviews can run, and if not, what to fix:
 
 ```sh
