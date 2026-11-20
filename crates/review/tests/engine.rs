@@ -241,6 +241,8 @@ async fn large_and_binary_files_skipped_with_reason_in_summary(pool: PgPool) {
     ];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
     set_limits(&pool, 50, 2).await;
+    // Daftar bawaan mengabaikan *.png; test ini menguji jalur `no_patch`.
+    set_ignore(&pool, Some(&[]), &[]).await;
 
     run(&s, Trigger::Opened).await.unwrap();
 
@@ -639,4 +641,127 @@ async fn slow_review_times_out_and_is_marked_failed(pool: PgPool) {
     assert_eq!(row.status, ReviewStatus::Failed);
     assert_eq!(row.error.as_deref(), Some("review timed out"));
     assert!(row.finished_at.is_some());
+}
+
+/// Simpan daftar ignore (`None` = bawaan) dan kata kunci judul.
+async fn set_ignore(pool: &PgPool, paths: Option<&[&str]>, keywords: &[&str]) {
+    let mut current = settings::get(pool).await.unwrap();
+    current.ignore_paths = paths.map(|p| p.iter().map(|s| s.to_string()).collect());
+    current.ignored_title_keywords = keywords.iter().map(|s| s.to_string()).collect();
+    settings::update(pool, &current).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn ignored_files_not_sent_to_llm(pool: PgPool) {
+    let files = vec![file("a.json", PATCH_2), file("b.rs", PATCH_2)];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    set_ignore(&pool, Some(&["**/*.json"]), &[]).await;
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    let calls = s.chat.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].user.contains("<file_path>\nb.rs\n</file_path>"));
+    let summary = s.git.state().reviews[0].summary.clone();
+    assert!(summary.contains("1 file ignored"));
+    assert!(!summary.contains("a.json"), "ignored files are not listed");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn ignored_files_do_not_count_toward_file_limit(pool: PgPool) {
+    let files = vec![file("a.json", PATCH_2), file("b.rs", PATCH_2)];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    set_ignore(&pool, Some(&["**/*.json"]), &[]).await;
+    set_limits(&pool, 1, 2000).await;
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let calls = s.chat.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].user.contains("<file_path>\nb.rs\n</file_path>"));
+    let summary = s.git.state().reviews[0].summary.clone();
+    assert!(!summary.contains("file limit reached"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn all_files_ignored_is_skipped_nothing_to_review(pool: PgPool) {
+    let files = vec![file("a.json", PATCH_2), file("dist/b.js", PATCH_2)];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    set_ignore(&pool, Some(&["**/*.json", "dist/**"]), &[]).await;
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Skipped);
+    assert_eq!(row.skip_reason.as_deref(), Some("nothing_to_review"));
+    assert!(s.chat.calls().is_empty());
+    let git = s.git.state();
+    assert!(git.reviews.is_empty());
+    assert!(git.comments.is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_review_applies_ignore(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    run(&s, Trigger::Opened).await.unwrap();
+    set_ignore(&pool, Some(&["**/*.json"]), &[]).await;
+    {
+        let mut git = s.git.state();
+        git.pr = pr("h2");
+        git.full = vec![file("a.rs", PATCH_234), file("b.json", PATCH_2)];
+        git.incremental = vec![
+            file("a.rs", "@@ -3,1 +3,2 @@\n c\n+d\n"),
+            file("b.json", PATCH_2),
+        ];
+    }
+
+    let id = run(&s, Trigger::Updated).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    let git = s.git.state();
+    assert_eq!(git.diff_between_calls.len(), 1, "incremental path taken");
+    let calls = s.chat.calls();
+    assert_eq!(calls.len(), 2, "first run a.rs, incremental run a.rs only");
+    assert!(calls[1].user.contains("<file_path>\na.rs\n</file_path>"));
+    assert!(git.reviews[1].summary.contains("1 file ignored"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn ignored_title_skips_auto_but_not_command(pool: PgPool) {
+    let mut wip = pr("h1");
+    wip.title = "WIP: Add login".into();
+    let s = setup(&pool, FakeGit::new(wip, vec![file("a.rs", PATCH_2)])).await;
+    set_ignore(&pool, None, &["wip"]).await;
+    // Diff tidak boleh diambil untuk review yang dilewati.
+    s.git.state().pr_diff_error = Some(GitError::Http("503".into()));
+
+    for trigger in [Trigger::Opened, Trigger::Updated] {
+        let id = run(&s, trigger).await.unwrap();
+        let row = review(&pool, id).await;
+        assert_eq!(row.status, ReviewStatus::Skipped);
+        assert_eq!(row.skip_reason.as_deref(), Some("ignored_title"));
+    }
+    assert!(s.chat.calls().is_empty());
+    assert!(s.git.state().reviews.is_empty());
+    assert!(s.git.state().comments.is_empty());
+
+    s.git.state().pr_diff_error = None;
+    let id = run(&s, Trigger::Command).await.unwrap();
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    assert_eq!(s.git.state().reviews.len(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn invalid_stored_ignore_list_falls_back_to_defaults(pool: PgPool) {
+    let files = vec![file("yarn.lock", PATCH_2), file("a.rs", PATCH_2)];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    set_ignore(&pool, Some(&["a[b"]), &[]).await;
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    let calls = s.chat.calls();
+    assert_eq!(calls.len(), 1, "yarn.lock ignored by the defaults");
+    assert!(calls[0].user.contains("<file_path>\na.rs\n</file_path>"));
 }

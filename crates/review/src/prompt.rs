@@ -190,10 +190,12 @@ pub fn format_inline(s: &Suggestion) -> String {
 }
 
 /// Komentar ringkasan review. `skipped` = (path, alasan) dengan alasan
-/// `no_patch` | `too_large` | `file_limit` | `unparseable` | `llm_error`.
+/// `no_patch` | `too_large` | `file_limit` | `unparseable` | `llm_error`. `ignored` = jumlah file
+/// yang cocok dengan daftar ignore (hanya jumlahnya yang ditampilkan, bukan namanya).
 pub fn format_summary(
     counts: &BTreeMap<Severity, usize>,
     skipped: &[(String, &'static str)],
+    ignored: usize,
 ) -> String {
     let mut out = format!("{MARKER}\n### Adudu reviewed this PR\n\n");
     let rows: Vec<String> = counts
@@ -206,6 +208,11 @@ pub fn format_summary(
         out.push_str("No issues found.");
     } else {
         out.push_str(&rows.join("\n"));
+    }
+    match ignored {
+        0 => {}
+        1 => out.push_str("\n\n1 file ignored"),
+        n => out.push_str(&format!("\n\n{n} files ignored")),
     }
     if !skipped.is_empty() {
         out.push_str("\n\n**Skipped files**\n");
@@ -225,6 +232,7 @@ fn skip_reason_label(reason: &str) -> &str {
         "file_limit" => "file limit reached",
         "unparseable" => "review output could not be parsed",
         "llm_error" => "LLM error",
+        "ignored_title" => "PR title matched an ignored keyword",
         other => other,
     }
 }
@@ -406,7 +414,7 @@ mod tests {
             ("logo.png".to_string(), "no_patch"),
             ("big.rs".to_string(), "too_large"),
         ];
-        let summary = format_summary(&counts, &skipped);
+        let summary = format_summary(&counts, &skipped, 0);
         assert!(summary.contains(MARKER));
         assert!(summary.contains("Adudu reviewed this PR"));
         assert!(summary.contains("- 🚨 Critical: 2\n- ℹ️ Info: 1"));
@@ -417,10 +425,22 @@ mod tests {
             )
         );
 
-        let empty = format_summary(&BTreeMap::from([(Severity::Info, 0)]), &[]);
+        let empty = format_summary(&BTreeMap::from([(Severity::Info, 0)]), &[], 0);
         assert!(empty.contains(MARKER));
         assert!(empty.contains("No issues found."));
         assert!(!empty.contains("Skipped"));
+        assert!(!empty.contains("ignored"));
+    }
+
+    #[test]
+    fn summary_includes_ignored_count() {
+        let counts = BTreeMap::from([(Severity::Warning, 1)]);
+        let skipped = [("big.rs".to_string(), "too_large")];
+        let summary = format_summary(&counts, &skipped, 3);
+        assert!(summary.contains("- ⚠️ Warning: 1\n\n3 files ignored\n\n**Skipped files**"));
+
+        let one = format_summary(&BTreeMap::new(), &[], 1);
+        assert!(one.ends_with("No issues found.\n\n1 file ignored"));
     }
 
     #[test]

@@ -5,9 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adus_core::crypto::Cipher;
+use adus_core::default_ignore::DEFAULT_IGNORE_PATHS;
 use adus_core::job::Trigger;
 use adus_core::types::{ConnectionKind, Severity};
 use adus_db::connections::{self, Connection, ConnectionStatus};
+use adus_db::ignore::{IgnoreMatcher, effective_ignore_paths, title_matches};
 use adus_db::repositories::{self, Repository};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::{memories, rules, settings};
@@ -156,6 +158,11 @@ impl Engine {
         }
 
         let settings = settings::get(&self.db).await.map_err(db_error)?;
+        // Sebelum cek model dan diff: PR yang dilewati tidak memicu komentar atau fetch diff.
+        if trigger != Trigger::Command && title_matches(&pr.title, &settings.ignored_title_keywords)
+        {
+            return Ok(Outcome::Skipped("ignored_title"));
+        }
         let model = match (&repo.review_provider_id, &repo.review_model) {
             (Some(provider), Some(model)) => Some((*provider, model.clone())),
             _ => settings
@@ -213,11 +220,20 @@ impl Engine {
             },
         };
 
+        let matcher = ignore_matcher(&effective_ignore_paths(&settings));
         let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
         let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
         let mut targets = Vec::new();
         let mut skipped: Vec<(String, &'static str)> = Vec::new();
+        let mut ignored = 0;
         for target in candidates {
+            // Hanya `path` baru yang dicocokkan, juga untuk file yang di-rename.
+            if let Some(matcher) = &matcher
+                && matcher.is_ignored(&target.file.path)
+            {
+                ignored += 1;
+                continue;
+            }
             if target.file.status == FileStatus::Deleted {
                 continue;
             }
@@ -301,7 +317,7 @@ impl Engine {
                 body: format_inline(s),
             })
             .collect();
-        let summary = format_summary(&counts, &skipped);
+        let summary = format_summary(&counts, &skipped, ignored);
         match git.post_review(&repo_ref, &pr, &comments, &summary).await {
             Ok(posted) => Ok(Outcome::Done { posted }),
             Err(err) => Err(self.post_error(&conn, err).await),
@@ -398,6 +414,25 @@ impl Engine {
             "the git provider rejected the token of connection \"{}\"",
             conn.name
         ))
+    }
+}
+
+/// Matcher daftar ignore. Daftar tersimpan yang tidak valid tidak boleh menggagalkan review:
+/// pakai daftar bawaan, dan bila itu pun gagal, review tanpa ignore (`None`).
+fn ignore_matcher(patterns: &[String]) -> Option<IgnoreMatcher> {
+    match IgnoreMatcher::new(patterns) {
+        Ok(matcher) => return Some(matcher),
+        Err(err) => {
+            tracing::warn!(error = %err, "stored ignore list is invalid, using the defaults")
+        }
+    }
+    let defaults: Vec<String> = DEFAULT_IGNORE_PATHS.iter().map(|p| p.to_string()).collect();
+    match IgnoreMatcher::new(&defaults) {
+        Ok(matcher) => Some(matcher),
+        Err(err) => {
+            tracing::warn!(error = %err, "default ignore list is invalid, ignoring no files");
+            None
+        }
     }
 }
 
