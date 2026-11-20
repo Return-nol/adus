@@ -270,7 +270,7 @@ async fn check_git(state: &AppState, out: &mut Vec<Check>) {
             .iter()
             .filter(|r| r.connection_id == conn.id && r.enabled)
         {
-            let name = format!("Webhooks: {}/{}", repo.owner, repo.name);
+            let name = format!("Webhooks: {}", repositories::display_name(repo));
             let found = if repo.webhook_external_ids.is_empty() {
                 Ok(Ok(false))
             } else {

@@ -242,6 +242,49 @@ async fn doctor_degraded_when_webhook_points_to_old_public_url(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn doctor_names_azure_webhook_check_by_project(pool: PgPool) {
+    let w = healthy_world(pool.clone()).await;
+    let encrypted = w.state.cipher.encrypt(PAT);
+    let conn = connections::insert(
+        &pool,
+        ConnectionKind::AzureDevops,
+        "Contoso",
+        "contoso",
+        &encrypted,
+        "9999",
+        "me",
+    )
+    .await
+    .unwrap();
+    let repo = repositories::insert(
+        &pool,
+        NewRepository {
+            connection_id: conn.id,
+            external_id: "az1",
+            owner: "contoso",
+            project: Some("p-guid"),
+            project_name: Some("Platform"),
+            name: "api",
+            default_branch: None,
+            webhook_token: "wh2",
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    repositories::set_webhook_ids(&pool, repo.id, &["sub-1".to_string()])
+        .await
+        .unwrap();
+    w.git.with(|s| {
+        s.missing_webhooks.insert("az1".into());
+    });
+
+    let report = doctor::run(&w.state).await;
+    assert_eq!(fails(&report), vec!["Webhooks: Platform/api"]);
+    cleanup_queue(&w.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn doctor_never_calls_ensure_webhooks(pool: PgPool) {
     let w = healthy_world(pool.clone()).await;
     w.git.with(|s| {
