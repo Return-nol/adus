@@ -8,12 +8,28 @@ Repo: https://github.com/Return-nol/adus. The GHCR image name is `ghcr.io/return
 
 - **Design (binding authority):** `docs/superpowers/specs/2026-11-19-adus-design.md`
 - **Web visual design (binding for `web/`):** `DESIGN.md` — warm cream/coffee palette, `#ff4f00` orange CTA accent, shapes, and component chrome (applied across light and dark themes).
-- **Implementation plan (27 tasks, 6 milestones):** `docs/superpowers/plans/2026-11-19-adus-v1.md`
-- **Execution ledger:** `.superpowers/sdd/2026-11-19-adus-v1/progress.md`. This folder is git-ignored and local only. It records which tasks are done, every ruling, deferred minor findings, and the briefs, reports and review diffs for each task.
+- **Implementation plan v1 (27 tasks, 6 milestones, complete):** `docs/superpowers/plans/2026-11-19-adus-v1.md`
+- **Follow-up design + plan (in progress):** `docs/superpowers/specs/2026-11-20-ignored-files-and-azure-project-design.md` and `docs/superpowers/plans/2026-11-20-ignored-files-and-azure-project.md` (7 tasks)
+- **Execution ledgers:** `.superpowers/sdd/2026-11-19-adus-v1/progress.md` (v1) and `.superpowers/sdd/2026-11-20-ignored-files-and-azure-project/progress.md` (follow-up). These folders are git-ignored and local only. They record which tasks are done, every ruling, deferred minor findings, and the briefs, reports and review diffs for each task.
 
 If the spec and the plan conflict, the spec wins. Record any new decision in the ledger as `Ruling: <what> — <why> — <cost if wrong>`.
 
-## Status (as of 2026-11-19)
+## Status (as of 2026-11-20)
+
+**v1 plan: all 27 tasks done.** The final whole-branch review found 1 Critical and 4 Important issues. All five were fixed in one wave (commits `7533f1b`..`c819e33`), and a re-review came back clean. The v1 branch has not been finished yet: there is no merge or PR, and the v1 SDD workspace has not been deleted. The rulings list for the user lives in the v1 ledger.
+
+**Follow-up plan (ignored files + Azure project names), 7 tasks:**
+
+| Task | What | State |
+|---|---|---|
+| 1 | Azure `project_name` (migration 0006), `display_name` from the server (`repositories::label` is the single Rust rule, `display_name_sql` its SQL twin), backfill on remote-repos and resync | done (`a0017db`, fix `a29632f`) |
+| 2 | Dashboard uses `display_name` everywhere; add-repo dialog gets search, counter and sort | **next** |
+| 3–6 | Global ignore list (Kodus defaults), settings API + test-a-file, engine applies ignore + title keywords, Settings UI | not started |
+| 7 | v1 follow-ups: no-model on `updated` → `skipped`, periodic `fail_stale`, `ChatError::Internal` text | not started |
+
+To resume the follow-up, run `subagent-driven-development` on the follow-up plan. It reads that plan's ledger. Tasks 5 and 7 use Opus high, the rest Sonnet high.
+
+### v1 task table (historical)
 
 Work is on branch `feat/adus-v1`. Nothing has been pushed.
 
@@ -34,7 +50,9 @@ Work is on branch `feat/adus-v1`. Nothing has been pushed.
 | 13 | AI provider/key DB (migration 0003), multi-key router with cooldown, usage logging | done |
 | 14 | AI provider, key, settings and usage APIs (incl. test-key) | done |
 | 15 | AI Providers, Settings, Token Usage pages | done (click-through and chart look not browser-tested) |
-| 16–27 | Rules/memory, queue, webhooks, review engine, `@adudu` commands, worker, reviews page, doctor, Docker/installer, CI | not started — **next: Task 16** |
+| 16–17 | Rules & memory (migration 0004) API + page | done |
+| 18–24 | Redis Streams queue, webhooks, prompt/parser, review engine (migration 0005), `@adudu` commands, worker, Reviews page | done (Opus high) |
+| 25–27 | CLI (`gen-secret`, `check-config`, `doctor`, `healthcheck`) + System status page, Docker/compose/installers, CI + GHCR release | done |
 
 To resume, run superpowers `subagent-driven-development` on the plan. It reads the ledger and continues from the first unfinished task. Implementers have been run on Sonnet at high effort, as the user asked. Deferred minor findings for the final whole-branch review are listed in the ledger (`Task N: minor (deferred)` lines), and so are notes aimed at later tasks (`Note for Task N`).
 
@@ -77,6 +95,9 @@ On Windows, if `cargo` is not on PATH, it is in `%USERPROFILE%\.cargo\bin`. The 
 
 - **Dev ports.** The host already runs native Postgres on 5432 and Redis on 6379, so the dev compose maps to **55432** and **55379**. Port 56379 cannot be used because it is inside a Windows reserved TCP range. Do not stop the user's native services.
 - **Docker Desktop.** It sometimes stops. Tests then fail with `PoolTimedOut`. Start Docker and run the dev compose again.
+- **Disk space on C:.** The Rust `target/` directory grows to tens of GB. When the drive fills up, the linker fails with `LNK1318`. Once only 19 MB was free, and deleting `target/debug/incremental` freed about 27 GB. `cargo clean` is always safe.
+- **Parallel linking on Windows.** Running `cargo test --workspace` with full parallelism can exhaust the paging file (os error 1455). Use `cargo test --workspace -j 2`.
+- **Two compose projects.** The user's own Adus stack (from the installer) runs under the default compose project name. When starting dev Postgres/Redis, use a separate project name: `docker compose -f docker-compose.dev.yml -p adus-dev up -d`. Never recreate or `down` the user's stack.
 - **No browser automation for UI checks.** A REA `capture_browser_scenario` run against the dashboard hung for more than 13 minutes and its Chrome had to be killed. Verify with curl and by reading the code, and say so in reports. The user does click-through testing.
 
 ## Code conventions (established in Tasks 1–15)
