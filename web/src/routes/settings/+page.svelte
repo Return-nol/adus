@@ -120,6 +120,17 @@
 		}
 	}
 
+	// Still on the defaults with only local edits: just refill them, nothing to save.
+	function startReset() {
+		if (isDefault) {
+			ignoreText = savedIgnore.join('\n');
+			ignoreError = '';
+			testResult = null;
+		} else {
+			resetOpen = true;
+		}
+	}
+
 	async function resetIgnore() {
 		busy = true;
 		try {
@@ -223,8 +234,8 @@
 							variant="outline"
 							size="sm"
 							class="ml-auto"
-							disabled={busy || isDefault}
-							onclick={() => (resetOpen = true)}
+							disabled={busy || (isDefault && !ignoreChanged)}
+							onclick={startReset}
 						>
 							Reset to defaults
 						</Button>
