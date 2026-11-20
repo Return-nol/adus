@@ -61,8 +61,8 @@
 		Only admins can manage users.
 	</div>
 {:else}
-	<Card.Root>
-		<Card.Content>
+	<Card.Root class="py-0">
+		<Card.Content class="px-0">
 			<Table.Root>
 				<Table.Header>
 					<Table.Row>
@@ -88,7 +88,7 @@
 									bind:checked={() => !user.disabled, (active) => setActive(user, active)}
 								/>
 							</Table.Cell>
-							<Table.Cell class="space-x-2 text-right">
+							<Table.Cell class="space-x-1 text-right">
 								<Button variant="outline" size="sm" onclick={() => openForm(user)}>Edit</Button>
 								<Button variant="outline" size="sm" onclick={() => openReset(user)}>
 									Reset password

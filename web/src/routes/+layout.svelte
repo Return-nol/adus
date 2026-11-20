@@ -35,7 +35,7 @@
 	{@render children()}
 {:else if !session.ready}
 	<div class="flex min-h-screen items-center justify-center p-6 text-sm text-muted-foreground">
-		Loading...
+		🛀 Adusing
 	</div>
 {:else if session.error}
 	<div class="flex min-h-screen items-center justify-center p-6">
@@ -49,12 +49,12 @@
 {:else if session.user}
 	<Sidebar.Provider>
 		<AppSidebar />
-		<div class="flex min-h-screen flex-1 flex-col">
+		<div class="flex min-h-screen min-w-0 flex-1 flex-col">
 			<header
 				class="flex h-14 items-center gap-3 border-b border-border/70 bg-background px-4 md:hidden"
 			>
 				<Sidebar.Trigger />
-				<span class="font-display text-lg font-medium tracking-tight">Adus</span>
+				<span class="font-display text-lg font-medium tracking-tight">🛀&nbsp;&nbsp;Adus</span>
 			</header>
 			<main class="mx-auto w-full max-w-6xl flex-1 px-5 py-6 sm:px-8 sm:py-8">
 				{@render children()}

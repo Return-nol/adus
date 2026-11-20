@@ -4,6 +4,7 @@
 	import { api, ApiError } from '#lib/api.js';
 	import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
+	import * as Card from '#lib/components/ui/card/index.js';
 	import * as Select from '#lib/components/ui/select/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
 	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
@@ -191,6 +192,8 @@
 		{/if}
 	</div>
 {:else if items.length > 0}
+<Card.Root class="py-0">
+		<Card.Content class="px-0">
 	<Table.Root>
 		<Table.Header>
 			<Table.Row>
@@ -258,6 +261,8 @@
 			{/each}
 		</Table.Body>
 	</Table.Root>
+		</Card.Content>
+</Card.Root>
 
 	<div class="mt-4 flex items-center justify-end gap-3 text-sm text-muted-foreground">
 		<span>Page {page} of {pages}</span>
