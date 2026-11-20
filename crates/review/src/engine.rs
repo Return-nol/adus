@@ -12,7 +12,9 @@ use adus_db::repositories::{self, Repository};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::{memories, rules, settings};
 use adus_git::diff::{added_line_count, commentable_lines};
-use adus_git::{FileDiff, FileStatus, GitError, GitProviderFactory, InlineComment, RepoRef};
+use adus_git::{
+    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, RepoRef,
+};
 use adus_llm::ChatRequest;
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use sqlx::PgPool;
@@ -117,21 +119,8 @@ impl Engine {
             return Ok(Outcome::Skipped("auto_review_off"));
         }
 
-        let conn = connections::get(&self.db, repo.connection_id)
-            .await
-            .map_err(db_error)?
-            .ok_or_else(|| EngineError::Fatal("connection not found".into()))?;
-        let token = self
-            .cipher
-            .decrypt(&conn.encrypted_token)
-            .map_err(|_| EngineError::Fatal("cannot decrypt the connection token".into()))?;
-        let git = self.git.create(conn.kind, &conn.org_or_owner, &token);
-        let repo_ref = RepoRef {
-            external_id: repo.external_id.clone(),
-            owner: repo.owner.clone(),
-            project: repo.project.clone(),
-            name: repo.name.clone(),
-        };
+        let conn = self.connection(repo).await?;
+        let (git, repo_ref) = self.provider(&conn, repo)?;
 
         let pr = match git.get_pr(&repo_ref, pr_number).await {
             Ok(pr) => pr,
@@ -287,6 +276,34 @@ impl Engine {
         }
     }
 
+    /// Connection milik repo.
+    pub(crate) async fn connection(&self, repo: &Repository) -> Result<Connection, EngineError> {
+        connections::get(&self.db, repo.connection_id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| EngineError::Fatal("connection not found".into()))
+    }
+
+    /// Provider git dengan PAT connection yang sudah didekripsi, plus referensi repo-nya.
+    pub(crate) fn provider(
+        &self,
+        conn: &Connection,
+        repo: &Repository,
+    ) -> Result<(Arc<dyn GitProvider>, RepoRef), EngineError> {
+        let token = self
+            .cipher
+            .decrypt(&conn.encrypted_token)
+            .map_err(|_| EngineError::Fatal("cannot decrypt the connection token".into()))?;
+        let git = self.git.create(conn.kind, &conn.org_or_owner, &token);
+        let repo_ref = RepoRef {
+            external_id: repo.external_id.clone(),
+            owner: repo.owner.clone(),
+            project: repo.project.clone(),
+            name: repo.name.clone(),
+        };
+        Ok((git, repo_ref))
+    }
+
     /// Saat mengambil data, semua error selain token ditolak dianggap sementara.
     async fn fetch_error(&self, conn: &Connection, err: GitError) -> EngineError {
         match err {
@@ -309,7 +326,7 @@ impl Engine {
     }
 
     /// PAT ditolak: tandai connection `invalid` supaya admin melihatnya di dashboard.
-    async fn unauthorized(&self, conn: &Connection) -> EngineError {
+    pub(crate) async fn unauthorized(&self, conn: &Connection) -> EngineError {
         if let Err(err) =
             connections::set_status(&self.db, conn.id, ConnectionStatus::Invalid).await
         {
@@ -353,7 +370,7 @@ fn incremental_targets(changed: Vec<FileDiff>, full: Vec<FileDiff>) -> Vec<Targe
         .collect()
 }
 
-fn db_error(err: sqlx::Error) -> EngineError {
+pub(crate) fn db_error(err: sqlx::Error) -> EngineError {
     EngineError::Retryable(format!("database: {err}"), None)
 }
 

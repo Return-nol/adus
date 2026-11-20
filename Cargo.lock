@@ -108,6 +108,7 @@ dependencies = [
  "adus-queue",
  "async-trait",
  "chrono",
+ "redis",
  "serde_json",
  "sqlx",
  "thiserror",

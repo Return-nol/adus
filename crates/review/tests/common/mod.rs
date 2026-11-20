@@ -326,3 +326,44 @@ pub fn finding(path: &str, line: u32, title: &str) -> String {
         r#"[{{"file":"{path}","line":{line},"severity":"warning","title":"{title}","body":"why"}}]"#
     )
 }
+
+pub fn redis_url() -> String {
+    std::env::var("REDIS_URL").expect("REDIS_URL must be set (see .cargo/config.toml)")
+}
+
+/// Antrian dengan prefix unik `test-{uuid}`; panggil `cleanup_queue` di akhir test.
+pub async fn test_queue() -> (adus_queue::Queue, String) {
+    let prefix = format!("test-{}", Uuid::new_v4());
+    let queue = adus_queue::Queue::connect(&redis_url(), &prefix)
+        .await
+        .unwrap();
+    (queue, prefix)
+}
+
+/// Hapus semua key Redis milik prefix test.
+pub async fn cleanup_queue(prefix: &str) {
+    use redis::AsyncCommands;
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let keys: Vec<String> = conn.keys(format!("{prefix}:*")).await.unwrap();
+    if !keys.is_empty() {
+        let _: () = conn.del(keys).await.unwrap();
+    }
+}
+
+/// Semua job di stream antrian test, urut masuk.
+pub async fn queued_jobs(prefix: &str) -> Vec<adus_core::job::Job> {
+    let client = redis::Client::open(redis_url()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let entries: Vec<(String, std::collections::HashMap<String, String>)> = redis::cmd("XRANGE")
+        .arg(format!("{prefix}:jobs"))
+        .arg("-")
+        .arg("+")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    entries
+        .iter()
+        .map(|(_, fields)| serde_json::from_str(&fields["job"]).unwrap())
+        .collect()
+}
