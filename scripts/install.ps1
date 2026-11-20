@@ -1,15 +1,30 @@
 #!/usr/bin/env pwsh
 # One-command installer for Adus: creates .env, generates secrets, starts the stack.
 # Safe to run again: values already in .env are never overwritten.
+# -Build: build the adus image from this checkout instead of pulling it (runs the latest source).
+param(
+    [switch]$Build,
+    [Parameter(ValueFromRemainingArguments)][string[]]$Rest
+)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
-
-Set-Location (Split-Path -Parent $PSScriptRoot)
 
 function Fail($message) {
     [Console]::Error.WriteLine("ERROR: $message")
     exit 1
 }
+
+if ($Rest) {
+    [Console]::Error.WriteLine(@"
+Usage: install.ps1 [-Build]
+
+  -Build   build the adus image from this checkout instead of pulling it
+           (use it to run the latest source)
+"@)
+    exit 1
+}
+
+Set-Location (Split-Path -Parent $PSScriptRoot)
 
 # Value of KEY in .env (empty if missing).
 function Get-EnvValue($key) {
@@ -95,8 +110,21 @@ if ($LASTEXITCODE -ne 0) {
 $check | Where-Object { "$_" -like 'WARN*' } | ForEach-Object { Write-Host $_ }
 
 # 6. Start
-docker compose pull
-if ($LASTEXITCODE -ne 0) { Write-Host 'Could not pull some images; continuing with local images / build' }
+if ($Build) {
+    docker compose build adus
+    if ($LASTEXITCODE -ne 0) { Fail 'could not build the adus image' }
+} else {
+    # The adus image on its own first: if it cannot be pulled (offline, no release yet), build it here.
+    docker compose pull adus
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host 'Could not pull the adus image; building it from this checkout'
+        docker compose build adus
+        if ($LASTEXITCODE -ne 0) { Fail 'could not build the adus image' }
+    }
+}
+# The other images (Postgres, Redis); adus was handled above.
+docker compose pull --ignore-buildable
+if ($LASTEXITCODE -ne 0) { Write-Host 'Could not pull some images; continuing with local images' }
 docker compose up -d
 if ($LASTEXITCODE -ne 0) { Fail 'docker compose up failed' }
 

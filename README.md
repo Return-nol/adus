@@ -15,6 +15,13 @@ You need Docker with Compose 2.20 or newer (and `curl` on Linux/macOS). Then, fr
 
 The installer creates `.env`, generates `ADUS_SECRET_KEY` and the database password, asks for your public URL, validates the configuration, starts the stack and waits until it is healthy. Run it again at any time: values already in `.env` are never overwritten.
 
+It pulls the published `adus` image; if that pull fails, it builds the image from your checkout instead. To run the latest source rather than the latest release, always build it:
+
+```sh
+./scripts/install.sh --build
+.\scripts\install.ps1 -Build
+```
+
 Then:
 
 1. Open `<your URL>/setup` and create the first admin account.
@@ -105,6 +112,8 @@ docker compose exec -T postgres pg_dump -U adus adus > adus-backup.sql
 ```sh
 docker compose pull && docker compose up -d
 ```
+
+To update to the latest source instead, pull the repository and rebuild: `git pull && ./scripts/install.sh --build` (Windows: `.\scripts\install.ps1 -Build`).
 
 Migrations run automatically at start. Stopping waits up to 35 s for running reviews to finish.
 

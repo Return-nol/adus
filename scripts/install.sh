@@ -4,9 +4,27 @@
 set -euo pipefail
 umask 077 # .env holds secrets: files this script writes are private to the owner
 
-cd "$(dirname "$0")/.."
-
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<USAGE >&2
+Usage: $0 [--build]
+
+  --build   build the adus image from this checkout instead of pulling it
+            (use it to run the latest source)
+USAGE
+  exit 1
+}
+
+build=
+for arg in "$@"; do
+  case "$arg" in
+    --build) build=1 ;;
+    *) usage ;;
+  esac
+done
+
+cd "$(dirname "$0")/.."
 
 # Print the value of KEY from .env (empty if missing).
 get() { grep -m1 "^$1=" .env | cut -d= -f2- | tr -d '\r' || true; }
@@ -84,7 +102,17 @@ fi
 echo "$check" | grep '^WARN' || true
 
 # 6. Start
-docker compose pull || echo "Could not pull some images; continuing with local images / build"
+if [ -n "$build" ]; then
+  docker compose build adus || die "could not build the adus image"
+else
+  # The adus image on its own first: if it cannot be pulled (offline, no release yet), build it here.
+  if ! docker compose pull adus; then
+    echo "Could not pull the adus image; building it from this checkout"
+    docker compose build adus || die "could not build the adus image"
+  fi
+fi
+# The other images (Postgres, Redis); adus was handled above.
+docker compose pull --ignore-buildable || echo "Could not pull some images; continuing with local images"
 docker compose up -d
 
 # 7. Wait for /healthz
