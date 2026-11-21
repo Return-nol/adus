@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use adus_llm::ToolDef;
 use globset::{Glob, GlobMatcher};
@@ -42,6 +43,29 @@ const NOTE_RESERVE_CHARS: usize = 300;
 const LINE_TRUNCATED: &str = " [line truncated]";
 /// Longest model-supplied text (pattern, tool name, parser message) echoed back.
 const MAX_ECHO_CHARS: usize = 200;
+/// Wall-clock budget of one `grep` or `find_files` call. The 10 MB regex size limit bounds
+/// memory, not time: a large pattern can push the regex engine to its slow O(pattern × text)
+/// path, so the walk and the line loop stop when this runs out.
+const SEARCH_TIME_BUDGET: Duration = Duration::from_secs(10);
+/// `grep` matches only this many leading bytes of a line, bounding the cost of the one regex
+/// call a deadline check cannot interrupt.
+const GREP_LINE_WINDOW: usize = 64 * 1024;
+
+/// Time and per-line bounds of the search tools. Fields so tests can shrink them.
+#[derive(Debug, Clone, Copy)]
+struct SearchLimits {
+    time_budget: Duration,
+    line_window: usize,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            time_budget: SEARCH_TIME_BUDGET,
+            line_window: GREP_LINE_WINDOW,
+        }
+    }
+}
 
 /// Arguments of `read_file`.
 #[derive(Debug, Clone, Deserialize)]
@@ -119,9 +143,9 @@ pub(crate) enum ToolError {
     NotADirectory(String),
     #[error("file exceeds 2 MB limit; use grep instead")]
     TooLarge,
-    #[error("binary file; only text files can be read")]
+    #[error("binary file; only text files can be read, so read a source or text file instead")]
     Binary,
-    #[error("cannot read the file ({0})")]
+    #[error("cannot read the file ({0}); try another path or use list_dir to check it")]
     Io(#[from] std::io::Error),
     #[error("start_line {start} is past the end of {path} ({total} lines)")]
     PastEnd {
@@ -131,11 +155,11 @@ pub(crate) enum ToolError {
     },
     #[error("end_line must not be smaller than start_line")]
     BadRange,
-    #[error("pattern must not be empty")]
+    #[error("pattern must not be empty; pass a regular expression such as fn\\s+main")]
     EmptyPattern,
     #[error("invalid regex: {0}; simplify the pattern or escape special characters")]
     Regex(String),
-    #[error("invalid glob pattern: {0}")]
+    #[error("invalid glob pattern: {0}; use *, ** and {{a,b}} with / separators")]
     Glob(String),
 }
 
@@ -309,6 +333,7 @@ pub struct Toolbox {
     workspace: Arc<RepoWorkspace>,
     cache: Arc<ToolCache>,
     read_only_defs: Vec<ToolDef>,
+    limits: SearchLimits,
 }
 
 impl Toolbox {
@@ -317,6 +342,7 @@ impl Toolbox {
             workspace,
             cache,
             read_only_defs: read_only_defs(),
+            limits: SearchLimits::default(),
         }
     }
 
@@ -334,7 +360,9 @@ impl Toolbox {
         };
         let workspace = Arc::clone(&self.workspace);
         let cache = Arc::clone(&self.cache);
-        let task = tokio::task::spawn_blocking(move || run_cached(&workspace, &cache, &call));
+        let limits = self.limits;
+        let task =
+            tokio::task::spawn_blocking(move || run_cached(&workspace, &cache, &call, limits));
         match task.await {
             Ok(Ok(content)) => ToolOutput::ok(content),
             Ok(Err(err)) => ToolOutput::error(&err),
@@ -361,7 +389,8 @@ impl Toolbox {
             start_line: Some(center_line.saturating_sub(radius).max(1)),
             end_line: Some(center_line.saturating_add(radius)),
         };
-        run_cached(&self.workspace, &self.cache, &ReadOnlyCall::ReadFile(args)).ok()
+        let call = ReadOnlyCall::ReadFile(args);
+        run_cached(&self.workspace, &self.cache, &call, self.limits).ok()
     }
 }
 
@@ -369,6 +398,7 @@ fn run_cached(
     ws: &RepoWorkspace,
     cache: &ToolCache,
     call: &ReadOnlyCall,
+    limits: SearchLimits,
 ) -> Result<String, ToolError> {
     let key = call.normalize(ws)?;
     if let Some(hit) = cache.get(&key) {
@@ -381,9 +411,9 @@ fn run_cached(
             path,
             glob,
             case_sensitive,
-        } => grep(ws, pattern, path, glob.as_deref(), *case_sensitive)?,
+        } => grep(ws, pattern, path, glob.as_deref(), *case_sensitive, limits)?,
         CacheKey::ListDir { path } => list_dir(ws, path)?,
-        CacheKey::FindFiles { pattern, path } => find_files(ws, pattern, path)?,
+        CacheKey::FindFiles { pattern, path } => find_files(ws, pattern, path, limits)?,
     };
     cache.insert(key, content.clone());
     Ok(content)
@@ -494,19 +524,45 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// One step of [`walk_files`].
+enum Walked {
+    File {
+        rel: String,
+        abs: PathBuf,
+    },
+    /// The time budget ran out; the walk stops here.
+    TimeUp,
+}
+
 /// Files under `target` (or `target` itself when it is a file), with their relative paths.
+/// Checks `deadline` before every walk entry, directories included, and yields one
+/// [`Walked::TimeUp`] when it has passed.
 fn walk_files(
     ws: &RepoWorkspace,
     target: &RepoPath,
-) -> impl Iterator<Item = (String, std::path::PathBuf)> {
+    deadline: Instant,
+) -> impl Iterator<Item = Walked> {
     let root = ws.root().to_path_buf();
+    let mut timed_out = false;
     walk(ws, target.abs())
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
-        .filter_map(move |entry| {
-            let rel = relative(&root, entry.path())?;
-            Some((rel, entry.into_path()))
+        .map_while(move |entry| {
+            if timed_out {
+                return None;
+            }
+            if Instant::now() >= deadline {
+                timed_out = true;
+                return Some(Some(Walked::TimeUp));
+            }
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                return Some(None);
+            }
+            Some(relative(&root, entry.path()).map(|rel| Walked::File {
+                rel,
+                abs: entry.into_path(),
+            }))
         })
+        .flatten()
 }
 
 fn compile_glob(pattern: &str) -> Result<GlobMatcher, ToolError> {
@@ -550,7 +606,9 @@ fn grep(
     rel: &str,
     glob: Option<&str>,
     case_sensitive: bool,
+    limits: SearchLimits,
 ) -> Result<String, ToolError> {
+    let deadline = Instant::now() + limits.time_budget;
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(!case_sensitive)
         .size_limit(REGEX_SIZE_LIMIT)
@@ -563,12 +621,25 @@ fn grep(
         return Err(ToolError::NotFound(rel.to_owned()));
     }
 
-    let mut out = Capped::new(GREP_MAX_CHARS - NOTE_RESERVE_CHARS);
-    let mut groups = 0;
+    let mut search = GrepSearch {
+        regex: &regex,
+        deadline,
+        line_window: limits.line_window,
+        out: Capped::new(GREP_MAX_CHARS - NOTE_RESERVE_CHARS),
+        groups: 0,
+        long_lines: 0,
+    };
     let mut scanned = 0;
     let mut skipped = 0;
     let mut truncated = None;
-    for (file_rel, abs) in walk_files(ws, &target) {
+    for walked in walk_files(ws, &target, deadline) {
+        let (file_rel, abs) = match walked {
+            Walked::File { rel, abs } => (rel, abs),
+            Walked::TimeUp => {
+                truncated = Some(time_limit_note());
+                break;
+            }
+        };
         if glob.as_ref().is_some_and(|g| !g.is_match(&file_rel)) {
             continue;
         }
@@ -583,13 +654,14 @@ fn grep(
             skipped += 1;
             continue;
         };
-        if let Err(reason) = grep_file(&regex, &file_rel, &text, &mut out, &mut groups) {
+        if let Err(reason) = search.file(&file_rel, &text) {
             truncated = Some(reason);
             break;
         }
     }
 
-    let mut result = out.text;
+    let (groups, long_lines) = (search.groups, search.long_lines);
+    let mut result = search.out.text;
     if groups == 0 && truncated.is_none() {
         let place = if rel.is_empty() {
             "the repository"
@@ -604,6 +676,12 @@ fn grep(
             "[{skipped} file(s) skipped: binary, unreadable or larger than 2 MB]\n"
         ));
     }
+    if long_lines > 0 {
+        let kib = limits.line_window / 1024;
+        result.push_str(&format!(
+            "[search truncated: {long_lines} line(s) longer than {kib} KiB were only searched in their first {kib} KiB]\n"
+        ));
+    }
     if let Some(reason) = truncated {
         result.push_str(&format!("[search truncated: {reason}]\n"));
     }
@@ -611,54 +689,98 @@ fn grep(
     Ok(result)
 }
 
-/// Appends the match groups of one file. `Err` carries the truncation reason.
-fn grep_file(
-    regex: &Regex,
-    rel: &str,
-    text: &str,
-    out: &mut Capped,
-    groups: &mut usize,
-) -> Result<(), String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let matches: Vec<usize> = (0..lines.len())
-        .filter(|&i| regex.is_match(lines[i]))
-        .collect();
-    // Merge the context windows of nearby matches into one group.
-    let mut windows: Vec<(usize, usize)> = Vec::new();
-    for &m in &matches {
-        let from = m.saturating_sub(GREP_CONTEXT_LINES);
-        let to = (m + GREP_CONTEXT_LINES).min(lines.len() - 1);
-        match windows.last_mut() {
-            Some(last) if from <= last.1 + 1 => last.1 = to,
-            _ => windows.push((from, to)),
-        }
-    }
-    let char_limit =
-        || format!("{GREP_MAX_CHARS} character limit reached; narrow the pattern, path or glob");
-    for (from, to) in windows {
-        if *groups == GREP_MAX_GROUPS {
-            return Err(format!(
-                "{GREP_MAX_GROUPS} match group limit reached; narrow the pattern, path or glob"
-            ));
-        }
-        let separator_ok = out.text.is_empty() || out.push_line("");
-        if !separator_ok || !out.push_line(rel) {
-            return Err(char_limit());
-        }
-        *groups += 1;
-        for (i, line) in lines.iter().enumerate().take(to + 1).skip(from) {
-            let mark = if matches.binary_search(&i).is_ok() {
-                '>'
+fn time_limit_note() -> String {
+    "time limit reached; narrow the pattern, path or glob".to_owned()
+}
+
+/// State of one `grep` call across files.
+struct GrepSearch<'r> {
+    regex: &'r Regex,
+    deadline: Instant,
+    line_window: usize,
+    out: Capped,
+    groups: usize,
+    /// Lines matched only within their first `line_window` bytes.
+    long_lines: usize,
+}
+
+impl GrepSearch<'_> {
+    /// Appends the match groups of one file. `Err` carries the truncation reason; matches
+    /// found before the deadline are still shown.
+    fn file(&mut self, rel: &str, text: &str) -> Result<(), String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut matches = Vec::new();
+        let mut timed_out = false;
+        for (i, line) in lines.iter().enumerate() {
+            if Instant::now() >= self.deadline {
+                timed_out = true;
+                break;
+            }
+            let window = if line.len() > self.line_window {
+                self.long_lines += 1;
+                prefix_at_char_boundary(line, self.line_window)
             } else {
-                '-'
+                line
             };
-            let line = excerpt(line, GREP_MAX_LINE_CHARS);
-            if !out.push_line(&format!("{}{mark} {line}", i + 1)) {
-                return Err(char_limit());
+            if self.regex.is_match(window) {
+                matches.push(i);
             }
         }
+        self.render(rel, &lines, &matches)?;
+        if timed_out {
+            return Err(time_limit_note());
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// Prints `matches` (sorted line indexes) with their context, merging nearby windows.
+    fn render(&mut self, rel: &str, lines: &[&str], matches: &[usize]) -> Result<(), String> {
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        for &m in matches {
+            let from = m.saturating_sub(GREP_CONTEXT_LINES);
+            let to = (m + GREP_CONTEXT_LINES).min(lines.len() - 1);
+            match windows.last_mut() {
+                Some(last) if from <= last.1 + 1 => last.1 = to,
+                _ => windows.push((from, to)),
+            }
+        }
+        let char_limit = || {
+            format!("{GREP_MAX_CHARS} character limit reached; narrow the pattern, path or glob")
+        };
+        for (from, to) in windows {
+            if self.groups == GREP_MAX_GROUPS {
+                return Err(format!(
+                    "{GREP_MAX_GROUPS} match group limit reached; narrow the pattern, path or glob"
+                ));
+            }
+            let separator_ok = self.out.text.is_empty() || self.out.push_line("");
+            if !separator_ok || !self.out.push_line(rel) {
+                return Err(char_limit());
+            }
+            self.groups += 1;
+            for (i, line) in lines.iter().enumerate().take(to + 1).skip(from) {
+                let mark = if matches.binary_search(&i).is_ok() {
+                    '>'
+                } else {
+                    '-'
+                };
+                let line = excerpt(line, GREP_MAX_LINE_CHARS);
+                if !self.out.push_line(&format!("{}{mark} {line}", i + 1)) {
+                    return Err(char_limit());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The longest prefix of `text` of at most `max` bytes that ends on a char boundary.
+fn prefix_at_char_boundary(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// `text` cut to `max` characters, marked when cut. Keeps model-supplied text (patterns,
@@ -714,7 +836,13 @@ fn list_dir(ws: &RepoWorkspace, rel: &str) -> Result<String, ToolError> {
     Ok(result)
 }
 
-fn find_files(ws: &RepoWorkspace, pattern: &str, rel: &str) -> Result<String, ToolError> {
+fn find_files(
+    ws: &RepoWorkspace,
+    pattern: &str,
+    rel: &str,
+    limits: SearchLimits,
+) -> Result<String, ToolError> {
+    let deadline = Instant::now() + limits.time_budget;
     let glob = compile_glob(pattern)?;
     let dir = resolve_rel(ws, rel)?;
     if dir.abs().is_file() {
@@ -723,20 +851,32 @@ fn find_files(ws: &RepoWorkspace, pattern: &str, rel: &str) -> Result<String, To
     if !dir.abs().is_dir() {
         return Err(ToolError::NotFound(rel.to_owned()));
     }
-    // One extra match tells whether the list was cut.
-    let mut found: Vec<String> = walk_files(ws, &dir)
-        .map(|(file_rel, _)| file_rel)
-        .filter(|file_rel| glob.is_match(file_rel))
-        .take(LIST_MAX_ENTRIES + 1)
-        .collect();
-    if found.is_empty() {
-        let pattern = excerpt(pattern, MAX_ECHO_CHARS);
-        return Ok(format!("No files match `{pattern}`."));
+    let mut found: Vec<String> = Vec::new();
+    let mut timed_out = false;
+    for walked in walk_files(ws, &dir, deadline) {
+        match walked {
+            Walked::File { rel, .. } if glob.is_match(&rel) => {
+                found.push(rel);
+                // One extra match tells whether the list was cut.
+                if found.len() > LIST_MAX_ENTRIES {
+                    break;
+                }
+            }
+            Walked::File { .. } => {}
+            Walked::TimeUp => {
+                timed_out = true;
+                break;
+            }
+        }
     }
     let more = found.len() > LIST_MAX_ENTRIES;
     found.truncate(LIST_MAX_ENTRIES);
     found.sort();
     let mut out = Capped::new(LIST_MAX_CHARS - NOTE_RESERVE_CHARS);
+    if found.is_empty() {
+        let pattern = excerpt(pattern, MAX_ECHO_CHARS);
+        out.push_line(&format!("No files match `{pattern}`."));
+    }
     let mut shown = 0;
     for path in &found {
         if !out.push_line(path) {
@@ -749,6 +889,9 @@ fn find_files(ws: &RepoWorkspace, pattern: &str, rel: &str) -> Result<String, To
         result.push_str(&format!(
             "[results truncated: showing {shown} matches; narrow the pattern or path]\n"
         ));
+    }
+    if timed_out {
+        result.push_str("[results truncated: time limit reached; narrow the pattern or path]\n");
     }
     result.pop();
     Ok(result)
@@ -789,9 +932,10 @@ fn read_only_defs() -> Vec<ToolDef> {
                 matched per line). Skips .gitignore'd, binary, secret and .git files and files \
                 over 2 MB. Output: groups separated by a blank line; each group starts with the \
                 file path, then lines `<n>> <text>` for matches and `<n>- <text>` for up to 2 \
-                context lines around them. Stops at 40 groups, 8,000 characters or 20,000 files \
-                scanned and then ends with `[search truncated: ...]`. Lines longer than 500 \
-                characters are cut."
+                context lines around them. Stops at 40 groups, 8,000 characters, 20,000 files \
+                scanned or 10 seconds and then ends with `[search truncated: ...]`. Only the \
+                first 64 KiB of each line is searched; printed lines longer than 500 characters \
+                are cut."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -839,8 +983,8 @@ fn read_only_defs() -> Vec<ToolDef> {
             description: "Find files whose path relative to the repository root matches a glob. \
                 * also matches /, so *.rs finds Rust files at any depth; use **/name.ext for a \
                 file name in any directory. Skips .gitignore'd, secret and .git files. Output: \
-                one path per line, sorted, at most 150 paths and 4,000 characters, then \
-                `[results truncated: ...]`."
+                one path per line, sorted, at most 150 paths and 4,000 characters; stops after \
+                10 seconds. A cut list ends with `[results truncated: ...]`."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -1237,6 +1381,124 @@ mod tests {
             err(&tb, "grep", json!({"pattern": "\\w{1000}{1000}"}))
                 .await
                 .contains("size limit")
+        );
+    }
+
+    fn limited(files: &[(&str, &[u8])], time_budget: Duration, line_window: usize) -> Toolbox {
+        let mut tb = toolbox(files);
+        tb.limits = SearchLimits {
+            time_budget,
+            line_window,
+        };
+        tb
+    }
+
+    #[tokio::test]
+    async fn grep_and_find_files_stop_when_the_time_budget_runs_out() {
+        let tb = limited(
+            &[("src/a.rs", b"needle\n")],
+            Duration::ZERO,
+            GREP_LINE_WINDOW,
+        );
+        assert_eq!(
+            ok(&tb, "grep", json!({"pattern": "needle"})).await,
+            "[search truncated: time limit reached; narrow the pattern, path or glob]"
+        );
+        assert_eq!(
+            ok(&tb, "find_files", json!({"pattern": "*.rs"})).await,
+            "No files match `*.rs`.\n\
+             [results truncated: time limit reached; narrow the pattern or path]"
+        );
+    }
+
+    #[test]
+    fn grep_line_loop_checks_the_deadline() {
+        let regex = Regex::new("needle").unwrap();
+        let mut search = GrepSearch {
+            regex: &regex,
+            deadline: Instant::now(),
+            line_window: GREP_LINE_WINDOW,
+            out: Capped::new(1_000),
+            groups: 0,
+            long_lines: 0,
+        };
+        assert_eq!(search.file("a.rs", "needle\n"), Err(time_limit_note()));
+        assert_eq!(search.groups, 0);
+        assert!(search.out.text.is_empty());
+    }
+
+    #[tokio::test]
+    async fn grep_bounds_slow_regexes_by_the_time_budget() {
+        // Pseudo-random a/b lines keep this pattern off the fast regex engines.
+        let mut state = 12_345_u32;
+        let mut text = String::new();
+        for _ in 0..400 {
+            for _ in 0..4_000 {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                text.push(if (state >> 16) & 1 == 0 { 'a' } else { 'b' });
+            }
+            text.push('\n');
+        }
+        let tb = limited(
+            &[("ab.txt", text.as_bytes())],
+            Duration::from_millis(50),
+            GREP_LINE_WINDOW,
+        );
+        let started = Instant::now();
+        let out = ok(&tb, "grep", json!({"pattern": "a[ab]{300}[c-y]"})).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            out.ends_with(
+                "[search truncated: time limit reached; narrow the pattern, path or glob]"
+            ),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_matches_only_the_line_window_of_long_lines() {
+        // Line 3 is cut inside a two-byte character, which must not panic.
+        let text = format!(
+            "{}needle\nneedle\na{}\n",
+            "x".repeat(1_030),
+            "\u{e9}".repeat(600)
+        );
+        let tb = limited(&[("a.txt", text.as_bytes())], SEARCH_TIME_BUDGET, 1_024);
+        let out = ok(&tb, "grep", json!({"pattern": "needle"})).await;
+        assert!(out.starts_with("a.txt\n1- xxx"), "{out}");
+        assert!(out.contains("\n2> needle\n3- a\u{e9}"), "{out}");
+        assert!(!out.contains("1> "), "{out}");
+        assert!(
+            out.ends_with(
+                "[search truncated: 2 line(s) longer than 1 KiB were only searched in their first 1 KiB]"
+            ),
+            "{out}"
+        );
+        assert_eq!(prefix_at_char_boundary("a\u{e9}", 2), "a");
+        assert_eq!(prefix_at_char_boundary("ab", 10), "ab");
+    }
+
+    #[tokio::test]
+    async fn search_errors_say_how_to_adjust() {
+        let tb = toolbox(&[("bin.dat", b"\0")]);
+        assert!(
+            err(&tb, "grep", json!({"pattern": ""}))
+                .await
+                .contains("pass a regular expression")
+        );
+        assert!(
+            err(&tb, "find_files", json!({"pattern": "{a"}))
+                .await
+                .contains("use *, ** and {a,b} with / separators")
+        );
+        assert!(
+            err(&tb, "read_file", json!({"path": "bin.dat"}))
+                .await
+                .contains("read a source or text file instead")
         );
     }
 
