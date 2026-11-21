@@ -796,23 +796,15 @@ fn ensure_private_root(root: &Path) -> std::io::Result<()> {
 }
 
 /// Unix: after creating `workspace` inside `root`, both must be real directories without group
-/// or other permissions, and `root` must belong to the user that owns `workspace` (this
-/// process). Only that user (or the superuser) can then have changed `root` or its entries, so
-/// no one else can have redirected, replaced or planted files in the workspace.
+/// or other permissions, owned by this process's uid ([`process_uid`]). With `root` owned by us
+/// at 0700, no other non-root user can enter it, rename within it, or replace anything under it,
+/// which closes the race between [`ensure_private_root`] and the workspace creation.
 #[cfg(unix)]
 fn verify_workspace_parent(root: &Path, workspace: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let root_meta = std::fs::symlink_metadata(root)?;
-    let ws_meta = std::fs::symlink_metadata(workspace)?;
-    let ws_uid = ws_meta.uid();
-    let root_ok = is_private_dir_of(
-        root_meta.file_type().is_dir(),
-        root_meta.mode(),
-        root_meta.uid(),
-        ws_uid,
-    );
-    let ws_ok = is_private_dir_of(ws_meta.file_type().is_dir(), ws_meta.mode(), ws_uid, ws_uid);
-    if root_ok && ws_ok {
+    let uid = process_uid()?;
+    let root_facts = DirFacts::of(&std::fs::symlink_metadata(root)?);
+    let ws_facts = DirFacts::of(&std::fs::symlink_metadata(workspace)?);
+    if workspace_parent_trusted(&root_facts, &ws_facts, uid) {
         Ok(())
     } else {
         Err(std::io::Error::new(
@@ -828,14 +820,59 @@ fn verify_workspace_parent(_root: &Path, _workspace: &Path) -> std::io::Result<(
     Ok(())
 }
 
-/// True for a real directory (`is_dir` from `symlink_metadata`, so never a symlink) without
-/// group or other permission bits, owned by `uid`.
+/// Our uid without `libc`: the owner of an anonymous temp file this process just created,
+/// read through the open handle (`fstat`), so no other user can substitute it.
+#[cfg(unix)]
+fn process_uid() -> std::io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    static UID: OnceLock<u32> = OnceLock::new();
+    if let Some(uid) = UID.get() {
+        return Ok(*uid);
+    }
+    let uid = tempfile::tempfile()?.metadata()?.uid();
+    Ok(*UID.get_or_init(|| uid))
+}
+
+/// What the ownership check needs from `symlink_metadata` of a directory.
 #[cfg_attr(
     all(not(unix), not(test)),
     expect(dead_code, reason = "ownership is only checked on Unix")
 )]
-fn is_private_dir_of(is_dir: bool, mode: u32, owner_uid: u32, uid: u32) -> bool {
-    is_dir && mode & 0o077 == 0 && owner_uid == uid
+struct DirFacts {
+    /// From `symlink_metadata`, so a symlink is never a directory.
+    is_dir: bool,
+    mode: u32,
+    uid: u32,
+}
+
+impl DirFacts {
+    #[cfg(unix)]
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            is_dir: meta.file_type().is_dir(),
+            mode: meta.mode(),
+            uid: meta.uid(),
+        }
+    }
+
+    /// A real directory without group or other permission bits, owned by `uid`.
+    #[cfg_attr(
+        all(not(unix), not(test)),
+        expect(dead_code, reason = "ownership is only checked on Unix")
+    )]
+    fn is_private_of(&self, uid: u32) -> bool {
+        self.is_dir && self.mode & 0o077 == 0 && self.uid == uid
+    }
+}
+
+/// Both the clones root and the new workspace are private directories of `process_uid`.
+#[cfg_attr(
+    all(not(unix), not(test)),
+    expect(dead_code, reason = "ownership is only checked on Unix")
+)]
+fn workspace_parent_trusted(root: &DirFacts, workspace: &DirFacts, process_uid: u32) -> bool {
+    root.is_private_of(process_uid) && workspace.is_private_of(process_uid)
 }
 
 /// Deletes a failed workspace now. Retries briefly because Windows releases the files of a
@@ -1423,26 +1460,48 @@ mod tests {
         }
     }
 
+    fn facts(is_dir: bool, mode: u32, uid: u32) -> DirFacts {
+        DirFacts { is_dir, mode, uid }
+    }
+
     #[test]
-    fn private_dir_check_requires_directory_mode_and_owner() {
-        assert!(is_private_dir_of(true, 0o40700, 1000, 1000));
-        assert!(is_private_dir_of(true, 0o700, 1000, 1000));
-        assert!(is_private_dir_of(true, 0o500, 1000, 1000));
-        // Owned by another user, even at 0700 (the race in which an owner flips the mode).
-        assert!(!is_private_dir_of(true, 0o700, 1001, 1000));
-        // Group or other bits.
-        assert!(!is_private_dir_of(true, 0o750, 1000, 1000));
-        assert!(!is_private_dir_of(true, 0o701, 1000, 1000));
-        assert!(!is_private_dir_of(true, 0o777, 1000, 1000));
+    fn workspace_parent_check_requires_private_dirs_of_the_process_uid() {
+        const ME: u32 = 1000;
+        const OTHER: u32 = 1001;
+        let ok = |root: DirFacts, ws: DirFacts| workspace_parent_trusted(&root, &ws, ME);
+        assert!(ok(facts(true, 0o40700, ME), facts(true, 0o40700, ME)));
+        assert!(ok(facts(true, 0o500, ME), facts(true, 0o700, ME)));
+        // Root and workspace both swapped in by another user: consistent, but not ours.
+        assert!(!ok(facts(true, 0o700, OTHER), facts(true, 0o700, OTHER)));
+        // Root ours, workspace replaced by another user.
+        assert!(!ok(facts(true, 0o700, ME), facts(true, 0o700, OTHER)));
+        // Root foreign at 0700 (an owner that flips the mode), workspace ours.
+        assert!(!ok(facts(true, 0o700, OTHER), facts(true, 0o700, ME)));
+        // Group or other bits on either.
+        for mode in [0o750, 0o701, 0o777] {
+            assert!(
+                !ok(facts(true, mode, ME), facts(true, 0o700, ME)),
+                "{mode:o}"
+            );
+            assert!(
+                !ok(facts(true, 0o700, ME), facts(true, mode, ME)),
+                "{mode:o}"
+            );
+        }
         // A symlink or file (`symlink_metadata` reports not-a-directory).
-        assert!(!is_private_dir_of(false, 0o700, 1000, 1000));
+        assert!(!ok(facts(false, 0o700, ME), facts(true, 0o700, ME)));
+        assert!(!ok(facts(true, 0o700, ME), facts(false, 0o700, ME)));
     }
 
     #[cfg(unix)]
     #[test]
     fn verify_workspace_parent_accepts_private_and_rejects_shared_root() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let root = private_root();
+        assert_eq!(
+            process_uid().unwrap(),
+            fs::symlink_metadata(root.path()).unwrap().uid()
+        );
         let ws = root.path().join("adus-ws");
         fs::create_dir(&ws).unwrap();
         fs::set_permissions(&ws, fs::Permissions::from_mode(0o700)).unwrap();
