@@ -319,6 +319,14 @@ pub async fn cleanup_orphaned_in(root: &Path, max_age: Duration) -> usize {
 }
 
 fn sweep_orphans(root: &Path, max_age: Duration) -> usize {
+    // Never follow a symlinked root: it would delete `adus-*` entries somewhere else.
+    match std::fs::symlink_metadata(root) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            tracing::warn!(path = %root.display(), "clones root is a symlink; not sweeping it");
+            return 0;
+        }
+        _ => {}
+    }
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
@@ -733,18 +741,54 @@ fn version_supported(version: (u32, u32)) -> bool {
     version >= MIN_GIT_VERSION
 }
 
-/// Creates `<root>/adus-{uuid}` (mode 0700 on Unix).
+/// Creates `<root>/adus-{uuid}`. On Unix both `root` and the workspace are private (0700), so
+/// other local users can neither read the checkout nor plant files in it.
 async fn create_workspace_dir(root: PathBuf) -> Result<TempDir, WorkspaceError> {
     tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&root)?;
-        tempfile::Builder::new()
-            .prefix(&format!("adus-{}", uuid::Uuid::new_v4()))
-            .rand_bytes(0)
-            .tempdir_in(&root)
+        ensure_private_root(&root)?;
+        let prefix = format!("adus-{}", uuid::Uuid::new_v4());
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(&prefix).rand_bytes(0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        builder.tempdir_in(&root)
     })
     .await
     .map_err(|_| WorkspaceError::Unavailable("cannot create workspace".into()))?
     .map_err(|e| unavailable("cannot create workspace", &e))
+}
+
+/// Creates `root` if missing. On Unix it must then be a real directory (not a symlink) without
+/// group or other permissions: a predictable path under a shared `/tmp` may have been created
+/// by another user first. A 0700 directory owned by someone else fails safe, because creating
+/// the workspace inside it is denied.
+#[cfg(unix)]
+fn ensure_private_root(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(root)?;
+    let private = meta.file_type().is_dir() && meta.permissions().mode() & 0o077 == 0;
+    if private {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "clones root is not a private directory",
+        ))
+    }
+}
+
+/// Windows: `%TEMP%` is already per user.
+#[cfg(not(unix))]
+fn ensure_private_root(root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)
 }
 
 /// Deletes a failed workspace now. Retries briefly because Windows releases the files of a
@@ -908,6 +952,17 @@ mod tests {
         source
     }
 
+    /// A temp dir usable as `clones_root` (0700 on Unix, as the cloner requires).
+    fn private_root() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        dir
+    }
+
     fn cloner(root: &Path) -> GitCliCloner {
         GitCliCloner {
             clones_root: root.to_path_buf(),
@@ -959,7 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn clones_local_repo_with_hardened_flags_and_deletes_on_drop() {
         let source = source_repo();
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let url = source.url();
 
         let ws = cloner(root.path())
@@ -1007,7 +1062,7 @@ mod tests {
     #[tokio::test]
     async fn hooks_in_workspace_do_not_fire_during_checkout() {
         let source = source_repo();
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let dir = TempDir::new_in(root.path()).unwrap();
         let cloner = cloner(root.path());
         let layout = Layout::new(dir.path(), root.path());
@@ -1032,7 +1087,7 @@ mod tests {
 
     #[test]
     fn fetch_puts_auth_header_in_env_not_argv() {
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let cloner = GitCliCloner {
             clones_root: root.path().to_path_buf(),
             ..GitCliCloner::default()
@@ -1106,7 +1161,7 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_fallback_refspec_when_primary_fetch_fails() {
         let source = source_repo();
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let url = source.url();
 
         let ws = cloner(root.path())
@@ -1133,7 +1188,7 @@ mod tests {
     #[tokio::test]
     async fn head_mismatch_with_expected_sha_still_succeeds() {
         let source = source_repo();
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let other = "0123456789abcdef0123456789abcdef01234567";
         let ws = cloner(root.path())
             .clone_pr(&spec(&source.url(), "refs/heads/main", None, other))
@@ -1144,7 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_checkout_over_max_bytes() {
         let source = source_repo();
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let cloner = GitCliCloner {
             max_bytes: 8,
             ..cloner(root.path())
@@ -1160,7 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_urls_outside_http_and_https() {
         let source = source_repo();
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let strict = GitCliCloner {
             clones_root: root.path().to_path_buf(),
             ..GitCliCloner::default()
@@ -1321,6 +1376,74 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clones_root_and_workspace_are_private() {
+        let source = source_repo();
+        let parent = private_root();
+        let clones = parent.path().join("adus-clones");
+        let ws = cloner(&clones)
+            .clone_pr(&spec(&source.url(), &source.head, None, &source.head))
+            .await
+            .unwrap();
+        assert_eq!(mode(&clones), 0o700);
+        let workspace_dir = ws.root().parent().unwrap();
+        assert_eq!(mode(workspace_dir), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_symlinked_or_shared_clones_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = source_repo();
+        let parent = private_root();
+        let target = parent.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let shared = parent.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+
+        for (root, perms) in [
+            (&link, None),
+            (&shared, Some(0o777)),
+            (&shared, Some(0o750)),
+        ] {
+            if let Some(perms) = perms {
+                fs::set_permissions(root, fs::Permissions::from_mode(perms)).unwrap();
+            }
+            let err = cloner(root)
+                .clone_pr(&spec(&source.url(), &source.head, None, &source.head))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, WorkspaceError::Unavailable(_)),
+                "{root:?}: {err:?}"
+            );
+        }
+        assert!(entries(&target).is_empty());
+        assert!(entries(&shared).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_refuses_symlinked_clones_root() {
+        let parent = private_root();
+        let target = parent.path().join("target");
+        fs::create_dir_all(target.join("adus-x")).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(cleanup_orphaned_in(&link, Duration::ZERO).await, 0);
+        assert!(target.join("adus-x").exists());
+    }
+
     #[cfg(windows)]
     #[test]
     fn resolve_rejects_junction_escaping_root() {
@@ -1427,7 +1550,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_sends_auth_header_and_maps_401_to_unauthorized() {
         let (url, seen) = spawn_401_server();
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let err = cloner(root.path())
             .clone_pr(&spec(
                 &url,
@@ -1457,7 +1580,7 @@ mod tests {
                 held.push(stream);
             }
         });
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         let cloner = GitCliCloner {
             clone_timeout: Duration::from_secs(2),
             ..cloner(root.path())
@@ -1479,7 +1602,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_orphaned_workspaces_removes_leftover_dirs() {
-        let root = TempDir::new().unwrap();
+        let root = private_root();
         fs::create_dir_all(root.path().join("adus-a/repo/src")).unwrap();
         fs::write(root.path().join("adus-a/repo/src/x.rs"), "x").unwrap();
         fs::write(root.path().join("adus-b"), "stray file").unwrap();
