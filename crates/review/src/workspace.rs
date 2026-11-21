@@ -3,7 +3,8 @@
 //! The worker holds decrypted PATs and server secrets, so the clone is built defensively:
 //! - the PAT only travels in the `git fetch` environment (`GIT_CONFIG_*`), never in argv, the
 //!   URL, `.git/config`, logs or errors (stderr is scrubbed);
-//! - every git process runs with a cleared environment, no system/global config, hooks pointed
+//! - every git process runs with a cleared environment (only `PATH`, the Windows basics and the
+//!   operator's proxy/CA variables are passed through), no system/global config, hooks pointed
 //!   at `/dev/null`, symlinks checked out as plain files, no fsmonitor, no LFS filters, no
 //!   submodules, no redirects and no credential helper;
 //! - the clone lives in a [`TempDir`] owned by [`RepoWorkspace`], so it is deleted on drop;
@@ -40,11 +41,30 @@ const REMOVE_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// Longest stderr excerpt kept in an error.
 const MAX_ERROR_CHARS: usize = 300;
 
-/// Environment variables passed through to git; everything else is cleared.
+/// Environment variables git needs to start, passed through; everything else is cleared
+/// except [`PROXY_AND_CA_ENV`].
 #[cfg(windows)]
 const PASSTHROUGH_ENV: &[&str] = &["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"];
 #[cfg(not(windows))]
 const PASSTHROUGH_ENV: &[&str] = &["PATH"];
+/// The operator's proxy and CA settings, also passed through, so a deployment behind an HTTPS
+/// proxy or a private CA can clone (`reqwest` already honours the proxy for API calls). Never
+/// `GIT_TRACE*` or `GIT_CURL_VERBOSE`, which would print the PAT, and not uppercase
+/// `HTTP_PROXY`, which curl ignores for http.
+const PROXY_AND_CA_ENV: &[&str] = &[
+    "http_proxy",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+];
 
 /// Case-insensitive git stderr phrases that mean the credentials were rejected. Never bare
 /// status digits: a ref or path may contain "401".
@@ -616,13 +636,23 @@ impl GitCliCloner {
         cmd
     }
 
-    /// Cleared environment plus the minimum git needs to start: no system or global config, no
-    /// prompts, English messages (auth detection matches them).
+    /// Cleared environment plus the minimum git needs to start and the operator's proxy/CA
+    /// variables: no system or global config, no prompts, English messages (auth detection
+    /// matches them).
     fn base_command(&self, layout: &Layout) -> Command {
+        self.base_command_with(layout, |key| std::env::var_os(key))
+    }
+
+    /// [`Self::base_command`] reading the passed-through variables from `host_env`.
+    fn base_command_with(
+        &self,
+        layout: &Layout,
+        host_env: impl Fn(&str) -> Option<OsString>,
+    ) -> Command {
         let mut cmd = Command::new("git");
         cmd.env_clear();
-        for key in PASSTHROUGH_ENV {
-            if let Some(value) = std::env::var_os(key) {
+        for key in PASSTHROUGH_ENV.iter().chain(PROXY_AND_CA_ENV) {
+            if let Some(value) = host_env(key) {
                 cmd.env(key, value);
             }
         }
@@ -744,8 +774,7 @@ pub fn version_supported(version: (u32, u32)) -> bool {
 }
 
 /// Creates `<root>/adus-{uuid}` (0700 on Unix) and, on Unix, checks afterwards that `root` is
-/// still a private directory owned by the same user as the new workspace (see
-/// [`verify_workspace_parent`]). The check runs before any git command; on failure the
+/// still a private directory owned by this process's uid (see [`verify_workspace_parent`]). The check runs before any git command; on failure the
 /// `TempDir` is dropped and nothing is fetched.
 async fn create_workspace_dir(root: PathBuf) -> Result<TempDir, WorkspaceError> {
     tokio::task::spawn_blocking(move || {
@@ -1242,6 +1271,43 @@ mod tests {
                 assert!(!value.contains(PAT), "PAT leaked into {key}");
             }
         }
+    }
+
+    #[test]
+    fn base_command_passes_proxy_and_ca_variables_and_clears_the_rest() {
+        let root = private_root();
+        let cloner = GitCliCloner {
+            clones_root: root.path().to_path_buf(),
+            ..GitCliCloner::default()
+        };
+        let layout = Layout::new(&root.path().join("adus-x"), root.path());
+        let host_env = |key: &str| {
+            ["HTTPS_PROXY", "SSL_CERT_FILE", "GIT_TRACE", "HTTP_PROXY"]
+                .contains(&key)
+                .then(|| OsString::from(format!("{key}-value")))
+        };
+
+        let cmd = cloner.base_command_with(&layout, host_env);
+
+        // Windows matches variable names case-insensitively, so compare upper-cased names.
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_ascii_uppercase(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let get = |key: &str| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        assert_eq!(get("HTTPS_PROXY"), Some(Some("HTTPS_PROXY-value".into())));
+        assert_eq!(
+            get("SSL_CERT_FILE"),
+            Some(Some("SSL_CERT_FILE-value".into()))
+        );
+        assert_eq!(get("GIT_TRACE"), None, "trace output could carry the PAT");
+        assert_eq!(get("HTTP_PROXY"), None, "curl ignores uppercase HTTP_PROXY");
     }
 
     #[tokio::test]

@@ -425,19 +425,39 @@ fn run_cached(
     if let Some(hit) = cache.get(&key) {
         return Ok(hit);
     }
-    let content = match &key {
-        CacheKey::ReadFile { path, start, end } => read_file(ws, path, *start, *end)?,
+    let found = match &key {
+        CacheKey::ReadFile { path, start, end } => {
+            ToolText::complete(read_file(ws, path, *start, *end)?)
+        }
         CacheKey::Grep {
             pattern,
             path,
             glob,
             case_sensitive,
         } => grep(ws, pattern, path, glob.as_deref(), *case_sensitive, limits)?,
-        CacheKey::ListDir { path } => list_dir(ws, path)?,
+        CacheKey::ListDir { path } => ToolText::complete(list_dir(ws, path)?),
         CacheKey::FindFiles { pattern, path } => find_files(ws, pattern, path, limits)?,
     };
-    cache.insert(key, content.clone());
-    Ok(content)
+    // A cut caused by load is not deterministic: a later identical call gets a fresh try.
+    if !found.time_cut {
+        cache.insert(key, found.text.clone());
+    }
+    Ok(found.text)
+}
+
+/// The text of a read-only call, and whether the search time budget cut it short.
+struct ToolText {
+    text: String,
+    time_cut: bool,
+}
+
+impl ToolText {
+    fn complete(text: String) -> Self {
+        Self {
+            text,
+            time_cut: false,
+        }
+    }
 }
 
 /// Reads a text file of at most 2 MB without a NUL byte in its first 8 KB. Invalid UTF-8 is
@@ -628,7 +648,7 @@ fn grep(
     glob: Option<&str>,
     case_sensitive: bool,
     limits: SearchLimits,
-) -> Result<String, ToolError> {
+) -> Result<ToolText, ToolError> {
     let deadline = Instant::now() + limits.time_budget;
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(!case_sensitive)
@@ -649,6 +669,7 @@ fn grep(
         out: Capped::new(GREP_MAX_CHARS - NOTE_RESERVE_CHARS),
         groups: 0,
         long_lines: 0,
+        timed_out: false,
     };
     let mut scanned = 0;
     let mut skipped = 0;
@@ -657,6 +678,7 @@ fn grep(
         let (file_rel, abs) = match walked {
             Walked::File { rel, abs } => (rel, abs),
             Walked::TimeUp => {
+                search.timed_out = true;
                 truncated = Some(time_limit_note());
                 break;
             }
@@ -681,7 +703,7 @@ fn grep(
         }
     }
 
-    let (groups, long_lines) = (search.groups, search.long_lines);
+    let (groups, long_lines, time_cut) = (search.groups, search.long_lines, search.timed_out);
     let mut result = search.out.text;
     if groups == 0 && truncated.is_none() {
         let place = if rel.is_empty() {
@@ -707,7 +729,10 @@ fn grep(
         result.push_str(&format!("[search truncated: {reason}]\n"));
     }
     result.pop();
-    Ok(result)
+    Ok(ToolText {
+        text: result,
+        time_cut,
+    })
 }
 
 fn time_limit_note() -> String {
@@ -723,6 +748,8 @@ struct GrepSearch<'r> {
     groups: usize,
     /// Lines matched only within their first `line_window` bytes.
     long_lines: usize,
+    /// The deadline passed before the search finished.
+    timed_out: bool,
 }
 
 impl GrepSearch<'_> {
@@ -749,6 +776,7 @@ impl GrepSearch<'_> {
         }
         self.render(rel, &lines, &matches)?;
         if timed_out {
+            self.timed_out = true;
             return Err(time_limit_note());
         }
         Ok(())
@@ -862,7 +890,7 @@ fn find_files(
     pattern: &str,
     rel: &str,
     limits: SearchLimits,
-) -> Result<String, ToolError> {
+) -> Result<ToolText, ToolError> {
     let deadline = Instant::now() + limits.time_budget;
     let glob = compile_glob(pattern)?;
     let dir = resolve_rel(ws, rel)?;
@@ -915,7 +943,10 @@ fn find_files(
         result.push_str("[results truncated: time limit reached; narrow the pattern or path]\n");
     }
     result.pop();
-    Ok(result)
+    Ok(ToolText {
+        text: result,
+        time_cut: timed_out,
+    })
 }
 
 fn read_only_defs() -> Vec<ToolDef> {
@@ -995,8 +1026,7 @@ fn read_only_defs() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Directory relative to the repository root. Defaults to the root."
                     }
-                },
-                "required": []
+                }
             }),
         },
         ToolDef {
@@ -1432,6 +1462,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn searches_cut_by_the_time_budget_are_not_cached() {
+        let files: &[(&str, &[u8])] = &[("src/a.rs", b"needle\n")];
+        let cut = limited(files, Duration::ZERO, GREP_LINE_WINDOW);
+        for _ in 0..2 {
+            ok(&cut, "grep", json!({"pattern": "needle"})).await;
+            ok(&cut, "find_files", json!({"pattern": "*.rs"})).await;
+        }
+        assert_eq!(cut.cache.hits(), 0, "a time-cut result is recomputed");
+
+        let full = toolbox(files);
+        for _ in 0..2 {
+            ok(&full, "grep", json!({"pattern": "needle"})).await;
+            ok(&full, "find_files", json!({"pattern": "*.rs"})).await;
+        }
+        assert_eq!(full.cache.hits(), 2, "a finished search is cached");
+    }
+
     #[test]
     fn grep_line_loop_checks_the_deadline() {
         let regex = Regex::new("needle").unwrap();
@@ -1442,8 +1490,10 @@ mod tests {
             out: Capped::new(1_000),
             groups: 0,
             long_lines: 0,
+            timed_out: false,
         };
         assert_eq!(search.file("a.rs", "needle\n"), Err(time_limit_note()));
+        assert!(search.timed_out);
         assert_eq!(search.groups, 0);
         assert!(search.out.text.is_empty());
     }
@@ -1735,7 +1785,11 @@ mod tests {
         for def in tb.read_only_tool_defs() {
             assert_eq!(def.parameters["type"], "object", "{}", def.name);
             assert!(def.parameters["properties"].is_object());
-            assert!(def.parameters["required"].is_array());
+            // Omitted or non-empty: an empty `required` is not known to be accepted by Gemini.
+            if let Some(required) = def.parameters.get("required") {
+                let names = required.as_array().unwrap();
+                assert!(!names.is_empty(), "{} has an empty required", def.name);
+            }
             assert!(!def.description.is_empty());
             assert_portable_schema(&def.parameters);
         }
