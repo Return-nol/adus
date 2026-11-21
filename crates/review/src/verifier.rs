@@ -32,7 +32,7 @@ pub const VERIFY_MAX_STEPS: usize = 6;
 /// Most candidates verified in one review; the rest are omitted, lowest severity first.
 pub const MAX_VERIFY_CANDIDATES: usize = 25;
 
-/// Lines shown on each side of the finding's line in `<code_context>`.
+/// Lines shown on each side of the finding's line (or span) in `<code_context>`.
 const SNIPPET_RADIUS: u32 = 40;
 /// Output cap of a diff-only verdict (a short JSON object).
 const VERDICT_MAX_TOKENS: u32 = 2_048;
@@ -218,9 +218,8 @@ async fn verify_one(
     let snippet = match evidence.toolbox {
         Some(toolbox) => {
             let s = &candidate.suggestion;
-            toolbox
-                .read_file_snippet(&s.file, s.line, SNIPPET_RADIUS)
-                .await
+            let (center, radius) = snippet_window(s);
+            toolbox.read_file_snippet(&s.file, center, radius).await
         }
         None => None,
     };
@@ -239,6 +238,17 @@ async fn verify_one(
     }
     let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), false);
     verify_diff_only(ctx, prompt).await
+}
+
+/// Centre and radius of `<code_context>`: [`SNIPPET_RADIUS`] lines around the whole span
+/// `start_line..=line` (just `line` for a single-line finding). `read_file` still caps it.
+fn snippet_window(s: &Suggestion) -> (u32, u32) {
+    let start = s
+        .start_line
+        .filter(|&start| start < s.line)
+        .unwrap_or(s.line);
+    let half = (s.line - start).div_ceil(2);
+    (s.line - half, SNIPPET_RADIUS.saturating_add(half))
 }
 
 async fn verify_with_tools(
@@ -392,7 +402,7 @@ fn submit_verdict_tool_def() -> ToolDef {
     }
 }
 
-const VERIFIER_ROLE: &str = r#"You are Adudu's verifier. Another reviewer reported the candidate finding in <candidate> on a pull request. Decide whether it should be posted. Be skeptical but fair: the finding is kept by default, and you drop it only when concrete evidence refutes it."#;
+const VERIFIER_ROLE: &str = r#"You are Adudu's verifier. Another reviewer reported the candidate finding in <candidate> on a pull request. Decide whether it should be posted. Be skeptical but fair: the finding is kept by default, and you drop it only when concrete evidence refutes it. `start_line`..`line` is the span the finding and its suggestion cover."#;
 
 const VERIFIER_DROP_RULES: &str = r#"<Verdict>
 Drop the finding (keep = false) only when the evidence shows one of these:
@@ -401,7 +411,7 @@ Drop the finding (keep = false) only when the evidence shows one of these:
 - The flagged branch can never run.
 - It is pure style, formatting or a nitpick that no team rule or repository instruction asks for.
 - It is a generic "missing X" or "consider X" with no concrete way to fail.
-Findings from the team-rules reviewer, and findings that cite a team rule or a repository instruction, are never dropped as style: check instead whether that rule or instruction applies to this file and whether the changed line breaks it, and drop the finding only when it does not.
+Findings reported by the Rules reviewer (`reported_by`), and findings that cite a team rule or a repository instruction, are never dropped as style. Check instead whether that rule or instruction applies to this file and whether the changed line breaks it: drop such a finding only when the rule or instruction does not apply to this file, or the changed line does not break it.
 When the evidence is not enough to refute the finding, keep it. Never rewrite the finding: you only decide keep or drop.
 </Verdict>"#;
 
@@ -439,9 +449,10 @@ fn build_system_prompt(with_tools: bool) -> String {
     )
 }
 
-/// The evidence bundle for one candidate: the finding as JSON, the rules matching its file,
-/// memories, repository instructions, the file's annotated diff and (with a checkout) the
-/// lines around the finding. Every section is wrapped with its closing tag neutralized.
+/// The evidence bundle for one candidate: the rules matching its file, memories, repository
+/// instructions, the file's annotated diff, (with a checkout) the lines around the finding,
+/// then the finding as JSON and the task. Every section is wrapped with its closing tag
+/// neutralized.
 fn build_user_prompt(
     candidate: &CandidateFinding,
     evidence: &Evidence<'_>,
@@ -476,8 +487,9 @@ fn build_user_prompt(
         .find(|target| normalize_path(&target.path) == file)
         .map_or_else(|| "(diff not available)".to_string(), diff_block);
 
+    // Per-file sections first and the candidate last, so candidates on the same file share a
+    // cacheable prompt prefix.
     let mut sections = vec![
-        wrap("candidate", &finding),
         wrap("rules", &or_none(format_rules(&rules))),
         wrap("memories", &or_none(format_memories(evidence.memories))),
     ];
@@ -488,6 +500,7 @@ fn build_user_prompt(
     if let Some(text) = snippet {
         sections.push(wrap("code_context", text));
     }
+    sections.push(wrap("candidate", &finding));
     sections.push(
         if with_tools {
             VERIFIER_TASK_TOOLS
@@ -1173,6 +1186,72 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn user_prompt_puts_shared_sections_first_and_the_candidate_last() {
+        let rules = [rule("Use tracing", "src/**")];
+        let memories = [memory("We use sqlx")];
+        let targets = [target_a()];
+        let evidence = Evidence {
+            targets: &targets,
+            rules: &rules,
+            memories: &memories,
+            repo_instructions: Some("Keep handlers thin"),
+            toolbox: None,
+        };
+        let prompt = build_user_prompt(
+            &bug("ordered"),
+            &evidence,
+            Some("[src/a.rs: lines 1-5 of 5]"),
+            true,
+        );
+
+        let order: Vec<usize> = [
+            "<rules>",
+            "<memories>",
+            "<repository_instructions>",
+            "<diff>",
+            "<code_context>",
+            "<candidate>",
+        ]
+        .iter()
+        .map(|tag| prompt.find(tag).unwrap())
+        .collect();
+        assert!(order.is_sorted(), "{order:?}");
+        assert!(prompt.ends_with(VERIFIER_TASK_TOOLS));
+
+        let system = build_system_prompt(true);
+        assert!(system.contains("Findings reported by the Rules reviewer (`reported_by`)"));
+        assert!(!system.contains("team-rules reviewer"));
+        assert!(system.contains("`start_line`..`line` is the span"));
+    }
+
+    #[tokio::test]
+    async fn code_context_covers_the_whole_start_line_span() {
+        let body: String = (1..=300).map(|i| format!("row {i}\n")).collect();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("src/a.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+        let ws = Arc::new(RepoWorkspace::from_temp_dir(dir).unwrap());
+        let tb = Toolbox::new(ws, Arc::new(ToolCache::new()));
+        let mut ranged = bug("ranged");
+        ranged.suggestion.start_line = Some(100);
+        ranged.suggestion.line = 190;
+        let chat = RoutedChat::keeping_everything();
+
+        verify(&chat, vec![ranged], Some(&tb), later(30_000)).await;
+
+        let prompt = first_user_text(&chat.requests()[0]).to_string();
+        let context = prompt
+            .split("<code_context>\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n</code_context>").next())
+            .unwrap();
+        for row in ["\n100: row 100\n", "\n190: row 190\n"] {
+            assert!(context.contains(row), "{row:?} missing from {context}");
+        }
+    }
+
     #[test]
     fn verify_and_dedup_futures_are_send() {
         fn assert_send<F: Send>(_: F) {}
