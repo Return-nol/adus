@@ -1,5 +1,6 @@
 use std::ops::RangeInclusive;
 
+use adus_core::types::ReviewMode;
 use adus_db::{
     ai,
     ignore::{self, IgnoreError, IgnoreMatcher},
@@ -43,6 +44,7 @@ struct SettingsJson {
     ignore_paths: Vec<String>,
     ignore_paths_is_default: bool,
     ignored_title_keywords: Vec<String>,
+    review_mode: ReviewMode,
 }
 
 impl From<Settings> for SettingsJson {
@@ -54,6 +56,7 @@ impl From<Settings> for SettingsJson {
             max_files_per_review: s.max_files_per_review,
             max_patch_lines_per_file: s.max_patch_lines_per_file,
             ignored_title_keywords: s.ignored_title_keywords,
+            review_mode: s.review_mode,
         }
     }
 }
@@ -68,6 +71,8 @@ struct SettingsBody {
     ignore_paths: Option<Option<Vec<String>>>,
     /// Tidak ada = biarkan.
     ignored_title_keywords: Option<Vec<String>>,
+    /// Tidak ada = biarkan.
+    review_mode: Option<ReviewMode>,
 }
 
 impl From<IgnoreError> for ApiError {
@@ -159,7 +164,7 @@ async fn replace(
         max_patch_lines_per_file: body.max_patch_lines_per_file,
         ignore_paths,
         ignored_title_keywords,
-        review_mode: current.review_mode,
+        review_mode: body.review_mode.unwrap_or(current.review_mode),
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }
