@@ -707,6 +707,35 @@ async fn openai_sends_tools_and_parses_tool_calls() {
     assert_eq!(body["tool_choice"], "auto");
 }
 
+/// Some compatible servers (older Ollama, LocalAI) send tool calls without an `id`, or with an
+/// empty one; the client makes one up that is unique in the conversation.
+#[tokio::test]
+async fn compatible_tool_calls_without_id_get_unique_synthetic_ids() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{
+            "message": {"content": null, "tool_calls": [
+                {"type": "function",
+                 "function": {"name": "grep", "arguments": "{\"pattern\":\"x\"}"}},
+                {"id": "", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\":\"d.rs\"}"}},
+                {"id": "call_kept", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\":\"e.rs\"}"}},
+            ]},
+            "finish_reason": "tool_calls",
+        }]})),
+    )
+    .await;
+    // `turn_two` already holds two tool calls, so new ids start at call_2_*.
+    let got = chat_with(ProviderKind::OpenaiCompatible, &server, &turn_two())
+        .await
+        .unwrap();
+    let ids: Vec<&str> = got.tool_calls.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["call_2_0", "call_2_1", "call_kept"]);
+    assert_eq!(got.tool_calls[0].arguments, json!({"pattern": "x"}));
+    assert_eq!(got.stop_reason, StopReason::ToolUse);
+}
+
 #[tokio::test]
 async fn openai_without_tools_omits_tools_and_tool_choice() {
     let server = serve(

@@ -60,7 +60,9 @@ struct WireMessage {
 
 #[derive(Deserialize)]
 struct WireToolCall {
-    id: String,
+    /// Some compatible servers (older Ollama, LocalAI) leave it out or send it empty.
+    #[serde(default)]
+    id: Option<String>,
     function: WireFunction,
 }
 
@@ -156,11 +158,17 @@ impl OpenAiClient {
                 .any(|s| !s.trim().is_empty())
         });
         let (text, wire_calls) = message.map_or((None, None), |m| (m.content, m.tool_calls));
+        // A missing id is made up; `prior` keeps it unique across the conversation (as Gemini).
+        let prior = req.prior_tool_calls();
         let tool_calls: Vec<ToolCall> = wire_calls
             .unwrap_or_default()
             .into_iter()
-            .map(|c| ToolCall {
-                id: c.id,
+            .enumerate()
+            .map(|(index, c)| ToolCall {
+                id: c
+                    .id
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| format!("call_{prior}_{index}")),
                 name: c.function.name,
                 arguments: parse_arguments(c.function.arguments),
                 provider_meta: None,
