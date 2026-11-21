@@ -160,7 +160,10 @@
 				<Card.Description>
 					{#if p.base_url}<code>{p.base_url}</code> ·
 					{/if}
-					Primary: <code>{p.primary_model}</code> · Fast:
+					Primary:
+					{#if p.primary_model}<code>{p.primary_model}</code>{:else}<span class="text-destructive">
+							not set — edit to choose a model
+						</span>{/if} · Fast:
 					{#if p.fast_model}<code>{p.fast_model}</code>{:else}uses primary{/if}
 				</Card.Description>
 				{#if isAdmin}

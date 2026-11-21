@@ -513,7 +513,7 @@ async fn disabled_provider_treated_as_no_model(pool: PgPool) {
         s.provider_id,
         "openai",
         None,
-        "gpt-test",
+        Some("gpt-test"),
         Some("gpt-fast"),
         false,
     )
@@ -532,6 +532,35 @@ async fn disabled_provider_treated_as_no_model(pool: PgPool) {
         EngineError::Fatal("no review model configured".to_string())
     );
     assert_eq!(s.git.state().comments.len(), 1);
+    assert!(s.chat.calls().is_empty());
+}
+
+/// Providers set up before models moved onto providers may have no primary model yet.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provider_without_primary_model_treated_as_no_model(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    adus_db::ai::update_provider(
+        &pool,
+        s.provider_id,
+        "openai",
+        None,
+        None,
+        Some("gpt-fast"),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let id = run(&s, Trigger::Updated).await.unwrap();
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Skipped);
+    assert_eq!(row.skip_reason.as_deref(), Some("no_model"));
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::Fatal("no review model configured".to_string())
+    );
     assert!(s.chat.calls().is_empty());
 }
 

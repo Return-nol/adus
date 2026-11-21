@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::types::{
     AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
     StopReason, ToolCall, UserPart, decode, is_reasoning_unsupported, key_header, non_empty,
-    normalize_model_ids, send,
+    normalize_model_ids, request_timeout, send,
 };
 
 pub struct AnthropicClient {
@@ -69,14 +69,6 @@ struct ModelItem {
     id: String,
 }
 
-fn thinking_budget(effort: ReasoningEffort) -> u32 {
-    match effort {
-        ReasoningEffort::Low => 2_048,
-        ReasoningEffort::Medium => 4_096,
-        ReasoningEffort::High => 8_192,
-    }
-}
-
 #[derive(Deserialize)]
 struct Usage {
     input_tokens: Option<u32>,
@@ -94,7 +86,7 @@ impl AnthropicClient {
     ) -> Result<ChatResponse, LlmError> {
         let mut max_tokens = req.max_tokens;
         let thinking = effort.map(|e| {
-            let budget = thinking_budget(e);
+            let budget = e.output_reserve();
             max_tokens = req.max_tokens.saturating_add(budget);
             json!({"type": "enabled", "budget_tokens": budget})
         });
@@ -138,7 +130,8 @@ impl AnthropicClient {
             .header("x-api-key", key_header(api_key)?)
             .header("anthropic-version", "2023-06-01")
             .json(&body);
-        let messages: Messages = decode(send(request, !req.tools.is_empty()).await?).await?;
+        let messages: Messages =
+            decode(send(request, !req.tools.is_empty(), request_timeout(effort)).await?).await?;
         let mut text = String::new();
         let mut thinking_blocks = Vec::new();
         let mut tool_calls = Vec::new();
@@ -208,7 +201,8 @@ impl LlmClient for AnthropicClient {
             .get(url)
             .header("x-api-key", key_header(api_key)?)
             .header("anthropic-version", "2023-06-01");
-        let payload: ModelsPayload = decode(send(request, false).await?).await?;
+        let payload: ModelsPayload =
+            decode(send(request, false, request_timeout(None)).await?).await?;
         Ok(normalize_model_ids(payload.data.into_iter().map(|m| m.id)))
     }
 }

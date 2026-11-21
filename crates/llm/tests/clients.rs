@@ -1388,6 +1388,8 @@ async fn openai_sends_reasoning_effort_when_configured() {
         .unwrap();
     let body = sent_body(&server).await;
     assert_eq!(body["reasoning_effort"], "high");
+    // Reasoning tokens count against the cap, so High reserves 8192 on top of the answer.
+    assert_eq!(body["max_completion_tokens"], 100 + 8192);
 }
 
 #[tokio::test]
@@ -1423,7 +1425,9 @@ async fn retries_without_effort_when_provider_rejects_reasoning_param() {
     let first: Value = requests[0].body_json().unwrap();
     let second: Value = requests[1].body_json().unwrap();
     assert_eq!(first["reasoning_effort"], "high");
+    assert_eq!(first["max_completion_tokens"], 100 + 8192);
     assert!(second.get("reasoning_effort").is_none());
+    assert_eq!(second["max_completion_tokens"], 100);
 }
 
 #[tokio::test]
@@ -1526,7 +1530,7 @@ async fn gemini_sends_thinking_budget_and_filters_thought_parts() {
     assert_eq!(resp.text, "visible answer");
     assert_eq!(
         sent_body(&server).await["generationConfig"],
-        json!({"maxOutputTokens": 200, "thinkingConfig": {"thinkingBudget": 1024}})
+        json!({"maxOutputTokens": 200 + 1024, "thinkingConfig": {"thinkingBudget": 1024}})
     );
 }
 

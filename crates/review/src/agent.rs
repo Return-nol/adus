@@ -461,8 +461,15 @@ fn message_char_len(message: &Message) -> usize {
             .iter()
             .map(|part| match part {
                 AssistantPart::Text(text) => text.chars().count(),
+                // `provider_meta` is replayed to the provider too (Anthropic thinking blocks,
+                // Gemini thought signatures), so it counts toward the context size.
                 AssistantPart::ToolCall(call) => {
-                    call.name.chars().count() + call.arguments.to_string().chars().count()
+                    call.name.chars().count()
+                        + call.arguments.to_string().chars().count()
+                        + call
+                            .provider_meta
+                            .as_ref()
+                            .map_or(0, |meta| meta.chars().count())
                 }
             })
             .sum::<usize>(),

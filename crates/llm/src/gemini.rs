@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::types::{
     AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
     StopReason, ToolCall, UserPart, decode, is_reasoning_unsupported, key_header, non_empty,
-    normalize_model_ids, send,
+    normalize_model_ids, request_timeout, send,
 };
 
 pub struct GeminiClient {
@@ -105,9 +105,12 @@ impl GeminiClient {
         req: &ChatRequest,
         effort: Option<ReasoningEffort>,
     ) -> Result<ChatResponse, LlmError> {
-        let mut generation_config = json!({"maxOutputTokens": req.max_tokens});
-        if let Some(e) = effort {
-            generation_config["thinkingConfig"] = json!({"thinkingBudget": thinking_budget(e)});
+        // Thinking tokens count against maxOutputTokens: add the budget on top of the answer.
+        let budget = effort.map(thinking_budget);
+        let mut generation_config =
+            json!({"maxOutputTokens": req.max_tokens.saturating_add(budget.unwrap_or(0))});
+        if let Some(budget) = budget {
+            generation_config["thinkingConfig"] = json!({"thinkingBudget": budget});
         }
         let mut body = json!({
             "systemInstruction": {"parts": [{"text": req.system}]},
@@ -138,7 +141,8 @@ impl GeminiClient {
             .post(url)
             .header("x-goog-api-key", key_header(api_key)?)
             .json(&body);
-        let generated: Generated = decode(send(request, !req.tools.is_empty()).await?).await?;
+        let generated: Generated =
+            decode(send(request, !req.tools.is_empty(), request_timeout(effort)).await?).await?;
         if let Some(reason) = generated.prompt_feedback.and_then(|f| f.block_reason) {
             return Err(LlmError::Invalid(format!("blocked: {reason}")));
         }
@@ -208,7 +212,8 @@ impl LlmClient for GeminiClient {
             .http
             .get(url)
             .header("x-goog-api-key", key_header(api_key)?);
-        let payload: GeminiModels = decode(send(request, false).await?).await?;
+        let payload: GeminiModels =
+            decode(send(request, false, request_timeout(None)).await?).await?;
         Ok(normalize_model_ids(
             payload
                 .models

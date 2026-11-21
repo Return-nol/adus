@@ -176,8 +176,13 @@ impl Engine {
             Some(id) => ai::get_provider(&self.db, id).await.map_err(db_error)?,
             None => None,
         }
-        .filter(|p| p.enabled && !p.primary_model.trim().is_empty());
-        let Some(provider) = provider else {
+        .filter(|p| p.enabled);
+        let model = provider.as_ref().and_then(|p| p.primary_model());
+        let Some((provider_id, model)) = provider
+            .as_ref()
+            .zip(model)
+            .map(|(p, m)| (p.id, m.to_string()))
+        else {
             // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
             // atau diminta lewat `@adudu review`, supaya tidak spam.
             // Bukan kegagalan: tanpa baris failed atau dead letter untuk setiap push.
@@ -186,7 +191,7 @@ impl Engine {
             }
             let body = format!(
                 "{MARKER}\nAdudu can't review yet: no AI model is configured. \
-                 An admin can set one under Settings."
+                 An admin can pick a provider under Settings and its model under AI Providers."
             );
             // Gagal posting tidak mengubah hasilnya: review tetap tidak bisa jalan.
             match git.post_comment(&repo_ref, pr_number, &body).await {
@@ -200,8 +205,6 @@ impl Engine {
             }
             return Err(EngineError::Fatal("no review model configured".into()));
         };
-        let provider_id = provider.id;
-        let model = provider.primary_model;
         let mode = mode_override
             .or(repo.review_mode)
             .unwrap_or(settings.review_mode);

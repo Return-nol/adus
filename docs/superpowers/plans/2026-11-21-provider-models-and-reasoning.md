@@ -4,7 +4,9 @@
 
 **Goal:** Move model configuration onto each AI Provider (`primary_model` required, `fast_model` optional falling back to `primary_model`), add live model discovery (`LlmClient::list_models` + searchable Combobox unlocked after testing the provider API connection), drop global/per-repo raw model strings (`default_model` / `review_model`), and add auto-adjusted `ReasoningEffort` (`Low | Medium | High`) with transparent non-reasoning model fallback.
 
-**Architecture:** `adus-llm` adds `LlmClient::list_models` (fetching `/models`, `/v1/models`, and `/v1beta/models`) and `ReasoningEffort` (`Low`, `Medium`, `High`) on `ChatRequest`, mapping effort to OpenAI `reasoning_effort`, Anthropic `thinking` (with multi-turn thinking block + signature echo via `ToolCall.provider_meta`), and Gemini `thinkingConfig.thinkingBudget` (with `thought: true` part filtering), and transparently retrying once with `effort: None` when a model returns HTTP 400/422 rejecting reasoning parameters. `adus-db` (migration `0009_provider_models.sql`) adds `primary_model TEXT NOT NULL` and `fast_model TEXT NULL` (`AiProvider::effective_fast_model`) to `ai_providers` and drops `settings.default_model` and `repositories.review_model`. `adus-review` resolves the provider's model tiers and task effort, while `adus-server` and `web/` expose `POST /api/v1/ai-providers/models`, interactive Combobox model selection gated on connection testing, optional initial key creation on provider creation, 1-click key testing, and per-repo provider override.
+**Architecture:** `adus-llm` adds `LlmClient::list_models` (fetching `/models`, `/v1/models`, and `/v1beta/models`) and `ReasoningEffort` (`Low`, `Medium`, `High`) on `ChatRequest`, mapping effort to OpenAI `reasoning_effort`, Anthropic `thinking` (with multi-turn thinking block + signature echo via `ToolCall.provider_meta`), and Gemini `thinkingConfig.thinkingBudget` (with `thought: true` part filtering), and transparently retrying once with `effort: None` when a model returns HTTP 400/422 rejecting reasoning parameters. `adus-db` (migration `0008_review_mode_and_provider_models.sql`) adds `primary_model TEXT NOT NULL` and `fast_model TEXT NULL` (`AiProvider::effective_fast_model`) to `ai_providers` and drops `settings.default_model` and `repositories.review_model`. `adus-review` resolves the provider's model tiers and task effort, while `adus-server` and `web/` expose `POST /api/v1/ai-providers/models`, interactive Combobox model selection gated on connection testing, optional initial key creation on provider creation, 1-click key testing, and per-repo provider override.
+
+**Post-review note (2026-11-21):** the migration was folded into `0008_review_mode_and_provider_models.sql`, and `primary_model` became nullable (`NULL` = needs setup, never an invented model). The spec records this and the other review fixes (reasoning output headroom, 300 s timeout with effort, HMAC-keyed model-list cache, stored keys only sent to the saved base URL); where this plan's text differs, the spec wins.
 
 **Tech Stack:** Rust 2024 (`tokio`, `reqwest`, `serde`, `serde_json`, `sqlx` runtime queries, `thiserror`), Postgres, Redis, SvelteKit 3 + Svelte 5 + shadcn-svelte (`Popover` + `Command` combobox, `DESIGN.md`).
 
@@ -31,7 +33,7 @@
 1. **Non-thinking model rejects reasoning parameters with HTTP 400/422:** A provider pairs a reasoning `primary_model` (e.g. `o3`) with a non-reasoning `fast_model` (e.g. `gpt-4o-mini` or an Ollama model) that returns 400 `"Unrecognized request argument supplied: reasoning_effort"` (or Anthropic/Gemini rejecting `thinking` / `thinkingConfig`). `LlmClient::chat` must retry once with `effort: None` and succeed without marking the key invalid or logging a failed usage row. Pinned in Task 1 (`retries_without_effort_when_provider_rejects_reasoning_param`).
 2. **Anthropic multi-turn tool call with extended thinking enabled:** Anthropic `/v1/messages` returns a `thinking` block (with `signature`) followed by a `tool_use` block, and rejects the next turn with HTTP 400 unless the assistant message replays the `thinking` (and `redacted_thinking`) blocks verbatim before the `tool_use` block. Pinned in Task 1 (`anthropic_sends_thinking_budget_and_replays_thinking_blocks_on_tool_turns`).
 3. **Gemini thinking parts polluting JSON output & `models/` prefix in `list_models`:** Gemini 2.5/3 returns `parts: [{"text": "internal chain of thought...", "thought": true}, {"text": "[{\"file\": ...}]"}]` and `/v1beta/models` returns `"name": "models/gemini-2.5-pro"` alongside embedding-only models. `GeminiClient` must exclude `thought: true` parts from `ChatResponse.text` and `list_models` must strip `"models/"` and filter to `generateContent`-capable models. Pinned in Task 1 (`gemini_sends_thinking_budget_and_filters_thought_parts` and `list_models_across_openai_anthropic_and_gemini`).
-4. **Optional `fast_model` fallback & upgrade migration:** An existing DB has `ai_providers` rows plus `settings.default_model` or `repositories.review_model`. Migration `0009_provider_models.sql` must backfill `primary_model` (`NOT NULL`), keep `fast_model` nullable (`TEXT NULL`), and `AiProvider::effective_fast_model()` must return `primary_model` whenever `fast_model` is `None` or blank. Pinned in Task 2 (`provider_models_crud_optional_fast_model_and_effective_fallback`).
+4. **Optional `fast_model` fallback & upgrade migration:** An existing DB has `ai_providers` rows plus `settings.default_model` or `repositories.review_model`. Migration `0008_review_mode_and_provider_models.sql` must backfill `primary_model` (`NOT NULL`), keep `fast_model` nullable (`TEXT NULL`), and `AiProvider::effective_fast_model()` must return `primary_model` whenever `fast_model` is `None` or blank. Pinned in Task 2 (`provider_models_crud_optional_fast_model_and_effective_fallback`).
 5. **Model discovery auth failure & disabled provider handling:** `POST /api/v1/ai-providers/models` with a rejected key must return 422 `token_invalid` without leaking the key or URL, and when editing a provider with `provider_id` it must decrypt and use a stored key on the server. A disabled default provider must be treated as `no_model` by `Engine` and `Status::Fail` by `doctor`. Pinned in Task 3 (`disabled_provider_treated_as_no_model`) and Task 4 (`discover_models_with_inline_key_stored_provider_key_and_422_on_bad_token`).
 
 ---
@@ -41,7 +43,7 @@
 | # | Scope | Primary Crates / Files |
 |---|---|---|
 | 1 | `ReasoningEffort` (`Low \| Medium \| High`), `LlmClient::list_models`, per-provider wire mapping, 1-shot non-reasoning fallback, `AgentLlm.effort` | `crates/llm`, `crates/review/src/agent.rs` |
-| 2 | Migration `0009_provider_models.sql` (`primary_model` NOT NULL & `fast_model` NULL on `ai_providers`, drop `default_model` & `review_model`) & `crates/db` | `migrations/0009_provider_models.sql`, `crates/db/src/{ai,settings,repositories}.rs`, `crates/llm/tests/router.rs` |
+| 2 | Migration `0008_review_mode_and_provider_models.sql` (`primary_model` NOT NULL & `fast_model` NULL on `ai_providers`, drop `default_model` & `review_model`) & `crates/db` | `migrations/0008_review_mode_and_provider_models.sql`, `crates/db/src/{ai,settings,repositories}.rs`, `crates/llm/tests/router.rs` |
 | 3 | Update `Engine` to resolve provider `primary_model` / `effective_fast_model()` & auto-adjusted `ReasoningEffort` | `crates/review/src/engine.rs`, `crates/review/tests/` |
 | 4 | Server REST APIs (`POST /ai-providers/models`, `ai`, `settings`, `repositories`) & `doctor` (`Default provider` check) | `crates/server/src/{api/*,doctor.rs}`, `crates/server/tests/` |
 | 5 | Dashboard UI (interactive Combobox in `provider-dialog.svelte` gated on connection test, 1-click key test in `ai-providers`, provider selection in `settings` & `repositories`) | `web/src/lib/components/provider-dialog.svelte`, `web/src/routes/{ai-providers,settings,repositories}/+page.svelte` |
@@ -99,7 +101,7 @@
 ### Task 2: Migration `0009` (`primary_model` & Optional `fast_model` on `ai_providers`; Drop `default_model` & `review_model`) & `crates/db`
 
 **Files:**
-- Create: `migrations/0009_provider_models.sql`
+- Create: `migrations/0008_review_mode_and_provider_models.sql`
 - Modify: `crates/db/src/ai.rs`, `crates/db/src/settings.rs`, `crates/db/src/repositories.rs`, `crates/llm/tests/router.rs`
 - Test: `crates/db/src/ai.rs`, `crates/db/src/repositories.rs`, `crates/llm/tests/router.rs`
 
@@ -123,8 +125,8 @@
   - Run: `cargo test -j 2 -p adus-db -p adus-llm`
   - Expected: FAIL
 
-- [ ] **Step 3: Create `migrations/0009_provider_models.sql` and update `crates/db/src/{ai,settings,repositories}.rs`**
-  - Implement the SQL from spec Section 3.1 in `migrations/0009_provider_models.sql`.
+- [ ] **Step 3: Create `migrations/0008_review_mode_and_provider_models.sql` and update `crates/db/src/{ai,settings,repositories}.rs`**
+  - Implement the SQL from spec Section 3.1 in `migrations/0008_review_mode_and_provider_models.sql`.
   - Update `AiProvider`, `PROVIDER_COLUMNS`, `insert_provider`, and `update_provider` in `crates/db/src/ai.rs`.
   - Remove `default_model` from `crates/db/src/settings.rs` and `review_model` from `crates/db/src/repositories.rs`.
 
@@ -133,7 +135,7 @@
   - Expected: PASS
 
 - [ ] **Step 5: Commit**
-  - `git add migrations/0009_provider_models.sql crates/db crates/llm/tests/router.rs`
+  - `git add migrations/0008_review_mode_and_provider_models.sql crates/db crates/llm/tests/router.rs`
   - `git commit -m "feat(db): add primary_model and optional fast_model to ai_providers"`
 
 ---

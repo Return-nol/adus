@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::types::{
     AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
     StopReason, ToolCall, UserPart, decode, format_provider_message, is_reasoning_unsupported,
-    key_header, non_empty, normalize_model_ids, send,
+    key_header, non_empty, normalize_model_ids, request_timeout, send,
 };
 
 pub struct OpenAiClient {
@@ -106,7 +106,9 @@ impl OpenAiClient {
             "model": req.model,
             "messages": wire_messages(req),
         });
-        body[self.max_tokens_field] = req.max_tokens.into();
+        // Reasoning tokens count against the same cap: reserve room for them.
+        let reserve = effort.map_or(0, ReasoningEffort::output_reserve);
+        body[self.max_tokens_field] = req.max_tokens.saturating_add(reserve).into();
         if let Some(e) = effort {
             body["reasoning_effort"] = e.as_str().into();
         }
@@ -133,6 +135,7 @@ impl OpenAiClient {
                 .header(AUTHORIZATION, bearer)
                 .json(&body),
             !req.tools.is_empty(),
+            request_timeout(effort),
         )
         .await?;
         let completion: Completion = decode(resp).await?;
@@ -207,7 +210,12 @@ impl LlmClient for OpenAiClient {
     async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError> {
         let url = format!("{}/models", self.base_url);
         let bearer = key_header(&format!("Bearer {api_key}"))?;
-        let resp = send(self.http.get(url).header(AUTHORIZATION, bearer), false).await?;
+        let resp = send(
+            self.http.get(url).header(AUTHORIZATION, bearer),
+            false,
+            request_timeout(None),
+        )
+        .await?;
         let payload: ModelsPayload = decode(resp).await?;
         let items = match payload {
             ModelsPayload::Wrapped { data } | ModelsPayload::List(data) => data,

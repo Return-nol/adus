@@ -51,51 +51,24 @@ This design moves model configuration onto each **AI Provider** as a required **
 
 ## 3. Detailed Component Specifications
 
-### 3.1 Database Schema & Migration (`migrations/0009_provider_models.sql`)
+### 3.1 Database Schema & Migration (`migrations/0008_review_mode_and_provider_models.sql`)
 
-```sql
--- Each AI provider carries its own primary_model (required) and fast_model (optional;
--- NULL falls back to primary_model).
--- Backfill existing providers from settings.default_model or repositories.review_model before
--- dropping those columns.
-ALTER TABLE ai_providers
-    ADD COLUMN primary_model TEXT NULL,
-    ADD COLUMN fast_model TEXT NULL;
+The provider model columns share migration 0008 with `review_mode` (agentic review engine spec §4.1): neither was released on its own, and they ship together.
 
-UPDATE ai_providers p
-SET primary_model = COALESCE(
-    (SELECT s.default_model FROM settings s WHERE s.default_provider_id = p.id AND btrim(COALESCE(s.default_model, '')) <> '' LIMIT 1),
-    (SELECT r.review_model FROM repositories r WHERE r.review_provider_id = p.id AND btrim(COALESCE(r.review_model, '')) <> '' ORDER BY r.created_at DESC LIMIT 1),
-    'default'
-);
-
-ALTER TABLE ai_providers
-    ALTER COLUMN primary_model SET NOT NULL;
-
-ALTER TABLE settings
-    DROP COLUMN default_model;
-
-ALTER TABLE repositories
-    DROP COLUMN review_model;
-```
+- `ai_providers` gains `primary_model TEXT NULL` and `fast_model TEXT NULL`.
+- **Backfill without inventing a model:** `primary_model` comes from `settings.default_model` when the provider was the default, else from the newest `repositories.review_model` of a repository that still exists (`deleted_at IS NULL`), both trimmed. A provider with neither stays `NULL`: it **needs setup**, and the engine, doctor and test-key treat it as having no model until an admin picks one. (A made-up placeholder such as `'default'` would pass every check and then fail every review.)
+- **Provider-only repo overrides:** the old engine ignored a repo override that named a provider but no model and used the global provider and model. The migration keeps that by clearing `review_provider_id` on those rows.
+- Then it drops `settings.default_model` and `repositories.review_model`.
+- Pinned by `migration_8_backfills_provider_models_without_inventing_one` (`crates/db/src/ai.rs`), which runs migrations 1–7, seeds old-style rows, then runs 8.
 
 #### `crates/db` Structs & Queries
 - `adus_db::ai::AiProvider`:
-  - Adds `pub primary_model: String` and `pub fast_model: Option<String>`.
-  - Adds helper:
-    ```rust
-    impl AiProvider {
-        pub fn effective_fast_model(&self) -> &str {
-            self.fast_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|m| !m.is_empty())
-                .unwrap_or(&self.primary_model)
-        }
-    }
-    ```
+  - Adds `pub primary_model: Option<String>` (`None` = needs setup) and `pub fast_model: Option<String>`.
+  - Helpers (blank counts as unset):
+    - `pub fn primary_model(&self) -> Option<&str>`
+    - `pub fn effective_fast_model(&self) -> Option<&str>`: the `fast_model`, else `primary_model()`.
 - `adus_db::ai::insert_provider(pool, kind, name, base_url, primary_model, fast_model: Option<&str>) -> Result<AiProvider>`.
-- `adus_db::ai::update_provider(pool, id, name, base_url, primary_model, fast_model: Option<&str>, enabled) -> Result<Option<AiProvider>>`.
+- `adus_db::ai::update_provider(pool, id, name, base_url, primary_model: Option<&str>, fast_model: Option<&str>, enabled) -> Result<Option<AiProvider>>` (a needs-setup provider can still be renamed or toggled).
 - `adus_db::settings::Settings`: drops `default_model: Option<String>`.
 - `adus_db::repositories::{Repository, RepoPatch}`: drops `review_model`.
 
@@ -151,15 +124,17 @@ pub struct ChatRequest {
 - `REASONING_UNSUPPORTED_MARKERS`:
   - `"reasoning_effort"`, `"reasoning effort"`, `"thinking"`, `"thinking_config"`, `"thinkingconfig"`, `"thinking_budget"`, `"thinkingbudget"`, `"budget_tokens"`, `"does not support reasoning"`.
 - When `req.effort.is_some()` and a call returns `LlmError::Invalid(msg)` whose lowercase message contains any `REASONING_UNSUPPORTED_MARKERS`, `LlmClient::chat` transparently retries **once** with `effort: None`.
+- **Output headroom:** every provider counts reasoning tokens against the same output cap as the answer, so a request with an effort asks for `max_tokens + reserve`. `ReasoningEffort::output_reserve()` is `Low => 2_048`, `Medium => 4_096`, `High => 8_192` (OpenAI/compatible and Anthropic); Gemini adds its own thinking budget. Without this, `High` on Gemini (budget 8192 = the engine's 8192 cap) or on OpenAI reasoning models can spend the whole cap thinking and return no answer.
+- **Timeout:** a request with an effort uses a 300 s per-request timeout instead of 120 s (`types::request_timeout`), since a long think plus the answer can run past two minutes. The retry without effort uses 120 s.
 - **OpenAI & OpenAI-Compatible (`openai.rs`):**
-  - When `effort` is `Some(e)`, sets `body["reasoning_effort"] = "low" | "medium" | "high"`.
+  - When `effort` is `Some(e)`, sets `body["reasoning_effort"] = "low" | "medium" | "high"` and raises the token field (`max_completion_tokens` / `max_tokens`) by `e.output_reserve()`.
 - **Anthropic (`anthropic.rs`):**
-  - Budgets: `Low => 2_048`, `Medium => 4_096`, `High => 8_192`.
+  - Budget: `e.output_reserve()` (`Low => 2_048`, `Medium => 4_096`, `High => 8_192`).
   - When `effort` is `Some(e)`, sets `body["thinking"] = json!({"type": "enabled", "budget_tokens": budget})` and `body["max_tokens"] = req.max_tokens.saturating_add(budget)`.
   - Preserves `Block::Thinking { thinking, signature }` and `Block::RedactedThinking { data }` in `tool_calls[0].provider_meta` (as a JSON array of raw block objects) and replays them at the start of `assistant_blocks()` on subsequent turns.
 - **Gemini (`gemini.rs`):**
   - Budgets: `Low => 1_024`, `Medium => 4_096`, `High => 8_192`.
-  - When `effort` is `Some(e)`, sets `body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": budget})`.
+  - When `effort` is `Some(e)`, sets `body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": budget})` and `maxOutputTokens = req.max_tokens + budget`.
   - Deserializes `#[serde(default)] thought: bool` on `Part` and skips `part.thought == true` when concatenating `ChatResponse.text`.
 
 ---
@@ -172,9 +147,10 @@ pub struct ChatRequest {
   - `ReviewMode::Specialists` → `ReasoningEffort::High`
 - **Provider resolution in `Engine::run` (`crates/review/src/engine.rs`):**
   1. `let provider_id = repo.review_provider_id.or(settings.default_provider_id);`
-  2. Resolve `provider` via `ai::get_provider(&self.db, id).await?`, requiring `provider.enabled && !provider.primary_model.trim().is_empty()`.
-  3. If missing, disabled, or `primary_model` is blank: handle with existing `no_model` behavior (`Outcome::Skipped("no_model")` on `Trigger::Updated`; PR comment + `EngineError::Fatal("no review model configured")` on `Trigger::Opened | Trigger::Command`).
-  4. Resolve `mode = mode_override.or(repo.review_mode).unwrap_or(settings.review_mode)` and pass `provider.primary_model` with `finder_effort(mode)` to review calls.
+  2. Resolve `provider` via `ai::get_provider(&self.db, id).await?`, requiring `provider.enabled` and `provider.primary_model()` to be `Some`.
+  3. If missing, disabled, or the provider has no primary model (needs setup): handle with existing `no_model` behavior (`Outcome::Skipped("no_model")` on `Trigger::Updated`; PR comment + `EngineError::Fatal("no review model configured")` on `Trigger::Opened | Trigger::Command`). The comment says to pick a provider under Settings and its model under AI Providers.
+  4. Resolve `mode = mode_override.or(repo.review_mode).unwrap_or(settings.review_mode)` and pass the primary model with `finder_effort(mode)` to review calls.
+  5. The agentic engine's Verifier and Dedup use `effective_fast_model()` with `ReasoningEffort::Low` (agentic review engine spec, decision 10).
 
 ---
 
@@ -183,17 +159,20 @@ pub struct ChatRequest {
 #### `/api/v1/ai-providers`, `/api/v1/ai-providers/models` & `/api/v1/ai-keys/{id}/test` (`crates/server/src/api/ai.rs`)
 - **`POST /api/v1/ai-providers/models` (`discover_models`):**
   - Admin-only (`AdminUser`).
-  - Body `DiscoverModels { kind: Option<ProviderKind>, base_url: Option<String>, key: Option<String>, provider_id: Option<Uuid> }`.
-  - Resolves `kind` and `base_url` (from `provider_id` if given, else from `body.kind` and `body.base_url`), resolves `secret` (inline `body.key` if non-empty, else first usable/enabled key of `provider_id`), calls `client_for(...).list_models(&secret).await`, maps `LlmError::Unauthorized` → 422 `token_invalid`, other errors → 502 `provider_error`, and returns `200 OK` `{"models": Vec<String>}`.
+  - Body `DiscoverModels { kind: Option<ProviderKind>, base_url: Option<String>, key: Option<String>, provider_id: Option<Uuid>, #[serde(default)] refresh: bool }`.
+  - Resolves `kind` and `base_url` (from `provider_id` if given, else from `body.kind` and `body.base_url`), resolves `secret` (inline `body.key` if non-empty, else first usable/enabled key of `provider_id`), calls `client_for(...).list_models(&secret).await`, maps `LlmError::Unauthorized` → 422 `token_invalid`, other errors → 502 `provider_error`, and returns `200 OK` `{"models": Vec<String>, "cached": bool}`.
+  - **A stored key only goes to the saved base URL.** With `provider_id`, a `base_url` that differs from the saved one (ignoring a trailing `/`) requires an inline `key`; otherwise 422 `validation_error` and nothing is sent. The dialog asks for the key again when the URL changes.
+  - **Model-list cache:** successful non-empty lists are cached in Redis for 1 hour under `{prefix}:cache:models:v2:<hex>`, where `<hex>` is an HMAC-SHA256 under `ADUS_SECRET_KEY` of kind, normalized base URL and API key (so no key name is derived from the API key alone). `refresh: true` skips the read; a 401 evicts the entry. The dashboard's **Test connection** always sends `refresh: true`, because a connection test must ask the provider (a revoked key must not show "Connected").
 - **`POST /api/v1/ai-providers` (`CreateProvider`):**
   - Body: `{ kind: ProviderKind, name: String, base_url: Option<String>, primary_model: String, fast_model: Option<String>, key: Option<String>, key_label: Option<String> }`.
   - Validates `name` and `primary_model` via `required(...)`; trims `fast_model` (empty string becomes `None`).
   - When `body.key` is `Some(raw)` and non-empty after trim, inserts the initial `AiKey` (with `label = key_label` defaulting to `"Default"`) and includes it in `ProviderJson.keys`.
 - **`PATCH /api/v1/ai-providers/{id}` (`UpdateProvider`):**
   - Body: `{ name: Option<String>, #[serde(default, deserialize_with = "present_or_null")] base_url: Option<Option<String>>, primary_model: Option<String>, #[serde(default, deserialize_with = "present_or_null")] fast_model: Option<Option<String>>, enabled: Option<bool> }`.
-- **`ProviderJson`:** includes `primary_model: String` and `fast_model: Option<String>`.
+- **`ProviderJson`:** includes `primary_model: Option<String>` (`null` = needs setup) and `fast_model: Option<String>`. A PATCH without `primary_model` keeps the current value, so a needs-setup provider can still be renamed or toggled.
 - **`POST /api/v1/ai-keys/{id}/test` (`TestKey`):**
-  - Body `TestKey { #[serde(default)] model: Option<String> }`; when `model` is `None` or blank, defaults to `provider.effective_fast_model().to_string()`.
+  - Body `TestKey { #[serde(default)] model: Option<String> }`; when `model` is `None` or blank, defaults to `provider.effective_fast_model()`; a provider with no model at all → 422 `validation_error` ("choose a primary model first"), no provider call.
+  - The ping asks for up to 512 output tokens (`TEST_KEY_MAX_TOKENS`). A tiny cap made OpenRouter-routed and reasoning models fail the ping by running out of tokens before answering, which looked like a broken key.
 
 #### `/api/v1/settings` & `/api/v1/repositories`
 - `settings.rs`: drops `default_model` from `SettingsJson` and `SettingsBody`; when `default_provider_id` is `Some(id)`, verifies `ai::get_provider` exists (else 404 `not_found`).
@@ -212,18 +191,19 @@ pub struct ChatRequest {
 ### 3.5 Dashboard UI (`web/`)
 
 1. **Provider Dialog (`web/src/lib/components/provider-dialog.svelte`):**
-   - `Provider` type adds `primary_model: string` and `fast_model: string | null`.
+   - `Provider` type adds `primary_model: string | null` and `fast_model: string | null`.
    - **Step 1 — Provider API & Connection Test:**
      - Fields: **Kind** (on create), **Name**, **Base URL** (when `shownKind === 'openai_compatible'`), **API key** (`type="password"`, required on create, optional on edit when `provider.keys.length > 0`), and a **Test connection** button (`POST /api/v1/ai-providers/models`).
      - Editing `kind`, `baseUrl`, or `apiKey` resets `tested = false` and `models = []`.
-     - When **Test connection** succeeds, sets `tested = true` and `models = reply.models`.
+     - **Test connection** sends `refresh: true`; on success sets `tested = true` and `models = reply.models`.
+     - When editing, a Base URL different from the saved one makes the API key required again (a saved key is never sent to a new URL). A key typed while editing is saved as another key of the provider (`Default` when it is the first).
    - **Step 2 — Interactive Model Comboboxes (`Popover` + `Command`):**
      - **Primary model (required)** and **Fast model (optional)** Comboboxes are **disabled while `!tested`**.
      - Once `tested === true`, each Combobox lets the user search/filter `models` interactively (and select a custom typed model name if their search query is not in `models`).
      - The **Fast model** Combobox includes a top option `"None (use Primary model)"` (`""`).
      - Submit button (**Add** / **Save**) is disabled while `busy || !tested || !primaryModel.trim()`.
 2. **AI Providers Page (`web/src/routes/ai-providers/+page.svelte`):**
-   - Shows `Primary: {p.primary_model} · Fast: {p.fast_model ?? 'uses primary'}` in `Card.Description`.
+   - Shows `Primary: {p.primary_model} · Fast: {p.fast_model ?? 'uses primary'}` in `Card.Description`; a provider with no primary model shows "not set — edit to choose a model" in the destructive text color.
    - Clicking **Test** on an API key runs a 1-click `POST /api/v1/ai-keys/${k.id}/test` with `{}` (removing the old model-input modal).
 3. **Settings Page (`web/src/routes/settings/+page.svelte`):**
    - Removes the **Default model** `<Input>`, keeping **Default provider** `<Select>`.

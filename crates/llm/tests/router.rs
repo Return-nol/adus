@@ -608,7 +608,7 @@ async fn no_keys_and_disabled_provider_return_no_keys(pool: PgPool) {
         s.provider.id,
         "test",
         Some("http://fake.local"),
-        "gpt-test",
+        Some("gpt-test"),
         None,
         false,
     )

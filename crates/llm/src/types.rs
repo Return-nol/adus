@@ -10,6 +10,8 @@ use serde_json::Value;
 
 /// Timeout satu request ke provider. Dipasang per request supaya `reqwest::Client` bisa dibagi.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Timeout for a request that asks for reasoning: thinking tokens add minutes of generation.
+const REASONING_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Batas panjang pesan error provider yang kita teruskan.
 const MAX_PROVIDER_MESSAGE: usize = 200;
 /// Batas atas `Retry-After`; mencegah overflow `Instant + Duration` di pemanggil.
@@ -31,6 +33,25 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
         }
+    }
+
+    /// Output tokens reserved for reasoning on top of the answer's `max_tokens`. Providers
+    /// count reasoning tokens against the same output cap, so without this a long think
+    /// leaves no room for the answer.
+    pub(crate) fn output_reserve(self) -> u32 {
+        match self {
+            Self::Low => 2_048,
+            Self::Medium => 4_096,
+            Self::High => 8_192,
+        }
+    }
+}
+
+/// Per-request timeout: longer when the request asks for reasoning.
+pub(crate) fn request_timeout(effort: Option<ReasoningEffort>) -> Duration {
+    match effort {
+        Some(_) => REASONING_REQUEST_TIMEOUT,
+        None => REQUEST_TIMEOUT,
     }
 }
 
@@ -240,8 +261,13 @@ const CONTEXT_OVERFLOW_MARKERS: [&str; 6] = [
 /// Kirim request lalu petakan status gagal ke `LlmError`.
 /// API key, URL, dan body request tidak pernah masuk pesan error.
 /// `has_tools`: the request carries tools, so a tools rejection becomes `ToolsUnsupported`.
-pub(crate) async fn send(req: RequestBuilder, has_tools: bool) -> Result<Response, LlmError> {
-    let resp = req.timeout(REQUEST_TIMEOUT).send().await.map_err(|e| {
+/// `timeout`: from [`request_timeout`] for chat calls, `REQUEST_TIMEOUT` for the rest.
+pub(crate) async fn send(
+    req: RequestBuilder,
+    has_tools: bool,
+    timeout: Duration,
+) -> Result<Response, LlmError> {
+    let resp = req.timeout(timeout).send().await.map_err(|e| {
         if e.is_builder() {
             LlmError::Invalid("invalid request".into())
         } else {

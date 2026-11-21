@@ -773,3 +773,122 @@ async fn discover_models_caches_per_key_and_supports_refresh(pool: PgPool) {
 
     cleanup_queue(&prefix).await;
 }
+
+/// Providers set up before models moved onto providers have no primary model: the API shows
+/// `null`, refuses a key test without a model, and still lets an admin toggle the provider.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provider_without_primary_model_needs_setup(pool: PgPool) {
+    let app = app(pool.clone()).await;
+    let admin = setup_admin(&app).await;
+    let server = MockServer::start().await;
+    let (provider_id, key_id) = mock_provider(&app, &admin, &server).await;
+    sqlx::query("UPDATE ai_providers SET primary_model = NULL, fast_model = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let list = send(&app, common::get("/api/v1/ai-providers", Some(&admin))).await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert_eq!(list.body[0]["primary_model"], Value::Null);
+
+    let test = call(
+        &app,
+        "POST",
+        &format!("/api/v1/ai-keys/{key_id}/test"),
+        &json!({}),
+        &admin,
+    )
+    .await;
+    assert_eq!(test.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(test.body["error"]["code"], "validation_error");
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    let toggled = call(
+        &app,
+        "PATCH",
+        &format!("/api/v1/ai-providers/{provider_id}"),
+        &json!({ "enabled": false }),
+        &admin,
+    )
+    .await;
+    assert_eq!(toggled.status, StatusCode::OK);
+    assert_eq!(toggled.body["primary_model"], Value::Null);
+
+    let fixed = call(
+        &app,
+        "PATCH",
+        &format!("/api/v1/ai-providers/{provider_id}"),
+        &json!({ "primary_model": "gpt-5" }),
+        &admin,
+    )
+    .await;
+    assert_eq!(fixed.status, StatusCode::OK);
+    assert_eq!(fixed.body["primary_model"], "gpt-5");
+}
+
+/// A saved key only goes to the provider's saved base URL: testing another URL needs the key
+/// typed in again, and nothing is sent to that URL without it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn discover_models_never_sends_a_stored_key_to_a_new_base_url(pool: PgPool) {
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let saved = MockServer::start().await;
+    let other = MockServer::start().await;
+    for server in [&saved, &other] {
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "gpt-5"}]
+            })))
+            .mount(server)
+            .await;
+    }
+    let created = create_provider(
+        &app,
+        &admin,
+        json!({
+            "kind": "openai_compatible",
+            "name": "Local",
+            "base_url": saved.uri(),
+            "primary_model": "gpt-5",
+            "key": SECRET
+        }),
+    )
+    .await;
+    let provider_id = created.body["id"].as_str().unwrap();
+
+    let same_url = call(
+        &app,
+        "POST",
+        "/api/v1/ai-providers/models",
+        &json!({ "provider_id": provider_id, "base_url": format!("{}/", saved.uri()), "refresh": true }),
+        &admin,
+    )
+    .await;
+    assert_eq!(same_url.status, StatusCode::OK);
+
+    let moved = call(
+        &app,
+        "POST",
+        "/api/v1/ai-providers/models",
+        &json!({ "provider_id": provider_id, "base_url": other.uri(), "refresh": true }),
+        &admin,
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(moved.body["error"]["code"], "validation_error");
+    assert!(other.received_requests().await.unwrap().is_empty());
+
+    let retyped = call(
+        &app,
+        "POST",
+        "/api/v1/ai-providers/models",
+        &json!({ "provider_id": provider_id, "base_url": other.uri(), "key": "sk-other-key-9999", "refresh": true }),
+        &admin,
+    )
+    .await;
+    assert_eq!(retyped.status, StatusCode::OK);
+    let sent = other.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].headers["authorization"], "Bearer sk-other-key-9999");
+}

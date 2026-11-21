@@ -14,7 +14,8 @@
 		kind: ProviderKind;
 		name: string;
 		base_url: string | null;
-		primary_model: string;
+		/** null = set up before models moved onto providers; needs a model. */
+		primary_model: string | null;
 		fast_model: string | null;
 		enabled: boolean;
 		keys: AiKey[];
@@ -84,7 +85,12 @@
 	});
 
 	const shownKind = $derived(provider?.kind ?? kind);
-	const needsKey = $derived(!provider || provider.keys.length === 0);
+	// A saved key is only ever sent to the saved base URL: a new URL needs the key again.
+	const urlChanged = $derived(
+		Boolean(provider) &&
+			baseUrl.trim().replace(/\/+$/, '') !== (provider?.base_url ?? '').trim().replace(/\/+$/, '')
+	);
+	const needsKey = $derived(!provider || provider.keys.length === 0 || urlChanged);
 	const canTest = $derived(
 		!testing &&
 			!busy &&
@@ -115,7 +121,9 @@
 			const reply = await api<{ models: string[] }>('POST', '/ai-providers/models', {
 				...(provider ? { provider_id: provider.id, base_url: trimmedUrl } : { kind }),
 				...(!provider && trimmedUrl ? { base_url: trimmedUrl } : {}),
-				...(trimmedKey ? { key: trimmedKey } : {})
+				...(trimmedKey ? { key: trimmedKey } : {}),
+				// A connection test always asks the provider, never the server's model-list cache.
+				refresh: true
 			});
 			models = reply.models;
 			tested = true;
@@ -145,9 +153,10 @@
 					primary_model: primary,
 					fast_model: fast
 				});
-				if (provider.keys.length === 0 && secret) {
+				// A key typed here (first key, or re-entered for a new base URL) is saved too.
+				if (secret) {
 					await api('POST', `/ai-providers/${provider.id}/keys`, {
-						label: 'Default',
+						label: provider.keys.length === 0 ? 'Default' : `Key ${provider.keys.length + 1}`,
 						key: secret
 					});
 				}
@@ -225,7 +234,11 @@
 						type="password"
 						autocomplete="off"
 						required={needsKey}
-						placeholder={needsKey ? 'sk-...' : 'Leave blank to use stored key'}
+						placeholder={urlChanged
+							? 'Enter the key again for the new URL'
+							: needsKey
+								? 'sk-...'
+								: 'Leave blank to use stored key'}
 						bind:value={apiKey}
 						oninput={resetConnection}
 					/>

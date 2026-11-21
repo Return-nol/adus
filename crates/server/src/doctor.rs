@@ -174,8 +174,14 @@ async fn check_settings(state: &AppState, out: &mut Vec<Check>) {
         ));
         return;
     };
-    if !provider.enabled || provider.primary_model.trim().is_empty() {
-        out.push(Check::problem(
+    let primary = provider.primary_model().filter(|_| provider.enabled);
+    let fast = provider
+        .fast_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    match (primary, fast) {
+        (None, _) => out.push(Check::problem(
             Status::Fail,
             "Default provider",
             &format!(
@@ -183,22 +189,15 @@ async fn check_settings(state: &AppState, out: &mut Vec<Check>) {
                 provider.name
             ),
             "Open AI Providers to enable the provider and configure its primary model",
-        ));
-    } else if let Some(fast) = provider
-        .fast_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-    {
-        out.push(Check::ok(format!(
-            "Default provider: {} ({} / {})",
-            provider.name, provider.primary_model, fast
-        )));
-    } else {
-        out.push(Check::ok(format!(
-            "Default provider: {} ({})",
-            provider.name, provider.primary_model
-        )));
+        )),
+        (Some(primary), Some(fast)) => out.push(Check::ok(format!(
+            "Default provider: {} ({primary} / {fast})",
+            provider.name
+        ))),
+        (Some(primary), None) => out.push(Check::ok(format!(
+            "Default provider: {} ({primary})",
+            provider.name
+        ))),
     }
 
     let usable = ai::candidate_keys(&state.db, provider_id, chrono::Utc::now())

@@ -25,8 +25,8 @@ It pulls the published `adus` image; if that pull fails, it builds the image fro
 Then:
 
 1. Open `<your URL>/setup` and create the first admin account.
-2. Add an AI provider with at least one API key.
-3. Choose a default model in Settings.
+2. Add an AI provider: enter an API key, test the connection, and pick its primary model (and optionally a cheaper fast model).
+3. Choose the default provider in Settings.
 4. Add a connection (a GitHub or Azure DevOps PAT) and pick the repositories to review.
 5. Check that reviews can run: `docker compose exec adus adus doctor`.
 

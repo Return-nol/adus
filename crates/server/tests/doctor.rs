@@ -161,13 +161,35 @@ async fn doctor_not_running_when_default_provider_disabled(pool: PgPool) {
         .unwrap()
         .default_provider_id
         .unwrap();
-    ai::update_provider(&pool, provider_id, "OpenAI", None, "gpt-x", None, false)
+    ai::update_provider(
+        &pool,
+        provider_id,
+        "OpenAI",
+        None,
+        Some("gpt-x"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let report = doctor::run(&w.state).await;
+    assert_eq!(report.verdict, Verdict::NotRunning);
+    assert_eq!(fails(&report), vec!["Default provider", "AI key"]);
+    cleanup_queue(&w.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn doctor_not_running_when_default_provider_has_no_model(pool: PgPool) {
+    let w = healthy_world(pool.clone()).await;
+    sqlx::query("UPDATE ai_providers SET primary_model = NULL")
+        .execute(&pool)
         .await
         .unwrap();
 
     let report = doctor::run(&w.state).await;
     assert_eq!(report.verdict, Verdict::NotRunning);
-    assert_eq!(fails(&report), vec!["Default provider", "AI key"]);
+    assert_eq!(fails(&report), vec!["Default provider"]);
     cleanup_queue(&w.prefix).await;
 }
 

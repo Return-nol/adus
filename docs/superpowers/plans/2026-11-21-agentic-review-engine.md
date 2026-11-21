@@ -63,7 +63,7 @@
 ### Task 1: `ReviewMode`, Migration `0008`, Job Override & `@adudu review deep`
 
 **Files:**
-- Create: `migrations/0008_review_mode.sql`
+- Create: `migrations/0008_review_mode.sql` (later folded with the provider model tiers into `migrations/0008_review_mode_and_provider_models.sql`)
 - Modify: `crates/core/src/types.rs`, `crates/core/src/job.rs`, `crates/db/src/settings.rs`, `crates/db/src/repositories.rs`, `crates/review/src/command.rs`, `crates/server/src/webhooks.rs`, `crates/adus/src/worker.rs`
 - Test: `crates/core/src/types.rs`, `crates/core/src/job.rs`, `crates/db/tests/` (settings/repositories DB tests), `crates/review/tests/command.rs`
 
@@ -87,7 +87,7 @@
   - `crates/review/tests/command.rs`: `parse_review_deep_and_specialists` (`@adudu review deep`, `@adudu review specialists`, `@adudu review generalist`, `@adudu review please` → `None`, `@adudu review deeper` → `None`) + verify `Command::Review { mode: Some(ReviewMode::Specialists) }` enqueues `Job::ReviewPr` with `mode_override: Some(ReviewMode::Specialists)`.
   - `crates/db` test: fresh `settings` row has `review_mode == ReviewMode::Generalist`; `repositories::update` can set `Some(Some(ReviewMode::Specialists))` and clear `Some(None)`.
 - [ ] **Step 2:** Run `cargo test -j 2 -p adus-core -p adus-db -p adus-review` → FAIL (compile/assertion failure).
-- [ ] **Step 3:** Implement `migrations/0008_review_mode.sql`, `ReviewMode`, `Job::ReviewPr`, `settings.rs`, `repositories.rs`, `command.rs`, `webhooks.rs`, `worker.rs`, and update `Engine::review_pr` signature (forwarding/ignoring `mode_override` cleanly until Task 8) plus test struct literals (`crates/review/tests/engine.rs`, `crates/server/src/webhooks.rs`, `crates/adus/tests/worker.rs`).
+- [ ] **Step 3:** Implement `migrations/0008_review_mode.sql` (now `0008_review_mode_and_provider_models.sql`), `ReviewMode`, `Job::ReviewPr`, `settings.rs`, `repositories.rs`, `command.rs`, `webhooks.rs`, `worker.rs`, and update `Engine::review_pr` signature (forwarding/ignoring `mode_override` cleanly until Task 8) plus test struct literals (`crates/review/tests/engine.rs`, `crates/server/src/webhooks.rs`, `crates/adus/tests/worker.rs`).
 - [ ] **Step 4:** Run `cargo test -j 2 -p adus-core -p adus-db -p adus-review -p adus-server -p adus` → PASS.
 - [ ] **Step 5:** Commit `feat: add review_mode config, DB columns, and @adudu review deep command`
 
@@ -108,7 +108,7 @@
   - `ToolResult { call_id: String, tool_name: String, content: String, is_error: bool }`
   - `ToolDef { name: String, description: String, parameters: serde_json::Value }`
   - `StopReason::{EndTurn, ToolUse, MaxTokens, Other}`
-  - `ChatRequest { model: String, system: String, messages: Vec<Message>, tools: Vec<ToolDef>, max_tokens: u32 }` + `ChatRequest::text(model, system, user, max_tokens) -> Self`
+  - `ChatRequest { model: String, system: String, messages: Vec<Message>, tools: Vec<ToolDef>, max_tokens: u32, effort: Option<ReasoningEffort> }` + `ChatRequest::text(model, system, user, max_tokens) -> Self` (`effort` added by the provider-models work; set with `.with_effort(e)`)
   - `ChatResponse { text: String, tool_calls: Vec<ToolCall>, stop_reason: StopReason, input_tokens: u32, output_tokens: u32, cache_read_tokens: u32, cache_write_tokens: u32 }`
   - `LlmError` adds `ToolsUnsupported(String)` and `ContextOverflow(String)`.
   - `ChatError` adds `ToolsUnsupported(String)` and `ContextOverflow(String)`.
@@ -367,11 +367,13 @@
   - `VerificationReport { pub kept: Vec<CandidateFinding>, pub dropped_refuted: usize, pub dropped_unverified: usize, pub truncated_by_cap: usize, pub all_retryable_error: Option<ChatError> }`
   - `pub async fn verify_candidates(ctx: VerifyContext<'_>, candidates: Vec<CandidateFinding>, targets: &[FileDiff], rules: &[Rule], memories: &[Memory], repo_instructions: Option<&str>, toolbox: Option<&Toolbox>, deadline: tokio::time::Instant) -> VerificationReport`:
     - Each candidate's verification runs under `tokio::time::timeout_at(deadline, ...)`; a candidate cut by the deadline is dropped as unverified and is **not** a retryable failure (spec 4.11).
+    - `ctx.model` is the provider's `effective_fast_model()`; every verifier call uses `ReasoningEffort::Low` (`AgentLlm.effort` / `.with_effort`). A `ToolsUnsupported` from the fast model switches the remaining candidates to the diff-only path.
     - When `toolbox.is_some()`, runs per-finding `run_react_loop` (`VERIFY_MAX_STEPS = 6`) with `submit_verdict` tool (`{ keep: bool, rationale: String }`) + read-only tools.
     - When `toolbox.is_none()` (diff-only fallback), runs 1 single-turn `ChatRequest::text` per candidate against the annotated file diff + rules + memories, parsing `{"keep": bool, "rationale": ...}` from JSON.
 - In `crates/review/src/dedup.rs`:
   - `pub struct DedupResult { pub kept: Vec<Suggestion>, pub dropped_duplicates: usize }`
   - `pub async fn deduplicate_findings(chat: &dyn ChatService, provider_id: Uuid, model: &str, usage_ctx: &UsageContext, findings: Vec<CandidateFinding>) -> DedupResult`:
+    - `model` is the provider's `effective_fast_model()`; the call uses `ReasoningEffort::Low`.
     - When `findings.len() < 2`, returns unchanged immediately (0 LLM calls).
     - Otherwise makes 1 `ChatRequest::text` call asking for `{"keep_indices": [0, ...]}`, validates bounds (`< findings.len()`), deduplicates indices while preserving ascending order, rejects empty `keep_indices` (falling back safely to all findings), and on any `ChatError`/parse failure logs a warning and returns all `findings` unchanged.
 
@@ -429,7 +431,8 @@
     - `Err(WorkspaceError::Unauthorized)` → mark connection `invalid` via `self.unauthorized(&conn).await` and return `Err(EngineError::Fatal(...))`.
     - `Err(WorkspaceError::TimedOut | TooLarge | Unavailable(_))` → log warning, push `"Codebase context unavailable — reviewed diff only"` to `warnings`, and proceed in diff-only fallback (`toolbox = None`).
 - **Finder execution & `ToolsUnsupported` mid-run fallback (Review Focus #4 & #6):**
-  - Resolve mode: `mode_override.or(repo.review_mode).unwrap_or(settings.review_mode)`.
+  - Resolve mode: `mode_override.or(repo.review_mode).unwrap_or(settings.review_mode)` (already in `run()` since the provider-models merge, together with the provider resolution `repo.review_provider_id.or(settings.default_provider_id)` → enabled provider with a `primary_model()`, else `no_model`).
+  - Finder `AgentLlm` uses `primary_model` + `finder_effort(mode)`; Verifier and Dedup use `effective_fast_model()` + `Low` (spec decision 10).
   - Run batches up to `BATCH_CONCURRENCY = 2` at a time; within a batch run all of its specialists in parallel (spec 4.7). Keep results ordered by (batch index, specialist order).
   - **Stage deadlines (spec 4.11, Review Focus #9):** compute `start = Instant::now()` at the top of `run()`; Finder deadline `start + review_timeout * 60 / 100`, Verifier `* 90 / 100`, Dedup `* 97 / 100`. Wrap each Finder task in `timeout_at`; a cut task is a failed specialist with warning `"{label} reviewer did not finish in time"`; if no Finder task finished at all → `Fatal("review timed out")`. Pass the Verifier deadline to `verify_candidates`; wrap `deduplicate_findings` in `timeout_at` and keep the verified list on expiry.
   - If any task returns `AgentError::ToolsUnsupported(_)`: log warning, add `"Model does not support tool calling — reviewed diff only"` to `warnings`, and re-run the Finder in self-contained diff-only mode (`with_tools = false`) — discarding the partial tool-mode attempt!
@@ -445,7 +448,7 @@
 - **RAII cleanup on timeout (Review Focus #8):** Ensure `RepoWorkspace` lives inside the `run()` future passed to `tokio::time::timeout(self.review_timeout, run)` so timeout or `JoinHandle::abort()` drops `RepoWorkspace` immediately.
 
 - [ ] **Step 1: Update test fakes (`crates/review/tests/common/mod.rs`, `crates/adus/tests/worker.rs`) & write failing integration tests in `crates/review/tests/engine.rs`**
-  - Update `FakeChat` in `crates/review/tests/common/mod.rs` to inspect/respond to multi-turn `ChatRequest` (`messages`, `tools`) and keep helper methods so existing engine tests (adapted for Finder → Verifier → Dedup flow) stay readable.
+  - Update `FakeChat` in `crates/review/tests/common/mod.rs` (its `ChatCall` already records `effort`; `setup` creates the provider with `primary_model` `gpt-test` and `fast_model` `gpt-fast`) to inspect/respond to multi-turn `ChatRequest` (`messages`, `tools`); assert Finder calls use `gpt-test` and Verifier/Dedup calls use `gpt-fast` + `Low` and keep helper methods so existing engine tests (adapted for Finder → Verifier → Dedup flow) stay readable.
   - Add `FakeCloner` over a `TempDir` repo fixture.
   - New tests in `crates/review/tests/engine.rs`:
     - `agentic_generalist_uses_tools_verifies_and_dedups` (Finder reads helper file, emits 2 findings; Verifier refutes 1 and keeps 1; 1 comment posted).
@@ -483,6 +486,7 @@
 
 **Edge Cases & Pitfalls:**
 - **Role enforcement:** Non-admin `user` role receives 403 on `PUT /settings` and `PATCH /repositories/{id}`, and can read `review_mode` on `GET`.
+- **No model fields:** `settings.default_model` and `repositories.review_model` no longer exist (models live on AI providers); test bodies must not send them. Repository PATCH already validates `review_provider_id` (404 for an unknown provider).
 - **Null clearing on repository PATCH:** Sending `{"review_mode": null}` resets repo override back to `None` (inherit global default), while omitting `review_mode` leaves it unchanged.
 
 - [ ] **Step 1: Write failing tests** (`crates/server/tests/review_mode.rs`):
@@ -511,7 +515,7 @@
   - Send `review_mode` in `PUT /settings`.
 - `web/src/routes/repositories/+page.svelte`:
   - Extend `Repo` type with `review_mode: 'generalist' | 'specialists' | null`.
-  - Update both the loading `TableSkeleton` headers and the `<Table.Header>`/`<Table.Body>` to add a **Review mode** column (`Default (global)`, `Generalist`, `Specialists`) — interactive `<Select>` when `isAdmin`, muted text label when non-admin `user`. Update empty-row `colspan={6}`.
+  - The table already has a **Provider** `<Select>` column (it replaced "Model override"); keep it. Update both the loading `TableSkeleton` headers (which must read `Provider`, not `Model override`) and the `<Table.Header>`/`<Table.Body>` to add a **Review mode** column (`Default (global)`, `Generalist`, `Specialists`) — interactive `<Select>` when `isAdmin`, muted text label when non-admin `user`. Update empty-row `colspan={6}`.
 
 **Edge Cases & Pitfalls:**
 - Follow `DESIGN.md` tokens and `#lib/components/ui/...` imports (`#lib/api.js`, `#lib/session.svelte.js`, no `$lib`).

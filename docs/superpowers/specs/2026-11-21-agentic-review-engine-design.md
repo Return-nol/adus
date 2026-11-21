@@ -32,7 +32,7 @@ This wave brings **Point 1 (Cross-file PR & codebase awareness)**, **Point 2 (Tw
 - **Point 3 (Previous-review findings table & repeat suppression):** Deferred to the next wave (`review_findings` persistence + `VERIFIER_REPEAT_RULE`).
 - **Executing repo code or compilers in worker:** `tsc`, `cargo check`, linters, arbitrary shell execution, and separate sandbox containers (e2b/Docker-in-Docker) remain strictly out of scope to keep the 3-container deployment and protect `ADUS_SECRET_KEY`, `DATABASE_URL`, `REDIS_URL`, and decrypted PATs.
 - **Stage 3 post-verify Enrichment/Calibration LLM pass:** Kept as a 2-stage funnel (`Finder` emits full `Suggestion` → `Verifier` → `Dedup`).
-- **Separate Verifier/utility model setting:** Finder, Verifier, and Dedup share the resolved review model.
+- **Per-stage model settings in the UI:** models come from the review's AI provider (`primary_model`, optional `fast_model`, see [2026-11-21-provider-models-and-reasoning-design.md](2026-11-21-provider-models-and-reasoning-design.md)); stages pick a tier and a reasoning effort automatically (decision 10).
 - **LLM-generated PR walkthroughs / auto-approval / custom agents / AST graph DB:** Out of scope for this wave.
 
 ---
@@ -50,7 +50,7 @@ This wave brings **Point 1 (Cross-file PR & codebase awareness)**, **Point 2 (Tw
 | 7 | **Verifier & Dedup** | Per-finding tool-enabled Verifier (concurrency 4, max 6 steps, max 25 candidates sorted `Critical → Warning → Info`, refute-to-drop / keep-by-default) → 1 single-turn PR-wide Semantic Dedup call when `verified.len() >= 2` |
 | 8 | **Partial failure policy** | Specialists: partial results allowed with summary warning; retry only if all specialists fail retryably. Verifier: **fail-closed** (drop unverified finding + summary warning). Dedup: safe fallback (keep verified findings as-is) |
 | 9 | **Output funnel** | 2-stage: Finder outputs full `Suggestion` (`file`, `line`, `severity`, `title`, `body`, optional `suggestion`), Verifier keeps/drops without rewriting, Dedup merges |
-| 10 | **Model & prompt caching** | Same model for Finder, Verifier, and Dedup. Shared static prompt sections placed before specialist `<Role>` for implicit prefix caching; Anthropic `cache_control: ephemeral` breakpoints + cache token accounting |
+| 10 | **Model & prompt caching** | One provider per review (`repo.review_provider_id` → `settings.default_provider_id`). Finder uses its `primary_model` with effort by mode (`Generalist` → `Medium`, `Specialists` → `High`, `finder_effort`); Verifier and Dedup use `effective_fast_model()` (the `fast_model`, else `primary_model`) with `Low` effort. Shared static prompt sections placed before specialist `<Role>` for implicit prefix caching; Anthropic `cache_control: ephemeral` breakpoints + cache token accounting |
 | 11 | **Context & budgets** | Batch diffs up to ~40K chars (full PR manifest in every batch); tool outputs capped (`read_file` ≤ 200 lines / 8K chars, `grep` ≤ 40 match groups / 8K chars, `list_dir`/`find_files` ≤ 150 entries / 4K chars); compact older tool results above ~160K chars; one-shot overflow recovery |
 | 12 | **Time budget** | Stage deadlines as fractions of `review_timeout`: Finder (incl. clone) by 60 %, Verifier by 90 %, Dedup + post in the rest. Work cut by a deadline is handled like a failure of that stage (Section 4.11), so a large PR still posts a partial review instead of timing out with nothing |
 | 13 | **Wave scope** | Point 1 + Point 2 + auto-loading repo instruction files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/*.mdc`) from the clone. Point 3 deferred |
@@ -68,7 +68,8 @@ Webhook / @adudu review [deep]
   Engine::review_pr (12m REVIEW_TIMEOUT < 13m JOB_TIMEOUT < 15m LOCK_TTL)
         │
         ├─ 1. Check repo enabled, auto_review, draft, ignored_title_keywords, head_sha dedup
-        ├─ 2. Resolve model (repo override -> settings default) & review_mode
+        ├─ 2. Resolve provider (repo override -> settings default; must be enabled with a
+        │     primary_model, else no_model) & review_mode
         │     (command override -> repo override -> settings default)
         ├─ 3. Fetch PR diff (full or incremental) + apply ignore_paths, max_patch_lines_per_file, max_files_per_review
         ├─ 4. Build PR File Manifest + group diffs into ~40K-char directory-clustered batches
@@ -97,7 +98,7 @@ Webhook / @adudu review [deep]
 
 Crate dependencies remain strictly acyclic:
 - `adus-core`: `ReviewMode`, `Job::ReviewPr.mode_override` (`#[serde(default)]`).
-- `adus-db`: `settings.review_mode`, `repositories.review_mode` (migration `0008_review_mode.sql`).
+- `adus-db`: `settings.review_mode`, `repositories.review_mode` (migration `0008_review_mode_and_provider_models.sql`, which also carries the provider model tiers).
 - `adus-git`: `CloneSpec` + `GitProvider::clone_spec(&self, repo, pr) -> Option<CloneSpec>` (optional method on trait so test fakes or mock providers can return `None`).
 - `adus-llm`: Multi-turn `Message`, `MessageRole`, `ContentPart`, `ToolDef`, `ToolCall`, `StopReason`, `CacheStats`, `LlmError::{ToolsUnsupported, ContextOverflow}`, `ChatError::{ToolsUnsupported, ContextOverflow}`, Anthropic `cache_control` breakpoints, OpenAI/OpenAI-compatible `tools`, Gemini `functionDeclarations` + `thoughtSignature` preservation.
 - `adus-review`: `workspace`, `tools`, `repo_instructions`, `agent`, `specialists`, `verifier`, `dedup`, updated `prompt`, `parse`, `command`, `engine`.
@@ -122,7 +123,8 @@ pub enum ReviewMode {
 }
 ```
 
-#### Migration `migrations/0008_review_mode.sql`
+#### Migration `migrations/0008_review_mode_and_provider_models.sql`
+The review-mode part is below; the same file also moves models onto AI providers (provider-models spec §3.1).
 ```sql
 CREATE TYPE review_mode AS ENUM ('generalist', 'specialists');
 
@@ -165,9 +167,11 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
     pub max_tokens: u32,
+    /// Reasoning effort (provider-models spec §3.2); `None` = provider default.
+    pub effort: Option<ReasoningEffort>,
 }
 ```
-Provide `ChatRequest::text(model, system, user, max_tokens)` for ergonomic single-turn calls (used by `ai::test_key`, diff-only Verifier, Semantic Dedup, and existing tests).
+Provide `ChatRequest::text(model, system, user, max_tokens)` (effort `None`, set with `.with_effort(e)`) for ergonomic single-turn calls (used by `ai::test_key`, diff-only Verifier, Semantic Dedup, and existing tests).
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -356,7 +360,7 @@ Limits & Safety:
 - `AgentError`: `ToolsUnsupported(String)`, `Chat(ChatError)`, `Unparseable(String)`.
 
 #### Loop Mechanics
-1. Send `ChatRequest { model, system, messages, tools, max_tokens }`.
+1. Send `ChatRequest { model, system, messages, tools, max_tokens, effort }` (`AgentLlm` carries `model` and `effort` for the stage, decision 10).
 2. Record assistant message (`text` + `tool_calls`) into `messages`.
 3. If `tool_calls` contains the configured terminal submit tool (`submit_findings` or `submit_verdict`):
    - Parse arguments into `T`. If valid → return `Ok(AgentOutcome { result, cut_short: false })`.
@@ -367,7 +371,7 @@ Limits & Safety:
 5. Otherwise, execute the non-submit read-only tool calls concurrently (up to `max_concurrent_tools`), append `Message::Tool { results }`, and advance step counter.
 6. **Budget wrap-up turn:** On `step == max_steps - 1` (last turn), **drop read-only tools** and keep only the submit tool (or prompt to submit now without more tool calls) so the model outputs its accumulated findings instead of hitting the wall empty-handed. If it still doesn't submit cleanly, return partial/unparseable handling (`cut_short: true` for Finder if prose recovers anything, `AgentError` for Verifier).
 7. **Context compaction & overflow recovery:**
-   - Before each LLM call, compute total chars across `messages`. While `total_chars > compaction_char_limit`, walk from the oldest `Message::Tool` forward (preserving `messages[0]` initial prompt and the **last 4 messages**, i.e., 2 turns) and replace each `ToolResult.content` longer than 120 chars with `"[earlier tool output omitted to save context]"`.
+   - Before each LLM call, compute total chars across `messages` (tool-call `provider_meta`, which replays thinking blocks, counts too). While `total_chars > compaction_char_limit`, walk from the oldest `Message::Tool` forward (preserving `messages[0]` initial prompt and the **last 4 messages**, i.e., 2 turns) and replace each `ToolResult.content` longer than 120 chars with `"[earlier tool output omitted to save context]"`.
    - If `ChatService::chat` returns `ChatError::ContextOverflow(_)`: perform **one-shot aggressive compaction** (keep only `messages[0]`, the latest assistant message + tool results truncated to 500 chars) and retry once; if it overflows again, surface `AgentError::Chat(ChatError::ContextOverflow(...))`.
 
 ---
@@ -407,6 +411,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 
 #### Step 2: Per-Finding Tool-Enabled Verifier (`verifier.rs`)
 - **Cap & prioritization:** If more than `MAX_VERIFY_CANDIDATES = 25` candidates survive deterministic filtering, sort by severity (`Critical > Warning > Info`, preserving original order on ties), verify the top 25, and record a summary warning (`"N lower-priority findings exceeded the verification cap and were omitted"`).
+- **Model:** the provider's `effective_fast_model()` with `ReasoningEffort::Low` (decision 10). The fast model may lack tool support even when the primary model has it: a `ToolsUnsupported` from the Verifier switches the remaining candidates to the diff-only path below.
 - **Concurrency:** Run up to `VERIFY_CONCURRENCY = 4` verifier tasks concurrently using `futures::stream::iter(...).buffer_unordered(VERIFY_CONCURRENCY)` (preserving deterministic ordering afterwards).
 - **Evidence bundle per candidate:**
   - The candidate finding JSON (`file`, `line`, `severity`, `title`, `body`, `suggestion`)
@@ -423,7 +428,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 
 #### Step 3: PR-Wide Semantic Deduplication (`dedup.rs`)
 - Runs **only when `verified.len() >= 2`**.
-- One single-turn `ChatRequest::text` call listing all surviving findings indexed `0..N` (with `file`, `line`, `severity`, `title`, `body`, `specialist`).
+- One single-turn `ChatRequest::text` call (`effective_fast_model()`, `ReasoningEffort::Low`) listing all surviving findings indexed `0..N` (with `file`, `line`, `severity`, `title`, `body`, `specialist`).
 - Instructs the model to identify semantic duplicates (findings describing the same underlying root cause at the same or related location—especially common when `Bug` and `Security` both flag the same flaw) and return JSON `{"keep_indices": [0, 2, ...]}` selecting the single clearest/highest-severity finding per root cause.
 - **Validation & safe fallback:** Validate indices are in bounds `0..N` and unique (reject empty `keep_indices` if input was non-empty!). On any LLM error, parse error, or invalid output, log a warning and keep all `verified` findings unchanged.
 
@@ -448,6 +453,8 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 | Clone + Finder | `start + 60 %` | Finder tasks still running are cancelled (`tokio::time::timeout_at`) and count as failed specialists with the note `"{label} reviewer did not finish in time"`. If **no** Finder task finished, the review fails `Fatal("review timed out")`, as today. |
 | Verifier | `start + 90 %` | Candidates without a verdict are dropped as unverified (fail-closed, never retryable). |
 | Dedup | `start + 97 %` (the last 3 %, ~20 s in production, is reserved for posting) | Dedup is cut and falls back safely (keep the verified list). |
+
+Reasoning makes each call slower: a request with an effort set gets a 300 s per-request timeout instead of 120 s, and its output cap grows by a reserve for reasoning tokens (provider-models spec §3.2). The stage deadlines above still bound the whole run; `Specialists` mode at `High` effort is the case most likely to hit the Finder deadline on a large PR, which ends in a partial review with notes, never a silent timeout.
 
 Cancelling an agent future drops its pending tool futures; `spawn_blocking` work already started runs to completion against its `Arc<RepoWorkspace>` clone. The directory is removed when the last `Arc` drops (at the latest when `run()` ends or is cancelled by the outer timeout).
 
