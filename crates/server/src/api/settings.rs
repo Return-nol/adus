@@ -30,6 +30,7 @@ pub fn routes() -> Router<AppState> {
 
 const FILES_RANGE: RangeInclusive<i32> = 1..=500;
 const PATCH_LINES_RANGE: RangeInclusive<i32> = 1..=100_000;
+const SMALL_PR_RANGE: RangeInclusive<i32> = 0..=10_000;
 const MAX_KEYWORD_LEN: usize = 100;
 const MAX_KEYWORDS: usize = 500;
 const MAX_TEST_PATH_LEN: usize = 1000;
@@ -45,6 +46,7 @@ struct SettingsJson {
     ignore_paths_is_default: bool,
     ignored_title_keywords: Vec<String>,
     review_mode: ReviewMode,
+    small_pr_max_lines: i32,
 }
 
 impl From<Settings> for SettingsJson {
@@ -57,6 +59,7 @@ impl From<Settings> for SettingsJson {
             max_patch_lines_per_file: s.max_patch_lines_per_file,
             ignored_title_keywords: s.ignored_title_keywords,
             review_mode: s.review_mode,
+            small_pr_max_lines: s.small_pr_max_lines,
         }
     }
 }
@@ -73,6 +76,8 @@ struct SettingsBody {
     ignored_title_keywords: Option<Vec<String>>,
     /// Tidak ada = biarkan.
     review_mode: Option<ReviewMode>,
+    /// Tidak ada = biarkan.
+    small_pr_max_lines: Option<i32>,
 }
 
 impl From<IgnoreError> for ApiError {
@@ -137,6 +142,13 @@ async fn replace(
             "max_patch_lines_per_file must be between 1 and 100000",
         ));
     }
+    if let Some(lines) = body.small_pr_max_lines
+        && !SMALL_PR_RANGE.contains(&lines)
+    {
+        return Err(ApiError::validation(
+            "small_pr_max_lines must be between 0 and 10000",
+        ));
+    }
     if let Some(provider_id) = body.default_provider_id
         && ai::get_provider(&state.db, provider_id).await?.is_none()
     {
@@ -165,6 +177,9 @@ async fn replace(
         ignore_paths,
         ignored_title_keywords,
         review_mode: body.review_mode.unwrap_or(current.review_mode),
+        small_pr_max_lines: body
+            .small_pr_max_lines
+            .unwrap_or(current.small_pr_max_lines),
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }

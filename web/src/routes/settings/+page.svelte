@@ -26,6 +26,7 @@
 		review_mode: ReviewMode;
 		max_files_per_review: number;
 		max_patch_lines_per_file: number;
+		small_pr_max_lines: number;
 		ignore_paths: string[];
 		ignore_paths_is_default: boolean;
 		ignored_title_keywords: string[];
@@ -41,6 +42,7 @@
 	let reviewMode = $state<ReviewMode>('generalist');
 	let maxFiles = $state(0);
 	let maxPatchLines = $state(0);
+	let smallPrMaxLines = $state(0);
 	// Ignored files: the textarea text, plus what the server last gave us.
 	let ignoreText = $state('');
 	let savedIgnore = $state<string[]>([]);
@@ -87,6 +89,7 @@
 		reviewMode = s.review_mode;
 		maxFiles = s.max_files_per_review;
 		maxPatchLines = s.max_patch_lines_per_file;
+		smallPrMaxLines = s.small_pr_max_lines;
 	}
 
 	async function load() {
@@ -120,6 +123,7 @@
 					review_mode: reviewMode,
 					max_files_per_review: maxFiles,
 					max_patch_lines_per_file: maxPatchLines,
+					small_pr_max_lines: smallPrMaxLines,
 					// Omitted unless edited, so saving other settings never pins the defaults.
 					...(ignoreChanged ? { ignore_paths: patterns } : {}),
 					ignored_title_keywords: lines(keywordsText)
@@ -204,7 +208,7 @@
 	<Card.Root class="max-w-2xl" aria-busy="true">
 		<Card.Content class="grid gap-4">
 			<span class="sr-only" role="status">Loading…</span>
-			{#each ['w-28', 'w-24', 'w-44', 'w-52'] as w, i (i)}
+			{#each ['w-28', 'w-24', 'w-44', 'w-52', 'w-56'] as w, i (i)}
 				<div class="grid gap-2">
 					<Skeleton class={`h-4 ${w}`} />
 					<Skeleton class="h-9 w-full rounded-sm" />
@@ -262,6 +266,22 @@
 						required
 						bind:value={maxPatchLines}
 					/>
+				</div>
+				<div class="grid gap-2">
+					<Label for="s-small">Small PR threshold (changed lines)</Label>
+					<Input
+						id="s-small"
+						type="number"
+						min="0"
+						max="10000"
+						required
+						bind:value={smallPrMaxLines}
+					/>
+					<p class="text-xs text-muted-foreground">
+						PRs with at most this many changed lines in up to 3 files, outside sensitive paths, are
+						reviewed from the diff only, in one Generalist pass. 0 = always full review.
+						<code class="font-mono">@adudu review</code> always runs the full review.
+					</p>
 				</div>
 				<div class="grid gap-2">
 					<div class="flex flex-wrap items-center gap-2">

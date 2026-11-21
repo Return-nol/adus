@@ -625,6 +625,8 @@ pub async fn setup(pool: &PgPool, git: FakeGit) -> Setup {
     .unwrap();
     let mut current = settings::get(pool).await.unwrap();
     current.default_provider_id = Some(provider.id);
+    // The small-PR path is opt-in per test: most tests use tiny diffs and expect the full path.
+    current.small_pr_max_lines = 0;
     settings::update(pool, &current).await.unwrap();
 
     let chat = Arc::new(FakeChat::default());

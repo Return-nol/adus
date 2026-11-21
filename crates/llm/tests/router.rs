@@ -695,6 +695,7 @@ async fn settings_row_exists_with_defaults(pool: PgPool) {
         ignore_paths: Some(vec!["dist/**".into()]),
         ignored_title_keywords: vec!["wip".into()],
         review_mode: adus_core::types::ReviewMode::Specialists,
+        small_pr_max_lines: 120,
     };
     assert_eq!(adus_db::settings::update(&pool, &new).await.unwrap(), new);
     // Hapus provider -> default_provider_id di-NULL-kan.

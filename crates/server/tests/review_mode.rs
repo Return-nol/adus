@@ -114,6 +114,40 @@ async fn put_settings_omitting_review_mode_keeps_existing_value(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn settings_small_pr_max_lines_defaults_to_50_and_validates_range(pool: PgPool) {
+    let (app, _git) = app_and_git(pool).await;
+    let admin = setup_admin(&app).await;
+    assert_eq!(read_settings(&app, &admin).await["small_pr_max_lines"], 50);
+
+    let reply = put_settings(&app, &admin, json!({ "small_pr_max_lines": 120 })).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["small_pr_max_lines"], 120);
+
+    // Omitting the field keeps the value.
+    let reply = put_settings(&app, &admin, json!({ "max_files_per_review": 60 })).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["small_pr_max_lines"], 120);
+
+    // 0 (never small) and 10000 are the inclusive bounds.
+    for ok in [0, 10_000] {
+        let reply = put_settings(&app, &admin, json!({ "small_pr_max_lines": ok })).await;
+        assert_eq!(reply.status, StatusCode::OK, "{ok}");
+        assert_eq!(reply.body["small_pr_max_lines"], ok);
+    }
+
+    // Out of range: 422 and nothing changes.
+    for bad in [-1, 10_001] {
+        let reply = put_settings(&app, &admin, json!({ "small_pr_max_lines": bad })).await;
+        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        assert_eq!(reply.body["error"]["code"], "validation_error");
+    }
+    assert_eq!(
+        read_settings(&app, &admin).await["small_pr_max_lines"],
+        10_000
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn patch_repo_sets_and_clears_review_mode_override(pool: PgPool) {
     let (app, admin, uri) = setup_with_repo(pool).await;
     assert!(repo_json(&app, &admin).await["review_mode"].is_null());

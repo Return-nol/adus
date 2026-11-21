@@ -36,6 +36,7 @@ use crate::prompt::{
     format_summary,
 };
 use crate::repo_instructions::load_repo_instructions;
+use crate::small_pr::is_small_pr;
 use crate::tools::{ToolCache, Toolbox};
 use crate::verifier::{CandidateFinding, VerifyContext, verify_candidates};
 use crate::workspace::{RepoCloner, WorkspaceError};
@@ -45,6 +46,8 @@ pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(12 * 60);
 
 /// Summary note when the clone failed (not for auth) and the review saw only the diff.
 const CODEBASE_UNAVAILABLE: &str = "Codebase context unavailable — reviewed diff only";
+/// Summary note for a small, low-risk PR reviewed without the clone (not a failure).
+const SMALL_PR_NOTE: &str = "Small change — reviewed diff only";
 /// Summary note when the model rejected tool calling.
 const TOOLS_UNSUPPORTED: &str = "Model does not support tool calling — reviewed diff only";
 
@@ -134,6 +137,9 @@ struct Stages<'a> {
     memories: &'a [Memory],
     usage: &'a UsageContext,
     deadlines: Deadlines,
+    /// `settings.small_pr_max_lines`; 0 when the PR must get the full review (a `Command`
+    /// trigger, or the feature is off).
+    small_pr_max_lines: u32,
 }
 
 impl Engine {
@@ -376,6 +382,10 @@ impl Engine {
                 memories: &memories,
                 usage: &usage,
                 deadlines,
+                small_pr_max_lines: match trigger {
+                    Trigger::Command => 0,
+                    _ => u32::try_from(settings.small_pr_max_lines).unwrap_or(0),
+                },
             };
             self.review_targets(&stages, targets, &manifest, &mut skipped, &mut warnings)
                 .await?
@@ -412,12 +422,28 @@ impl Engine {
             .collect();
         let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS);
 
+        // A small, low-risk PR is reviewed from the diff alone, in one Generalist pass: no
+        // clone and no tools (the same diff-only path as a failed clone, but not a failure).
+        let small = is_small_pr(&files, s.rules, s.small_pr_max_lines);
+        let mode = if small {
+            ReviewMode::Generalist
+        } else {
+            s.mode
+        };
+
         // Clone: auth failure is fatal; anything else, or a clone still running at the Finder
         // deadline (spec decision 12: the clone is part of the Finder budget), falls back to
         // the diff only.
         let clone_started = Instant::now();
         let mut fallback_reason = None;
-        let workspace = match s.git.clone_spec(s.repo_ref, s.pr) {
+        let clone_spec = if small {
+            warnings.push(SMALL_PR_NOTE.into());
+            fallback_reason = Some("small_pr");
+            None
+        } else {
+            s.git.clone_spec(s.repo_ref, s.pr)
+        };
+        let workspace = match clone_spec {
             None => None,
             Some(spec) => {
                 let clone = self.cloner.clone_pr(&spec);
@@ -455,13 +481,13 @@ impl Engine {
             batches: &batches,
             memories: s.memories,
             repo_instructions: repo_instructions.as_deref(),
-            mode: s.mode,
+            mode,
         };
         let llm = FinderLlm {
             chat: self.chat.as_ref(),
             provider_id: s.provider_id,
             model: s.primary_model,
-            effort: finder_effort(s.mode),
+            effort: finder_effort(mode),
             usage: s.usage,
         };
         let finder = run_finder(llm, &input, toolbox.as_ref(), s.deadlines.finder).await;
@@ -476,7 +502,7 @@ impl Engine {
         let finder_tasks = finder.tasks.len();
         let (cache_read_tokens, cache_write_tokens) = finder_cache_tokens(&finder.tasks);
         let candidates =
-            collect_candidates(finder.tasks, s.mode, &batches, &allowed, skipped, warnings)?;
+            collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
         let candidate_count = candidates.len();
 
         let (verified, verifier_dropped) = if candidates.is_empty() {
@@ -540,7 +566,7 @@ impl Engine {
         };
 
         tracing::info!(
-            review_mode = ?s.mode,
+            review_mode = ?mode,
             clone_ms,
             fallback_reason,
             finder_tasks,

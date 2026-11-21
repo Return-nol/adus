@@ -6,6 +6,7 @@ pub mod finder;
 pub mod parse;
 pub mod prompt;
 pub mod repo_instructions;
+pub mod small_pr;
 pub mod specialists;
 pub mod tools;
 pub mod verifier;

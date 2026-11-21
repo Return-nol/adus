@@ -1484,6 +1484,124 @@ async fn clone_failure_falls_back_to_diff_only_with_summary_note(pool: PgPool) {
     assert_eq!(conn.status, ConnectionStatus::Ok);
 }
 
+const SMALL_PR_NOTE: &str = "Small change — reviewed diff only";
+
+/// Turn the small-PR path on (the shared `setup` disables it).
+async fn enable_small_pr(pool: &PgPool) {
+    let mut current = settings::get(pool).await.unwrap();
+    current.small_pr_max_lines = 50;
+    settings::update(pool, &current).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn small_pr_skips_clone_and_tools_but_still_verifies(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    enable_small_pr(&pool).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    assert!(s.cloner.urls().is_empty(), "no clone for a small PR");
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 1);
+    assert_eq!(
+        finder[0].tools,
+        vec!["submit_findings"],
+        "no repository tools"
+    );
+    assert!(finder[0].system.contains("You cannot open other files"));
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 1, "the Verifier still runs");
+    assert!(verifier[0].tools.is_empty(), "diff-only Verifier");
+    let git = s.git.state();
+    assert_eq!(git.reviews[0].comments.len(), 1);
+    let summary = &git.reviews[0].summary;
+    assert!(
+        summary.contains(&format!(
+            "**Notes**
+- {SMALL_PR_NOTE}"
+        )),
+        "{summary}"
+    );
+    assert!(!summary.contains(CODEBASE_NOTE), "not a fallback failure");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn command_review_of_small_pr_runs_full_review(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    enable_small_pr(&pool).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[(
+        "a.rs", "a
+b
+",
+    )]);
+
+    let id = run(&s, Trigger::Command).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    assert_eq!(s.cloner.urls().len(), 1, "@adudu review clones");
+    let finder = s.chat.finder_calls();
+    assert!(finder[0].tools.contains(&"read_file".to_string()));
+    assert!(!s.git.state().reviews[0].summary.contains(SMALL_PR_NOTE));
+
+    // `@adudu review deep` runs the specialists, also on a small PR.
+    let before = s.chat.finder_calls().len();
+    run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+    assert!(s.chat.finder_calls().len() - before > 1);
+    assert_eq!(s.cloner.urls().len(), 2);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn small_pr_in_specialists_mode_runs_generalist_once(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    enable_small_pr(&pool).await;
+    let mut current = settings::get(&pool).await.unwrap();
+    current.review_mode = ReviewMode::Specialists;
+    settings::update(&pool, &current).await.unwrap();
+    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 1, "one Generalist pass, no specialists");
+    assert!(finder[0].system.contains(GENERALIST_ROLE));
+    assert_eq!(finder[0].effort, Some(ReasoningEffort::Medium));
+    assert_eq!(s.chat.verifier_calls().len(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn risky_small_pr_gets_full_review(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/auth/login.rs", PATCH_2)]),
+    )
+    .await;
+    enable_small_pr(&pool).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[(
+        "src/auth/login.rs",
+        "a
+b
+",
+    )]);
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    assert_eq!(s.cloner.urls().len(), 1, "risky path is cloned");
+    assert!(
+        s.chat.finder_calls()[0]
+            .tools
+            .contains(&"read_file".to_string())
+    );
+    assert!(!s.git.state().reviews[0].summary.contains(SMALL_PR_NOTE));
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn clone_unauthorized_marks_connection_invalid_and_fails(pool: PgPool) {
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;

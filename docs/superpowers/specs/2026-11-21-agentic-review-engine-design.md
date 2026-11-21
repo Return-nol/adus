@@ -54,6 +54,7 @@ This wave brings **Point 1 (Cross-file PR & codebase awareness)**, **Point 2 (Tw
 | 11 | **Context & budgets** | Batch diffs up to ~40K chars (full PR manifest in every batch); tool outputs capped (`read_file` ≤ 200 lines / 8K chars, `grep` ≤ 40 match groups / 8K chars, `list_dir`/`find_files` ≤ 150 entries / 4K chars); compact older tool results above ~160K chars; one-shot overflow recovery |
 | 12 | **Time budget** | Stage deadlines as fractions of `review_timeout`: Finder (incl. clone) by 60 %, Verifier by 90 %, Dedup + post in the rest. Work cut by a deadline is handled like a failure of that stage (Section 4.11), so a large PR still posts a partial review instead of timing out with nothing |
 | 13 | **Wave scope** | Point 1 + Point 2 + auto-loading repo instruction files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/*.mdc`) from the clone. Point 3 deferred |
+| 14 | **Small PR** | A small, low-risk PR (`settings.small_pr_max_lines`, default 50, `0` = off; at most 3 reviewed files; no risky path, no covering enabled `critical` rule) skips the clone and the tools and is reviewed diff-only in one Generalist pass; Verifier and Dedup still run. `@adudu review` / `review deep` always get the full review (Section 4.13) |
 
 ---
 
@@ -73,6 +74,7 @@ Webhook / @adudu review [deep]
         │     (command override -> repo override -> settings default)
         ├─ 3. Fetch PR diff (full or incremental) + apply ignore_paths, max_patch_lines_per_file, max_files_per_review
         ├─ 4. Build PR File Manifest + group diffs into ~40K-char directory-clustered batches
+        ├─ 4b. Small PR (not for `@adudu review`; Section 4.13): skip step 5, no tools, mode forced to Generalist
         ├─ 5. Ephemeral Clone (`RepoCloner::clone_pr`, 60 s timeout)
         │     ├─ Auth error -> Connection Invalid + Fatal
         │     ├─ Non-auth error / timeout -> fallback to diff-only mode + Summary Warning
@@ -130,6 +132,10 @@ CREATE TYPE review_mode AS ENUM ('generalist', 'specialists');
 
 ALTER TABLE settings
     ADD COLUMN review_mode review_mode NOT NULL DEFAULT 'generalist';
+
+ALTER TABLE settings
+    ADD COLUMN small_pr_max_lines INTEGER NOT NULL DEFAULT 50
+        CHECK (small_pr_max_lines BETWEEN 0 AND 10000);
 
 ALTER TABLE repositories
     ADD COLUMN review_mode review_mode NULL;
@@ -466,6 +472,7 @@ Cancelling an agent future drops its pending tool futures; `spawn_blocking` work
 
 - **Settings (`GET`/`PUT /api/v1/settings`):**
   - Add `review_mode: "generalist" | "specialists"` (`SettingsJson` & optional `SettingsBody.review_mode: Option<ReviewMode>` so partial callers without the field remain backwards compatible).
+  - Add `small_pr_max_lines: i32` (optional in `SettingsBody`, absent keeps the value; outside `0..=10000` is a 422 `validation_error`) and a **Small PR threshold (changed lines)** number field (Section 4.13).
   - UI (`web/src/routes/settings/+page.svelte`): add a **Review mode** `<Select>` ("Generalist (balanced)" / "Specialists (deep: Bug, Security, Performance & Rules)") with helper copy mentioning `@adudu review deep`.
 - **Repositories (`GET /api/v1/repositories`, `PATCH /api/v1/repositories/{id}`):**
   - Add `review_mode: Option<ReviewMode>` (`null` = inherit global default) to `RepositoryJson` and `UpdateRepository` (using `present_or_null` so `null` clears override).
@@ -486,6 +493,24 @@ Added 2026-11-22 (user decision). A multi-line ` ```suggestion ` fence anchored 
   - Azure DevOps: thread context `rightFileStart {line: start_line, offset: 1}` and `rightFileEnd {line, offset: end_offset}`, where `end_offset` is the UTF-16 length of the end line + 1 (`right_line_end_offset`); single-line threads keep `offset: 1` on both ends. `end_offset` is ignored by GitHub.
   - Providers re-check `start_line < line` and fall back to single-line.
 - **Unverified offline:** live GitHub same-hunk acceptance and Apply behaviour, and Azure offset semantics — user click-test.
+
+### 4.13 Small PR: Diff-Only Review (`crates/review/src/small_pr.rs`)
+
+Added 2026-11-22 (user decision). A small, low-risk PR does not need a clone or an agent that walks the repository, so it takes the cheap path.
+
+- **Predicate:** `is_small_pr(targets, rules, max_lines)` over the **reviewed targets only** (ignored and skipped files never count; an all-ignored PR never gets here). True only when all hold:
+  - `max_lines > 0` (`settings.small_pr_max_lines`, default 50, range `0..=10000`; `0` = never);
+  - `1 <= targets.len() <= SMALL_PR_MAX_FILES` (3);
+  - changed lines (`+` and `-` inside hunks, summed over the targets) `<= max_lines`;
+  - no target is on a **risky path**, checked on `normalize_path`, case-insensitive, for both `path` and `old_path` (renames):
+    - security/access: any path segment containing `auth`, `security`, `crypto`, `permission`, `secret`, `token`, `session` or `password`;
+    - data/schema: under `migrations/`, `*.sql`, file stem `schema`;
+    - shared contracts: `*.proto`, `openapi.*`, `*.graphql`, file name `lib.rs`, `mod.rs`, `index.ts`, `index.js`;
+    - build/deploy: `Dockerfile*`, `.github/workflows/**`, `Cargo.toml`, `package.json`;
+  - no target is covered (`rule_matches_path`) by an enabled `critical` rule (the same applicable-rules list the engine batches with).
+- **Engine:** decided in `review_targets` before the clone. When small: no `clone_spec` / `clone_pr`, no `Toolbox`, so the Finder runs with `with_tools = false` and the Verifier runs diff-only (the existing diff-only path of Section 4.8, reused, not a second path). The mode is forced to `Generalist` after normal resolution (Section 4.1), whatever the repo or global mode, so the Finder is one call per batch with `finder_effort(Generalist)`. The Verifier and Dedup still run.
+- **Command bypass:** `Trigger::Command` (`@adudu review`, `@adudu review deep`) never takes this path: it clones, uses tools and honours the requested mode.
+- **Not a failure:** the summary note is `Small change — reviewed diff only` (not `Codebase context unavailable`). Logs carry `fallback_reason = "small_pr"` and the effective `review_mode`. Finder failure handling is unchanged (Generalist still retries when every failure is retryable, decision 8).
 
 ---
 

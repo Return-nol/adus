@@ -16,10 +16,13 @@ pub struct Settings {
     pub ignored_title_keywords: Vec<String>,
     /// Global default review mode; a repository can override it.
     pub review_mode: ReviewMode,
+    /// PRs with at most this many changed lines (and few, non-sensitive files) are reviewed
+    /// diff-only. 0 = never.
+    pub small_pr_max_lines: i32,
 }
 
 const COLUMNS: &str = "default_provider_id, max_files_per_review, \
-     max_patch_lines_per_file, ignore_paths, ignored_title_keywords, review_mode";
+     max_patch_lines_per_file, ignore_paths, ignored_title_keywords, review_mode, \n     small_pr_max_lines";
 
 pub async fn get(pool: &PgPool) -> Result<Settings> {
     sqlx::query_as(&format!("SELECT {COLUMNS} FROM settings WHERE id = 1"))
@@ -32,7 +35,7 @@ pub async fn update(pool: &PgPool, new: &Settings) -> Result<Settings> {
     sqlx::query_as(&format!(
         "UPDATE settings SET default_provider_id = $1, \
          max_files_per_review = $2, max_patch_lines_per_file = $3, \
-         ignore_paths = $4, ignored_title_keywords = $5, review_mode = $6 WHERE id = 1 \
+         ignore_paths = $4, ignored_title_keywords = $5, review_mode = $6, small_pr_max_lines = $7 WHERE id = 1 \
          RETURNING {COLUMNS}"
     ))
     .bind(new.default_provider_id)
@@ -41,6 +44,7 @@ pub async fn update(pool: &PgPool, new: &Settings) -> Result<Settings> {
     .bind(&new.ignore_paths)
     .bind(&new.ignored_title_keywords)
     .bind(new.review_mode)
+    .bind(new.small_pr_max_lines)
     .fetch_one(pool)
     .await
 }

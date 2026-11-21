@@ -5,6 +5,12 @@ CREATE TYPE review_mode AS ENUM ('generalist', 'specialists');
 ALTER TABLE settings
     ADD COLUMN review_mode review_mode NOT NULL DEFAULT 'generalist';
 
+-- A PR with at most this many changed lines (and few files, outside sensitive paths) is
+-- reviewed from the diff only. 0 = never treat a PR as small.
+ALTER TABLE settings
+    ADD COLUMN small_pr_max_lines INTEGER NOT NULL DEFAULT 50
+        CHECK (small_pr_max_lines BETWEEN 0 AND 10000);
+
 ALTER TABLE repositories
     ADD COLUMN review_mode review_mode NULL;
 

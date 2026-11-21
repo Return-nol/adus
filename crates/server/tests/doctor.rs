@@ -58,6 +58,7 @@ async fn healthy_world(pool: PgPool) -> World {
             ignore_paths: None,
             ignored_title_keywords: vec![],
             review_mode: Default::default(),
+            small_pr_max_lines: 50,
         },
     )
     .await
