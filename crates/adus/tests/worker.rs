@@ -16,6 +16,7 @@ use adus_git::HttpGitProviderFactory;
 use adus_llm::router::LlmRouter;
 use adus_queue::{Delivery, Queue};
 use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT};
+use adus_review::workspace::GitCliCloner;
 use async_trait::async_trait;
 use redis::AsyncCommands;
 use sqlx::PgPool;
@@ -246,6 +247,7 @@ async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool)
         cipher: cipher.clone(),
         git: Arc::new(git),
         chat: Arc::new(LlmRouter::new(pool.clone(), cipher, http)),
+        cloner: Arc::new(GitCliCloner::default()),
         review_timeout: REVIEW_TIMEOUT,
     };
     let delivery = deliver(&queue, &review_job(repo.id, 7), 5).await;

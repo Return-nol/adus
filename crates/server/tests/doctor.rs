@@ -410,3 +410,40 @@ async fn user_role_cannot_run_doctor_403(pool: PgPool) {
     assert!(first["impact"].is_string() && first["fix"].is_string());
     cleanup_queue(&prefix).await;
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn doctor_checks_the_git_binary(pool: PgPool) {
+    let w = healthy_world(pool).await;
+
+    let report = doctor::run(&w.state).await;
+
+    // The test host (and CI) has git 2.31+ on PATH.
+    let git: Vec<_> = report
+        .checks
+        .iter()
+        .filter(|c| c.name.starts_with("Git"))
+        .collect();
+    assert_eq!(git.len(), 1, "{:?}", report.checks);
+    assert_eq!(git[0].status, Status::Ok);
+    assert!(
+        git[0].name.starts_with("Git: git version 2."),
+        "{}",
+        git[0].name
+    );
+    cleanup_queue(&w.prefix).await;
+}
+
+#[tokio::test]
+async fn missing_git_binary_is_a_warning_not_a_failure() {
+    let check = doctor::git_binary_check("adus-no-such-git-binary").await;
+
+    assert_eq!(check.status, Status::Warn);
+    assert_eq!(check.name, "Git");
+    assert_eq!(
+        check.impact.as_deref(),
+        Some(
+            "`git` 2.31+ not found — reviews fall back to diff-only mode without codebase context"
+        )
+    );
+    assert!(check.fix.is_some());
+}

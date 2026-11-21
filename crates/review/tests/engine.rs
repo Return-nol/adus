@@ -1,6 +1,6 @@
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adus_core::job::Trigger;
 use adus_core::types::{ADUDU_MARKER, ReviewMode, Severity};
@@ -13,7 +13,12 @@ use adus_git::{ConnectionKind, FileStatus, GitError};
 use adus_llm::ReasoningEffort;
 use adus_llm::router::ChatError;
 use adus_review::engine::EngineError;
-use common::{FakeGit, PAT, Setup, file, finding, pr, setup};
+use adus_review::workspace::WorkspaceError;
+use common::{
+    CloneBehavior, FakeGit, PAT, Reply, Setup, Stage, big_file, clone_spec, diff_header, file,
+    finding, pr, setup,
+};
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -21,6 +26,15 @@ use uuid::Uuid;
 const PATCH_234: &str = "@@ -1,1 +1,4 @@\n a\n+b\n+c\n+d\n";
 /// Satu baris ditambah: 2.
 const PATCH_2: &str = "@@ -1,1 +1,2 @@\n a\n+b\n";
+
+const GENERALIST_ROLE: &str = "You are the generalist reviewer";
+const BUG_ROLE: &str = "You are the correctness reviewer";
+const SECURITY_ROLE: &str = "You are the security reviewer";
+const PERFORMANCE_ROLE: &str = "You are the performance reviewer";
+const RULES_ROLE: &str = "You are the team-rules reviewer";
+
+const CODEBASE_NOTE: &str = "Codebase context unavailable — reviewed diff only";
+const TOOLS_NOTE: &str = "Model does not support tool calling — reviewed diff only";
 
 async fn review(pool: &PgPool, id: Uuid) -> Review {
     reviews::list(pool, None, 1, 100)
@@ -40,7 +54,15 @@ async fn set_limits(pool: &PgPool, max_files: i32, max_lines: i32) {
 
 /// Review PR 7 di repo hasil `setup`; repo itu ada, jadi selalu ada baris review.
 async fn run(s: &Setup, trigger: Trigger) -> Result<Uuid, EngineError> {
-    let result = s.engine.review_pr(s.repository_id, 7, trigger, None).await;
+    run_mode(s, trigger, None).await
+}
+
+async fn run_mode(
+    s: &Setup,
+    trigger: Trigger,
+    mode: Option<ReviewMode>,
+) -> Result<Uuid, EngineError> {
+    let result = s.engine.review_pr(s.repository_id, 7, trigger, mode).await;
     result.map(|id| id.expect("review row"))
 }
 
@@ -48,15 +70,10 @@ async fn latest(pool: &PgPool) -> Review {
     reviews::list(pool, None, 1, 1).await.unwrap().remove(0)
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn full_review_posts_valid_comments_and_summary(pool: PgPool) {
-    let s = setup(
-        &pool,
-        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_234)]),
-    )
-    .await;
+/// A global rule for `src/**`.
+async fn insert_rule(pool: &PgPool) {
     rules::insert(
-        &pool,
+        pool,
         NewRule {
             scope: KnowledgeScope::Global,
             repository_id: None,
@@ -68,6 +85,21 @@ async fn full_review_posts_valid_comments_and_summary(pool: PgPool) {
     )
     .await
     .unwrap();
+}
+
+/// One finding as a JSON object for `submit_findings`.
+fn finding_json(path: &str, line: u32, severity: &str, title: &str) -> serde_json::Value {
+    json!({"file": path, "line": line, "severity": severity, "title": title, "body": "why"})
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn full_review_posts_valid_comments_and_summary(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_234)]),
+    )
+    .await;
+    insert_rule(&pool).await;
     let both = r#"[{"file":"src/a.rs","line":3,"severity":"critical","title":"Bug","body":"why"},
                    {"file":"src/a.rs","line":1,"severity":"info","title":"Context line","body":"x"}]"#;
     s.chat.push(Ok(both));
@@ -96,13 +128,23 @@ async fn full_review_posts_valid_comments_and_summary(pool: PgPool) {
     assert!(posted.summary.contains(ADUDU_MARKER));
     assert!(posted.summary.contains("Critical: 1"));
     assert!(!posted.summary.contains("Info"));
+    assert!(!posted.summary.contains("**Notes**"));
 
-    let calls = s.chat.calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].provider_id, s.provider_id);
-    assert_eq!(calls[0].model, "gpt-test");
-    assert_eq!(calls[0].max_tokens, 8192);
-    assert!(calls[0].user.contains("No unwrap"));
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 1);
+    assert_eq!(finder[0].provider_id, s.provider_id);
+    assert_eq!(finder[0].model, "gpt-test");
+    assert_eq!(finder[0].max_tokens, 8192);
+    assert!(finder[0].user.contains("No unwrap"));
+    // The one valid finding is verified with the fast model; one finding needs no dedup.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 1);
+    assert_eq!(verifier[0].provider_id, s.provider_id);
+    assert_eq!(verifier[0].model, "gpt-fast");
+    assert_eq!(verifier[0].effort, Some(ReasoningEffort::Low));
+    assert!(verifier[0].user.contains("\"title\": \"Bug\""));
+    assert!(s.chat.dedup_calls().is_empty());
+    assert_eq!(s.chat.calls().len(), 2);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -200,13 +242,17 @@ async fn incremental_review_only_new_commit_lines(pool: PgPool) {
         git.diff_between_calls,
         vec![("h1".to_string(), "h2".to_string())]
     );
-    let calls = s.chat.calls();
+    let calls = s.chat.finder_calls();
     assert_eq!(calls.len(), 2, "first run 1 file, incremental run 1 file");
-    assert!(calls[1].user.contains("<file_path>\na.rs\n</file_path>"));
+    assert!(calls[1].user.contains(&diff_header("a.rs")));
+    assert!(!calls[1].user.contains(&diff_header("b.rs")));
+    assert!(!calls[1].user.contains(&diff_header("c.rs")));
     assert!(
         calls[1].user.contains("4 + d"),
         "prompt has the new-commit patch"
     );
+    // Only the finding on a new line reaches the Verifier.
+    assert_eq!(s.chat.verifier_calls().len(), 1);
     let comments = &git.reviews[1].comments;
     assert_eq!(comments.len(), 1);
     assert_eq!((comments[0].path.as_str(), comments[0].line), ("a.rs", 4));
@@ -247,13 +293,41 @@ async fn large_and_binary_files_skipped_with_reason_in_summary(pool: PgPool) {
 
     run(&s, Trigger::Opened).await.unwrap();
 
-    let calls = s.chat.calls();
+    let calls = s.chat.finder_calls();
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].user.contains("<file_path>\nok.rs\n</file_path>"));
+    assert!(calls[0].user.contains(&diff_header("ok.rs")));
+    for path in ["big.rs", "logo.png", "gone.rs"] {
+        assert!(!calls[0].user.contains(&diff_header(path)), "{path}");
+    }
     let summary = s.git.state().reviews[0].summary.clone();
     assert!(summary.contains("`big.rs`: patch too large"));
     assert!(summary.contains("`logo.png`: no diff available (binary or too large)"));
     assert!(!summary.contains("gone.rs"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_skipped_files_posts_summary_without_llm_or_clone(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("big.rs", PATCH_234)]),
+    )
+    .await;
+    s.git.state().clone_spec = Some(clone_spec());
+    set_limits(&pool, 50, 2).await;
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 0);
+    assert!(s.chat.calls().is_empty());
+    assert!(
+        s.cloner.urls().is_empty(),
+        "nothing to review, nothing cloned"
+    );
+    let summary = s.git.state().reviews[0].summary.clone();
+    assert!(summary.contains("No issues found."));
+    assert!(summary.contains("`big.rs`: patch too large"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -268,7 +342,12 @@ async fn file_limit_respected(pool: PgPool) {
 
     run(&s, Trigger::Opened).await.unwrap();
 
-    assert_eq!(s.chat.calls().len(), 2);
+    // The two small files share one Finder batch; c.rs is not sent.
+    let calls = s.chat.finder_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].user.contains(&diff_header("a.rs")));
+    assert!(calls[0].user.contains(&diff_header("b.rs")));
+    assert!(!calls[0].user.contains(&diff_header("c.rs")));
     let summary = s.git.state().reviews[0].summary.clone();
     assert!(summary.contains("`c.rs`: file limit reached"));
     assert!(!summary.contains("`a.rs`"));
@@ -276,18 +355,28 @@ async fn file_limit_respected(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn unparseable_output_retried_once_then_skipped(pool: PgPool) {
-    let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
+    // Each big file gets its own Finder batch.
+    let files = vec![big_file("a.rs"), big_file("b.rs")];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
-    // Kedua file berjalan bersamaan: panggilan pertama a.rs, lalu b.rs, lalu ulangan keduanya.
-    s.chat.delay("b.rs", Duration::from_millis(50));
-    s.chat.push(Ok("I think it's fine"));
-    s.chat.push(Ok("nope"));
-    s.chat.push(Ok(&finding("a.rs", 2, "Second try")));
-    s.chat.push(Ok("still nope"));
+    let a = diff_header("a.rs");
+    let b = diff_header("b.rs");
+    s.chat
+        .push_for(Stage::Finder, &a, Reply::text("I think it's fine"));
+    s.chat.push_for(
+        Stage::Finder,
+        &a,
+        Reply::text(&finding("a.rs", 2, "Second try")),
+    );
+    s.chat.push_for(Stage::Finder, &b, Reply::text("nope"));
+    s.chat
+        .push_for(Stage::Finder, &b, Reply::text("still nope"));
 
     let id = run(&s, Trigger::Opened).await.unwrap();
 
-    assert_eq!(s.chat.calls().len(), 4);
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 4);
+    assert_eq!(finder.iter().filter(|c| c.user.contains(&a)).count(), 2);
+    assert_eq!(finder.iter().filter(|c| c.user.contains(&b)).count(), 2);
     assert_eq!(review(&pool, id).await.comments_posted, 1);
     let git = s.git.state();
     assert!(git.reviews[0].comments[0].body.contains("Second try"));
@@ -300,12 +389,17 @@ async fn unparseable_output_retried_once_then_skipped(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn all_keys_failed_is_retryable_and_posts_nothing(pool: PgPool) {
-    let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
+    let files = vec![big_file("a.rs"), big_file("b.rs")];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
-    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
-    s.chat.push(Err(ChatError::AllKeysFailed {
-        retry_after: Some(Duration::from_secs(30)),
-    }));
+    for path in ["a.rs", "b.rs"] {
+        s.chat.push_for(
+            Stage::Finder,
+            &diff_header(path),
+            Reply::Err(ChatError::AllKeysFailed {
+                retry_after: Some(Duration::from_secs(30)),
+            }),
+        );
+    }
 
     let err = run(&s, Trigger::Opened).await.unwrap_err();
 
@@ -321,21 +415,56 @@ async fn all_keys_failed_is_retryable_and_posts_nothing(pool: PgPool) {
     // Retryable: barisnya dihapus, percobaan ulang membuat baris baru.
     assert!(reviews::list(&pool, None, 1, 10).await.unwrap().is_empty());
 
+    s.git.state().full = vec![file("a.rs", PATCH_2)];
     s.chat.push(Err(ChatError::NoKeys));
     assert!(matches!(
         run(&s, Trigger::Opened).await,
         Err(EngineError::Retryable(_, None))
     ));
     assert!(reviews::list(&pool, None, 1, 10).await.unwrap().is_empty());
+    assert!(s.git.state().reviews.is_empty());
+}
+
+/// Spec decision 8: the review is retried only when every Finder task failed retryably.
+#[sqlx::test(migrations = "../../migrations")]
+async fn one_rate_limited_batch_is_skipped_and_the_rest_posted(pool: PgPool) {
+    let files = vec![big_file("a.rs"), big_file("b.rs")];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("a.rs"),
+        Reply::Err(ChatError::AllKeysFailed { retry_after: None }),
+    );
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("b.rs"),
+        Reply::text(&finding("b.rs", 2, "Bug")),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    assert_eq!(git.reviews[0].comments[0].path, "b.rs");
+    assert!(git.reviews[0].summary.contains("`a.rs`: LLM error"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn one_invalid_file_is_skipped_and_review_posted(pool: PgPool) {
-    let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
+    let files = vec![big_file("a.rs"), big_file("b.rs")];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
-    s.chat
-        .push(Err(ChatError::Invalid("empty response".into())));
-    s.chat.push(Ok(&finding("b.rs", 2, "Bug")));
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("a.rs"),
+        Reply::Err(ChatError::Invalid("empty response".into())),
+    );
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("b.rs"),
+        Reply::text(&finding("b.rs", 2, "Bug")),
+    );
 
     let id = run(&s, Trigger::Opened).await.unwrap();
 
@@ -349,45 +478,46 @@ async fn one_invalid_file_is_skipped_and_review_posted(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn one_context_overflow_file_is_skipped_and_review_posted(pool: PgPool) {
-    let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
+    let files = vec![big_file("a.rs"), big_file("b.rs")];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
-    s.chat
-        .push(Err(ChatError::ContextOverflow("prompt is too long".into())));
-    s.chat.push(Ok(&finding("b.rs", 2, "Bug")));
+    let a = diff_header("a.rs");
+    // The agent retries an overflow once on a compacted conversation; both fail.
+    for _ in 0..2 {
+        s.chat.push_for(
+            Stage::Finder,
+            &a,
+            Reply::Err(ChatError::ContextOverflow("prompt is too long".into())),
+        );
+    }
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("b.rs"),
+        Reply::text(&finding("b.rs", 2, "Bug")),
+    );
 
     let id = run(&s, Trigger::Opened).await.unwrap();
 
     let row = review(&pool, id).await;
     assert_eq!(row.status, ReviewStatus::Done);
     assert_eq!(row.comments_posted, 1);
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.iter().filter(|c| c.user.contains(&a)).count(), 2);
     let git = s.git.state();
     assert_eq!(git.reviews[0].comments[0].path, "b.rs");
     assert!(git.reviews[0].summary.contains("`a.rs`: LLM error"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn tools_unsupported_is_fatal(pool: PgPool) {
-    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
-    s.chat
-        .push(Err(ChatError::ToolsUnsupported("no tools".into())));
-
-    let err = run(&s, Trigger::Opened).await.unwrap_err();
-
-    assert!(
-        matches!(&err, EngineError::Fatal(m) if m.contains("tools not supported")),
-        "{err:?}"
-    );
-    assert_eq!(latest(&pool).await.status, ReviewStatus::Failed);
-}
-
-#[sqlx::test(migrations = "../../migrations")]
 async fn every_file_invalid_is_fatal(pool: PgPool) {
-    let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
+    let files = vec![big_file("a.rs"), big_file("b.rs")];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
-    s.chat
-        .push(Err(ChatError::Invalid("model not found".into())));
-    s.chat
-        .push(Err(ChatError::Invalid("model not found".into())));
+    for path in ["a.rs", "b.rs"] {
+        s.chat.push_for(
+            Stage::Finder,
+            &diff_header(path),
+            Reply::Err(ChatError::Invalid("model not found".into())),
+        );
+    }
 
     let err = run(&s, Trigger::Opened).await.unwrap_err();
 
@@ -395,22 +525,46 @@ async fn every_file_invalid_is_fatal(pool: PgPool) {
         matches!(&err, EngineError::Fatal(m) if m.contains("model not found")),
         "{err:?}"
     );
+    assert_eq!(s.chat.finder_calls().len(), 2);
     assert!(s.git.state().reviews.is_empty());
     let row = latest(&pool).await;
     assert_eq!(row.status, ReviewStatus::Failed);
 }
 
+/// R-T8-3: every Finder task unparseable is a clean failure, never an empty "No issues" review.
 #[sqlx::test(migrations = "../../migrations")]
-async fn concurrent_files_keep_comment_order(pool: PgPool) {
+async fn every_batch_unparseable_is_fatal(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.chat.push(Ok("looks fine"));
+    s.chat.push(Ok("still fine"));
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert!(
+        matches!(&err, EngineError::Fatal(m) if m.contains("could not be parsed")),
+        "{err:?}"
+    );
+    assert!(s.git.state().reviews.is_empty());
+    assert_eq!(latest(&pool).await.status, ReviewStatus::Failed);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_batches_keep_comment_order(pool: PgPool) {
     let paths = ["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f.rs"];
-    let files = paths.iter().map(|p| file(p, PATCH_2)).collect();
+    let files = paths.iter().map(|p| big_file(p)).collect();
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
     for path in paths {
-        s.chat.push(Ok(&finding(path, 2, path)));
+        s.chat.push_for(
+            Stage::Finder,
+            &diff_header(path),
+            Reply::text(&finding(path, 2, path)),
+        );
     }
     // Yang pertama paling lambat: tanpa urutan terjaga, komentarnya akan terakhir.
-    s.chat.delay("a.rs", Duration::from_millis(300));
-    s.chat.delay("b.rs", Duration::from_millis(150));
+    s.chat
+        .delay(&diff_header("a.rs"), Duration::from_millis(300));
+    s.chat
+        .delay(&diff_header("b.rs"), Duration::from_millis(150));
 
     run(&s, Trigger::Opened).await.unwrap();
 
@@ -420,11 +574,13 @@ async fn concurrent_files_keep_comment_order(pool: PgPool) {
         .map(|c| c.path.clone())
         .collect();
     assert_eq!(posted, paths);
-    assert!(
-        s.chat.max_in_flight() > 1,
-        "files are reviewed concurrently"
-    );
-    assert!(s.chat.max_in_flight() <= 4, "at most 4 at once");
+    assert_eq!(s.chat.finder_calls().len(), 6, "one batch per big file");
+    let finder = s.chat.max_in_flight(Stage::Finder);
+    assert!(finder > 1, "batches are reviewed concurrently");
+    assert!(finder <= 2, "at most BATCH_CONCURRENCY = 2 batches at once");
+    let verifier = s.chat.max_in_flight(Stage::Verifier);
+    assert!(verifier > 1, "candidates are verified concurrently");
+    assert!(verifier <= 4, "at most 4 verifiers at once");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -497,12 +653,15 @@ async fn repo_provider_override_wins(pool: PgPool) {
     repositories::update(&pool, s.repository_id, patch)
         .await
         .unwrap();
+    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
 
     run(&s, Trigger::Opened).await.unwrap();
 
     let calls = s.chat.calls();
-    assert_eq!(calls[0].provider_id, other.id);
-    assert_eq!(calls[0].model, "claude-test");
+    assert_eq!(calls.len(), 2, "Finder and Verifier");
+    assert!(calls.iter().all(|c| c.provider_id == other.id));
+    // No fast model: the Verifier falls back to the primary model.
+    assert!(calls.iter().all(|c| c.model == "claude-test"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -572,13 +731,7 @@ async fn review_mode_adjusts_reasoning_effort(pool: PgPool) {
     run(&s, Trigger::Opened).await.unwrap();
 
     // mode_override = Specialists -> High.
-    s.engine
-        .review_pr(
-            s.repository_id,
-            7,
-            Trigger::Command,
-            Some(ReviewMode::Specialists),
-        )
+    run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
         .await
         .unwrap();
 
@@ -611,17 +764,86 @@ async fn review_mode_adjusts_reasoning_effort(pool: PgPool) {
     settings::update(&pool, &current).await.unwrap();
     run(&s, Trigger::Opened).await.unwrap();
 
-    let efforts: Vec<Option<ReasoningEffort>> =
-        s.chat.calls().into_iter().map(|c| c.effort).collect();
-    assert_eq!(
-        efforts,
-        vec![
-            Some(ReasoningEffort::Medium),
-            Some(ReasoningEffort::High),
-            Some(ReasoningEffort::High),
-            Some(ReasoningEffort::High),
-        ]
-    );
+    // Specialists runs Bug, Security and Performance (no rule matches, so no Rules agent).
+    let efforts: Vec<Option<ReasoningEffort>> = s
+        .chat
+        .finder_calls()
+        .into_iter()
+        .map(|c| c.effort)
+        .collect();
+    let high = Some(ReasoningEffort::High);
+    let mut expected = vec![Some(ReasoningEffort::Medium)];
+    expected.extend([high; 9]);
+    assert_eq!(efforts, expected);
+    assert!(s.chat.finder_calls().iter().all(|c| c.model == "gpt-test"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_mode_precedence_command_overrides_repo_overrides_settings(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    let mut current = settings::get(&pool).await.unwrap();
+    current.review_mode = ReviewMode::Specialists;
+    settings::update(&pool, &current).await.unwrap();
+    let set_repo_mode = |mode: Option<ReviewMode>| {
+        let pool = pool.clone();
+        let id = s.repository_id;
+        async move {
+            let patch = RepoPatch {
+                review_mode: Some(mode),
+                ..Default::default()
+            };
+            repositories::update(&pool, id, patch).await.unwrap();
+        }
+    };
+    // Role of each Finder call made from `from` on.
+    let roles_since = |from: usize| -> Vec<&'static str> {
+        s.chat.finder_calls()[from..]
+            .iter()
+            .map(|c| {
+                [
+                    GENERALIST_ROLE,
+                    BUG_ROLE,
+                    SECURITY_ROLE,
+                    PERFORMANCE_ROLE,
+                    RULES_ROLE,
+                ]
+                .into_iter()
+                .find(|role| c.system.contains(role))
+                .expect("a Finder role")
+            })
+            .collect()
+    };
+    let specialists = vec![BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE];
+
+    // Repo (Generalist) beats settings (Specialists).
+    set_repo_mode(Some(ReviewMode::Generalist)).await;
+    run(&s, Trigger::Opened).await.unwrap();
+    assert_eq!(roles_since(0), vec![GENERALIST_ROLE]);
+
+    // Command (Specialists) beats repo (Generalist).
+    run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+    assert_eq!(roles_since(1), specialists);
+
+    // No command, no repo override: settings (Specialists).
+    set_repo_mode(None).await;
+    run(&s, Trigger::Opened).await.unwrap();
+    assert_eq!(roles_since(4), specialists);
+
+    // Command (Generalist) beats repo (Specialists).
+    set_repo_mode(Some(ReviewMode::Specialists)).await;
+    run_mode(&s, Trigger::Command, Some(ReviewMode::Generalist))
+        .await
+        .unwrap();
+    assert_eq!(roles_since(7), vec![GENERALIST_ROLE]);
+
+    let efforts: Vec<_> = s.chat.finder_calls().iter().map(|c| c.effort).collect();
+    let (medium, high) = (Some(ReasoningEffort::Medium), Some(ReasoningEffort::High));
+    let mut expected = vec![medium];
+    expected.extend([high; 6]);
+    expected.push(medium);
+    assert_eq!(efforts, expected);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -692,13 +914,16 @@ async fn post_error_retryable_on_github_fatal_on_azure(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn usage_context_carries_review_id(pool: PgPool) {
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
 
     let id = run(&s, Trigger::Opened).await.unwrap();
 
     let calls = s.chat.calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].ctx.review_id, Some(id));
-    assert_eq!(calls[0].ctx.repository_id, Some(s.repository_id));
+    assert_eq!(calls.len(), 2, "Finder and Verifier");
+    for call in calls {
+        assert_eq!(call.ctx.review_id, Some(id));
+        assert_eq!(call.ctx.repository_id, Some(s.repository_id));
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -829,9 +1054,10 @@ async fn ignored_files_not_sent_to_llm(pool: PgPool) {
     let id = run(&s, Trigger::Opened).await.unwrap();
 
     assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
-    let calls = s.chat.calls();
+    let calls = s.chat.finder_calls();
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].user.contains("<file_path>\nb.rs\n</file_path>"));
+    assert!(calls[0].user.contains(&diff_header("b.rs")));
+    assert!(!calls[0].user.contains(&diff_header("a.json")));
     let summary = s.git.state().reviews[0].summary.clone();
     assert!(summary.contains("1 file ignored"));
     assert!(!summary.contains("a.json"), "ignored files are not listed");
@@ -846,9 +1072,9 @@ async fn ignored_files_do_not_count_toward_file_limit(pool: PgPool) {
 
     run(&s, Trigger::Opened).await.unwrap();
 
-    let calls = s.chat.calls();
+    let calls = s.chat.finder_calls();
     assert_eq!(calls.len(), 1);
-    assert!(calls[0].user.contains("<file_path>\nb.rs\n</file_path>"));
+    assert!(calls[0].user.contains(&diff_header("b.rs")));
     let summary = s.git.state().reviews[0].summary.clone();
     assert!(!summary.contains("file limit reached"));
 }
@@ -890,9 +1116,10 @@ async fn incremental_review_applies_ignore(pool: PgPool) {
     assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
     let git = s.git.state();
     assert_eq!(git.diff_between_calls.len(), 1, "incremental path taken");
-    let calls = s.chat.calls();
+    let calls = s.chat.finder_calls();
     assert_eq!(calls.len(), 2, "first run a.rs, incremental run a.rs only");
-    assert!(calls[1].user.contains("<file_path>\na.rs\n</file_path>"));
+    assert!(calls[1].user.contains(&diff_header("a.rs")));
+    assert!(!calls[1].user.contains(&diff_header("b.json")));
     assert!(git.reviews[1].summary.contains("1 file ignored"));
 }
 
@@ -930,7 +1157,444 @@ async fn invalid_stored_ignore_list_falls_back_to_defaults(pool: PgPool) {
     let id = run(&s, Trigger::Opened).await.unwrap();
 
     assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
-    let calls = s.chat.calls();
-    assert_eq!(calls.len(), 1, "yarn.lock ignored by the defaults");
-    assert!(calls[0].user.contains("<file_path>\na.rs\n</file_path>"));
+    let calls = s.chat.finder_calls();
+    assert_eq!(calls.len(), 1, "one batch");
+    assert!(calls[0].user.contains(&diff_header("a.rs")));
+    assert!(
+        !calls[0].user.contains(&diff_header("yarn.lock")),
+        "yarn.lock ignored by the defaults"
+    );
+}
+
+// ---- Agentic pipeline: clone, tools, specialists, Verifier, Dedup, deadlines ----
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn agentic_generalist_uses_tools_verifies_and_dedups(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/login.rs", PATCH_234)]),
+    )
+    .await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[
+        ("src/login.rs", "a\nb\nc\nd\n"),
+        (
+            "src/helper.rs",
+            "pub fn is_admin() -> bool {\n    false\n}\n",
+        ),
+    ]);
+    s.chat.push_stage(
+        Stage::Finder,
+        Reply::tool("read_file", json!({"path": "src/helper.rs"})),
+    );
+    s.chat.push_stage(
+        Stage::Finder,
+        Reply::submit(json!([
+            finding_json("src/login.rs", 2, "critical", "Real bug"),
+            finding_json("src/login.rs", 3, "warning", "False alarm"),
+        ])),
+    );
+    s.chat.push_for(
+        Stage::Verifier,
+        "False alarm",
+        Reply::text(r#"{"keep": false, "rationale": "is_admin guards it"}"#),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+
+    // Finder: primary model at Medium, repository tools, then the helper file's content.
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 2);
+    for call in &finder {
+        assert_eq!(call.model, "gpt-test");
+        assert_eq!(call.effort, Some(ReasoningEffort::Medium));
+        assert!(call.system.contains(GENERALIST_ROLE));
+        assert!(call.system.contains("You can read the repository"));
+    }
+    assert_eq!(
+        finder[0].tools,
+        vec![
+            "read_file",
+            "grep",
+            "list_dir",
+            "find_files",
+            "submit_findings"
+        ]
+    );
+    assert!(finder[0].tool_results.is_empty());
+    assert_eq!(finder[1].tool_results.len(), 1);
+    assert!(finder[1].tool_results[0].contains("pub fn is_admin() -> bool"));
+
+    // Verifier: fast model at Low, with tools, one call per candidate.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 2);
+    for call in &verifier {
+        assert_eq!(call.model, "gpt-fast");
+        assert_eq!(call.effort, Some(ReasoningEffort::Low));
+        assert!(call.tools.contains(&"read_file".to_string()));
+        assert!(call.tools.contains(&"submit_verdict".to_string()));
+    }
+    // One verified finding is left: semantic dedup needs at least two.
+    assert!(s.chat.dedup_calls().is_empty());
+
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert_eq!(posted.comments.len(), 1);
+    assert_eq!(posted.comments[0].line, 2);
+    assert!(posted.comments[0].body.contains("Real bug"));
+    assert!(posted.summary.contains("Critical: 1"));
+    assert!(!posted.summary.contains("Warning"));
+    assert!(!posted.summary.contains("**Notes**"));
+
+    assert_eq!(s.cloner.urls(), vec![clone_spec().url]);
+    let root = &s.cloner.roots()[0];
+    assert!(!root.exists(), "the workspace is deleted after the review");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_234)]),
+    )
+    .await;
+    insert_rule(&pool).await;
+    s.chat.push_for(
+        Stage::Finder,
+        BUG_ROLE,
+        Reply::text(
+            &json!([finding_json(
+                "src/a.rs",
+                2,
+                "critical",
+                "Missing null check"
+            )])
+            .to_string(),
+        ),
+    );
+    s.chat.push_for(
+        Stage::Finder,
+        SECURITY_ROLE,
+        Reply::text(
+            &json!([finding_json("src/a.rs", 2, "critical", "Unvalidated input")]).to_string(),
+        ),
+    );
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0]}"#));
+
+    let id = run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 4, "Bug, Security, Performance and Rules");
+    for role in [BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE, RULES_ROLE] {
+        assert_eq!(
+            finder.iter().filter(|c| c.system.contains(role)).count(),
+            1,
+            "{role}"
+        );
+    }
+    for call in &finder {
+        assert_eq!(call.model, "gpt-test");
+        assert_eq!(call.effort, Some(ReasoningEffort::High));
+        assert!(call.user.contains("No unwrap"));
+    }
+
+    // The Verifier keeps both findings; dedup merges them into one.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 2);
+    assert!(verifier.iter().all(|c| c.model == "gpt-fast"));
+    let dedup = s.chat.dedup_calls();
+    assert_eq!(dedup.len(), 1);
+    assert_eq!(dedup[0].model, "gpt-fast");
+    assert_eq!(dedup[0].effort, Some(ReasoningEffort::Low));
+    assert!(dedup[0].user.contains("Missing null check"));
+    assert!(dedup[0].user.contains("Unvalidated input"));
+    assert!(dedup[0].user.contains("Bug reviewer"));
+    assert!(dedup[0].user.contains("Security reviewer"));
+
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert_eq!(posted.comments.len(), 1);
+    assert!(posted.comments[0].body.contains("Missing null check"));
+    assert!(posted.summary.contains("Critical: 1"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn partial_specialist_failure_publishes_surviving_with_warning(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.chat.push_for(
+        Stage::Finder,
+        PERFORMANCE_ROLE,
+        Reply::Err(ChatError::Invalid("bad request".into())),
+    );
+    s.chat.push_for(
+        Stage::Finder,
+        BUG_ROLE,
+        Reply::text(&finding("a.rs", 2, "Bug")),
+    );
+
+    let id = run_mode(&s, Trigger::Opened, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert!(posted.comments[0].body.contains("Bug"));
+    assert!(
+        posted
+            .summary
+            .contains("**Notes**\n- Performance reviewer did not complete"),
+        "{}",
+        posted.summary
+    );
+    assert!(!posted.summary.contains("Skipped files"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn clone_failure_falls_back_to_diff_only_with_summary_note(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    let failures = [
+        WorkspaceError::TimedOut,
+        WorkspaceError::TooLarge,
+        WorkspaceError::Unavailable("network".into()),
+    ];
+    for (index, failure) in failures.into_iter().enumerate() {
+        s.cloner.set(CloneBehavior::Fail(failure));
+        s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
+
+        let id = run(&s, Trigger::Opened).await.unwrap();
+
+        assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+        let finder = s.chat.finder_calls();
+        let call = finder.last().unwrap();
+        assert_eq!(call.tools, vec!["submit_findings"], "no repository tools");
+        assert!(call.system.contains("You cannot open other files"));
+        let verifier = s.chat.verifier_calls();
+        assert!(
+            verifier.last().unwrap().tools.is_empty(),
+            "diff-only Verifier"
+        );
+        let git = s.git.state();
+        let posted = &git.reviews[index];
+        assert_eq!(posted.comments.len(), 1);
+        assert!(
+            posted
+                .summary
+                .contains(&format!("**Notes**\n- {CODEBASE_NOTE}")),
+            "{}",
+            posted.summary
+        );
+    }
+    assert_eq!(s.cloner.urls().len(), 3);
+    let conn = connections::get(&pool, s.connection_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conn.status, ConnectionStatus::Ok);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn clone_unauthorized_marks_connection_invalid_and_fails(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner
+        .set(CloneBehavior::Fail(WorkspaceError::Unauthorized));
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert_eq!(
+        err,
+        EngineError::Fatal("the git provider rejected the token of connection \"gh\"".into())
+    );
+    let conn = connections::get(&pool, s.connection_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conn.status, ConnectionStatus::Invalid);
+    assert!(s.chat.calls().is_empty());
+    assert!(s.git.state().reviews.is_empty());
+    assert_eq!(latest(&pool).await.status, ReviewStatus::Failed);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn tools_unsupported_falls_back_to_diff_only_with_summary_note(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[("a.rs", "a\nb\n")]);
+    s.chat.push(Err(ChatError::ToolsUnsupported(
+        "model does not support tools".into(),
+    )));
+    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 2, "tool attempt, then the diff-only re-run");
+    assert!(finder[0].tools.contains(&"read_file".to_string()));
+    assert!(finder[1].tools.is_empty(), "no tools at all on the re-run");
+    assert!(finder[1].system.contains("You cannot open other files"));
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 1);
+    assert!(verifier[0].tools.is_empty(), "diff-only Verifier");
+    let git = s.git.state();
+    let summary = &git.reviews[0].summary;
+    assert!(
+        summary.contains(&format!("**Notes**\n- {TOOLS_NOTE}")),
+        "{summary}"
+    );
+    assert_eq!(summary.matches(TOOLS_NOTE).count(), 1);
+    assert!(!summary.contains(CODEBASE_NOTE));
+    assert!(!s.cloner.roots()[0].exists());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn verifier_fail_closed_drops_unverified_finding_with_warning(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_234)])).await;
+    s.chat.push(Ok(&json!([
+        finding_json("a.rs", 2, "warning", "Kept one"),
+        finding_json("a.rs", 3, "warning", "Lost one"),
+    ])
+    .to_string()));
+    s.chat.push_for(
+        Stage::Verifier,
+        "Lost one",
+        Reply::Err(ChatError::Invalid("bad request".into())),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    assert_eq!(s.chat.verifier_calls().len(), 2);
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert!(posted.comments[0].body.contains("Kept one"));
+    assert!(
+        posted
+            .summary
+            .contains("**Notes**\n- 1 candidate finding(s) could not be verified and were omitted"),
+        "{}",
+        posted.summary
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn verifier_all_retryable_failures_retry_the_review(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
+    s.chat.push_stage(
+        Stage::Verifier,
+        Reply::Err(ChatError::AllKeysFailed {
+            retry_after: Some(Duration::from_secs(20)),
+        }),
+    );
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert!(
+        matches!(err, EngineError::Retryable(_, Some(after)) if after == Duration::from_secs(20)),
+        "{err:?}"
+    );
+    assert!(
+        s.git.state().reviews.is_empty(),
+        "never posted as no issues"
+    );
+    assert!(reviews::list(&pool, None, 1, 10).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[
+        ("a.rs", "a\nb\n"),
+        ("AGENTS.md", "Always log with tracing, never println."),
+    ]);
+    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 1);
+    assert!(finder[0].user.contains("<repository_instructions>"));
+    assert!(
+        finder[0]
+            .user
+            .contains("--- AGENTS.md ---\nAlways log with tracing, never println.")
+    );
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 1);
+    assert!(
+        verifier[0]
+            .user
+            .contains("Always log with tracing, never println.")
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn finder_deadline_cuts_slow_specialist_and_posts_survivors_with_note(pool: PgPool) {
+    let mut s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    // Finder deadline at 60 % = 1.8 s; the Performance reviewer would answer after 30 s.
+    s.engine.review_timeout = Duration::from_secs(3);
+    s.chat.delay(PERFORMANCE_ROLE, Duration::from_secs(30));
+    s.chat.push_for(
+        Stage::Finder,
+        BUG_ROLE,
+        Reply::text(&finding("a.rs", 2, "Bug")),
+    );
+    let started = Instant::now();
+
+    let id = run_mode(&s, Trigger::Opened, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    let summary = &git.reviews[0].summary;
+    assert!(
+        summary.contains("**Notes**\n- Performance reviewer did not finish in time"),
+        "{summary}"
+    );
+    assert!(!summary.contains("Bug reviewer"));
+    assert!(!summary.contains("Security reviewer"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
+    let mut s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    // Finder deadline at 60 % = 1.2 s, well before the 2 s review timeout.
+    s.engine.review_timeout = Duration::from_secs(2);
+    s.chat
+        .delay("<ReviewInstructions>", Duration::from_secs(30));
+    let started = Instant::now();
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert_eq!(err, EngineError::Fatal("review timed out".into()));
+    assert!(started.elapsed() < Duration::from_millis(1900));
+    assert!(s.git.state().reviews.is_empty());
+    let row = latest(&pool).await;
+    assert_eq!(row.status, ReviewStatus::Failed);
+    assert_eq!(row.error.as_deref(), Some("review timed out"));
 }

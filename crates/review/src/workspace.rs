@@ -721,7 +721,8 @@ impl Redactor {
     }
 }
 
-fn parse_git_version(output: &str) -> Option<(u32, u32)> {
+/// `(major, minor)` from `git --version` output (e.g. `git version 2.43.0`).
+pub fn parse_git_version(output: &str) -> Option<(u32, u32)> {
     let version = output.trim().strip_prefix("git version ")?;
     let mut parts = version.split('.');
     let mut number = || -> Option<u32> {
@@ -737,7 +738,8 @@ fn parse_git_version(output: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-fn version_supported(version: (u32, u32)) -> bool {
+/// Whether this git can take the auth header from the environment (2.31+).
+pub fn version_supported(version: (u32, u32)) -> bool {
     version >= MIN_GIT_VERSION
 }
 

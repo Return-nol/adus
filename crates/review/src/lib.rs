@@ -2,6 +2,7 @@ pub mod agent;
 pub mod command;
 pub mod dedup;
 pub mod engine;
+pub mod finder;
 pub mod parse;
 pub mod prompt;
 pub mod repo_instructions;

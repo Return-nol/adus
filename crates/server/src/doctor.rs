@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use adus_db::{ai, connections, repositories, settings};
+use adus_review::workspace::{parse_git_version, version_supported};
 use serde::Serialize;
 
 use crate::{
@@ -17,6 +18,8 @@ use crate::{
 
 /// Satu panggilan ke provider git yang lebih lama dari ini dianggap gagal.
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+/// `git --version` yang lebih lama dari ini dianggap gagal.
+const GIT_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Urutan deklarasi = urutan tampil: Fail dulu, lalu Warn, lalu Ok.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -93,6 +96,7 @@ pub async fn run(state: &AppState) -> Report {
     }
     check_redis(state, &mut core, &mut extra).await;
     check_git(state, &mut extra).await;
+    check_git_binary(&mut extra).await;
 
     let verdict = if core.iter().any(|c| c.status == Status::Fail) {
         Verdict::NotRunning
@@ -336,6 +340,41 @@ async fn check_git(state: &AppState, out: &mut Vec<Check>) {
                 )),
             }
         }
+    }
+}
+
+/// `git` 2.31+ di PATH, untuk clone review. Tanpa itu review tetap jalan dengan diff saja,
+/// jadi hanya `Warn`.
+async fn check_git_binary(out: &mut Vec<Check>) {
+    out.push(git_binary_check("git").await);
+}
+
+/// Jalankan `program --version` (tanpa shell, maks 5 dtk): `Ok` untuk git 2.31+, selain itu
+/// `Warn`. `program` adalah parameter supaya test bisa memakai binary yang tidak ada.
+pub async fn git_binary_check(program: &str) -> Check {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(GIT_VERSION_TIMEOUT, command.output()).await;
+    let version = match output {
+        Ok(Ok(output)) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            parse_git_version(&text)
+                .filter(|v| version_supported(*v))
+                .map(|_| text)
+        }
+        _ => None,
+    };
+    match version {
+        Some(text) => Check::ok(format!("Git: {text}")),
+        None => Check::problem(
+            Status::Warn,
+            "Git",
+            "`git` 2.31+ not found — reviews fall back to diff-only mode without codebase context",
+            "Install git 2.31 or newer on the host that runs `adus serve` and make sure it is on PATH (the Docker image already includes it)",
+        ),
     }
 }
 

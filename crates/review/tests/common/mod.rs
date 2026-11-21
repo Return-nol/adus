@@ -1,7 +1,8 @@
 //! Fake git dan LLM untuk test engine, plus helper seed database.
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -9,12 +10,15 @@ use adus_core::crypto::Cipher;
 use adus_core::types::{ConnectionKind, ProviderKind};
 use adus_db::{ai, connections, repositories, settings};
 use adus_git::{
-    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
-    PullRequest, RemoteRepo, RepoRef,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment,
+    PatOwner, PullRequest, RemoteRepo, RepoRef,
 };
 use adus_llm::router::{ChatError, ChatService, UsageContext};
-use adus_llm::{ChatRequest, ChatResponse, Message, ReasoningEffort, StopReason, UserPart};
+use adus_llm::{
+    ChatRequest, ChatResponse, Message, ReasoningEffort, StopReason, ToolCall, UserPart,
+};
 use adus_review::engine::{Engine, REVIEW_TIMEOUT};
+use adus_review::workspace::{RepoCloner, RepoWorkspace, WorkspaceError};
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -55,6 +59,8 @@ pub struct GitState {
     pub diff_between_calls: Vec<(String, String)>,
     pub reviews: Vec<PostedReview>,
     pub comments: Vec<String>,
+    /// Hasil `clone_spec` (`None`: provider tanpa clone, review diff-only).
+    pub clone_spec: Option<CloneSpec>,
 }
 
 /// Provider git palsu sekaligus pabriknya. Clone berbagi keadaan yang sama.
@@ -80,6 +86,7 @@ impl FakeGit {
                 diff_between_calls: Vec::new(),
                 reviews: Vec::new(),
                 comments: Vec::new(),
+                clone_spec: None,
             })),
         }
     }
@@ -201,49 +208,184 @@ impl GitProvider for FakeGit {
         state.comments.push(body.to_string());
         Ok(())
     }
+
+    fn clone_spec(&self, _repo: &RepoRef, _pr: &PullRequest) -> Option<CloneSpec> {
+        self.state().clone_spec.clone()
+    }
+}
+
+/// Which review stage sent a chat request, read from its system prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Stage {
+    Finder,
+    Verifier,
+    Dedup,
+    Other,
+}
+
+fn stage_of(system: &str) -> Stage {
+    if system.contains("<ReviewInstructions>") {
+        Stage::Finder
+    } else if system.contains("Adudu's verifier") {
+        Stage::Verifier
+    } else if system.contains("You merge duplicate findings") {
+        Stage::Dedup
+    } else {
+        Stage::Other
+    }
+}
+
+/// One scripted model answer.
+#[derive(Debug, Clone)]
+pub enum Reply {
+    Text(String),
+    /// Tool calls `(name, arguments)`, no text.
+    Tools(Vec<(String, serde_json::Value)>),
+    Err(ChatError),
+}
+
+impl Reply {
+    pub fn text(text: &str) -> Reply {
+        Reply::Text(text.to_string())
+    }
+
+    /// One `submit_findings` call carrying `findings` (a JSON array).
+    pub fn submit(findings: serde_json::Value) -> Reply {
+        Reply::Tools(vec![(
+            "submit_findings".into(),
+            serde_json::json!({ "findings": findings }),
+        )])
+    }
+
+    pub fn tool(name: &str, args: serde_json::Value) -> Reply {
+        Reply::Tools(vec![(name.to_string(), args)])
+    }
+}
+
+/// A scripted answer for `stage`, used by the first call whose system prompt or first user
+/// message contains `needle` (any call of that stage when `None`).
+struct Scripted {
+    stage: Stage,
+    needle: Option<String>,
+    reply: Reply,
 }
 
 /// Satu panggilan `chat` yang tercatat.
 #[derive(Debug, Clone)]
 pub struct ChatCall {
+    pub stage: Stage,
     pub provider_id: Uuid,
     pub model: String,
+    pub system: String,
+    /// The first user message (the prompt).
     pub user: String,
+    /// Names of the tools offered.
+    pub tools: Vec<String>,
+    /// Contents of every tool result in the conversation, in order.
+    pub tool_results: Vec<String>,
     pub max_tokens: u32,
     pub effort: Option<ReasoningEffort>,
     pub ctx: UsageContext,
 }
 
-/// LLM palsu: jawaban diambil berurutan dari `script`; habis → `[]`. Prompt yang memuat path di
-/// `delays` dijawab setelah jeda itu (urutan pengambilan jawaban tetap urutan panggilan).
+/// LLM palsu. Jawaban diambil dari skrip: entri pertama untuk stage itu yang `needle`-nya cocok.
+/// Tanpa entri: Finder `[]`, Verifier `{"keep": true}`, Dedup jawaban tak valid (semua
+/// dipertahankan). Panggilan Finder yang memuat `needle` dari `delay` dijawab setelah jeda itu
+/// (urutan pengambilan jawaban tetap urutan panggilan).
 #[derive(Default)]
 pub struct FakeChat {
-    script: Mutex<VecDeque<Result<String, ChatError>>>,
+    script: Mutex<Vec<Scripted>>,
     calls: Mutex<Vec<ChatCall>>,
     delays: Mutex<Vec<(String, Duration)>>,
-    in_flight: Mutex<(usize, usize)>,
+    /// Per stage: (running now, most at once).
+    in_flight: Mutex<HashMap<Stage, (usize, usize)>>,
+    next_call_id: Mutex<usize>,
 }
 
 impl FakeChat {
+    /// A Finder answer for any batch and specialist.
     pub fn push(&self, result: Result<&str, ChatError>) {
-        self.script
-            .lock()
-            .unwrap()
-            .push_back(result.map(str::to_string));
+        let reply = match result {
+            Ok(text) => Reply::text(text),
+            Err(err) => Reply::Err(err),
+        };
+        self.script_for(Stage::Finder, None, reply);
+    }
+
+    /// An answer for `stage`, for the first call that contains `needle`.
+    pub fn push_for(&self, stage: Stage, needle: &str, reply: Reply) {
+        self.script_for(stage, Some(needle), reply);
+    }
+
+    /// An answer for any call of `stage`.
+    pub fn push_stage(&self, stage: Stage, reply: Reply) {
+        self.script_for(stage, None, reply);
+    }
+
+    fn script_for(&self, stage: Stage, needle: Option<&str>, reply: Reply) {
+        self.script.lock().unwrap().push(Scripted {
+            stage,
+            needle: needle.map(str::to_string),
+            reply,
+        });
     }
 
     pub fn calls(&self) -> Vec<ChatCall> {
         self.calls.lock().unwrap().clone()
     }
 
-    /// Jawaban untuk file `path` ditunda selama `delay`.
-    pub fn delay(&self, path: &str, delay: Duration) {
-        self.delays.lock().unwrap().push((path.to_string(), delay));
+    pub fn calls_of(&self, stage: Stage) -> Vec<ChatCall> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c.stage == stage)
+            .collect()
     }
 
-    /// Jumlah panggilan terbanyak yang pernah berjalan bersamaan.
-    pub fn max_in_flight(&self) -> usize {
-        self.in_flight.lock().unwrap().1
+    pub fn finder_calls(&self) -> Vec<ChatCall> {
+        self.calls_of(Stage::Finder)
+    }
+
+    pub fn verifier_calls(&self) -> Vec<ChatCall> {
+        self.calls_of(Stage::Verifier)
+    }
+
+    pub fn dedup_calls(&self) -> Vec<ChatCall> {
+        self.calls_of(Stage::Dedup)
+    }
+
+    /// Finder calls that contain `needle` (e.g. `=== a.rs (` or a role line) answer after `delay`.
+    pub fn delay(&self, needle: &str, delay: Duration) {
+        self.delays
+            .lock()
+            .unwrap()
+            .push((needle.to_string(), delay));
+    }
+
+    /// Most calls of `stage` that ever ran at the same time.
+    pub fn max_in_flight(&self, stage: Stage) -> usize {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .get(&stage)
+            .map_or(0, |(_, max)| *max)
+    }
+
+    fn next_reply(&self, stage: Stage, haystack: &str) -> Reply {
+        let mut script = self.script.lock().unwrap();
+        let found = script.iter().position(|s| {
+            s.stage == stage
+                && s.needle
+                    .as_ref()
+                    .is_none_or(|n| haystack.contains(n.as_str()))
+        });
+        match found {
+            Some(index) => script.remove(index).reply,
+            None => match stage {
+                Stage::Verifier => Reply::text(r#"{"keep": true, "rationale": "fake"}"#),
+                Stage::Dedup => Reply::text("no answer"),
+                Stage::Finder | Stage::Other => Reply::text("[]"),
+            },
+        }
     }
 }
 
@@ -255,7 +397,7 @@ impl ChatService for FakeChat {
         req: ChatRequest,
         ctx: UsageContext,
     ) -> Result<ChatResponse, ChatError> {
-        // The engine sends single-turn requests: the prompt is the first user message.
+        let stage = stage_of(&req.system);
         let user = req
             .messages
             .iter()
@@ -264,40 +406,165 @@ impl ChatService for FakeChat {
                 _ => None,
             })
             .unwrap_or_default();
-        let delay = self
-            .delays
-            .lock()
-            .unwrap()
+        let tool_results = req
+            .messages
             .iter()
-            .find(|(path, _)| user.contains(&format!("<file_path>\n{path}\n")))
-            .map(|(_, delay)| *delay);
+            .flat_map(|m| match m {
+                Message::Tool { results } => results.iter().map(|r| r.content.clone()).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let haystack = format!("{}\n{user}", req.system);
+        let delay = match stage {
+            Stage::Finder => self
+                .delays
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(needle, _)| haystack.contains(needle.as_str()))
+                .map(|(_, delay)| *delay),
+            _ => None,
+        };
         self.calls.lock().unwrap().push(ChatCall {
+            stage,
             provider_id,
             model: req.model,
+            system: req.system,
             user,
+            tools: req.tools.iter().map(|t| t.name.clone()).collect(),
+            tool_results,
             max_tokens: req.max_tokens,
             effort: req.effort,
             ctx,
         });
-        let next = self.script.lock().unwrap().pop_front();
+        let reply = self.next_reply(stage, &haystack);
         {
             let mut in_flight = self.in_flight.lock().unwrap();
-            in_flight.0 += 1;
-            in_flight.1 = in_flight.1.max(in_flight.0);
+            let entry = in_flight.entry(stage).or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.max(entry.0);
         }
         // Selalu menunggu sebentar, supaya panggilan lain sempat mulai (concurrency terlihat).
+        // A call cut by a deadline is dropped while sleeping; its in-flight count then stays.
         tokio::time::sleep(delay.unwrap_or(Duration::from_millis(5))).await;
-        self.in_flight.lock().unwrap().0 -= 1;
-        next.unwrap_or(Ok("[]".to_string()))
-            .map(|text| ChatResponse {
-                text,
-                tool_calls: Vec::new(),
-                stop_reason: StopReason::EndTurn,
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            })
+        if let Some(entry) = self.in_flight.lock().unwrap().get_mut(&stage) {
+            entry.0 -= 1;
+        }
+        let response = |text: String, tool_calls: Vec<ToolCall>| ChatResponse {
+            stop_reason: if tool_calls.is_empty() {
+                StopReason::EndTurn
+            } else {
+                StopReason::ToolUse
+            },
+            text,
+            tool_calls,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        match reply {
+            Reply::Text(text) => Ok(response(text, Vec::new())),
+            Reply::Tools(calls) => {
+                let mut next = self.next_call_id.lock().unwrap();
+                let calls = calls
+                    .into_iter()
+                    .map(|(name, arguments)| {
+                        *next += 1;
+                        ToolCall {
+                            id: format!("call_{next}"),
+                            name,
+                            arguments,
+                            provider_meta: None,
+                        }
+                    })
+                    .collect();
+                Ok(response(String::new(), calls))
+            }
+            Reply::Err(err) => Err(err),
+        }
+    }
+}
+
+/// What `FakeCloner::clone_pr` does.
+#[derive(Debug, Clone)]
+pub enum CloneBehavior {
+    /// A checkout holding these `(path, content)` files.
+    Files(Vec<(String, String)>),
+    Fail(WorkspaceError),
+}
+
+/// Cloner over a `TempDir` fixture. Records each spec's URL and each workspace root.
+pub struct FakeCloner {
+    behavior: Mutex<CloneBehavior>,
+    urls: Mutex<Vec<String>>,
+    roots: Mutex<Vec<PathBuf>>,
+}
+
+impl Default for FakeCloner {
+    fn default() -> Self {
+        FakeCloner {
+            behavior: Mutex::new(CloneBehavior::Files(Vec::new())),
+            urls: Mutex::new(Vec::new()),
+            roots: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl FakeCloner {
+    pub fn set(&self, behavior: CloneBehavior) {
+        *self.behavior.lock().unwrap() = behavior;
+    }
+
+    pub fn files(&self, files: &[(&str, &str)]) {
+        let files = files
+            .iter()
+            .map(|(p, c)| (p.to_string(), c.to_string()))
+            .collect();
+        self.set(CloneBehavior::Files(files));
+    }
+
+    pub fn urls(&self) -> Vec<String> {
+        self.urls.lock().unwrap().clone()
+    }
+
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.roots.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl RepoCloner for FakeCloner {
+    async fn clone_pr(&self, spec: &CloneSpec) -> Result<RepoWorkspace, WorkspaceError> {
+        self.urls.lock().unwrap().push(spec.url.clone());
+        let behavior = self.behavior.lock().unwrap().clone();
+        let files = match behavior {
+            CloneBehavior::Files(files) => files,
+            CloneBehavior::Fail(err) => return Err(err),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        for (path, content) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let workspace = RepoWorkspace::from_temp_dir(dir).unwrap();
+        self.roots
+            .lock()
+            .unwrap()
+            .push(workspace.root().to_path_buf());
+        Ok(workspace)
+    }
+}
+
+/// A clone spec for `acme/api` PR 7 (what a real provider would return).
+pub fn clone_spec() -> CloneSpec {
+    CloneSpec {
+        url: "https://github.com/acme/api.git".into(),
+        refspec: "refs/pull/7/head".into(),
+        fallback_refspec: None,
+        expected_sha: "h1".into(),
+        auth_header: "Basic secret".into(),
     }
 }
 
@@ -306,6 +573,7 @@ pub struct Setup {
     pub engine: Engine,
     pub git: FakeGit,
     pub chat: Arc<FakeChat>,
+    pub cloner: Arc<FakeCloner>,
     pub connection_id: Uuid,
     pub repository_id: Uuid,
     pub provider_id: Uuid,
@@ -350,16 +618,19 @@ pub async fn setup(pool: &PgPool, git: FakeGit) -> Setup {
     settings::update(pool, &current).await.unwrap();
 
     let chat = Arc::new(FakeChat::default());
+    let cloner = Arc::new(FakeCloner::default());
     Setup {
         engine: Engine {
             db: pool.clone(),
             cipher: Arc::new(cipher),
             git: Arc::new(git.clone()),
             chat: chat.clone(),
+            cloner: cloner.clone(),
             review_timeout: REVIEW_TIMEOUT,
         },
         git,
         chat,
+        cloner,
         connection_id: conn.id,
         repository_id: repo.id,
         provider_id: provider.id,
@@ -385,6 +656,20 @@ pub fn file(path: &str, patch: &str) -> FileDiff {
         status: FileStatus::Modified,
         patch: Some(patch.into()),
     }
+}
+
+/// A file whose rendered diff (~25K chars) is too large to share a Finder batch with another
+/// such file, so each one is reviewed by its own Finder agent. Line 2 is added.
+pub fn big_file(path: &str) -> FileDiff {
+    file(
+        path,
+        &format!("@@ -1,1 +1,2 @@\n a\n+{}\n", "x".repeat(25_000)),
+    )
+}
+
+/// The `=== path (` header that starts a file's diff in a Finder prompt.
+pub fn diff_header(path: &str) -> String {
+    format!("=== {path} (")
 }
 
 /// Jawaban LLM berisi satu temuan.

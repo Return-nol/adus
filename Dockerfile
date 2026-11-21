@@ -33,7 +33,7 @@ RUN cargo build --release -p adus
 # 4. Runtime image.
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin adus
 COPY --from=build /app/target/release/adus /usr/local/bin/adus
