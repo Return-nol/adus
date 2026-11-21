@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use adus_llm::{ChatRequest, ChatResponse, LlmError, ProviderKind, client_for, default_base_url};
+use adus_llm::{
+    AssistantPart, ChatRequest, ChatResponse, LlmError, Message, ProviderKind, StopReason,
+    ToolCall, ToolDef, ToolResult, UserPart, client_for, default_base_url,
+};
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -8,18 +11,97 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const KEY: &str = "sk-secret-key";
 
 fn request() -> ChatRequest {
-    ChatRequest {
-        model: "m-1".into(),
-        system: "be brief".into(),
-        user: "hello".into(),
-        max_tokens: 321,
-    }
+    ChatRequest::text("m-1", "be brief", "hello", 321)
 }
 
 async fn chat(kind: ProviderKind, server: &MockServer) -> Result<ChatResponse, LlmError> {
+    chat_with(kind, server, &request()).await
+}
+
+async fn chat_with(
+    kind: ProviderKind,
+    server: &MockServer,
+    req: &ChatRequest,
+) -> Result<ChatResponse, LlmError> {
     client_for(kind, Some(&server.uri()), reqwest::Client::new())
-        .chat(KEY, &request())
+        .chat(KEY, req)
         .await
+}
+
+/// Body JSON of the single request the mock server received.
+async fn sent_body(server: &MockServer) -> Value {
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    requests[0].body_json().unwrap()
+}
+
+fn tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "read_file".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        },
+        ToolDef {
+            name: "grep".into(),
+            description: "Search files".into(),
+            parameters: json!({"type": "object", "properties": {"pattern": {"type": "string"}}}),
+        },
+    ]
+}
+
+fn with_tools() -> ChatRequest {
+    let mut req = request();
+    req.tools = tools();
+    req
+}
+
+/// Turn two: the model asked for two tools and both results are back (the second failed).
+fn turn_two() -> ChatRequest {
+    let mut req = with_tools();
+    req.messages.push(Message::Assistant {
+        parts: vec![
+            AssistantPart::Text("checking".into()),
+            AssistantPart::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "a.rs"}),
+                provider_meta: Some("sig-a".into()),
+            }),
+            AssistantPart::ToolCall(ToolCall {
+                id: "call_2".into(),
+                name: "grep".into(),
+                arguments: json!({"pattern": "todo"}),
+                provider_meta: None,
+            }),
+        ],
+    });
+    req.messages.push(Message::Tool {
+        results: vec![
+            ToolResult {
+                call_id: "call_1".into(),
+                tool_name: "read_file".into(),
+                content: "fn main() {}".into(),
+                is_error: false,
+            },
+            ToolResult {
+                call_id: "call_2".into(),
+                tool_name: "grep".into(),
+                content: "bad pattern".into(),
+                is_error: true,
+            },
+        ],
+    });
+    req
+}
+
+/// `turn_two` plus a user nudge right after the tool results.
+fn turn_two_with_nudge() -> ChatRequest {
+    let mut req = turn_two();
+    req.messages.push(Message::User {
+        parts: vec![UserPart::Text("please submit".into())],
+    });
+    req
 }
 
 /// Mock yang menjawab `response` untuk POST ke `route`, tanpa pencocokan lain.
@@ -66,7 +148,10 @@ async fn openai_parses_text_and_usage() {
             ],
         })))
         .respond_with(ok(json!({
-            "choices": [{"message": {"role": "assistant", "content": "hi there"}}],
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi there"},
+                "finish_reason": "stop",
+            }],
             "usage": {"prompt_tokens": 11, "completion_tokens": 7},
         })))
         .expect(1)
@@ -78,8 +163,12 @@ async fn openai_parses_text_and_usage() {
         got,
         ChatResponse {
             text: "hi there".into(),
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
             input_tokens: 11,
-            output_tokens: 7
+            output_tokens: 7,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         }
     );
 }
@@ -198,9 +287,13 @@ async fn anthropic_parses_text_and_usage() {
         .and(header("anthropic-version", "2023-06-01"))
         .and(body_partial_json(json!({
             "model": "m-1",
-            "system": "be brief",
+            "system": [{
+                "type": "text",
+                "text": "be brief",
+                "cache_control": {"type": "ephemeral"},
+            }],
             "max_tokens": 321,
-            "messages": [{"role": "user", "content": "hello"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
         })))
         .respond_with(ok(json!({
             "content": [
@@ -208,6 +301,7 @@ async fn anthropic_parses_text_and_usage() {
                 {"type": "text", "text": "part one, "},
                 {"type": "text", "text": "part two"},
             ],
+            "stop_reason": "end_turn",
             "usage": {"input_tokens": 5, "output_tokens": 9},
         })))
         .expect(1)
@@ -219,8 +313,12 @@ async fn anthropic_parses_text_and_usage() {
         got,
         ChatResponse {
             text: "part one, part two".into(),
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
             input_tokens: 5,
-            output_tokens: 9
+            output_tokens: 9,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         }
     );
 }
@@ -229,7 +327,7 @@ async fn anthropic_parses_text_and_usage() {
 async fn anthropic_no_text_blocks_is_invalid() {
     let server = serve(
         ANTHROPIC_PATH,
-        ok(json!({"content": [{"type": "tool_use", "id": "t"}]})),
+        ok(json!({"content": [{"type": "thinking", "thinking": "hmm"}]})),
     )
     .await;
     assert_eq!(
@@ -252,7 +350,10 @@ async fn gemini_parses_text_and_usage() {
             "generationConfig": {"maxOutputTokens": 321},
         })))
         .respond_with(ok(json!({
-            "candidates": [{"content": {"parts": [{"text": "a"}, {"text": "b"}]}}],
+            "candidates": [{
+                "content": {"parts": [{"text": "a"}, {"text": "b"}]},
+                "finishReason": "STOP",
+            }],
             "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4},
         })))
         .expect(1)
@@ -264,8 +365,12 @@ async fn gemini_parses_text_and_usage() {
         got,
         ChatResponse {
             text: "ab".into(),
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
             input_tokens: 3,
-            output_tokens: 4
+            output_tokens: 4,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         }
     );
 }
@@ -533,4 +638,589 @@ async fn multibyte_message_is_truncated_on_char_boundary() {
         panic!("expected Invalid");
     };
     assert_eq!(msg.matches('é').count(), 200);
+}
+
+// ---------- Tool calling: OpenAI ----------
+
+#[tokio::test]
+async fn openai_sends_tools_and_parses_tool_calls() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_9",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"b.rs\"}"},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 8,
+                "prompt_tokens_details": {"cached_tokens": 100},
+            },
+        })),
+    )
+    .await;
+
+    let got = chat_with(ProviderKind::Openai, &server, &with_tools())
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        ChatResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "call_9".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "b.rs"}),
+                provider_meta: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 120,
+            output_tokens: 8,
+            cache_read_tokens: 100,
+            cache_write_tokens: 0,
+        }
+    );
+    let body = sent_body(&server).await;
+    assert_eq!(
+        body["tools"],
+        json!([
+            {"type": "function", "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }},
+            {"type": "function", "function": {
+                "name": "grep",
+                "description": "Search files",
+                "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+            }},
+        ])
+    );
+    assert_eq!(body["tool_choice"], "auto");
+}
+
+#[tokio::test]
+async fn openai_without_tools_omits_tools_and_tool_choice() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{"message": {"content": "x"}}]})),
+    )
+    .await;
+    chat(ProviderKind::Openai, &server).await.unwrap();
+    let body = sent_body(&server).await;
+    assert!(body.get("tools").is_none());
+    assert!(body.get("tool_choice").is_none());
+}
+
+#[tokio::test]
+async fn openai_serializes_tool_calls_and_tool_role_on_turn_two() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{"message": {"content": "done"}, "finish_reason": "stop"}]})),
+    )
+    .await;
+    chat_with(ProviderKind::Openai, &server, &turn_two())
+        .await
+        .unwrap();
+    assert_eq!(
+        sent_body(&server).await["messages"],
+        json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "checking", "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "grep", "arguments": "{\"pattern\":\"todo\"}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "fn main() {}"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "bad pattern"},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn openai_assistant_with_only_tool_calls_sends_null_content() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{"message": {"content": "done"}}]})),
+    )
+    .await;
+    let mut req = turn_two();
+    if let Message::Assistant { parts } = &mut req.messages[1] {
+        parts.remove(0);
+    }
+    chat_with(ProviderKind::Openai, &server, &req)
+        .await
+        .unwrap();
+    let body = sent_body(&server).await;
+    assert_eq!(body["messages"][2]["content"], Value::Null);
+    assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call_1");
+}
+
+#[tokio::test]
+async fn openai_malformed_tool_arguments_are_wrapped_not_fatal() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{
+            "message": {"content": null, "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "grep", "arguments": "{\"pattern\": "},
+            }]},
+            "finish_reason": "tool_calls",
+        }]})),
+    )
+    .await;
+    let got = chat_with(ProviderKind::Openai, &server, &with_tools())
+        .await
+        .unwrap();
+    let args = &got.tool_calls[0].arguments;
+    assert_eq!(args["raw"], "{\"pattern\": ");
+    assert!(
+        args["__raw_parse_error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn compatible_with_tools_still_sends_max_tokens_only() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{"message": {"content": "x"}}]})),
+    )
+    .await;
+    chat_with(ProviderKind::OpenaiCompatible, &server, &with_tools())
+        .await
+        .unwrap();
+    let body = sent_body(&server).await;
+    assert_eq!(body["max_tokens"], 321);
+    assert!(body.get("max_completion_tokens").is_none());
+    assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+}
+
+#[tokio::test]
+async fn compatible_model_without_tool_support_is_tools_unsupported() {
+    // OpenAI-style object error and Ollama-style string error.
+    for body in [
+        json!({"error": {"message": "This model does not support tools"}}),
+        json!({"error": "registry.ollama.ai/library/tiny:latest does not support tools"}),
+    ] {
+        let server = serve(OPENAI_PATH, ResponseTemplate::new(400).set_body_json(body)).await;
+        let err = chat_with(ProviderKind::OpenaiCompatible, &server, &with_tools())
+            .await
+            .unwrap_err();
+        let LlmError::ToolsUnsupported(msg) = &err else {
+            panic!("expected ToolsUnsupported, got {err:?}");
+        };
+        assert!(msg.contains("does not support tools"), "{msg}");
+        assert!(!msg.contains(KEY), "{msg}");
+    }
+}
+
+#[tokio::test]
+async fn tools_marker_without_tools_in_request_stays_invalid() {
+    let server = serve(
+        OPENAI_PATH,
+        ResponseTemplate::new(400)
+            .set_body_json(json!({"error": {"message": "model does not support tools"}})),
+    )
+    .await;
+    let err = chat(ProviderKind::OpenaiCompatible, &server)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LlmError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn unknown_tools_field_is_tools_unsupported() {
+    let server = serve(
+        OPENAI_PATH,
+        ResponseTemplate::new(422)
+            .set_body_json(json!({"error": {"message": "Unknown field: tools"}})),
+    )
+    .await;
+    let err = chat_with(ProviderKind::OpenaiCompatible, &server, &with_tools())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LlmError::ToolsUnsupported(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn compatible_maximum_context_length_is_context_overflow() {
+    let server = serve(
+        OPENAI_PATH,
+        ResponseTemplate::new(400).set_body_json(json!({"error": {
+            "message": "This model's maximum context length is 8192 tokens.",
+            "code": "context_length_exceeded",
+        }})),
+    )
+    .await;
+    let err = chat(ProviderKind::OpenaiCompatible, &server)
+        .await
+        .unwrap_err();
+    let LlmError::ContextOverflow(msg) = &err else {
+        panic!("expected ContextOverflow, got {err:?}");
+    };
+    assert!(msg.contains("maximum context length"), "{msg}");
+}
+
+#[tokio::test]
+async fn context_overflow_markers_map_for_every_provider() {
+    for (kind, route) in ALL {
+        for (status, message) in [
+            (400, "prompt is too long: 210000 tokens > 200000 maximum"),
+            (
+                400,
+                "The input token count exceeds the maximum number of tokens allowed",
+            ),
+            (422, "Input is too long for requested model"),
+        ] {
+            let server = serve(
+                route,
+                ResponseTemplate::new(status).set_body_json(json!({"error": {"message": message}})),
+            )
+            .await;
+            let err = chat(kind, &server).await.unwrap_err();
+            assert!(
+                matches!(err, LlmError::ContextOverflow(_)),
+                "{kind:?} {status} {message}: {err:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn status_413_is_context_overflow() {
+    for (kind, route) in ALL {
+        let server = serve(
+            route,
+            ResponseTemplate::new(413)
+                .set_body_json(json!({"error": {"message": "Request exceeds the maximum size"}})),
+        )
+        .await;
+        let err = chat(kind, &server).await.unwrap_err();
+        let LlmError::ContextOverflow(msg) = &err else {
+            panic!("{kind:?}: expected ContextOverflow, got {err:?}");
+        };
+        assert!(msg.contains("413"), "{msg}");
+    }
+    // Without a body too.
+    let server = serve(OPENAI_PATH, ResponseTemplate::new(413)).await;
+    let err = chat(ProviderKind::Openai, &server).await.unwrap_err();
+    assert!(matches!(err, LlmError::ContextOverflow(_)), "{err:?}");
+}
+
+#[test]
+fn new_llm_error_display_text() {
+    assert_eq!(
+        LlmError::ToolsUnsupported("x".into()).to_string(),
+        "tools not supported: x"
+    );
+    assert_eq!(
+        LlmError::ContextOverflow("y".into()).to_string(),
+        "context window exceeded: y"
+    );
+}
+
+#[tokio::test]
+async fn length_finish_maps_to_max_tokens_for_every_provider() {
+    let cases = [
+        (
+            ProviderKind::Openai,
+            OPENAI_PATH,
+            json!({"choices": [{"message": {"content": "cut"}, "finish_reason": "length"}]}),
+        ),
+        (
+            ProviderKind::Anthropic,
+            ANTHROPIC_PATH,
+            json!({"content": [{"type": "text", "text": "cut"}], "stop_reason": "max_tokens"}),
+        ),
+        (
+            ProviderKind::Gemini,
+            GEMINI_PATH,
+            json!({"candidates": [{
+                "content": {"parts": [{"text": "cut"}]},
+                "finishReason": "MAX_TOKENS",
+            }]}),
+        ),
+    ];
+    for (kind, route, response) in cases {
+        let server = serve(route, ok(response)).await;
+        let got = chat(kind, &server).await.unwrap();
+        assert_eq!(got.stop_reason, StopReason::MaxTokens, "{kind:?}");
+    }
+}
+
+// ---------- Tool calling: Anthropic ----------
+
+#[tokio::test]
+async fn anthropic_sends_cache_control_on_system_last_tool_and_checkpoint() {
+    let server = serve(
+        ANTHROPIC_PATH,
+        ok(json!({"content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"})),
+    )
+    .await;
+    chat_with(ProviderKind::Anthropic, &server, &turn_two())
+        .await
+        .unwrap();
+    let ephemeral = json!({"type": "ephemeral"});
+    assert_eq!(
+        sent_body(&server).await,
+        json!({
+            "model": "m-1",
+            "max_tokens": 321,
+            "system": [{"type": "text", "text": "be brief", "cache_control": ephemeral}],
+            "tools": [
+                {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+                {
+                    "name": "grep",
+                    "description": "Search files",
+                    "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+                    "cache_control": ephemeral,
+                },
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "a.rs"}},
+                    {"type": "tool_use", "id": "call_2", "name": "grep", "input": {"pattern": "todo"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "fn main() {}", "is_error": false},
+                    {"type": "tool_result", "tool_use_id": "call_2", "content": "bad pattern", "is_error": true,
+                     "cache_control": ephemeral},
+                ]},
+            ],
+        })
+    );
+}
+
+#[tokio::test]
+async fn anthropic_merges_tool_results_and_following_user_text_into_one_user_turn() {
+    let server = serve(
+        ANTHROPIC_PATH,
+        ok(json!({"content": [{"type": "text", "text": "done"}]})),
+    )
+    .await;
+    chat_with(ProviderKind::Anthropic, &server, &turn_two_with_nudge())
+        .await
+        .unwrap();
+    let messages = &sent_body(&server).await["messages"];
+    assert_eq!(messages.as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        messages[2],
+        json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "fn main() {}", "is_error": false},
+            {"type": "tool_result", "tool_use_id": "call_2", "content": "bad pattern", "is_error": true},
+            {"type": "text", "text": "please submit", "cache_control": {"type": "ephemeral"}},
+        ]})
+    );
+}
+
+#[tokio::test]
+async fn anthropic_empty_system_and_no_tools_are_omitted() {
+    let server = serve(
+        ANTHROPIC_PATH,
+        ok(json!({"content": [{"type": "text", "text": "pong"}]})),
+    )
+    .await;
+    let req = ChatRequest::text("m-1", "", "ping", 5);
+    chat_with(ProviderKind::Anthropic, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(
+        sent_body(&server).await,
+        json!({
+            "model": "m-1",
+            "max_tokens": 5,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+        })
+    );
+}
+
+#[tokio::test]
+async fn anthropic_parses_tool_use_and_cache_usage() {
+    let server = serve(
+        ANTHROPIC_PATH,
+        ok(json!({
+            "content": [
+                {"type": "text", "text": "Let me look."},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "c.rs"}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 50,
+            },
+        })),
+    )
+    .await;
+    let got = chat_with(ProviderKind::Anthropic, &server, &with_tools())
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        ChatResponse {
+            text: "Let me look.".into(),
+            tool_calls: vec![ToolCall {
+                id: "toolu_1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "c.rs"}),
+                provider_meta: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 160,
+            output_tokens: 7,
+            cache_read_tokens: 100,
+            cache_write_tokens: 50,
+        }
+    );
+}
+
+// ---------- Tool calling: Gemini ----------
+
+#[tokio::test]
+async fn gemini_sends_function_declarations_and_round_trips_thought_signature() {
+    let server = serve(
+        GEMINI_PATH,
+        ok(json!({"candidates": [{"content": {"parts": [{"text": "done"}]}}]})),
+    )
+    .await;
+    chat_with(ProviderKind::Gemini, &server, &turn_two_with_nudge())
+        .await
+        .unwrap();
+    assert_eq!(
+        sent_body(&server).await,
+        json!({
+            "systemInstruction": {"parts": [{"text": "be brief"}]},
+            "generationConfig": {"maxOutputTokens": 321},
+            "tools": [{"functionDeclarations": [
+                {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+                {
+                    "name": "grep",
+                    "description": "Search files",
+                    "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}},
+                },
+            ]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+            "contents": [
+                {"role": "user", "parts": [{"text": "hello"}]},
+                {"role": "model", "parts": [
+                    {"text": "checking"},
+                    {"functionCall": {"name": "read_file", "args": {"path": "a.rs"}},
+                     "thoughtSignature": "sig-a"},
+                    {"functionCall": {"name": "grep", "args": {"pattern": "todo"}}},
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "read_file",
+                        "response": {"result": "fn main() {}", "isError": false}}},
+                    {"functionResponse": {"name": "grep",
+                        "response": {"result": "bad pattern", "isError": true}}},
+                    {"text": "please submit"},
+                ]},
+            ],
+        })
+    );
+}
+
+#[tokio::test]
+async fn gemini_without_tools_omits_tools_and_tool_config() {
+    let server = serve(
+        GEMINI_PATH,
+        ok(json!({"candidates": [{"content": {"parts": [{"text": "x"}]}}]})),
+    )
+    .await;
+    chat(ProviderKind::Gemini, &server).await.unwrap();
+    let body = sent_body(&server).await;
+    assert!(body.get("tools").is_none());
+    assert!(body.get("toolConfig").is_none());
+}
+
+#[tokio::test]
+async fn gemini_assigns_unique_synthetic_ids_and_keeps_thought_signature() {
+    let server = serve(
+        GEMINI_PATH,
+        ok(json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [
+                    {"functionCall": {"name": "grep", "args": {"pattern": "x"}},
+                     "thoughtSignature": "sig-b"},
+                    {"functionCall": {"name": "read_file", "args": {"path": "d.rs"}}},
+                ]},
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 300,
+                "candidatesTokenCount": 12,
+                "cachedContentTokenCount": 256,
+            },
+        })),
+    )
+    .await;
+    // `turn_two` already holds two tool calls, so new ids start at gc_2_*.
+    let got = chat_with(ProviderKind::Gemini, &server, &turn_two())
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        ChatResponse {
+            text: String::new(),
+            tool_calls: vec![
+                ToolCall {
+                    id: "gc_2_0".into(),
+                    name: "grep".into(),
+                    arguments: json!({"pattern": "x"}),
+                    provider_meta: Some("sig-b".into()),
+                },
+                ToolCall {
+                    id: "gc_2_1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "d.rs"}),
+                    provider_meta: None,
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 300,
+            output_tokens: 12,
+            cache_read_tokens: 256,
+            cache_write_tokens: 0,
+        }
+    );
+}
+
+#[test]
+fn text_request_holds_one_user_message_and_no_tools() {
+    let req = ChatRequest::text("m", "sys", "hi", 9);
+    assert_eq!(
+        req.messages,
+        vec![Message::User {
+            parts: vec![UserPart::Text("hi".into())]
+        }]
+    );
+    assert!(req.tools.is_empty());
+    assert_eq!(
+        (req.model.as_str(), req.system.as_str(), req.max_tokens),
+        ("m", "sys", 9)
+    );
 }

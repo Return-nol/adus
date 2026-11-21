@@ -291,8 +291,8 @@ impl Engine {
                     found.extend(keep_valid(suggestions, &target.file, &target.allowed));
                 }
                 Ok(None) => skipped.push((target.file.path, "unparseable")),
-                // Satu file ditolak (mis. output kosong): lewati file itu saja.
-                Err(err @ ChatError::Invalid(_)) => {
+                // Satu file ditolak (mis. output kosong, prompt terlalu panjang): lewati file itu saja.
+                Err(err @ (ChatError::Invalid(_) | ChatError::ContextOverflow(_))) => {
                     tracing::warn!(%review_id, error = %err, "LLM rejected one file; skipping it");
                     skipped.push((target.file.path, "llm_error"));
                     rejected.push(err);
@@ -338,12 +338,7 @@ impl Engine {
         ctx: &UsageContext,
     ) -> Result<Option<Vec<Suggestion>>, ChatError> {
         for _attempt in 0..2 {
-            let req = ChatRequest {
-                model: model.to_string(),
-                system: system.clone(),
-                user: user.clone(),
-                max_tokens: MAX_OUTPUT_TOKENS,
-            };
+            let req = ChatRequest::text(model, system.as_str(), user.as_str(), MAX_OUTPUT_TOKENS);
             let response = self.chat.chat(provider_id, req, ctx.clone()).await?;
             if let Ok(suggestions) = parse_suggestions(&response.text) {
                 return Ok(Some(suggestions));
@@ -481,6 +476,8 @@ fn chat_error(err: ChatError) -> EngineError {
         ChatError::NoKeys | ChatError::Internal(_) => {
             EngineError::Retryable(format!("LLM: {err}"), None)
         }
-        ChatError::Invalid(_) => EngineError::Fatal(format!("LLM: {err}")),
+        ChatError::Invalid(_) | ChatError::ToolsUnsupported(_) | ChatError::ContextOverflow(_) => {
+            EngineError::Fatal(format!("LLM: {err}"))
+        }
     }
 }

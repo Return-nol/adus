@@ -13,7 +13,7 @@ use adus_git::{
     PullRequest, RemoteRepo, RepoRef,
 };
 use adus_llm::router::{ChatError, ChatService, UsageContext};
-use adus_llm::{ChatRequest, ChatResponse};
+use adus_llm::{ChatRequest, ChatResponse, Message, StopReason, UserPart};
 use adus_review::engine::{Engine, REVIEW_TIMEOUT};
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -254,17 +254,26 @@ impl ChatService for FakeChat {
         req: ChatRequest,
         ctx: UsageContext,
     ) -> Result<ChatResponse, ChatError> {
+        // The engine sends single-turn requests: the prompt is the first user message.
+        let user = req
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                Message::User { parts } => parts.first().map(|UserPart::Text(t)| t.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
         let delay = self
             .delays
             .lock()
             .unwrap()
             .iter()
-            .find(|(path, _)| req.user.contains(&format!("<file_path>\n{path}\n")))
+            .find(|(path, _)| user.contains(&format!("<file_path>\n{path}\n")))
             .map(|(_, delay)| *delay);
         self.calls.lock().unwrap().push(ChatCall {
             provider_id,
             model: req.model,
-            user: req.user,
+            user,
             max_tokens: req.max_tokens,
             ctx,
         });
@@ -280,8 +289,12 @@ impl ChatService for FakeChat {
         next.unwrap_or(Ok("[]".to_string()))
             .map(|text| ChatResponse {
                 text,
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
                 input_tokens: 1,
                 output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             })
     }
 }

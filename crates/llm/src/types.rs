@@ -5,6 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::header::HeaderValue;
 use reqwest::{RequestBuilder, Response, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Timeout satu request ke provider. Dipasang per request supaya `reqwest::Client` bisa dibagi.
@@ -14,18 +15,123 @@ const MAX_PROVIDER_MESSAGE: usize = 200;
 /// Batas atas `Retry-After`; mencegah overflow `Instant + Duration` di pemanggil.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 
+/// One LLM call: a system prompt, the conversation so far, and the tools the model may call.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatRequest {
     pub model: String,
     pub system: String,
-    pub user: String,
+    pub messages: Vec<Message>,
+    /// Empty: no tools are sent, and an error is never reported as `ToolsUnsupported`.
+    pub tools: Vec<ToolDef>,
     pub max_tokens: u32,
+}
+
+impl ChatRequest {
+    /// Single-turn request: one user message, no tools.
+    pub fn text(
+        model: impl Into<String>,
+        system: impl Into<String>,
+        user: impl Into<String>,
+        max_tokens: u32,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            system: system.into(),
+            messages: vec![Message::User {
+                parts: vec![UserPart::Text(user.into())],
+            }],
+            tools: Vec::new(),
+            max_tokens,
+        }
+    }
+
+    /// Number of tool calls the assistant already made in this conversation.
+    pub(crate) fn prior_tool_calls(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|m| match m {
+                Message::Assistant { parts } => parts
+                    .iter()
+                    .filter(|p| matches!(p, AssistantPart::ToolCall(_)))
+                    .count(),
+                Message::User { .. } | Message::Tool { .. } => 0,
+            })
+            .sum()
+    }
+}
+
+/// One turn of the conversation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum Message {
+    User {
+        parts: Vec<UserPart>,
+    },
+    Assistant {
+        parts: Vec<AssistantPart>,
+    },
+    /// Results of the tool calls from the previous assistant turn.
+    Tool {
+        results: Vec<ToolResult>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UserPart {
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AssistantPart {
+    Text(String),
+    ToolCall(ToolCall),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Provider call id; Gemini has none, so its client assigns `gc_{prior}_{idx}`.
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+    /// Opaque provider metadata (Gemini `thoughtSignature`), sent back verbatim on the next turn.
+    pub provider_meta: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub tool_name: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// A tool the model may call; `parameters` is a JSON Schema object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+/// Why the model stopped generating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatResponse {
     pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub stop_reason: StopReason,
+    /// Total input tokens, cached ones included.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -38,6 +144,12 @@ pub enum LlmError {
     Transient(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// The model or endpoint rejected the `tools` in the request.
+    #[error("tools not supported: {0}")]
+    ToolsUnsupported(String),
+    /// The prompt does not fit the model's context window (or the request is too large).
+    #[error("context window exceeded: {0}")]
+    ContextOverflow(String),
 }
 
 #[async_trait]
@@ -45,9 +157,29 @@ pub trait LlmClient: Send + Sync {
     async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError>;
 }
 
+/// Substrings (lowercase) in an error body that mean the model or endpoint cannot use tools.
+const TOOLS_UNSUPPORTED_MARKERS: [&str; 5] = [
+    "does not support tools",
+    "tool_use is not supported",
+    "tools is not supported",
+    "function calling is not supported",
+    "tool calling is not supported",
+];
+/// Substrings (lowercase) in an error body that mean the prompt is too long for the model.
+const CONTEXT_OVERFLOW_MARKERS: [&str; 7] = [
+    "context_length_exceeded",
+    "maximum context length",
+    "prompt is too long",
+    "exceeds the maximum",
+    "too many tokens",
+    "token count exceeds",
+    "input is too long",
+];
+
 /// Kirim request lalu petakan status gagal ke `LlmError`.
 /// API key, URL, dan body request tidak pernah masuk pesan error.
-pub(crate) async fn send(req: RequestBuilder) -> Result<Response, LlmError> {
+/// `has_tools`: the request carries tools, so a tools rejection becomes `ToolsUnsupported`.
+pub(crate) async fn send(req: RequestBuilder, has_tools: bool) -> Result<Response, LlmError> {
     let resp = req.timeout(REQUEST_TIMEOUT).send().await.map_err(|e| {
         if e.is_builder() {
             LlmError::Invalid("invalid request".into())
@@ -65,19 +197,43 @@ pub(crate) async fn send(req: RequestBuilder) -> Result<Response, LlmError> {
         },
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => LlmError::Unauthorized,
         s if s.is_server_error() => LlmError::Transient(format!("provider status {s}")),
-        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY => {
+        StatusCode::BAD_REQUEST
+        | StatusCode::NOT_FOUND
+        | StatusCode::UNPROCESSABLE_ENTITY
+        | StatusCode::PAYLOAD_TOO_LARGE => {
             // Body error bisa gagal dibaca/di-parse; itu tidak mengubah klasifikasi.
-            let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+            let raw = resp.bytes().await.unwrap_or_default();
+            let body = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
             if is_bad_api_key(&body) {
                 return Err(LlmError::Unauthorized);
             }
-            LlmError::Invalid(format!(
-                "provider status {status}{}",
-                provider_message(&body)
-            ))
+            let message = format!("provider status {status}{}", provider_message(&body));
+            // Markers are searched in the whole body: some providers put them in `error.code`.
+            let lower = String::from_utf8_lossy(&raw).to_lowercase();
+            let too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
+            if has_tools && !too_large && tools_unsupported(&lower) {
+                LlmError::ToolsUnsupported(message)
+            } else if too_large || (status != StatusCode::NOT_FOUND && context_overflow(&lower)) {
+                LlmError::ContextOverflow(message)
+            } else {
+                LlmError::Invalid(message)
+            }
         }
         other => LlmError::Invalid(format!("unexpected provider status {other}")),
     })
+}
+
+fn tools_unsupported(lower_body: &str) -> bool {
+    TOOLS_UNSUPPORTED_MARKERS
+        .iter()
+        .any(|m| lower_body.contains(m))
+        || (lower_body.contains("unknown field") && lower_body.contains("tools"))
+}
+
+fn context_overflow(lower_body: &str) -> bool {
+    CONTEXT_OVERFLOW_MARKERS
+        .iter()
+        .any(|m| lower_body.contains(m))
 }
 
 /// `Retry-After` dalam detik. Bentuk HTTP-date diabaikan.
@@ -103,8 +259,10 @@ fn is_bad_api_key(body: &Value) -> bool {
 
 /// `: <error.message>` dari body error provider (OpenAI, Anthropic, Gemini sama-sama
 /// memakai `error.message`), dipotong 200 karakter. Kosong kalau tidak ada.
+/// Some OpenAI-compatible servers (e.g. Ollama) send `error` as a plain string instead.
 fn provider_message(body: &Value) -> String {
-    match body["error"]["message"].as_str() {
+    let error = &body["error"];
+    match error["message"].as_str().or_else(|| error.as_str()) {
         Some(m) if !m.is_empty() => {
             let short: String = m.chars().take(MAX_PROVIDER_MESSAGE).collect();
             format!(": {short}")
@@ -131,9 +289,9 @@ pub(crate) async fn decode<T: serde::de::DeserializeOwned>(resp: Response) -> Re
     serde_json::from_slice(&bytes).map_err(|_| LlmError::Invalid("malformed response".into()))
 }
 
-/// Teks hasil harus tidak kosong.
-pub(crate) fn non_empty(text: String) -> Result<String, LlmError> {
-    if text.trim().is_empty() {
+/// A response must carry text or at least one tool call.
+pub(crate) fn non_empty(text: String, tool_calls: &[ToolCall]) -> Result<String, LlmError> {
+    if text.trim().is_empty() && tool_calls.is_empty() {
         Err(LlmError::Invalid("empty response".into()))
     } else {
         Ok(text)

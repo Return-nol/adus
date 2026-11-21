@@ -10,7 +10,10 @@ pub use adus_core::types::ProviderKind;
 pub use anthropic::AnthropicClient;
 pub use gemini::GeminiClient;
 pub use openai::OpenAiClient;
-pub use types::{ChatRequest, ChatResponse, LlmClient, LlmError};
+pub use types::{
+    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, StopReason, ToolCall,
+    ToolDef, ToolResult, UserPart,
+};
 
 /// Base URL bawaan tiap provider. `OpenaiCompatible` tidak punya (wajib diisi admin).
 pub fn default_base_url(kind: ProviderKind) -> Option<&'static str> {

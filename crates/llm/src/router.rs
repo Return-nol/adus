@@ -39,6 +39,12 @@ pub enum ChatError {
     /// Request-nya sendiri ditolak provider; key lain tidak akan membantu.
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// The model or endpoint does not support tool calling; key lain tidak akan membantu.
+    #[error("tools not supported: {0}")]
+    ToolsUnsupported(String),
+    /// The prompt does not fit the model's context window; the caller must shrink it.
+    #[error("context window exceeded: {0}")]
+    ContextOverflow(String),
     /// Database tidak bisa dibaca, atau tidak ada key yang bisa didekripsi; LLM belum dipanggil.
     #[error("internal error: {0}")]
     Internal(String),
@@ -206,10 +212,28 @@ impl ChatService for LlmRouter {
                     self.log_usage(&ctx, &key, &req, latency_ms, None, Some("transient"))
                         .await;
                 }
+                // Request-level errors: the key is fine, so its status is left alone.
                 Err(LlmError::Invalid(message)) => {
                     self.log_usage(&ctx, &key, &req, latency_ms, None, Some("invalid"))
                         .await;
                     return Err(ChatError::Invalid(message));
+                }
+                Err(LlmError::ToolsUnsupported(message)) => {
+                    self.log_usage(
+                        &ctx,
+                        &key,
+                        &req,
+                        latency_ms,
+                        None,
+                        Some("tools_unsupported"),
+                    )
+                    .await;
+                    return Err(ChatError::ToolsUnsupported(message));
+                }
+                Err(LlmError::ContextOverflow(message)) => {
+                    self.log_usage(&ctx, &key, &req, latency_ms, None, Some("context_overflow"))
+                        .await;
+                    return Err(ChatError::ContextOverflow(message));
                 }
             }
         }

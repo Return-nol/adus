@@ -6,7 +6,7 @@ use adus_core::crypto::{Cipher, last4};
 use adus_core::types::ProviderKind;
 use adus_db::ai::{self, AiKey, AiKeyStatus, AiProvider};
 use adus_llm::router::{ChatError, ChatService, LlmRouter, UsageContext};
-use adus_llm::{ChatRequest, ChatResponse, LlmClient, LlmError};
+use adus_llm::{ChatRequest, ChatResponse, LlmClient, LlmError, StopReason};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -55,8 +55,12 @@ impl LlmClient for SharedFake {
 fn ok_response() -> ChatResponse {
     ChatResponse {
         text: "hello".into(),
+        tool_calls: Vec::new(),
+        stop_reason: StopReason::EndTurn,
         input_tokens: 10,
         output_tokens: 5,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     }
 }
 
@@ -67,12 +71,7 @@ fn rate_limited(secs: u64) -> Result<ChatResponse, LlmError> {
 }
 
 fn request() -> ChatRequest {
-    ChatRequest {
-        model: "gpt-test".into(),
-        system: "sys".into(),
-        user: "user".into(),
-        max_tokens: 100,
-    }
+    ChatRequest::text("gpt-test", "sys", "user", 100)
 }
 
 struct Setup {
@@ -380,6 +379,56 @@ async fn invalid_request_stops_without_trying_other_keys(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(rows, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn router_does_not_penalize_key_on_tools_unsupported_or_overflow(pool: PgPool) {
+    let s = setup(&pool, ProviderKind::Openai, 2).await;
+    s.fake.script(
+        "key-0",
+        vec![
+            Err(LlmError::ToolsUnsupported("no tools here".into())),
+            Err(LlmError::ContextOverflow("too long".into())),
+        ],
+    );
+    // key-1 was just used, so key-0 is always tried first.
+    ai::mark_used(&pool, s.keys[1].id, Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        chat(&s).await.unwrap_err(),
+        ChatError::ToolsUnsupported("no tools here".into())
+    );
+    assert_eq!(
+        chat(&s).await.unwrap_err(),
+        ChatError::ContextOverflow("too long".into())
+    );
+    // Request-level errors: one call each, no other key tried.
+    assert_eq!(s.fake.calls(), ["key-0", "key-0"]);
+    let key = key_state(&pool, &s, 0).await;
+    assert_eq!(key.status, AiKeyStatus::Ok);
+    assert!(key.cooldown_until.is_none());
+    assert!(key.last_used_at.is_none());
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT error_kind FROM llm_usage WHERE NOT success ORDER BY error_kind",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(kinds, ["context_overflow", "tools_unsupported"]);
+}
+
+#[test]
+fn new_chat_error_display_text() {
+    assert_eq!(
+        ChatError::ToolsUnsupported("x".into()).to_string(),
+        "tools not supported: x"
+    );
+    assert_eq!(
+        ChatError::ContextOverflow("y".into()).to_string(),
+        "context window exceeded: y"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

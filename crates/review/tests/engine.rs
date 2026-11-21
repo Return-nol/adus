@@ -347,6 +347,39 @@ async fn one_invalid_file_is_skipped_and_review_posted(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn one_context_overflow_file_is_skipped_and_review_posted(pool: PgPool) {
+    let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    s.chat
+        .push(Err(ChatError::ContextOverflow("prompt is too long".into())));
+    s.chat.push(Ok(&finding("b.rs", 2, "Bug")));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    assert_eq!(git.reviews[0].comments[0].path, "b.rs");
+    assert!(git.reviews[0].summary.contains("`a.rs`: LLM error"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn tools_unsupported_is_fatal(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.chat
+        .push(Err(ChatError::ToolsUnsupported("no tools".into())));
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert!(
+        matches!(&err, EngineError::Fatal(m) if m.contains("tools not supported")),
+        "{err:?}"
+    );
+    assert_eq!(latest(&pool).await.status, ReviewStatus::Failed);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn every_file_invalid_is_fatal(pool: PgPool) {
     let files = vec![file("a.rs", PATCH_2), file("b.rs", PATCH_2)];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;

@@ -286,6 +286,8 @@ fn error_kind(err: &LlmError) -> &'static str {
         LlmError::Unauthorized => "unauthorized",
         LlmError::Transient(_) => "transient",
         LlmError::Invalid(_) => "invalid",
+        LlmError::ToolsUnsupported(_) => "tools_unsupported",
+        LlmError::ContextOverflow(_) => "context_overflow",
     }
 }
 
@@ -310,12 +312,7 @@ async fn test_key(
             "the stored key could not be decrypted".to_string(),
         )),
         Ok(secret) => {
-            let req = ChatRequest {
-                model: model.clone(),
-                system: String::new(),
-                user: "ping".into(),
-                max_tokens: 5,
-            };
+            let req = ChatRequest::text(model.as_str(), "", "ping", 5);
             client_for(
                 provider.kind,
                 provider.base_url.as_deref(),
