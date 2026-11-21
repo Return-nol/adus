@@ -392,6 +392,27 @@ impl Toolbox {
         let call = ReadOnlyCall::ReadFile(args);
         run_cached(&self.workspace, &self.cache, &call, self.limits).ok()
     }
+
+    /// [`Self::read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
+    pub async fn read_file_snippet(
+        &self,
+        path: &str,
+        center_line: u32,
+        radius: u32,
+    ) -> Option<String> {
+        let this = Self {
+            workspace: Arc::clone(&self.workspace),
+            cache: Arc::clone(&self.cache),
+            // Only `read_file` runs here; the tool definitions are not needed.
+            read_only_defs: Vec::new(),
+            limits: self.limits,
+        };
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || this.read_file_snippet_sync(&path, center_line, radius))
+            .await
+            .ok()
+            .flatten()
+    }
 }
 
 fn run_cached(

@@ -6,6 +6,7 @@ use adus_core::types::{Severity, normalize_path};
 use adus_git::FileDiff;
 use adus_llm::ToolDef;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -50,6 +51,19 @@ fn first_json_array(raw: &str) -> Option<Vec<Map<String, Value>>> {
         }
     }
     saw_empty.then(Vec::new)
+}
+
+/// The first JSON object in `raw` (fenced or surrounded by prose) that deserializes into `T`.
+/// Objects that do not fit `T` (for example a quoted finding) are skipped; text after the
+/// object is ignored.
+// ponytail: O(n²) on text with many `{` that are not JSON; model replies are small.
+pub(crate) fn first_json_object<T: DeserializeOwned>(raw: &str) -> Option<T> {
+    raw.match_indices('{').find_map(|(start, _)| {
+        serde_json::Deserializer::from_str(&raw[start..])
+            .into_iter::<T>()
+            .next()?
+            .ok()
+    })
 }
 
 fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {

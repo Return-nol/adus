@@ -89,7 +89,7 @@ pub fn build_prompt(
 
 /// Bungkus data tak tepercaya dalam `<tag>...</tag>`. Tag penutup yang sama di dalam data
 /// dinetralkan supaya isi tidak bisa "keluar" dari bagiannya.
-fn wrap(tag: &str, content: &str) -> String {
+pub(crate) fn wrap(tag: &str, content: &str) -> String {
     format!("<{tag}>\n{}\n</{tag}>", neutralize_close_tag(content, tag))
 }
 
@@ -111,7 +111,7 @@ fn neutralize_close_tag(content: &str, tag: &str) -> String {
     out
 }
 
-fn or_none(text: String) -> String {
+pub(crate) fn or_none(text: String) -> String {
     if text.is_empty() {
         "(none)".to_string()
     } else {
@@ -251,8 +251,34 @@ pub fn build_finder_user_prompt(
     repo_instructions: Option<&str>,
     with_tools: bool,
 ) -> String {
-    let rules_text: Vec<String> = batch
-        .rules
+    let diffs: Vec<String> = batch.files.iter().map(|file| diff_block(file)).collect();
+
+    let mut sections = vec![
+        wrap("pr_title", &pr.title),
+        wrap(
+            "pr_description",
+            &truncate_chars(&pr.description, MAX_DESCRIPTION_CHARS),
+        ),
+        wrap("pr_manifest", manifest),
+        wrap("rules", &or_none(format_rules(&batch.rules))),
+        wrap("memories", &or_none(format_memories(memories))),
+    ];
+    if let Some(text) = repo_instructions {
+        sections.push(wrap("repository_instructions", text));
+    }
+    sections.push(wrap("diffs", &diffs.join("\n\n")));
+    let task = if with_tools {
+        FINDER_TASK_TOOLS
+    } else {
+        FINDER_TASK_DIFF_ONLY
+    };
+    sections.push(task.to_string());
+    sections.join("\n\n")
+}
+
+/// Numbered team rules, each with its severity and the files it applies to (`""` when none).
+pub(crate) fn format_rules(rules: &[&Rule]) -> String {
+    let lines: Vec<String> = rules
         .iter()
         .enumerate()
         .map(|(i, rule)| {
@@ -269,38 +295,21 @@ pub fn build_finder_user_prompt(
             )
         })
         .collect();
-    let memories_text: Vec<String> = memories
+    lines.join("\n\n")
+}
+
+/// Team memories as a `- ` list (`""` when none).
+pub(crate) fn format_memories(memories: &[Memory]) -> String {
+    let lines: Vec<String> = memories
         .iter()
         .map(|memory| format!("- {}", memory.content))
         .collect();
-    let diffs: Vec<String> = batch.files.iter().map(|file| diff_block(file)).collect();
-
-    let mut sections = vec![
-        wrap("pr_title", &pr.title),
-        wrap(
-            "pr_description",
-            &truncate_chars(&pr.description, MAX_DESCRIPTION_CHARS),
-        ),
-        wrap("pr_manifest", manifest),
-        wrap("rules", &or_none(rules_text.join("\n\n"))),
-        wrap("memories", &or_none(memories_text.join("\n"))),
-    ];
-    if let Some(text) = repo_instructions {
-        sections.push(wrap("repository_instructions", text));
-    }
-    sections.push(wrap("diffs", &diffs.join("\n\n")));
-    let task = if with_tools {
-        FINDER_TASK_TOOLS
-    } else {
-        FINDER_TASK_DIFF_ONLY
-    };
-    sections.push(task.to_string());
-    sections.join("\n\n")
+    lines.join("\n")
 }
 
 /// One file of a batch as the Finder sees it: a `=== path (status) ===` header, then the patch
 /// with new-file line numbers.
-fn diff_block(file: &FileDiff) -> String {
+pub(crate) fn diff_block(file: &FileDiff) -> String {
     format!(
         "=== {} ({}) ===\n{}",
         file.path,
