@@ -497,6 +497,8 @@ pub enum CloneBehavior {
 /// Cloner over a `TempDir` fixture. Records each spec's URL and each workspace root.
 pub struct FakeCloner {
     behavior: Mutex<CloneBehavior>,
+    /// `clone_pr` waits this long first (a slow fetch).
+    delay: Mutex<Duration>,
     urls: Mutex<Vec<String>>,
     roots: Mutex<Vec<PathBuf>>,
 }
@@ -505,6 +507,7 @@ impl Default for FakeCloner {
     fn default() -> Self {
         FakeCloner {
             behavior: Mutex::new(CloneBehavior::Files(Vec::new())),
+            delay: Mutex::new(Duration::ZERO),
             urls: Mutex::new(Vec::new()),
             roots: Mutex::new(Vec::new()),
         }
@@ -524,6 +527,11 @@ impl FakeCloner {
         self.set(CloneBehavior::Files(files));
     }
 
+    /// Every later `clone_pr` waits `delay` before it answers.
+    pub fn delay(&self, delay: Duration) {
+        *self.delay.lock().unwrap() = delay;
+    }
+
     pub fn urls(&self) -> Vec<String> {
         self.urls.lock().unwrap().clone()
     }
@@ -537,6 +545,8 @@ impl FakeCloner {
 impl RepoCloner for FakeCloner {
     async fn clone_pr(&self, spec: &CloneSpec) -> Result<RepoWorkspace, WorkspaceError> {
         self.urls.lock().unwrap().push(spec.url.clone());
+        let delay = *self.delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
         let behavior = self.behavior.lock().unwrap().clone();
         let files = match behavior {
             CloneBehavior::Files(files) => files,

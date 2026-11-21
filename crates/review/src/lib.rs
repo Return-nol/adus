@@ -13,12 +13,12 @@ pub mod workspace;
 
 pub use dedup::{DedupResult, deduplicate_findings};
 pub use parse::{
-    CommentableRange, ParseError, Suggestion, keep_valid, keep_valid_batch, parse_submit_findings,
+    CommentableRange, ParseError, Suggestion, keep_valid_batch, parse_submit_findings,
     parse_suggestions, submit_findings_tool_def,
 };
 pub use prompt::{
     DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestEntry, batch_targets, build_finder_system_prompt,
-    build_finder_user_prompt, build_manifest, build_prompt, format_inline, format_summary,
+    build_finder_user_prompt, build_manifest, format_inline, format_summary,
 };
 pub use specialists::{SpecialistKind, active_specialists};
 pub use verifier::{

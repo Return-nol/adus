@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::agent::AgentError;
 use crate::dedup::deduplicate_findings;
 use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
-use crate::parse::{CommentableRange, Suggestion, keep_valid_batch};
+use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
     DiffBatch, MARKER, MAX_BATCH_CHARS, batch_targets, build_manifest, format_inline,
     format_summary,
@@ -412,21 +412,34 @@ impl Engine {
             .collect();
         let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS);
 
-        // Clone: auth failure is fatal; anything else falls back to the diff only.
+        // Clone: auth failure is fatal; anything else, or a clone still running at the Finder
+        // deadline (spec decision 12: the clone is part of the Finder budget), falls back to
+        // the diff only.
         let clone_started = Instant::now();
         let mut fallback_reason = None;
         let workspace = match s.git.clone_spec(s.repo_ref, s.pr) {
             None => None,
-            Some(spec) => match self.cloner.clone_pr(&spec).await {
-                Ok(workspace) => Some(Arc::new(workspace)),
-                Err(WorkspaceError::Unauthorized) => return Err(self.unauthorized(s.conn).await),
-                Err(err) => {
-                    tracing::warn!(error = %err, "clone failed; reviewing the diff only");
-                    warnings.push(CODEBASE_UNAVAILABLE.into());
-                    fallback_reason = Some("clone_failed");
-                    None
+            Some(spec) => {
+                let clone = self.cloner.clone_pr(&spec);
+                match tokio::time::timeout_at(s.deadlines.finder, clone).await {
+                    Ok(Ok(workspace)) => Some(Arc::new(workspace)),
+                    Ok(Err(WorkspaceError::Unauthorized)) => {
+                        return Err(self.unauthorized(s.conn).await);
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, "clone failed; reviewing the diff only");
+                        warnings.push(CODEBASE_UNAVAILABLE.into());
+                        fallback_reason = Some("clone_failed");
+                        None
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!("clone cut by the finder deadline; reviewing the diff only");
+                        warnings.push(CODEBASE_UNAVAILABLE.into());
+                        fallback_reason = Some("clone_timed_out");
+                        None
+                    }
                 }
-            },
+            }
         };
         let clone_ms = clone_started.elapsed().as_millis();
         let repo_instructions = match &workspace {
@@ -462,7 +475,8 @@ impl Engine {
         };
         let finder_tasks = finder.tasks.len();
         let (cache_read_tokens, cache_write_tokens) = finder_cache_tokens(&finder.tasks);
-        let candidates = collect_candidates(finder.tasks, &batches, &allowed, skipped, warnings)?;
+        let candidates =
+            collect_candidates(finder.tasks, s.mode, &batches, &allowed, skipped, warnings)?;
         let candidate_count = candidates.len();
 
         let (verified, verifier_dropped) = if candidates.is_empty() {
@@ -533,7 +547,7 @@ impl Engine {
             candidates = candidate_count,
             verified_kept,
             verifier_dropped,
-            dedup_dropped = verified_kept - found.len(),
+            dedup_dropped = verified_kept.saturating_sub(found.len()),
             cache_read_tokens,
             cache_write_tokens,
             "review stages finished"
@@ -647,14 +661,18 @@ fn finder_cache_tokens(tasks: &[FinderTask]) -> (u32, u32) {
 }
 
 /// Turns Finder results into candidates for the Verifier, in (batch, specialist) order: each
-/// result is filtered to its batch's commentable lines, then exact `(file, line, title)`
-/// duplicates are dropped across the whole review.
+/// result is filtered to its batch's [`CommentableRange`]s (commentable lines, and hunks for a
+/// `start_line`), then exact `(file, line, title)` duplicates are merged across the whole
+/// review (see [`dedup_exact`]).
 ///
-/// A failed task becomes a summary note when another agent reviewed its batch (or when the
-/// deadline cut it); when no agent reviewed a batch, its files are listed as skipped. When no
-/// task succeeded at all, the review fails (see [`all_failed`]).
+/// A failed task becomes a summary note when another agent reviewed its batch; when no agent
+/// reviewed a batch, its files are listed as skipped (reason `timed_out` when the Finder
+/// deadline cut every agent of it). When no task succeeded at all, the review fails (see
+/// [`all_failed`]); in `Generalist` mode it is also retried when every failure was retryable
+/// (see [`generalist_retry`]).
 fn collect_candidates(
     tasks: Vec<FinderTask>,
+    mode: ReviewMode,
     batches: &[DiffBatch<'_>],
     allowed: &HashMap<String, CommentableRange>,
     skipped: &mut Vec<(String, &'static str)>,
@@ -662,6 +680,11 @@ fn collect_candidates(
 ) -> Result<Vec<CandidateFinding>, EngineError> {
     if !tasks.is_empty() && tasks.iter().all(|task| task.result.is_err()) {
         return Err(all_failed(tasks));
+    }
+    if mode == ReviewMode::Generalist
+        && let Some(err) = generalist_retry(&tasks)
+    {
+        return Err(err);
     }
     let reviewed: HashSet<usize> = tasks
         .iter()
@@ -684,51 +707,46 @@ fn collect_candidates(
         .collect();
 
     let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
     // Batch index → skip reason, for batches no agent reviewed.
     let mut unreviewed: BTreeMap<usize, &'static str> = BTreeMap::new();
     for task in tasks {
         let label = task.kind.label();
-        match task.result {
+        let reason = match task.result {
             Ok(outcome) => {
-                let Some(lines) = batch_allowed.get(task.batch) else {
+                let Some(range) = batch_allowed.get(task.batch) else {
                     continue;
                 };
-                for suggestion in keep_valid_batch(outcome.result, lines) {
-                    let key = (
-                        suggestion.file.clone(),
-                        suggestion.line,
-                        suggestion.title.clone(),
-                    );
-                    if seen.insert(key) {
-                        candidates.push(CandidateFinding {
-                            suggestion,
-                            specialist: task.kind,
-                        });
-                    }
-                }
+                candidates.extend(keep_valid_batch(outcome.result, range).into_iter().map(
+                    |suggestion| CandidateFinding {
+                        suggestion,
+                        specialist: task.kind,
+                    },
+                ));
+                continue;
             }
             Err(FinderFailure::TimedOut) => {
                 push_once(warnings, format!("{label} reviewer did not finish in time"));
+                "timed_out"
             }
             Err(FinderFailure::Agent(_)) if reviewed.contains(&task.batch) => {
                 push_once(warnings, format!("{label} reviewer did not complete"));
+                continue;
             }
-            Err(FinderFailure::Agent(err)) => {
-                let reason = match err {
-                    AgentError::Unparseable(_) => "unparseable",
-                    _ => "llm_error",
-                };
-                unreviewed
-                    .entry(task.batch)
-                    .and_modify(|current| {
-                        if *current != reason {
-                            *current = "llm_error";
-                        }
-                    })
-                    .or_insert(reason);
-            }
+            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => "unparseable",
+            Err(FinderFailure::Agent(_)) => "llm_error",
+        };
+        if reviewed.contains(&task.batch) {
+            continue;
         }
+        // Differing reasons for one batch read as a plain LLM error.
+        unreviewed
+            .entry(task.batch)
+            .and_modify(|current| {
+                if *current != reason {
+                    *current = "llm_error";
+                }
+            })
+            .or_insert(reason);
     }
     for (index, reason) in unreviewed {
         if let Some(batch) = batches.get(index) {
@@ -736,7 +754,36 @@ fn collect_candidates(
             skipped.extend(batch.files.iter().map(|file| (file.path.clone(), reason)));
         }
     }
-    Ok(candidates)
+    Ok(dedup_exact(candidates, |c| &c.suggestion))
+}
+
+/// Generalist rule of spec decision 8: when some Finder task failed and every failure was a
+/// retryable chat error (`AllKeysFailed`, `NoKeys`, `Internal`), retry the review rather than
+/// post it with those files skipped. A deadline cut is never retryable. The retry waits for
+/// the first `AllKeysFailed`'s `retry_after`.
+fn generalist_retry(tasks: &[FinderTask]) -> Option<EngineError> {
+    let mut first_retryable: Option<&ChatError> = None;
+    let mut rate_limited: Option<&ChatError> = None;
+    for task in tasks {
+        let err = match &task.result {
+            Ok(_) => continue,
+            Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(err) => err,
+            Err(_) => return None,
+        };
+        first_retryable.get_or_insert(err);
+        if matches!(err, ChatError::AllKeysFailed { .. }) {
+            rate_limited.get_or_insert(err);
+        }
+    }
+    rate_limited.or(first_retryable).cloned().map(chat_error)
+}
+
+/// `AllKeysFailed`, `NoKeys` and `Internal` may pass when the job is retried later.
+fn is_retryable(err: &ChatError) -> bool {
+    matches!(
+        err,
+        ChatError::AllKeysFailed { .. } | ChatError::NoKeys | ChatError::Internal(_)
+    )
 }
 
 /// The error when no Finder task succeeded. Retryable only when every failure was a
@@ -749,13 +796,11 @@ fn all_failed(tasks: Vec<FinderTask>) -> EngineError {
         let error = match task.result {
             Ok(_) => continue,
             Err(FinderFailure::TimedOut) => EngineError::Fatal("review timed out".into()),
-            Err(FinderFailure::Agent(AgentError::Chat(err))) => match err {
-                ChatError::AllKeysFailed { .. } | ChatError::NoKeys | ChatError::Internal(_) => {
-                    retryable.get_or_insert(err);
-                    continue;
-                }
-                other => chat_error(other),
-            },
+            Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(&err) => {
+                retryable.get_or_insert(err);
+                continue;
+            }
+            Err(FinderFailure::Agent(AgentError::Chat(err))) => chat_error(err),
             Err(FinderFailure::Agent(AgentError::Unparseable(_))) => {
                 EngineError::Fatal("LLM: review output could not be parsed".into())
             }

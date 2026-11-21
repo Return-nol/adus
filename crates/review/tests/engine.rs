@@ -425,10 +425,49 @@ async fn all_keys_failed_is_retryable_and_posts_nothing(pool: PgPool) {
     assert!(s.git.state().reviews.is_empty());
 }
 
-/// Spec decision 8: the review is retried only when every Finder task failed retryably.
+/// Spec decision 8, Generalist rule: when every failed Finder task failed retryably, the whole
+/// review is retried instead of posting the other batches.
 #[sqlx::test(migrations = "../../migrations")]
-async fn one_rate_limited_batch_is_skipped_and_the_rest_posted(pool: PgPool) {
-    let files = vec![big_file("a.rs"), big_file("b.rs")];
+async fn generalist_rate_limited_batch_retries_the_review(pool: PgPool) {
+    let files = vec![big_file("a.rs"), big_file("b.rs"), big_file("c.rs")];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("a.rs"),
+        Reply::Err(ChatError::NoKeys),
+    );
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("b.rs"),
+        Reply::Err(ChatError::AllKeysFailed {
+            retry_after: Some(Duration::from_secs(45)),
+        }),
+    );
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("c.rs"),
+        Reply::text(&finding("c.rs", 2, "Bug")),
+    );
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    // The first `AllKeysFailed` sets the retry delay.
+    assert_eq!(
+        err,
+        EngineError::Retryable(
+            "LLM: all API keys failed".into(),
+            Some(Duration::from_secs(45))
+        )
+    );
+    assert!(s.git.state().reviews.is_empty(), "nothing posted");
+    assert!(s.chat.verifier_calls().is_empty());
+    assert!(reviews::list(&pool, None, 1, 10).await.unwrap().is_empty());
+}
+
+/// A non-retryable failure among the failed tasks keeps the partial post in Generalist mode.
+#[sqlx::test(migrations = "../../migrations")]
+async fn generalist_mixed_failures_post_the_rest_with_skipped_files(pool: PgPool) {
+    let files = vec![big_file("a.rs"), big_file("b.rs"), big_file("c.rs")];
     let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
     s.chat.push_for(
         Stage::Finder,
@@ -438,7 +477,12 @@ async fn one_rate_limited_batch_is_skipped_and_the_rest_posted(pool: PgPool) {
     s.chat.push_for(
         Stage::Finder,
         &diff_header("b.rs"),
-        Reply::text(&finding("b.rs", 2, "Bug")),
+        Reply::Err(ChatError::Invalid("bad request".into())),
+    );
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("c.rs"),
+        Reply::text(&finding("c.rs", 2, "Bug")),
     );
 
     let id = run(&s, Trigger::Opened).await.unwrap();
@@ -447,8 +491,41 @@ async fn one_rate_limited_batch_is_skipped_and_the_rest_posted(pool: PgPool) {
     assert_eq!(row.status, ReviewStatus::Done);
     assert_eq!(row.comments_posted, 1);
     let git = s.git.state();
-    assert_eq!(git.reviews[0].comments[0].path, "b.rs");
-    assert!(git.reviews[0].summary.contains("`a.rs`: LLM error"));
+    assert_eq!(git.reviews[0].comments[0].path, "c.rs");
+    let summary = &git.reviews[0].summary;
+    assert!(summary.contains("`a.rs`: LLM error"), "{summary}");
+    assert!(summary.contains("`b.rs`: LLM error"), "{summary}");
+}
+
+/// Spec decision 8, Specialists: a rate-limited specialist is a note; the survivors are posted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn specialists_rate_limited_task_posts_survivors_with_note(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.chat.push_for(
+        Stage::Finder,
+        PERFORMANCE_ROLE,
+        Reply::Err(ChatError::AllKeysFailed { retry_after: None }),
+    );
+    s.chat.push_for(
+        Stage::Finder,
+        BUG_ROLE,
+        Reply::text(&finding("a.rs", 2, "Bug")),
+    );
+
+    let id = run_mode(&s, Trigger::Opened, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    let summary = &git.reviews[0].summary;
+    assert!(
+        summary.contains("**Notes**\n- Performance reviewer did not complete"),
+        "{summary}"
+    );
+    assert!(!summary.contains("Skipped files"), "{summary}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1599,6 +1676,67 @@ async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
     assert_eq!(row.error.as_deref(), Some("review timed out"));
 }
 
+/// A batch whose only agent was cut by the Finder deadline is listed under Skipped files, so the
+/// summary never implies its files were reviewed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn finder_deadline_lists_the_unfinished_batch_as_skipped(pool: PgPool) {
+    let files = vec![big_file("a.rs"), big_file("b.rs")];
+    let mut s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    // Finder deadline at 60 % = 1.8 s; the b.rs batch would answer after 30 s.
+    s.engine.review_timeout = Duration::from_secs(3);
+    s.chat.delay(&diff_header("b.rs"), Duration::from_secs(30));
+    s.chat.push_for(
+        Stage::Finder,
+        &diff_header("a.rs"),
+        Reply::text(&finding("a.rs", 2, "Bug")),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    let summary = &git.reviews[0].summary;
+    assert!(
+        summary.contains("**Skipped files**\n- `b.rs`: review did not finish in time"),
+        "{summary}"
+    );
+    assert!(!summary.contains("`a.rs`"), "{summary}");
+    assert!(
+        summary.contains("**Notes**\n- Generalist reviewer did not finish in time"),
+        "{summary}"
+    );
+}
+
+/// Spec decision 12: the clone counts against the Finder deadline. A clone still running then
+/// is abandoned and the Finder falls back to the diff.
+#[sqlx::test(migrations = "../../migrations")]
+async fn clone_is_bounded_by_the_finder_deadline(pool: PgPool) {
+    let mut s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    // Finder deadline at 60 % = 1.2 s; the clone would take 30 s.
+    s.engine.review_timeout = Duration::from_secs(2);
+    s.cloner.delay(Duration::from_secs(30));
+    let started = Instant::now();
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    // The clone used up the Finder budget, so the diff-only Finder is cut at once.
+    assert_eq!(err, EngineError::Fatal("review timed out".into()));
+    assert!(started.elapsed() < Duration::from_millis(1900));
+    assert_eq!(s.cloner.urls().len(), 1);
+    let finder = s.chat.finder_calls();
+    assert!(
+        !finder.is_empty(),
+        "the Finder ran after the clone timed out"
+    );
+    for call in &finder {
+        assert_eq!(call.tools, vec!["submit_findings"], "no repository tools");
+        assert!(call.system.contains("You cannot open other files"));
+    }
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn multiline_finding_keeps_same_hunk_span_and_drops_cross_hunk_start_line(pool: PgPool) {
     let patch = "@@ -1,2 +1,4 @@\n ctx\n+let a = 1;\n+let b = 2;\n tail\n\
@@ -1612,6 +1750,7 @@ async fn multiline_finding_keeps_same_hunk_span_and_drops_cross_hunk_start_line(
             "severity": "warning",
             "title": "Same hunk",
             "body": "spans lines 2-3",
+            "suggestion": "let a = 10;\nlet b = 20;",
         },
         {
             "file": "src/a.rs",
@@ -1620,6 +1759,7 @@ async fn multiline_finding_keeps_same_hunk_span_and_drops_cross_hunk_start_line(
             "severity": "info",
             "title": "Cross hunk",
             "body": "cannot span across hunks",
+            "suggestion": "let a = 1;\nlet b = 2;\nlet y = 4;",
         },
     ]);
     s.chat.push(Ok(&findings.to_string()));
@@ -1647,7 +1787,116 @@ async fn multiline_finding_keeps_same_hunk_span_and_drops_cross_hunk_start_line(
     assert_eq!(posted[0].start_line, Some(2));
     assert_eq!(posted[0].line, 3);
     assert_eq!(posted[0].end_offset, Some(11));
+    assert!(
+        posted[0]
+            .body
+            .ends_with("```suggestion\nlet a = 10;\nlet b = 20;\n```"),
+        "{}",
+        posted[0].body
+    );
     assert_eq!(posted[1].start_line, None);
     assert_eq!(posted[1].line, 13);
     assert_eq!(posted[1].end_offset, None);
+    // The dropped span takes its multi-line suggestion with it: posted on line 13 alone it
+    // would duplicate lines on "Apply suggestion".
+    assert!(posted[1].body.contains("cannot span across hunks"));
+    assert!(
+        !posted[1].body.contains("```suggestion"),
+        "{}",
+        posted[1].body
+    );
+}
+
+/// Incremental review: ranges are checked against the hunks shared by the new commit's diff
+/// and the PR diff (`intersect_hunks`), not against the wider commit hunk.
+#[sqlx::test(migrations = "../../migrations")]
+async fn incremental_review_keeps_ranges_inside_the_intersected_hunk_only(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_2)]),
+    )
+    .await;
+    run(&s, Trigger::Opened).await.unwrap();
+    {
+        let mut git = s.git.state();
+        git.pr = pr("h2");
+        // PR diff: two hunks, new lines 1-4 and 10-13 (added: 2, 3, 11, 12).
+        git.full = vec![file(
+            "src/a.rs",
+            "@@ -1,2 +1,4 @@\n l1\n+l2\n+l3\n l4\n@@ -8,2 +10,4 @@\n l10\n+l11\n+l12\n l13\n",
+        )];
+        // New commit: one wide hunk, new lines 1-13, adding the same lines.
+        git.incremental = vec![file(
+            "src/a.rs",
+            "@@ -1,9 +1,13 @@\n l1\n+l2\n+l3\n l4\n l5\n l6\n l7\n l8\n l9\n l10\n+l11\n+l12\n l13\n",
+        )];
+    }
+    let findings = json!([
+        {
+            "file": "src/a.rs", "start_line": 2, "line": 3, "severity": "warning",
+            "title": "Inside", "body": "inside the PR hunk", "suggestion": "L2\nL3",
+        },
+        {
+            "file": "src/a.rs", "start_line": 3, "line": 11, "severity": "warning",
+            "title": "Crossing", "body": "leaves the PR hunk", "suggestion": "x\ny\nz",
+        },
+    ]);
+    s.chat.push(Ok(&findings.to_string()));
+
+    let id = run(&s, Trigger::Updated).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    let git = s.git.state();
+    assert_eq!(git.diff_between_calls.len(), 1, "incremental path taken");
+    let posted = &git.reviews[1].comments;
+    assert_eq!(posted.len(), 2);
+    assert_eq!((posted[0].start_line, posted[0].line), (Some(2), 3));
+    assert_eq!(posted[0].end_offset, Some(3));
+    assert!(posted[0].body.ends_with("```suggestion\nL2\nL3\n```"));
+    assert_eq!((posted[1].start_line, posted[1].line), (None, 11));
+    assert_eq!(posted[1].end_offset, None);
+    assert!(
+        !posted[1].body.contains("```suggestion"),
+        "{}",
+        posted[1].body
+    );
+}
+
+/// Two specialists report the same `(file, line, title)`; the one with a valid range is kept.
+#[sqlx::test(migrations = "../../migrations")]
+async fn exact_duplicates_prefer_the_entry_with_a_valid_range(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_234)]),
+    )
+    .await;
+    s.chat.push_for(
+        Stage::Finder,
+        BUG_ROLE,
+        Reply::text(&json!([finding_json("src/a.rs", 3, "warning", "Dup")]).to_string()),
+    );
+    let ranged = json!([{
+        "file": "src/a.rs", "start_line": 2, "line": 3, "severity": "warning",
+        "title": "Dup", "body": "ranged", "suggestion": "B\nC",
+    }]);
+    s.chat.push_for(
+        Stage::Finder,
+        SECURITY_ROLE,
+        Reply::text(&ranged.to_string()),
+    );
+
+    run_mode(&s, Trigger::Opened, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        s.chat.verifier_calls().len(),
+        1,
+        "one candidate after exact dedup"
+    );
+    let git = s.git.state();
+    let posted = &git.reviews[0].comments;
+    assert_eq!(posted.len(), 1);
+    assert_eq!((posted[0].start_line, posted[0].line), (Some(2), 3));
+    assert!(posted[0].body.contains("ranged"));
 }
