@@ -3,13 +3,14 @@ mod common;
 use std::time::Duration;
 
 use adus_core::job::Trigger;
-use adus_core::types::{ADUDU_MARKER, Severity};
+use adus_core::types::{ADUDU_MARKER, ReviewMode, Severity};
 use adus_db::connections::{self, ConnectionStatus};
 use adus_db::repositories::{self, RepoPatch};
 use adus_db::reviews::{self, Review, ReviewStatus};
 use adus_db::rules::{self, KnowledgeScope, NewRule};
 use adus_db::settings;
 use adus_git::{ConnectionKind, FileStatus, GitError};
+use adus_llm::ReasoningEffort;
 use adus_llm::router::ChatError;
 use adus_review::engine::EngineError;
 use common::{FakeGit, PAT, Setup, file, finding, pr, setup};
@@ -431,7 +432,6 @@ async fn no_model_configured_fails_with_pr_comment(pool: PgPool) {
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
     let mut current = settings::get(&pool).await.unwrap();
     current.default_provider_id = None;
-    current.default_model = None;
     settings::update(&pool, &current).await.unwrap();
 
     let err = run(&s, Trigger::Opened).await.unwrap_err();
@@ -478,15 +478,20 @@ async fn no_model_on_updated_is_skipped_not_failed(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn repo_model_override_wins(pool: PgPool) {
+async fn repo_provider_override_wins(pool: PgPool) {
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
-    let other =
-        adus_db::ai::insert_provider(&pool, adus_core::types::ProviderKind::Anthropic, "a", None)
-            .await
-            .unwrap();
+    let other = adus_db::ai::insert_provider(
+        &pool,
+        adus_core::types::ProviderKind::Anthropic,
+        "a",
+        None,
+        "claude-test",
+        None,
+    )
+    .await
+    .unwrap();
     let patch = RepoPatch {
         review_provider_id: Some(Some(other.id)),
-        review_model: Some(Some("claude-test".into())),
         ..Default::default()
     };
     repositories::update(&pool, s.repository_id, patch)
@@ -498,6 +503,96 @@ async fn repo_model_override_wins(pool: PgPool) {
     let calls = s.chat.calls();
     assert_eq!(calls[0].provider_id, other.id);
     assert_eq!(calls[0].model, "claude-test");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn disabled_provider_treated_as_no_model(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    adus_db::ai::update_provider(
+        &pool,
+        s.provider_id,
+        "openai",
+        None,
+        "gpt-test",
+        Some("gpt-fast"),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let id = run(&s, Trigger::Updated).await.unwrap();
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Skipped);
+    assert_eq!(row.skip_reason.as_deref(), Some("no_model"));
+    assert!(s.git.state().comments.is_empty());
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::Fatal("no review model configured".to_string())
+    );
+    assert_eq!(s.git.state().comments.len(), 1);
+    assert!(s.chat.calls().is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_mode_adjusts_reasoning_effort(pool: PgPool) {
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+
+    // Default (Generalist) -> Medium.
+    run(&s, Trigger::Opened).await.unwrap();
+
+    // mode_override = Specialists -> High.
+    s.engine
+        .review_pr(
+            s.repository_id,
+            7,
+            Trigger::Command,
+            Some(ReviewMode::Specialists),
+        )
+        .await
+        .unwrap();
+
+    // repo.review_mode = Specialists -> High.
+    repositories::update(
+        &pool,
+        s.repository_id,
+        RepoPatch {
+            review_mode: Some(Some(ReviewMode::Specialists)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    run(&s, Trigger::Opened).await.unwrap();
+
+    // Clear repo override, set settings.review_mode = Specialists -> High.
+    repositories::update(
+        &pool,
+        s.repository_id,
+        RepoPatch {
+            review_mode: Some(None),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut current = settings::get(&pool).await.unwrap();
+    current.review_mode = ReviewMode::Specialists;
+    settings::update(&pool, &current).await.unwrap();
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let efforts: Vec<Option<ReasoningEffort>> =
+        s.chat.calls().into_iter().map(|c| c.effort).collect();
+    assert_eq!(
+        efforts,
+        vec![
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::High),
+        ]
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

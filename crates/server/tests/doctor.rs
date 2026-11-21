@@ -42,7 +42,7 @@ async fn healthy_world(pool: PgPool) -> World {
     let git = Arc::new(FakeGitFactory::default());
     let state = app_state(pool.clone(), "http://localhost:8080", git.clone(), queue);
 
-    let provider = ai::insert_provider(&pool, ProviderKind::Openai, "OpenAI", None)
+    let provider = ai::insert_provider(&pool, ProviderKind::Openai, "OpenAI", None, "gpt-x", None)
         .await
         .unwrap();
     let encrypted = state.cipher.encrypt(API_KEY);
@@ -53,7 +53,6 @@ async fn healthy_world(pool: PgPool) -> World {
         &pool,
         &Settings {
             default_provider_id: Some(provider.id),
-            default_model: Some("gpt-x".into()),
             max_files_per_review: 50,
             max_patch_lines_per_file: 2000,
             ignore_paths: None,
@@ -135,26 +134,12 @@ async fn doctor_not_running_without_worker_heartbeat(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn doctor_not_running_with_blank_default_model(pool: PgPool) {
-    let w = healthy_world(pool.clone()).await;
-    sqlx::query("UPDATE settings SET default_model = '   '")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let report = doctor::run(&w.state).await;
-    assert_eq!(report.verdict, Verdict::NotRunning);
-    assert_eq!(fails(&report), vec!["Default model"]);
-    cleanup_queue(&w.prefix).await;
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn doctor_not_running_without_default_model(pool: PgPool) {
+async fn doctor_not_running_without_default_provider(pool: PgPool) {
     let w = healthy_world(pool.clone()).await;
     let current = settings::get(&pool).await.unwrap();
     settings::update(
         &pool,
         &Settings {
-            default_model: None,
             default_provider_id: None,
             ..current
         },
@@ -164,7 +149,25 @@ async fn doctor_not_running_without_default_model(pool: PgPool) {
 
     let report = doctor::run(&w.state).await;
     assert_eq!(report.verdict, Verdict::NotRunning);
-    assert_eq!(fails(&report), vec!["Default model"]);
+    assert_eq!(fails(&report), vec!["Default provider"]);
+    cleanup_queue(&w.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn doctor_not_running_when_default_provider_disabled(pool: PgPool) {
+    let w = healthy_world(pool.clone()).await;
+    let provider_id = settings::get(&pool)
+        .await
+        .unwrap()
+        .default_provider_id
+        .unwrap();
+    ai::update_provider(&pool, provider_id, "OpenAI", None, "gpt-x", None, false)
+        .await
+        .unwrap();
+
+    let report = doctor::run(&w.state).await;
+    assert_eq!(report.verdict, Verdict::NotRunning);
+    assert_eq!(fails(&report), vec!["Default provider", "AI key"]);
     cleanup_queue(&w.prefix).await;
 }
 

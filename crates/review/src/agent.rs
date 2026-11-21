@@ -4,7 +4,8 @@
 
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use adus_llm::{
-    AssistantPart, ChatRequest, ChatResponse, Message, ToolCall, ToolDef, ToolResult, UserPart,
+    AssistantPart, ChatRequest, ChatResponse, Message, ReasoningEffort, ToolCall, ToolDef,
+    ToolResult, UserPart,
 };
 use futures::{StreamExt, stream};
 use serde_json::Value;
@@ -110,6 +111,7 @@ pub struct AgentLlm<'a> {
     pub provider_id: Uuid,
     pub model: &'a str,
     pub system: &'a str,
+    pub effort: Option<ReasoningEffort>,
     /// Cloned into every `chat` call.
     pub usage: &'a UsageContext,
 }
@@ -288,6 +290,7 @@ async fn request(
         messages: messages.to_vec(),
         tools,
         max_tokens,
+        effort: llm.effort,
     };
     let first = llm
         .chat
@@ -476,8 +479,10 @@ mod tests {
     use std::fs;
     use std::sync::{Arc, Mutex};
 
-    use adus_llm::UserPart;
-    use adus_llm::{AssistantPart, ChatRequest, ChatResponse, StopReason, ToolCall, ToolResult};
+    use adus_llm::{
+        AssistantPart, ChatRequest, ChatResponse, ReasoningEffort, StopReason, ToolCall,
+        ToolResult, UserPart,
+    };
     use async_trait::async_trait;
     use serde_json::json;
     use tempfile::TempDir;
@@ -650,6 +655,7 @@ mod tests {
             provider_id: Uuid::from_u128(1),
             model: "m1",
             system: "sys",
+            effort: Some(ReasoningEffort::Medium),
             usage: &usage,
         };
         run_react_loop(&llm, tools, &SubmitAnswer::new(), config, "PROMPT".into()).await
@@ -750,6 +756,7 @@ mod tests {
         assert_eq!(reqs[0].model, "m1");
         assert_eq!(reqs[0].system, "sys");
         assert_eq!(reqs[0].max_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(reqs[0].effort, Some(ReasoningEffort::Medium));
         assert_eq!(reqs[0].messages, vec![user("PROMPT")]);
 
         let second = &reqs[1].messages;
@@ -1256,6 +1263,7 @@ mod tests {
             provider_id: Uuid::nil(),
             model: "m",
             system: "s",
+            effort: None,
             usage: &usage,
         };
         let tb = default_toolbox();

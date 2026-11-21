@@ -11,8 +11,8 @@ pub use anthropic::AnthropicClient;
 pub use gemini::GeminiClient;
 pub use openai::OpenAiClient;
 pub use types::{
-    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, StopReason, ToolCall,
-    ToolDef, ToolResult, UserPart,
+    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
+    StopReason, ToolCall, ToolDef, ToolResult, UserPart,
 };
 
 /// Base URL bawaan tiap provider. `OpenaiCompatible` tidak punya (wajib diisi admin).
@@ -49,6 +49,12 @@ struct MissingBaseUrl;
 #[async_trait]
 impl LlmClient for MissingBaseUrl {
     async fn chat(&self, _api_key: &str, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        Err(LlmError::Invalid(
+            "base_url required for openai_compatible".into(),
+        ))
+    }
+
+    async fn list_models(&self, _api_key: &str) -> Result<Vec<String>, LlmError> {
         Err(LlmError::Invalid(
             "base_url required for openai_compatible".into(),
         ))

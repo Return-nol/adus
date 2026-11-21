@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use adus_llm::{
-    AssistantPart, ChatRequest, ChatResponse, LlmError, Message, ProviderKind, StopReason,
-    ToolCall, ToolDef, ToolResult, UserPart, client_for, default_base_url,
+    AssistantPart, ChatRequest, ChatResponse, LlmError, Message, ProviderKind, ReasoningEffort,
+    StopReason, ToolCall, ToolDef, ToolResult, UserPart, client_for, default_base_url,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, header, method, path};
@@ -1372,5 +1372,279 @@ async fn gemini_drops_empty_assistant_text_parts() {
              "thoughtSignature": "sig-a"},
             {"functionCall": {"name": "grep", "args": {"pattern": "todo"}}},
         ]})
+    );
+}
+
+#[tokio::test]
+async fn openai_sends_reasoning_effort_when_configured() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({"choices": [{"message": {"content": "ok"}}]})),
+    )
+    .await;
+    let req = ChatRequest::text("o3", "sys", "hi", 100).with_effort(ReasoningEffort::High);
+    chat_with(ProviderKind::Openai, &server, &req)
+        .await
+        .unwrap();
+    let body = sent_body(&server).await;
+    assert_eq!(body["reasoning_effort"], "high");
+}
+
+#[tokio::test]
+async fn retries_without_effort_when_provider_rejects_reasoning_param() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(OPENAI_PATH))
+        .and(body_partial_json(json!({"reasoning_effort": "high"})))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "Unrecognized request argument supplied: reasoning_effort"}
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(OPENAI_PATH))
+        .respond_with(ok(json!({
+            "choices": [{"message": {"content": "recovered"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req = ChatRequest::text("gpt-4o-mini", "sys", "hi", 100).with_effort(ReasoningEffort::High);
+    let resp = chat_with(ProviderKind::Openai, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(resp.text, "recovered");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first: Value = requests[0].body_json().unwrap();
+    let second: Value = requests[1].body_json().unwrap();
+    assert_eq!(first["reasoning_effort"], "high");
+    assert!(second.get("reasoning_effort").is_none());
+}
+
+#[tokio::test]
+async fn anthropic_sends_thinking_budget_and_replays_thinking_blocks_on_tool_turns() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ANTHROPIC_PATH))
+        .respond_with(ok(json!({
+            "content": [
+                {"type": "thinking", "thinking": "check caller", "signature": "sig_1"},
+                {"type": "redacted_thinking", "data": "red_1"},
+                {"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {"path": "a.rs"}}
+            ],
+            "stop_reason": "tool_use"
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(ANTHROPIC_PATH))
+        .respond_with(ok(json!({
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut req = ChatRequest::text("claude-sonnet-4-5", "sys", "hi", 8192)
+        .with_effort(ReasoningEffort::Medium);
+    req.tools = tools();
+
+    let first_resp = chat_with(ProviderKind::Anthropic, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(first_resp.tool_calls.len(), 1);
+    assert_eq!(first_resp.tool_calls[0].id, "tu_1");
+
+    req.messages.push(Message::Assistant {
+        parts: vec![AssistantPart::ToolCall(first_resp.tool_calls[0].clone())],
+    });
+    req.messages.push(Message::Tool {
+        results: vec![ToolResult {
+            call_id: "tu_1".into(),
+            tool_name: "read_file".into(),
+            content: "fn a() {}".into(),
+            is_error: false,
+        }],
+    });
+    let second_resp = chat_with(ProviderKind::Anthropic, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(second_resp.text, "done");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first_body: Value = requests[0].body_json().unwrap();
+    assert_eq!(
+        first_body["thinking"],
+        json!({"type": "enabled", "budget_tokens": 4096})
+    );
+    assert_eq!(first_body["max_tokens"], 8192 + 4096);
+
+    let second_body: Value = requests[1].body_json().unwrap();
+    assert_eq!(
+        second_body["messages"][1],
+        json!({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "check caller", "signature": "sig_1"},
+                {"type": "redacted_thinking", "data": "red_1"},
+                {"type": "tool_use", "id": "tu_1", "name": "read_file", "input": {"path": "a.rs"}}
+            ]
+        })
+    );
+}
+
+#[tokio::test]
+async fn gemini_sends_thinking_budget_and_filters_thought_parts() {
+    let server = serve(
+        GEMINI_PATH,
+        ok(json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "internal thought", "thought": true},
+                        {"text": "visible answer"}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        })),
+    )
+    .await;
+    let req = ChatRequest::text("m-1", "sys", "hi", 200).with_effort(ReasoningEffort::Low);
+    let resp = chat_with(ProviderKind::Gemini, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(resp.text, "visible answer");
+    assert_eq!(
+        sent_body(&server).await["generationConfig"],
+        json!({"maxOutputTokens": 200, "thinkingConfig": {"thinkingBudget": 1024}})
+    );
+}
+
+#[tokio::test]
+async fn list_models_across_openai_anthropic_and_gemini() {
+    let openai_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        .respond_with(ok(json!({
+            "data": [{"id": "gpt-5"}, {"id": "gpt-5-mini"}, {"id": "gpt-5"}]
+        })))
+        .expect(1)
+        .mount(&openai_server)
+        .await;
+    let openai_models = client_for(
+        ProviderKind::Openai,
+        Some(&openai_server.uri()),
+        reqwest::Client::new(),
+    )
+    .list_models(KEY)
+    .await
+    .unwrap();
+    assert_eq!(openai_models, vec!["gpt-5", "gpt-5-mini"]);
+
+    let anthropic_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("x-api-key", KEY))
+        .and(header("anthropic-version", "2023-06-01"))
+        .respond_with(ok(json!({
+            "data": [{"id": "claude-sonnet-4-5"}, {"id": "claude-haiku-4-5"}]
+        })))
+        .expect(1)
+        .mount(&anthropic_server)
+        .await;
+    let anthropic_models = client_for(
+        ProviderKind::Anthropic,
+        Some(&anthropic_server.uri()),
+        reqwest::Client::new(),
+    )
+    .list_models(KEY)
+    .await
+    .unwrap();
+    assert_eq!(
+        anthropic_models,
+        vec!["claude-haiku-4-5", "claude-sonnet-4-5"]
+    );
+
+    let gemini_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1beta/models"))
+        .and(header("x-goog-api-key", KEY))
+        .respond_with(ok(json!({
+            "models": [
+                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]}
+            ]
+        })))
+        .expect(1)
+        .mount(&gemini_server)
+        .await;
+    let gemini_models = client_for(
+        ProviderKind::Gemini,
+        Some(&gemini_server.uri()),
+        reqwest::Client::new(),
+    )
+    .list_models(KEY)
+    .await
+    .unwrap();
+    assert_eq!(gemini_models, vec!["gemini-2.5-pro"]);
+}
+
+#[tokio::test]
+async fn openai_compatible_surfaces_http_200_error_body() {
+    for (body, expected) in [
+        (
+            json!({"error": {"message": "Upstream failed", "code": 502}}),
+            LlmError::Transient("provider status 502: Upstream failed".into()),
+        ),
+        (
+            json!({"error": {"message": "Invalid auth", "code": 401}}),
+            LlmError::Unauthorized,
+        ),
+        (
+            json!({"error": {"message": "Rate limited", "code": 429}}),
+            LlmError::RateLimited { retry_after: None },
+        ),
+        (
+            json!({"error": {"message": "Insufficient credits", "code": 402}}),
+            LlmError::Invalid("provider status 402: Insufficient credits".into()),
+        ),
+    ] {
+        let server = serve(OPENAI_PATH, ok(body)).await;
+        let err = chat(ProviderKind::OpenaiCompatible, &server)
+            .await
+            .unwrap_err();
+        assert_eq!(err, expected);
+    }
+}
+
+#[tokio::test]
+async fn openai_compatible_reports_reasoning_budget_exhaustion() {
+    let server = serve(
+        OPENAI_PATH,
+        ok(json!({
+            "choices": [{
+                "message": {"content": "", "reasoning": "thinking step 1..."},
+                "finish_reason": "length"
+            }]
+        })),
+    )
+    .await;
+    let err = chat(ProviderKind::OpenaiCompatible, &server)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        LlmError::Invalid("empty response: model exhausted max_tokens during reasoning".into())
     );
 }

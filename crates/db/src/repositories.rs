@@ -21,7 +21,6 @@ pub struct Repository {
     pub webhook_external_ids: Vec<String>,
     pub webhook_token: Option<String>,
     pub review_provider_id: Option<Uuid>,
-    pub review_model: Option<String>,
     /// Per-repository review mode; NULL = use the global setting.
     pub review_mode: Option<ReviewMode>,
     pub created_at: DateTime<Utc>,
@@ -44,14 +43,13 @@ pub struct RepoPatch {
     pub enabled: Option<bool>,
     pub auto_review: Option<bool>,
     pub review_provider_id: Option<Option<Uuid>>,
-    pub review_model: Option<Option<String>>,
     pub review_mode: Option<Option<ReviewMode>>,
 }
 
 // Semua query di bawah hanya melihat repo aktif (`deleted_at IS NULL`).
 const COLUMNS: &str = "id, connection_id, external_id, owner, project, project_name, name, default_branch, \
                        enabled, auto_review, webhook_external_ids, webhook_token, \
-                       review_provider_id, review_model, review_mode, created_at";
+                       review_provider_id, review_mode, created_at";
 
 /// `None` jika repo yang sama sudah aktif di connection ini.
 pub async fn insert(pool: &PgPool, new: NewRepository<'_>) -> Result<Option<Repository>> {
@@ -96,13 +94,13 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Repository>> {
 }
 
 pub async fn update(pool: &PgPool, id: Uuid, patch: RepoPatch) -> Result<Option<Repository>> {
-    // $4 / $6 / $8 menandai apakah kolom nullable diubah (termasuk dikosongkan); $5 / $7 / $9 nilai barunya.
+    // $4 / $6 menandai apakah kolom nullable diubah (termasuk dikosongkan); $5 / $7 nilai barunya.
     sqlx::query_as(&format!(
         "UPDATE repositories SET \
            enabled = COALESCE($2, enabled), \
            auto_review = COALESCE($3, auto_review), \
            review_provider_id = CASE WHEN $4 THEN $5 ELSE review_provider_id END, \
-           review_model = CASE WHEN $6 THEN $7 ELSE review_model END,            review_mode = CASE WHEN $8 THEN $9 ELSE review_mode END \
+           review_mode = CASE WHEN $6 THEN $7 ELSE review_mode END \
          WHERE id = $1 AND deleted_at IS NULL RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -110,8 +108,6 @@ pub async fn update(pool: &PgPool, id: Uuid, patch: RepoPatch) -> Result<Option<
     .bind(patch.auto_review)
     .bind(patch.review_provider_id.is_some())
     .bind(patch.review_provider_id.flatten())
-    .bind(patch.review_model.is_some())
-    .bind(patch.review_model.flatten())
     .bind(patch.review_mode.is_some())
     .bind(patch.review_mode.flatten())
     .fetch_optional(pool)
@@ -287,7 +283,6 @@ mod tests {
             webhook_external_ids: vec![],
             webhook_token: None,
             review_provider_id: None,
-            review_model: None,
             review_mode: None,
             created_at: Utc::now(),
         }
@@ -359,7 +354,6 @@ mod tests {
             webhook_external_ids: vec![],
             webhook_token: Some("tok".into()),
             review_provider_id: None,
-            review_model: None,
             review_mode: None,
             created_at: Utc::now(),
         };

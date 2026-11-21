@@ -21,7 +21,7 @@ async fn call(app: &Router, method: &str, uri: &str, body: &Value, cookie: &str)
 
 /// Provider `openai` dengan satu key berlabel `label`; mengembalikan (provider_id, key_id).
 async fn provider_with_key(app: &Router, admin: &str, name: &str, label: &str) -> (String, String) {
-    let body = json!({ "kind": "openai", "name": name });
+    let body = json!({ "kind": "openai", "name": name, "primary_model": "gpt-5" });
     let provider = send(app, post_json("/api/v1/ai-providers", &body, Some(admin))).await;
     let provider = provider.body["id"].as_str().unwrap().to_string();
     let uri = format!("/api/v1/ai-providers/{provider}/keys");
@@ -331,7 +331,7 @@ async fn user_role_can_read_usage_but_not_edit_keys(pool: PgPool) {
         (
             "POST",
             "/api/v1/ai-providers".to_string(),
-            json!({ "kind": "openai", "name": "x" }),
+            json!({ "kind": "openai", "name": "x", "primary_model": "gpt-5" }),
         ),
         ("PATCH", provider_uri.clone(), json!({ "name": "x" })),
         ("DELETE", provider_uri.clone(), Value::Null),
@@ -346,7 +346,7 @@ async fn user_role_can_read_usage_but_not_edit_keys(pool: PgPool) {
         (
             "PUT",
             "/api/v1/settings".to_string(),
-            json!({ "default_provider_id": null, "default_model": null,
+            json!({ "default_provider_id": null,
                     "max_files_per_review": 1, "max_patch_lines_per_file": 1 }),
         ),
     ];

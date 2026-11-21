@@ -1,5 +1,5 @@
 use adus_db::{
-    connections,
+    ai, connections,
     repositories::{self, NewRepository, RepoPatch, Repository},
 };
 use adus_git::RepoRef;
@@ -44,8 +44,6 @@ struct UpdateRepository {
     /// Ada dan `null` = kosongkan; tidak ada = biarkan.
     #[serde(default, deserialize_with = "present_or_null")]
     review_provider_id: Option<Option<Uuid>>,
-    #[serde(default, deserialize_with = "present_or_null")]
-    review_model: Option<Option<String>>,
 }
 
 /// Membedakan field yang tidak dikirim (`None`) dari field yang dikirim `null` (`Some(None)`).
@@ -73,7 +71,6 @@ struct RepositoryJson {
     enabled: bool,
     auto_review: bool,
     review_provider_id: Option<Uuid>,
-    review_model: Option<String>,
     webhook_count: usize,
     created_at: DateTime<Utc>,
 }
@@ -93,7 +90,6 @@ impl From<Repository> for RepositoryJson {
             enabled: r.enabled,
             auto_review: r.auto_review,
             review_provider_id: r.review_provider_id,
-            review_model: r.review_model,
             webhook_count: r.webhook_external_ids.len(),
             created_at: r.created_at,
         }
@@ -227,14 +223,15 @@ async fn update(
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(body): ApiJson<UpdateRepository>,
 ) -> Result<Json<RepositoryJson>, ApiError> {
+    if let Some(Some(provider_id)) = body.review_provider_id
+        && ai::get_provider(&state.db, provider_id).await?.is_none()
+    {
+        return Err(ApiError::not_found());
+    }
     let patch = RepoPatch {
         enabled: body.enabled,
         auto_review: body.auto_review,
         review_provider_id: body.review_provider_id,
-        // String kosong sama dengan menghapus override.
-        review_model: body
-            .review_model
-            .map(|m| m.map(|m| m.trim().to_string()).filter(|m| !m.is_empty())),
         // The API does not expose the review mode yet.
         review_mode: None,
     };

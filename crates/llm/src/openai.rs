@@ -7,8 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::types::{
-    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, StopReason, ToolCall,
-    UserPart, decode, key_header, non_empty, send,
+    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
+    StopReason, ToolCall, UserPart, decode, format_provider_message, is_reasoning_unsupported,
+    key_header, non_empty, normalize_model_ids, send,
 };
 
 pub struct OpenAiClient {
@@ -33,6 +34,13 @@ struct Completion {
     #[serde(default)]
     choices: Vec<Choice>,
     usage: Option<Usage>,
+    error: Option<WireError>,
+}
+
+#[derive(Deserialize)]
+struct WireError {
+    message: Option<String>,
+    code: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +52,8 @@ struct Choice {
 #[derive(Deserialize)]
 struct WireMessage {
     content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_content: Option<String>,
     // Some compatible servers send `"tool_calls": null`, hence `Option`.
     tool_calls: Option<Vec<WireToolCall>>,
 }
@@ -73,14 +83,33 @@ struct PromptTokensDetails {
     cached_tokens: Option<u32>,
 }
 
-#[async_trait]
-impl LlmClient for OpenAiClient {
-    async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ModelsPayload {
+    Wrapped { data: Vec<ModelItem> },
+    List(Vec<ModelItem>),
+}
+
+#[derive(Deserialize)]
+struct ModelItem {
+    id: String,
+}
+
+impl OpenAiClient {
+    async fn chat_once(
+        &self,
+        api_key: &str,
+        req: &ChatRequest,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<ChatResponse, LlmError> {
         let mut body = json!({
             "model": req.model,
             "messages": wire_messages(req),
         });
         body[self.max_tokens_field] = req.max_tokens.into();
+        if let Some(e) = effort {
+            body["reasoning_effort"] = e.as_str().into();
+        }
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req
                 .tools
@@ -107,11 +136,22 @@ impl LlmClient for OpenAiClient {
         )
         .await?;
         let completion: Completion = decode(resp).await?;
+        if completion.choices.is_empty()
+            && let Some(err) = completion.error
+        {
+            return Err(wire_error(err));
+        }
         let (message, finish_reason) = completion
             .choices
             .into_iter()
             .next()
             .map_or((None, None), |c| (Some(c.message), c.finish_reason));
+        let has_reasoning = message.as_ref().is_some_and(|m| {
+            [m.reasoning.as_deref(), m.reasoning_content.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|s| !s.trim().is_empty())
+        });
         let (text, wire_calls) = message.map_or((None, None), |m| (m.content, m.tool_calls));
         let tool_calls: Vec<ToolCall> = wire_calls
             .unwrap_or_default()
@@ -123,9 +163,19 @@ impl LlmClient for OpenAiClient {
                 provider_meta: None,
             })
             .collect();
+        let text = text.unwrap_or_default();
+        if text.trim().is_empty()
+            && tool_calls.is_empty()
+            && finish_reason.as_deref() == Some("length")
+            && has_reasoning
+        {
+            return Err(LlmError::Invalid(
+                "empty response: model exhausted max_tokens during reasoning".into(),
+            ));
+        }
         let usage = completion.usage;
         Ok(ChatResponse {
-            text: non_empty(text.unwrap_or_default(), &tool_calls)?,
+            text: non_empty(text, &tool_calls)?,
             tool_calls,
             stop_reason: stop_reason(finish_reason.as_deref()),
             input_tokens: usage.as_ref().and_then(|u| u.prompt_tokens).unwrap_or(0),
@@ -140,6 +190,29 @@ impl LlmClient for OpenAiClient {
                 .unwrap_or(0),
             cache_write_tokens: 0,
         })
+    }
+}
+
+#[async_trait]
+impl LlmClient for OpenAiClient {
+    async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        match self.chat_once(api_key, req, req.effort).await {
+            Err(ref err) if req.effort.is_some() && is_reasoning_unsupported(err) => {
+                self.chat_once(api_key, req, None).await
+            }
+            other => other,
+        }
+    }
+
+    async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError> {
+        let url = format!("{}/models", self.base_url);
+        let bearer = key_header(&format!("Bearer {api_key}"))?;
+        let resp = send(self.http.get(url).header(AUTHORIZATION, bearer), false).await?;
+        let payload: ModelsPayload = decode(resp).await?;
+        let items = match payload {
+            ModelsPayload::Wrapped { data } | ModelsPayload::List(data) => data,
+        };
+        Ok(normalize_model_ids(items.into_iter().map(|m| m.id)))
     }
 }
 
@@ -208,5 +281,29 @@ fn stop_reason(finish_reason: Option<&str>) -> StopReason {
         Some("length") => StopReason::MaxTokens,
         Some("stop") => StopReason::EndTurn,
         _ => StopReason::Other,
+    }
+}
+
+/// Maps an OpenRouter-style `{"error": ...}` payload sent inside an HTTP 200 completion body.
+fn wire_error(err: WireError) -> LlmError {
+    let code = err
+        .code
+        .as_ref()
+        .and_then(Value::as_u64)
+        .and_then(|n| u16::try_from(n).ok());
+    let suffix = err
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map_or_else(String::new, format_provider_message);
+    match code {
+        Some(401 | 403) => LlmError::Unauthorized,
+        Some(429) => LlmError::RateLimited { retry_after: None },
+        Some(c) if (500..=599).contains(&c) => {
+            LlmError::Transient(format!("provider status {c}{suffix}"))
+        }
+        Some(c) => LlmError::Invalid(format!("provider status {c}{suffix}")),
+        None => LlmError::Invalid(format!("provider error{suffix}")),
     }
 }

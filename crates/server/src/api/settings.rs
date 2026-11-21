@@ -37,7 +37,6 @@ const MAX_TEST_PATH_LEN: usize = 1000;
 #[derive(Serialize)]
 struct SettingsJson {
     default_provider_id: Option<Uuid>,
-    default_model: Option<String>,
     max_files_per_review: i32,
     max_patch_lines_per_file: i32,
     /// Daftar yang berlaku: tersimpan, atau bawaan bila belum pernah disimpan.
@@ -52,7 +51,6 @@ impl From<Settings> for SettingsJson {
             ignore_paths: ignore::effective_ignore_paths(&s),
             ignore_paths_is_default: s.ignore_paths.is_none(),
             default_provider_id: s.default_provider_id,
-            default_model: s.default_model,
             max_files_per_review: s.max_files_per_review,
             max_patch_lines_per_file: s.max_patch_lines_per_file,
             ignored_title_keywords: s.ignored_title_keywords,
@@ -63,7 +61,6 @@ impl From<Settings> for SettingsJson {
 #[derive(Deserialize)]
 struct SettingsBody {
     default_provider_id: Option<Uuid>,
-    default_model: Option<String>,
     max_files_per_review: i32,
     max_patch_lines_per_file: i32,
     /// Tidak ada = biarkan; `null` = kembali ke bawaan; array = ganti.
@@ -135,21 +132,10 @@ async fn replace(
             "max_patch_lines_per_file must be between 1 and 100000",
         ));
     }
-    let model = body
-        .default_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string);
-    if let Some(provider_id) = body.default_provider_id {
-        if model.is_none() {
-            return Err(ApiError::validation(
-                "default_model is required when default_provider_id is set",
-            ));
-        }
-        if ai::get_provider(&state.db, provider_id).await?.is_none() {
-            return Err(ApiError::not_found());
-        }
+    if let Some(provider_id) = body.default_provider_id
+        && ai::get_provider(&state.db, provider_id).await?.is_none()
+    {
+        return Err(ApiError::not_found());
     }
     // Semua validasi selesai sebelum satu-satunya penulisan di bawah.
     let current = settings::get(&state.db).await?;
@@ -169,7 +155,6 @@ async fn replace(
     };
     let new = Settings {
         default_provider_id: body.default_provider_id,
-        default_model: model,
         max_files_per_review: body.max_files_per_review,
         max_patch_lines_per_file: body.max_patch_lines_per_file,
         ignore_paths,

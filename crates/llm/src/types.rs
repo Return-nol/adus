@@ -15,6 +15,25 @@ const MAX_PROVIDER_MESSAGE: usize = 200;
 /// Batas atas `Retry-After`; mencegah overflow `Instant + Duration` di pemanggil.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 
+/// Effort level for reasoning/thinking models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 /// One LLM call: a system prompt, the conversation so far, and the tools the model may call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatRequest {
@@ -24,6 +43,7 @@ pub struct ChatRequest {
     /// Empty: no tools are sent, and an error is never reported as `ToolsUnsupported`.
     pub tools: Vec<ToolDef>,
     pub max_tokens: u32,
+    pub effort: Option<ReasoningEffort>,
 }
 
 impl ChatRequest {
@@ -42,7 +62,13 @@ impl ChatRequest {
             }],
             tools: Vec::new(),
             max_tokens,
+            effort: None,
         }
+    }
+
+    pub fn with_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.effort = Some(effort);
+        self
     }
 
     /// Number of tool calls the assistant already made in this conversation.
@@ -155,6 +181,42 @@ pub enum LlmError {
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError>;
+    async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError>;
+}
+
+/// Substrings (lowercase) in a provider error that mean the model rejected reasoning/thinking params.
+const REASONING_UNSUPPORTED_MARKERS: [&str; 9] = [
+    "reasoning_effort",
+    "reasoning effort",
+    "thinking",
+    "thinking_config",
+    "thinkingconfig",
+    "thinking_budget",
+    "thinkingbudget",
+    "budget_tokens",
+    "does not support reasoning",
+];
+
+pub(crate) fn is_reasoning_unsupported(err: &LlmError) -> bool {
+    let LlmError::Invalid(msg) = err else {
+        return false;
+    };
+    let lower = msg.to_lowercase();
+    !lower.starts_with("provider status 404")
+        && REASONING_UNSUPPORTED_MARKERS
+            .iter()
+            .any(|m| lower.contains(m))
+}
+
+pub(crate) fn normalize_model_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Substrings (lowercase) in a provider error that mean the model or endpoint cannot use tools.
@@ -274,12 +336,14 @@ fn is_bad_api_key(body: &Value) -> bool {
 fn provider_message(body: &Value) -> String {
     let error = &body["error"];
     match error["message"].as_str().or_else(|| error.as_str()) {
-        Some(m) if !m.is_empty() => {
-            let short: String = m.chars().take(MAX_PROVIDER_MESSAGE).collect();
-            format!(": {short}")
-        }
+        Some(m) if !m.is_empty() => format_provider_message(m),
         _ => String::new(),
     }
+}
+
+pub(crate) fn format_provider_message(msg: &str) -> String {
+    let short: String = msg.chars().take(MAX_PROVIDER_MESSAGE).collect();
+    format!(": {short}")
 }
 
 /// Header berisi API key, ditandai sensitif supaya tidak muncul di log/Debug.

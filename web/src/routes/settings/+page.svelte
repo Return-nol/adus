@@ -16,7 +16,6 @@
 
 	type Settings = {
 		default_provider_id: string | null;
-		default_model: string | null;
 		max_files_per_review: number;
 		max_patch_lines_per_file: number;
 		ignore_paths: string[];
@@ -31,7 +30,6 @@
 	let busy = $state(false);
 	// '' = no default provider.
 	let providerId = $state('');
-	let model = $state('');
 	let maxFiles = $state(0);
 	let maxPatchLines = $state(0);
 	// Ignored files: the textarea text, plus what the server last gave us.
@@ -77,7 +75,6 @@
 		fillIgnore(s);
 		keywordsText = s.ignored_title_keywords.join('\n');
 		providerId = s.default_provider_id ?? '';
-		model = s.default_model ?? '';
 		maxFiles = s.max_files_per_review;
 		maxPatchLines = s.max_patch_lines_per_file;
 	}
@@ -110,7 +107,6 @@
 			fill(
 				await api<Settings>('PUT', '/settings', {
 					default_provider_id: providerId || null,
-					default_model: model.trim() || null,
 					max_files_per_review: maxFiles,
 					max_patch_lines_per_file: maxPatchLines,
 					// Omitted unless edited, so saving other settings never pins the defaults.
@@ -121,7 +117,7 @@
 			toast.success('Settings saved');
 		} catch (e) {
 			if (e instanceof ApiError && e.code === 'invalid_glob') ignoreError = e.message;
-			else fail(e); // e.g. 422 default_model required
+			else fail(e);
 		} finally {
 			busy = false;
 		}
@@ -147,7 +143,6 @@
 			fillIgnore(
 				await api<Settings>('PUT', '/settings', {
 					default_provider_id: saved.default_provider_id,
-					default_model: saved.default_model,
 					max_files_per_review: saved.max_files_per_review,
 					max_patch_lines_per_file: saved.max_patch_lines_per_file,
 					ignore_paths: null
@@ -198,7 +193,7 @@
 	<Card.Root class="max-w-2xl" aria-busy="true">
 		<Card.Content class="grid gap-4">
 			<span class="sr-only" role="status">Loading…</span>
-			{#each ['w-28', 'w-24', 'w-44', 'w-52'] as w, i (i)}
+			{#each ['w-28', 'w-44', 'w-52'] as w, i (i)}
 				<div class="grid gap-2">
 					<Skeleton class={`h-4 ${w}`} />
 					<Skeleton class="h-9 w-full rounded-sm" />
@@ -224,14 +219,6 @@
 							{/each}
 						</Select.Content>
 					</Select.Root>
-				</div>
-				<div class="grid gap-2">
-					<Label for="s-model">Default model</Label>
-					<Input
-						id="s-model"
-						placeholder="Required when a default provider is set"
-						bind:value={model}
-					/>
 				</div>
 				<div class="grid gap-2">
 					<Label for="s-files">Max files per review (1-500)</Label>

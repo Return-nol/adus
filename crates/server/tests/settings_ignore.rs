@@ -25,7 +25,7 @@ async fn login_user(app: &Router, admin: &str) -> String {
 /// PUT /settings dengan field wajib bawaan ditambah `extra`.
 async fn put_settings(app: &Router, cookie: &str, extra: Value) -> common::Reply {
     let mut body = json!({
-        "default_provider_id": null, "default_model": null,
+        "default_provider_id": null,
         "max_files_per_review": 50, "max_patch_lines_per_file": 2000
     });
     body.as_object_mut()

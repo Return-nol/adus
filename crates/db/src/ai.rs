@@ -21,8 +21,20 @@ pub struct AiProvider {
     pub kind: ProviderKind,
     pub name: String,
     pub base_url: Option<String>,
+    pub primary_model: String,
+    pub fast_model: Option<String>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+}
+
+impl AiProvider {
+    pub fn effective_fast_model(&self) -> &str {
+        self.fast_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&self.primary_model)
+    }
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -48,7 +60,8 @@ pub struct KeyPatch {
     pub secret: Option<(String, String)>,
 }
 
-const PROVIDER_COLUMNS: &str = "id, kind, name, base_url, enabled, created_at";
+const PROVIDER_COLUMNS: &str =
+    "id, kind, name, base_url, primary_model, fast_model, enabled, created_at";
 const KEY_COLUMNS: &str = "id, provider_id, label, encrypted_key, key_last4, enabled, status, \
                            cooldown_until, last_used_at, created_at";
 
@@ -57,14 +70,19 @@ pub async fn insert_provider(
     kind: ProviderKind,
     name: &str,
     base_url: Option<&str>,
+    primary_model: &str,
+    fast_model: Option<&str>,
 ) -> Result<AiProvider> {
     sqlx::query_as(&format!(
-        "INSERT INTO ai_providers (kind, name, base_url) VALUES ($1, $2, $3) \
+        "INSERT INTO ai_providers (kind, name, base_url, primary_model, fast_model) \
+         VALUES ($1, $2, $3, $4, $5) \
          RETURNING {PROVIDER_COLUMNS}"
     ))
     .bind(kind)
     .bind(name)
     .bind(base_url)
+    .bind(primary_model)
+    .bind(fast_model)
     .fetch_one(pool)
     .await
 }
@@ -92,15 +110,20 @@ pub async fn update_provider(
     id: Uuid,
     name: &str,
     base_url: Option<&str>,
+    primary_model: &str,
+    fast_model: Option<&str>,
     enabled: bool,
 ) -> Result<Option<AiProvider>> {
     sqlx::query_as(&format!(
-        "UPDATE ai_providers SET name = $2, base_url = $3, enabled = $4 WHERE id = $1 \
+        "UPDATE ai_providers SET name = $2, base_url = $3, primary_model = $4, fast_model = $5, \
+         enabled = $6 WHERE id = $1 \
          RETURNING {PROVIDER_COLUMNS}"
     ))
     .bind(id)
     .bind(name)
     .bind(base_url)
+    .bind(primary_model)
+    .bind(fast_model)
     .bind(enabled)
     .fetch_optional(pool)
     .await
@@ -246,4 +269,56 @@ pub async fn mark_invalid(pool: &PgPool, key_id: Uuid) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn provider_models_crud_optional_fast_model_and_effective_fallback(pool: PgPool) {
+        let created = insert_provider(
+            &pool,
+            ProviderKind::Anthropic,
+            "Anthropic",
+            None,
+            "claude-sonnet-4-5",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.primary_model, "claude-sonnet-4-5");
+        assert_eq!(created.fast_model, None);
+        assert_eq!(created.effective_fast_model(), "claude-sonnet-4-5");
+
+        let with_fast = update_provider(
+            &pool,
+            created.id,
+            "Anthropic",
+            None,
+            "claude-sonnet-4-5",
+            Some("claude-haiku-4-5"),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(with_fast.fast_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(with_fast.effective_fast_model(), "claude-haiku-4-5");
+
+        let cleared = update_provider(
+            &pool,
+            created.id,
+            "Anthropic",
+            None,
+            "claude-sonnet-4-5",
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cleared.fast_model, None);
+        assert_eq!(cleared.effective_fast_model(), "claude-sonnet-4-5");
+    }
 }

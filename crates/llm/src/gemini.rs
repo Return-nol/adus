@@ -6,8 +6,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::types::{
-    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, StopReason, ToolCall,
-    UserPart, decode, key_header, non_empty, send,
+    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
+    StopReason, ToolCall, UserPart, decode, is_reasoning_unsupported, key_header, non_empty,
+    normalize_model_ids, send,
 };
 
 pub struct GeminiClient {
@@ -56,6 +57,8 @@ struct Content {
 #[serde(rename_all = "camelCase")]
 struct Part {
     text: Option<String>,
+    #[serde(default)]
+    thought: bool,
     function_call: Option<FunctionCall>,
     thought_signature: Option<String>,
 }
@@ -74,13 +77,42 @@ struct Usage {
     cached_content_token_count: Option<u32>,
 }
 
-#[async_trait]
-impl LlmClient for GeminiClient {
-    async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+#[derive(Deserialize)]
+struct GeminiModels {
+    #[serde(default)]
+    models: Vec<GeminiModel>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiModel {
+    name: String,
+    supported_generation_methods: Option<Vec<String>>,
+}
+
+fn thinking_budget(effort: ReasoningEffort) -> u32 {
+    match effort {
+        ReasoningEffort::Low => 1_024,
+        ReasoningEffort::Medium => 4_096,
+        ReasoningEffort::High => 8_192,
+    }
+}
+
+impl GeminiClient {
+    async fn chat_once(
+        &self,
+        api_key: &str,
+        req: &ChatRequest,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<ChatResponse, LlmError> {
+        let mut generation_config = json!({"maxOutputTokens": req.max_tokens});
+        if let Some(e) = effort {
+            generation_config["thinkingConfig"] = json!({"thinkingBudget": thinking_budget(e)});
+        }
         let mut body = json!({
             "systemInstruction": {"parts": [{"text": req.system}]},
             "contents": wire_contents(&req.messages),
-            "generationConfig": {"maxOutputTokens": req.max_tokens},
+            "generationConfig": generation_config,
         });
         if !req.tools.is_empty() {
             let declarations: Vec<Value> = req
@@ -126,7 +158,9 @@ impl LlmClient for GeminiClient {
         let mut text = String::new();
         let mut tool_calls = Vec::new();
         for part in parts {
-            if let Some(t) = part.text {
+            if let Some(t) = part.text
+                && !part.thought
+            {
                 text.push_str(&t);
             }
             if let Some(call) = part.function_call {
@@ -154,6 +188,45 @@ impl LlmClient for GeminiClient {
             cache_read_tokens: field(|u| u.cached_content_token_count),
             cache_write_tokens: 0,
         })
+    }
+}
+
+#[async_trait]
+impl LlmClient for GeminiClient {
+    async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        match self.chat_once(api_key, req, req.effort).await {
+            Err(ref err) if req.effort.is_some() && is_reasoning_unsupported(err) => {
+                self.chat_once(api_key, req, None).await
+            }
+            other => other,
+        }
+    }
+
+    async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError> {
+        let url = format!("{}/v1beta/models", self.base_url);
+        let request = self
+            .http
+            .get(url)
+            .header("x-goog-api-key", key_header(api_key)?);
+        let payload: GeminiModels = decode(send(request, false).await?).await?;
+        Ok(normalize_model_ids(
+            payload
+                .models
+                .into_iter()
+                .filter(|m| {
+                    m.supported_generation_methods
+                        .as_ref()
+                        .is_none_or(|methods| {
+                            methods.iter().any(|method| method == "generateContent")
+                        })
+                })
+                .map(|m| {
+                    m.name
+                        .strip_prefix("models/")
+                        .unwrap_or(&m.name)
+                        .to_string()
+                }),
+        ))
     }
 }
 

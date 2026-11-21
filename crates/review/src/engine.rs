@@ -11,13 +11,13 @@ use adus_db::connections::{self, Connection, ConnectionStatus};
 use adus_db::ignore::{IgnoreMatcher, default_ignore_paths, effective_ignore_paths, title_matches};
 use adus_db::repositories::{self, Repository};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
-use adus_db::{memories, rules, settings};
+use adus_db::{ai, memories, rules, settings};
 use adus_git::diff::{added_line_count, commentable_lines};
 use adus_git::{
     FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, RepoRef,
 };
-use adus_llm::ChatRequest;
 use adus_llm::router::{ChatError, ChatService, UsageContext};
+use adus_llm::{ChatRequest, ReasoningEffort};
 use futures::StreamExt;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -67,6 +67,13 @@ struct Target {
     allowed: BTreeSet<u32>,
 }
 
+pub fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
+    match mode {
+        ReviewMode::Generalist => ReasoningEffort::Medium,
+        ReviewMode::Specialists => ReasoningEffort::High,
+    }
+}
+
 impl Engine {
     /// Review satu PR. Return id baris `reviews`, atau `None` jika repo tidak ada / sudah dihapus
     /// (tidak ada repo untuk dicatat). Selesai, dilewati, dan `Fatal` meninggalkan baris; pada
@@ -77,8 +84,7 @@ impl Engine {
         repository_id: Uuid,
         pr_number: i64,
         trigger: Trigger,
-        // Accepted now, used once the review modes are wired into the engine.
-        _mode_override: Option<ReviewMode>,
+        mode_override: Option<ReviewMode>,
     ) -> Result<Option<Uuid>, EngineError> {
         let Some(repo) = repositories::get(&self.db, repository_id)
             .await
@@ -95,7 +101,7 @@ impl Engine {
 
         // Timeout di sini, bukan di worker, supaya baris review tetap dicatat gagal. Fatal:
         // mengulang PR yang sama hanya menghabiskan token LLM lagi sampai timeout lagi.
-        let run = self.run(&repo, review_id, pr_number, trigger);
+        let run = self.run(&repo, review_id, pr_number, trigger, mode_override);
         let outcome = match tokio::time::timeout(self.review_timeout, run).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => Err(EngineError::Fatal("review timed out".into())),
@@ -133,6 +139,7 @@ impl Engine {
         review_id: Uuid,
         pr_number: i64,
         trigger: Trigger,
+        mode_override: Option<ReviewMode>,
     ) -> Result<Outcome, EngineError> {
         if !repo.enabled {
             return Ok(Outcome::Skipped("repository_disabled"));
@@ -164,13 +171,13 @@ impl Engine {
         {
             return Ok(Outcome::Skipped("ignored_title"));
         }
-        let model = match (&repo.review_provider_id, &repo.review_model) {
-            (Some(provider), Some(model)) => Some((*provider, model.clone())),
-            _ => settings
-                .default_provider_id
-                .zip(settings.default_model.clone()),
-        };
-        let Some((provider_id, model)) = model else {
+        let provider_id = repo.review_provider_id.or(settings.default_provider_id);
+        let provider = match provider_id {
+            Some(id) => ai::get_provider(&self.db, id).await.map_err(db_error)?,
+            None => None,
+        }
+        .filter(|p| p.enabled && !p.primary_model.trim().is_empty());
+        let Some(provider) = provider else {
             // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
             // atau diminta lewat `@adudu review`, supaya tidak spam.
             // Bukan kegagalan: tanpa baris failed atau dead letter untuk setiap push.
@@ -193,6 +200,12 @@ impl Engine {
             }
             return Err(EngineError::Fatal("no review model configured".into()));
         };
+        let provider_id = provider.id;
+        let model = provider.primary_model;
+        let mode = mode_override
+            .or(repo.review_mode)
+            .unwrap_or(settings.review_mode);
+        let effort = finder_effort(mode);
 
         // Updated + review sebelumnya di commit lain → hanya baris dari commit baru.
         let last = match trigger {
@@ -277,7 +290,7 @@ impl Engine {
         // Maksimal FILE_CONCURRENCY sekaligus; `buffered` menjaga urutan hasil = urutan file,
         // jadi komentar selalu terposting dengan urutan yang sama.
         let results: Vec<_> = futures::stream::iter(prompts)
-            .map(|(system, user)| self.ask(provider_id, &model, system, user, &ctx))
+            .map(|(system, user)| self.ask(provider_id, &model, effort, system, user, &ctx))
             .buffered(FILE_CONCURRENCY)
             .collect()
             .await;
@@ -333,12 +346,14 @@ impl Engine {
         &self,
         provider_id: Uuid,
         model: &str,
+        effort: ReasoningEffort,
         system: String,
         user: String,
         ctx: &UsageContext,
     ) -> Result<Option<Vec<Suggestion>>, ChatError> {
         for _attempt in 0..2 {
-            let req = ChatRequest::text(model, system.as_str(), user.as_str(), MAX_OUTPUT_TOKENS);
+            let req = ChatRequest::text(model, system.as_str(), user.as_str(), MAX_OUTPUT_TOKENS)
+                .with_effort(effort);
             let response = self.chat.chat(provider_id, req, ctx.clone()).await?;
             if let Ok(suggestions) = parse_suggestions(&response.text) {
                 return Ok(Some(suggestions));

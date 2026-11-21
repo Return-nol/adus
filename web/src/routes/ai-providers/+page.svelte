@@ -14,15 +14,12 @@
 	import { Badge } from '#lib/components/ui/badge/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
-	import * as Dialog from '#lib/components/ui/dialog/index.js';
-	import { Input } from '#lib/components/ui/input/index.js';
-	import { Label } from '#lib/components/ui/label/index.js';
 	import { Switch } from '#lib/components/ui/switch/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
 	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
 	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 
-	type Settings = { default_provider_id: string | null; default_model: string | null };
+	type Settings = { default_provider_id: string | null };
 
 	let providers = $state<Provider[]>([]);
 	let settings = $state<Settings | null>(null);
@@ -37,9 +34,6 @@
 	let editKey = $state<AiKey | null>(null);
 	let confirmOpen = $state(false);
 	let confirm = $state<{ title: string; text: string; run: () => Promise<void> } | null>(null);
-	let testOpen = $state(false);
-	let testKey = $state<AiKey | null>(null);
-	let testModel = $state('');
 
 	// The server enforces admin too; this only hides/disables controls for role `user`.
 	const isAdmin = $derived(session.user?.role === 'admin');
@@ -86,28 +80,18 @@
 		confirmOpen = true;
 	}
 
-	function openTest(p: Provider, k: AiKey) {
-		testKey = k;
-		testModel = settings?.default_provider_id === p.id ? (settings.default_model ?? '') : '';
-		testOpen = true;
-	}
-
-	async function runTest(event: SubmitEvent) {
-		event.preventDefault();
-		const k = testKey;
-		if (!k || busy.has(k.id)) return;
+	async function runTest(k: AiKey) {
+		if (busy.has(k.id)) return;
 		busy.add(k.id);
 		try {
-			const r = await api<{ ok: boolean; error?: string }>('POST', `/ai-keys/${k.id}/test`, {
-				model: testModel
-			});
-			testOpen = false;
+			const r = await api<{ ok: boolean; error?: string }>('POST', `/ai-keys/${k.id}/test`, {});
 			if (r.ok) toast.success(`Key ${k.label} works`);
 			else toast.error(`Key ${k.label} failed`, { description: r.error });
 		} catch (e) {
 			fail(e);
+		} finally {
+			busy.delete(k.id);
 		}
-		busy.delete(k.id);
 	}
 
 	function cooldown(k: AiKey) {
@@ -139,6 +123,7 @@
 				<Skeleton class="h-5 w-20 rounded-full" />
 				<Skeleton class="h-5 w-16 rounded-full" />
 			</div>
+			<Skeleton class="h-4 w-64" />
 			{#if isAdmin}
 				<Card.Action class="flex items-center gap-2">
 					<Skeleton class="h-5 w-9 rounded-full" />
@@ -172,7 +157,12 @@
 					{#if settings?.default_provider_id === p.id}<Badge>default</Badge>{/if}
 					{#if !p.enabled}<Badge variant="outline">disabled</Badge>{/if}
 				</Card.Title>
-				{#if p.base_url}<Card.Description><code>{p.base_url}</code></Card.Description>{/if}
+				<Card.Description>
+					{#if p.base_url}<code>{p.base_url}</code> ·
+					{/if}
+					Primary: <code>{p.primary_model}</code> · Fast:
+					{#if p.fast_model}<code>{p.fast_model}</code>{:else}uses primary{/if}
+				</Card.Description>
 				{#if isAdmin}
 					<Card.Action class="flex flex-wrap items-center gap-2">
 						<Switch
@@ -248,7 +238,7 @@
 											variant="outline"
 											size="sm"
 											disabled={busy.has(k.id)}
-											onclick={() => openTest(p, k)}
+											onclick={() => runTest(k)}
 										>
 											Test
 										</Button>
@@ -308,26 +298,6 @@
 
 <ProviderDialog bind:open={providerOpen} provider={editProvider} onsaved={load} />
 <AiKeyDialog bind:open={keyOpen} providerId={keyProviderId} aiKey={editKey} onsaved={load} />
-
-<Dialog.Root bind:open={testOpen}>
-	<Dialog.Content>
-		<Dialog.Header>
-			<Dialog.Title>Test key {testKey?.label}</Dialog.Title>
-			<Dialog.Description>
-				Sends one tiny request with this key. It is recorded in token usage.
-			</Dialog.Description>
-		</Dialog.Header>
-		<form class="grid gap-4" onsubmit={runTest}>
-			<div class="grid gap-2">
-				<Label for="t-model">Model</Label>
-				<Input id="t-model" required placeholder="e.g. gpt-4o-mini" bind:value={testModel} />
-			</div>
-			<Dialog.Footer>
-				<Button type="submit" disabled={!testKey || busy.has(testKey.id)}>Run test</Button>
-			</Dialog.Footer>
-		</form>
-	</Dialog.Content>
-</Dialog.Root>
 
 <AlertDialog.Root bind:open={confirmOpen}>
 	<AlertDialog.Content>

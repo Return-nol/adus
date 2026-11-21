@@ -141,44 +141,77 @@ async fn check_database(state: &AppState, out: &mut Vec<Check>) -> bool {
     true
 }
 
-/// Model default terisi dan provider default punya minimal satu key yang bisa dipakai.
+/// Provider default terisi (aktif + punya primary_model) dan punya minimal satu key yang bisa dipakai.
 async fn check_settings(state: &AppState, out: &mut Vec<Check>) {
     let Ok(settings) = settings::get(&state.db).await else {
         out.push(Check::problem(
             Status::Fail,
-            "Default model",
-            "Settings cannot be read, so no model can be chosen",
+            "Default provider",
+            "Settings cannot be read, so no provider can be chosen",
             "Check the database and run `adus doctor` again",
         ));
         return;
     };
-    let model = settings.default_model.filter(|m| !m.trim().is_empty());
-    let (Some(provider_id), Some(model)) = (settings.default_provider_id, model) else {
+    let Some(provider_id) = settings.default_provider_id else {
         out.push(Check::problem(
             Status::Fail,
-            "Default model",
-            "No default provider and model is set, so reviews have no model to use",
-            "Open Settings and choose a default provider and model",
+            "Default provider",
+            "No default AI provider is set, so reviews have no model to use",
+            "Open Settings and choose a default provider",
         ));
         return;
     };
-    out.push(Check::ok(format!("Default model: {model}")));
-
     let provider = ai::get_provider(&state.db, provider_id)
         .await
         .ok()
         .flatten();
-    let provider_name = provider.map_or("default provider".to_string(), |p| p.name);
+    let Some(provider) = provider else {
+        out.push(Check::problem(
+            Status::Fail,
+            "Default provider",
+            "The configured default provider could not be loaded",
+            "Open Settings and choose a valid default provider",
+        ));
+        return;
+    };
+    if !provider.enabled || provider.primary_model.trim().is_empty() {
+        out.push(Check::problem(
+            Status::Fail,
+            "Default provider",
+            &format!(
+                "{} is disabled or has no primary model configured, so reviews cannot run",
+                provider.name
+            ),
+            "Open AI Providers to enable the provider and configure its primary model",
+        ));
+    } else if let Some(fast) = provider
+        .fast_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        out.push(Check::ok(format!(
+            "Default provider: {} ({} / {})",
+            provider.name, provider.primary_model, fast
+        )));
+    } else {
+        out.push(Check::ok(format!(
+            "Default provider: {} ({})",
+            provider.name, provider.primary_model
+        )));
+    }
+
     let usable = ai::candidate_keys(&state.db, provider_id, chrono::Utc::now())
         .await
         .map(|keys| keys.len());
     match usable {
-        Ok(n) if n > 0 => out.push(Check::ok(format!("AI key: {provider_name} ({n} usable)"))),
+        Ok(n) if n > 0 => out.push(Check::ok(format!("AI key: {} ({n} usable)", provider.name))),
         _ => out.push(Check::problem(
             Status::Fail,
             "AI key",
             &format!(
-                "{provider_name} has no enabled key that is valid and out of cooldown, so every review fails"
+                "{} has no enabled key that is valid and out of cooldown, so every review fails",
+                provider.name
             ),
             "Open AI Providers and add a key, or fix or enable an existing one",
         )),

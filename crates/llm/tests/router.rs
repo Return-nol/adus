@@ -50,6 +50,10 @@ impl LlmClient for SharedFake {
             .and_then(|queue| queue.pop_front());
         next.unwrap_or_else(|| Ok(ok_response()))
     }
+
+    async fn list_models(&self, _api_key: &str) -> Result<Vec<String>, LlmError> {
+        Ok(Vec::new())
+    }
 }
 
 fn ok_response() -> ChatResponse {
@@ -84,9 +88,16 @@ struct Setup {
 
 async fn setup(pool: &PgPool, kind: ProviderKind, key_count: usize) -> Setup {
     let cipher = Arc::new(Cipher::from_base64_key(SECRET_KEY).unwrap());
-    let provider = ai::insert_provider(pool, kind, "test", Some("http://fake.local"))
-        .await
-        .unwrap();
+    let provider = ai::insert_provider(
+        pool,
+        kind,
+        "test",
+        Some("http://fake.local"),
+        "gpt-test",
+        None,
+    )
+    .await
+    .unwrap();
     let mut keys = Vec::new();
     for i in 0..key_count {
         let plain = format!("key-{i}");
@@ -597,6 +608,8 @@ async fn no_keys_and_disabled_provider_return_no_keys(pool: PgPool) {
         s.provider.id,
         "test",
         Some("http://fake.local"),
+        "gpt-test",
+        None,
         false,
     )
     .await
@@ -665,12 +678,18 @@ async fn settings_row_exists_with_defaults(pool: PgPool) {
     assert_eq!(current.max_patch_lines_per_file, 2000);
     assert_eq!(current.default_provider_id, None);
 
-    let provider = ai::insert_provider(&pool, ProviderKind::Gemini, "g", None)
-        .await
-        .unwrap();
+    let provider = ai::insert_provider(
+        &pool,
+        ProviderKind::Gemini,
+        "g",
+        None,
+        "gemini-x",
+        Some("gemini-fast"),
+    )
+    .await
+    .unwrap();
     let new = adus_db::settings::Settings {
         default_provider_id: Some(provider.id),
-        default_model: Some("gemini-x".into()),
         max_files_per_review: 10,
         max_patch_lines_per_file: 500,
         ignore_paths: Some(vec!["dist/**".into()]),

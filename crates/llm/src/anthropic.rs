@@ -6,8 +6,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::types::{
-    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, StopReason, ToolCall,
-    UserPart, decode, key_header, non_empty, send,
+    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
+    StopReason, ToolCall, UserPart, decode, is_reasoning_unsupported, key_header, non_empty,
+    normalize_model_ids, send,
 };
 
 pub struct AnthropicClient {
@@ -38,14 +39,42 @@ enum Block {
     Text {
         text: String,
     },
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default)]
+        signature: String,
+    },
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
     ToolUse {
         id: String,
         name: String,
         input: Value,
     },
-    /// `thinking` and any other block type are ignored.
     #[serde(other)]
     Other,
+}
+
+#[derive(Deserialize)]
+struct ModelsPayload {
+    #[serde(default)]
+    data: Vec<ModelItem>,
+}
+
+#[derive(Deserialize)]
+struct ModelItem {
+    id: String,
+}
+
+fn thinking_budget(effort: ReasoningEffort) -> u32 {
+    match effort {
+        ReasoningEffort::Low => 2_048,
+        ReasoningEffort::Medium => 4_096,
+        ReasoningEffort::High => 8_192,
+    }
 }
 
 #[derive(Deserialize)]
@@ -56,14 +85,27 @@ struct Usage {
     cache_creation_input_tokens: Option<u32>,
 }
 
-#[async_trait]
-impl LlmClient for AnthropicClient {
-    async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+impl AnthropicClient {
+    async fn chat_once(
+        &self,
+        api_key: &str,
+        req: &ChatRequest,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<ChatResponse, LlmError> {
+        let mut max_tokens = req.max_tokens;
+        let thinking = effort.map(|e| {
+            let budget = thinking_budget(e);
+            max_tokens = req.max_tokens.saturating_add(budget);
+            json!({"type": "enabled", "budget_tokens": budget})
+        });
         let mut body = json!({
             "model": req.model,
-            "max_tokens": req.max_tokens,
+            "max_tokens": max_tokens,
             "messages": wire_messages(&req.messages),
         });
+        if let Some(thinking) = thinking {
+            body["thinking"] = thinking;
+        }
         // Up to three cache breakpoints (system, last tool, last user turn); the API allows four.
         if !req.system.is_empty() {
             body["system"] = json!([{
@@ -98,10 +140,23 @@ impl LlmClient for AnthropicClient {
             .json(&body);
         let messages: Messages = decode(send(request, !req.tools.is_empty()).await?).await?;
         let mut text = String::new();
+        let mut thinking_blocks = Vec::new();
         let mut tool_calls = Vec::new();
         for block in messages.content {
             match block {
                 Block::Text { text: t } => text.push_str(&t),
+                Block::Thinking {
+                    thinking,
+                    signature,
+                } => thinking_blocks.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking,
+                    "signature": signature,
+                })),
+                Block::RedactedThinking { data } => thinking_blocks.push(json!({
+                    "type": "redacted_thinking",
+                    "data": data,
+                })),
                 Block::ToolUse { id, name, input } => tool_calls.push(ToolCall {
                     id,
                     name,
@@ -110,6 +165,11 @@ impl LlmClient for AnthropicClient {
                 }),
                 Block::Other => {}
             }
+        }
+        if !thinking_blocks.is_empty()
+            && let Some(first) = tool_calls.first_mut()
+        {
+            first.provider_meta = serde_json::to_string(&thinking_blocks).ok();
         }
         let usage = messages.usage;
         let field = |f: fn(&Usage) -> Option<u32>| usage.as_ref().and_then(f).unwrap_or(0);
@@ -127,6 +187,29 @@ impl LlmClient for AnthropicClient {
             cache_read_tokens: cache_read,
             cache_write_tokens: cache_write,
         })
+    }
+}
+
+#[async_trait]
+impl LlmClient for AnthropicClient {
+    async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        match self.chat_once(api_key, req, req.effort).await {
+            Err(ref err) if req.effort.is_some() && is_reasoning_unsupported(err) => {
+                self.chat_once(api_key, req, None).await
+            }
+            other => other,
+        }
+    }
+
+    async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError> {
+        let url = format!("{}/v1/models", self.base_url);
+        let request = self
+            .http
+            .get(url)
+            .header("x-api-key", key_header(api_key)?)
+            .header("anthropic-version", "2023-06-01");
+        let payload: ModelsPayload = decode(send(request, false).await?).await?;
+        Ok(normalize_model_ids(payload.data.into_iter().map(|m| m.id)))
     }
 }
 
@@ -189,20 +272,31 @@ fn wire_messages(messages: &[Message]) -> Vec<Value> {
 }
 
 fn assistant_blocks(parts: &[AssistantPart]) -> Vec<Value> {
-    parts
-        .iter()
-        // The API rejects empty text blocks.
-        .filter(|p| !matches!(p, AssistantPart::Text(t) if t.is_empty()))
-        .map(|p| match p {
-            AssistantPart::Text(t) => json!({"type": "text", "text": t}),
-            AssistantPart::ToolCall(c) => json!({
+    let mut out = Vec::new();
+    // Thinking blocks must precede any tool_use blocks when replaying an extended-thinking turn.
+    for part in parts {
+        if let AssistantPart::ToolCall(call) = part
+            && let Some(meta) = &call.provider_meta
+            && let Ok(blocks) = serde_json::from_str::<Vec<Value>>(meta)
+        {
+            out.extend(blocks);
+            break;
+        }
+    }
+    for part in parts {
+        match part {
+            // The API rejects empty text blocks.
+            AssistantPart::Text(t) if t.is_empty() => {}
+            AssistantPart::Text(t) => out.push(json!({"type": "text", "text": t})),
+            AssistantPart::ToolCall(c) => out.push(json!({
                 "type": "tool_use",
                 "id": c.id,
                 "name": c.name,
                 "input": c.arguments,
-            }),
-        })
-        .collect()
+            })),
+        }
+    }
+    out
 }
 
 fn stop_reason(stop_reason: Option<&str>) -> StopReason {

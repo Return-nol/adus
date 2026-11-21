@@ -13,7 +13,7 @@ use adus_git::{
     PullRequest, RemoteRepo, RepoRef,
 };
 use adus_llm::router::{ChatError, ChatService, UsageContext};
-use adus_llm::{ChatRequest, ChatResponse, Message, StopReason, UserPart};
+use adus_llm::{ChatRequest, ChatResponse, Message, ReasoningEffort, StopReason, UserPart};
 use adus_review::engine::{Engine, REVIEW_TIMEOUT};
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -210,6 +210,7 @@ pub struct ChatCall {
     pub model: String,
     pub user: String,
     pub max_tokens: u32,
+    pub effort: Option<ReasoningEffort>,
     pub ctx: UsageContext,
 }
 
@@ -275,6 +276,7 @@ impl ChatService for FakeChat {
             model: req.model,
             user,
             max_tokens: req.max_tokens,
+            effort: req.effort,
             ctx,
         });
         let next = self.script.lock().unwrap().pop_front();
@@ -333,12 +335,18 @@ pub async fn setup(pool: &PgPool, git: FakeGit) -> Setup {
         webhook_token: "t",
     };
     let repo = repositories::insert(pool, repo).await.unwrap().unwrap();
-    let provider = ai::insert_provider(pool, ProviderKind::Openai, "openai", None)
-        .await
-        .unwrap();
+    let provider = ai::insert_provider(
+        pool,
+        ProviderKind::Openai,
+        "openai",
+        None,
+        "gpt-test",
+        Some("gpt-fast"),
+    )
+    .await
+    .unwrap();
     let mut current = settings::get(pool).await.unwrap();
     current.default_provider_id = Some(provider.id);
-    current.default_model = Some("gpt-test".into());
     settings::update(pool, &current).await.unwrap();
 
     let chat = Arc::new(FakeChat::default());

@@ -383,3 +383,31 @@ fn backoff_values() {
     assert_eq!(backoff(9), Duration::from_secs(160));
     assert_eq!(backoff(MAX_ATTEMPTS), Duration::from_secs(160));
 }
+
+#[tokio::test]
+async fn cache_set_get_and_del() {
+    let (queue, prefix) = new_queue().await;
+
+    assert_eq!(queue.cache_get("models:test").await.unwrap(), None);
+
+    queue
+        .cache_set("models:test", "[\"a\"]", Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.cache_get("models:test").await.unwrap(),
+        Some("[\"a\"]".to_string())
+    );
+
+    let mut conn = raw_connection().await;
+    let ttl: i64 = conn
+        .ttl(format!("{prefix}:cache:models:test"))
+        .await
+        .unwrap();
+    assert!(ttl > 0 && ttl <= 60, "ttl was {ttl}");
+
+    queue.cache_del("models:test").await.unwrap();
+    assert_eq!(queue.cache_get("models:test").await.unwrap(), None);
+
+    cleanup(&prefix).await;
+}

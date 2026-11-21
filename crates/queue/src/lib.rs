@@ -6,6 +6,7 @@
 //! - `{prefix}:delayed`     sorted set job retry, score = waktu jatuh tempo (unix ms)
 //! - `{prefix}:dedup:{key}` penanda delivery webhook yang sudah pernah dilihat
 //! - `{prefix}:lock:{key}`  lock dengan token
+//! - `{prefix}:cache:{key}` cache key dengan TTL
 //! - `{prefix}:worker:{name}:hb` heartbeat worker (unix detik), kedaluwarsa setelah 30 dtk
 //!
 //! Tiap entri stream punya field `job` (JSON) dan `attempt` (angka desimal, default 1).
@@ -320,6 +321,37 @@ impl Queue {
         Ok(())
     }
 
+    /// Ambil nilai cache string untuk `key`, atau `None` jika tidak ada/kedaluwarsa.
+    pub async fn cache_get(&self, key: &str) -> Result<Option<String>, QueueError> {
+        let value: Option<String> = redis::cmd("GET")
+            .arg(self.cache_key(key))
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(value)
+    }
+
+    /// Simpan nilai cache string untuk `key` dengan TTL `ttl` (minimal 1 detik).
+    pub async fn cache_set(&self, key: &str, value: &str, ttl: Duration) -> Result<(), QueueError> {
+        let secs = ttl.as_secs().max(1);
+        let _: () = redis::cmd("SET")
+            .arg(self.cache_key(key))
+            .arg(value)
+            .arg("EX")
+            .arg(secs)
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Hapus nilai cache untuk `key` jika ada.
+    pub async fn cache_del(&self, key: &str) -> Result<(), QueueError> {
+        let _: i64 = redis::cmd("DEL")
+            .arg(self.cache_key(key))
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(())
+    }
+
     /// Tandai `worker` masih hidup selama 30 dtk ke depan. Worker memanggilnya tiap 10 dtk.
     pub async fn heartbeat(&self, worker: &str) -> Result<(), QueueError> {
         let _: () = redis::cmd("SET")
@@ -522,6 +554,10 @@ impl Queue {
 
     fn lock_key(&self, key: &str) -> String {
         format!("{}:lock:{key}", self.prefix)
+    }
+
+    fn cache_key(&self, key: &str) -> String {
+        format!("{}:cache:{key}", self.prefix)
     }
 
     fn heartbeat_key(&self, worker: &str) -> String {

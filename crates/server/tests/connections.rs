@@ -459,21 +459,46 @@ async fn remote_repos_flags_added_and_marks_invalid_on_bad_token(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn update_repository_settings(pool: PgPool) {
     let (app, _git, admin) = setup(pool).await;
+    let provider = send(
+        &app,
+        post_json(
+            "/api/v1/ai-providers",
+            &json!({ "kind": "openai", "name": "OpenAI", "primary_model": "gpt-5" }),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(provider.status, StatusCode::CREATED);
+    let provider_id = provider.body["id"].as_str().unwrap();
+
     let conn = connection_with_token(&app, &admin).await;
     let repo = add_repo(&app, &admin, &conn, "1").await;
     let uri = format!("/api/v1/repositories/{}", repo.body["id"].as_str().unwrap());
 
-    let body = json!({ "enabled": false, "review_model": "gpt-x" });
+    let body = json!({ "enabled": false, "review_provider_id": provider_id });
     let reply = send(&app, json_req("PATCH", &uri, &body, Some(&admin))).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body["enabled"], false);
     assert_eq!(reply.body["auto_review"], true);
-    assert_eq!(reply.body["review_model"], "gpt-x");
+    assert_eq!(reply.body["review_provider_id"], provider_id);
+
+    let missing = send(
+        &app,
+        json_req(
+            "PATCH",
+            &uri,
+            &json!({ "review_provider_id": "00000000-0000-0000-0000-000000000001" }),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
 
     // Field yang tidak dikirim tetap; `null` mengosongkan.
-    let body = json!({ "review_model": null });
+    let body = json!({ "review_provider_id": null });
     let reply = send(&app, json_req("PATCH", &uri, &body, Some(&admin))).await;
-    assert_eq!(reply.body["review_model"], Value::Null);
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["review_provider_id"], Value::Null);
     assert_eq!(reply.body["enabled"], false);
 }
 
