@@ -158,7 +158,7 @@ impl LlmClient for GeminiClient {
 }
 
 /// Conversation as Gemini `contents`. Tool results travel in a `user` turn, and adjacent turns
-/// with the same role are merged into one.
+/// with the same role are merged into one, `functionResponse` parts first, then the text.
 fn wire_contents(messages: &[Message]) -> Vec<Value> {
     let mut out: Vec<(&str, Vec<Value>)> = Vec::new();
     for message in messages {
@@ -185,7 +185,11 @@ fn wire_contents(messages: &[Message]) -> Vec<Value> {
             ),
         };
         match out.last_mut() {
-            Some((last_role, last_parts)) if *last_role == role => last_parts.extend(parts),
+            Some((last_role, last_parts)) if *last_role == role => {
+                last_parts.extend(parts);
+                // Stable: keeps the order within the responses and within the text.
+                last_parts.sort_by_key(|p| p.get("functionResponse").is_none());
+            }
             _ => out.push((role, parts)),
         }
     }
@@ -197,6 +201,8 @@ fn wire_contents(messages: &[Message]) -> Vec<Value> {
 fn model_parts(parts: &[AssistantPart]) -> Vec<Value> {
     parts
         .iter()
+        // The API rejects empty text parts.
+        .filter(|p| !matches!(p, AssistantPart::Text(t) if t.is_empty()))
         .map(|p| match p {
             AssistantPart::Text(t) => json!({"text": t}),
             AssistantPart::ToolCall(c) => {

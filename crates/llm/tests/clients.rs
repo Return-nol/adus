@@ -1224,3 +1224,153 @@ fn text_request_holds_one_user_message_and_no_tools() {
         ("m", "sys", 9)
     );
 }
+
+// ---------- Fix round 1 ----------
+
+/// `turn_two` with a user note between the assistant's tool calls and the tool results.
+fn user_then_tool() -> ChatRequest {
+    let mut req = turn_two();
+    req.messages.insert(
+        2,
+        Message::User {
+            parts: vec![UserPart::Text("note".into())],
+        },
+    );
+    req
+}
+
+#[tokio::test]
+async fn overflow_phrases_outside_the_spec_list_stay_invalid() {
+    for message in [
+        "max_tokens exceeds the maximum allowed value of 4096",
+        "too many tokens in stop sequence",
+    ] {
+        let server = serve(
+            OPENAI_PATH,
+            ResponseTemplate::new(400).set_body_json(json!({"error": {"message": message}})),
+        )
+        .await;
+        let err = chat(ProviderKind::OpenaiCompatible, &server)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::Invalid(_)), "{message}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn markers_in_echoed_input_do_not_classify_the_error() {
+    let echoed = "maximum context length; does not support tools; prompt is too long";
+    for (status, body) in [
+        // FastAPI/pydantic style: no `error` object, the input is echoed in `detail`.
+        (
+            422,
+            json!({"detail": [{
+                "type": "missing",
+                "loc": ["body", "messages", 1],
+                "msg": "Field required",
+                "input": {"content": echoed},
+            }]}),
+        ),
+        // An `error` object whose message is unrelated, with the input echoed beside it.
+        (
+            400,
+            json!({"error": {"message": "Invalid value for 'messages'", "input": echoed}}),
+        ),
+    ] {
+        let server = serve(
+            OPENAI_PATH,
+            ResponseTemplate::new(status).set_body_json(body),
+        )
+        .await;
+        let err = chat_with(ProviderKind::OpenaiCompatible, &server, &with_tools())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::Invalid(_)), "{status}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn overflow_marker_in_error_code_or_type_is_context_overflow() {
+    for error in [
+        json!({"message": "Request rejected", "code": "context_length_exceeded"}),
+        json!({"message": "Request rejected", "type": "context_length_exceeded"}),
+    ] {
+        let server = serve(
+            OPENAI_PATH,
+            ResponseTemplate::new(400).set_body_json(json!({ "error": error })),
+        )
+        .await;
+        let err = chat(ProviderKind::Openai, &server).await.unwrap_err();
+        assert!(matches!(err, LlmError::ContextOverflow(_)), "{err:?}");
+    }
+}
+
+#[tokio::test]
+async fn anthropic_puts_tool_results_before_text_when_user_precedes_tool() {
+    let server = serve(
+        ANTHROPIC_PATH,
+        ok(json!({"content": [{"type": "text", "text": "done"}]})),
+    )
+    .await;
+    chat_with(ProviderKind::Anthropic, &server, &user_then_tool())
+        .await
+        .unwrap();
+    let messages = &sent_body(&server).await["messages"];
+    assert_eq!(messages.as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        messages[2],
+        json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "fn main() {}", "is_error": false},
+            {"type": "tool_result", "tool_use_id": "call_2", "content": "bad pattern", "is_error": true},
+            {"type": "text", "text": "note", "cache_control": {"type": "ephemeral"}},
+        ]})
+    );
+}
+
+#[tokio::test]
+async fn gemini_puts_function_responses_before_text_when_user_precedes_tool() {
+    let server = serve(
+        GEMINI_PATH,
+        ok(json!({"candidates": [{"content": {"parts": [{"text": "done"}]}}]})),
+    )
+    .await;
+    chat_with(ProviderKind::Gemini, &server, &user_then_tool())
+        .await
+        .unwrap();
+    let contents = &sent_body(&server).await["contents"];
+    assert_eq!(contents.as_array().map(Vec::len), Some(3));
+    assert_eq!(
+        contents[2],
+        json!({"role": "user", "parts": [
+            {"functionResponse": {"name": "read_file",
+                "response": {"result": "fn main() {}", "isError": false}}},
+            {"functionResponse": {"name": "grep",
+                "response": {"result": "bad pattern", "isError": true}}},
+            {"text": "note"},
+        ]})
+    );
+}
+
+#[tokio::test]
+async fn gemini_drops_empty_assistant_text_parts() {
+    let server = serve(
+        GEMINI_PATH,
+        ok(json!({"candidates": [{"content": {"parts": [{"text": "done"}]}}]})),
+    )
+    .await;
+    let mut req = turn_two();
+    if let Message::Assistant { parts } = &mut req.messages[1] {
+        parts[0] = AssistantPart::Text(String::new());
+    }
+    chat_with(ProviderKind::Gemini, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(
+        sent_body(&server).await["contents"][1],
+        json!({"role": "model", "parts": [
+            {"functionCall": {"name": "read_file", "args": {"path": "a.rs"}},
+             "thoughtSignature": "sig-a"},
+            {"functionCall": {"name": "grep", "args": {"pattern": "todo"}}},
+        ]})
+    );
+}

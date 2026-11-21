@@ -157,7 +157,7 @@ pub trait LlmClient: Send + Sync {
     async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError>;
 }
 
-/// Substrings (lowercase) in an error body that mean the model or endpoint cannot use tools.
+/// Substrings (lowercase) in a provider error that mean the model or endpoint cannot use tools.
 const TOOLS_UNSUPPORTED_MARKERS: [&str; 5] = [
     "does not support tools",
     "tool_use is not supported",
@@ -165,13 +165,12 @@ const TOOLS_UNSUPPORTED_MARKERS: [&str; 5] = [
     "function calling is not supported",
     "tool calling is not supported",
 ];
-/// Substrings (lowercase) in an error body that mean the prompt is too long for the model.
-const CONTEXT_OVERFLOW_MARKERS: [&str; 7] = [
+/// Substrings (lowercase) in a provider error that mean the prompt is too long for the model.
+const CONTEXT_OVERFLOW_MARKERS: [&str; 6] = [
     "context_length_exceeded",
     "maximum context length",
     "prompt is too long",
-    "exceeds the maximum",
-    "too many tokens",
+    "exceeds the maximum number of tokens",
     "token count exceeds",
     "input is too long",
 ];
@@ -208,8 +207,7 @@ pub(crate) async fn send(req: RequestBuilder, has_tools: bool) -> Result<Respons
                 return Err(LlmError::Unauthorized);
             }
             let message = format!("provider status {status}{}", provider_message(&body));
-            // Markers are searched in the whole body: some providers put them in `error.code`.
-            let lower = String::from_utf8_lossy(&raw).to_lowercase();
+            let lower = error_text(&body);
             let too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
             if has_tools && !too_large && tools_unsupported(&lower) {
                 LlmError::ToolsUnsupported(message)
@@ -223,17 +221,30 @@ pub(crate) async fn send(req: RequestBuilder, has_tools: bool) -> Result<Respons
     })
 }
 
-fn tools_unsupported(lower_body: &str) -> bool {
-    TOOLS_UNSUPPORTED_MARKERS
+/// Lowercased `error.message`, `error.code`, `error.type`, or a plain-string `error`, one per
+/// line. Only these fields are scanned for markers: some servers echo the request input
+/// elsewhere in the body, and that input (PR code) may contain the marker phrases.
+fn error_text(body: &Value) -> String {
+    let error = &body["error"];
+    [&error["message"], &error["code"], &error["type"], error]
         .iter()
-        .any(|m| lower_body.contains(m))
-        || (lower_body.contains("unknown field") && lower_body.contains("tools"))
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase()
 }
 
-fn context_overflow(lower_body: &str) -> bool {
+fn tools_unsupported(lower_error: &str) -> bool {
+    TOOLS_UNSUPPORTED_MARKERS
+        .iter()
+        .any(|m| lower_error.contains(m))
+        || (lower_error.contains("unknown field") && lower_error.contains("tools"))
+}
+
+fn context_overflow(lower_error: &str) -> bool {
     CONTEXT_OVERFLOW_MARKERS
         .iter()
-        .any(|m| lower_body.contains(m))
+        .any(|m| lower_error.contains(m))
 }
 
 /// `Retry-After` dalam detik. Bentuk HTTP-date diabaikan.

@@ -136,6 +136,7 @@ fn ephemeral() -> Value {
 
 /// Conversation as Anthropic messages. Tool results travel in a `user` message, and adjacent
 /// messages with the same role are merged, because the API rejects two `user` turns in a row.
+/// In a merged turn the `tool_result` blocks come first (the API requires it), then the text.
 /// With two or more messages, the last block of the last `user` turn gets a cache breakpoint.
 fn wire_messages(messages: &[Message]) -> Vec<Value> {
     let mut out: Vec<(&str, Vec<Value>)> = Vec::new();
@@ -165,7 +166,11 @@ fn wire_messages(messages: &[Message]) -> Vec<Value> {
             ),
         };
         match out.last_mut() {
-            Some((last_role, last_blocks)) if *last_role == role => last_blocks.extend(blocks),
+            Some((last_role, last_blocks)) if *last_role == role => {
+                last_blocks.extend(blocks);
+                // Stable: keeps the order within the tool results and within the text.
+                last_blocks.sort_by_key(|b| b["type"] != "tool_result");
+            }
             _ => out.push((role, blocks)),
         }
     }
