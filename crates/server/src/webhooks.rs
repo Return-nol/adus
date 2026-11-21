@@ -233,6 +233,7 @@ pub fn parse_github(event: &str, body: &Value, repo_id: Uuid) -> Option<Job> {
                 repository_id: repo_id,
                 pr_number: pr_number(&body["pull_request"]["number"])?,
                 trigger,
+                mode_override: None,
             })
         }
         // `issue.pull_request` hanya ada jika issue itu sebuah PR.
@@ -284,6 +285,7 @@ pub fn parse_azure(body: &Value, repo_id: Uuid) -> Option<Job> {
         repository_id: repo_id,
         pr_number: pr_number(&resource["pullRequestId"])?,
         trigger,
+        mode_override: None,
     })
 }
 
@@ -355,6 +357,7 @@ mod tests {
             repository_id: Uuid::nil(),
             pr_number,
             trigger,
+            mode_override: None,
         })
     }
 

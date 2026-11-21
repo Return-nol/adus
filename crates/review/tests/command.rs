@@ -1,7 +1,7 @@
 mod common;
 
 use adus_core::job::{CommentAuthor, Job, Trigger};
-use adus_core::types::{ADUDU_MARKER, ConnectionKind};
+use adus_core::types::{ADUDU_MARKER, ConnectionKind, ReviewMode};
 use adus_db::connections::{self, ConnectionStatus};
 use adus_db::memories::{self, MemorySource};
 use adus_db::rules::KnowledgeScope;
@@ -44,12 +44,32 @@ async fn github_setup(pool: &PgPool) -> Setup {
 fn parse_review_case_insensitive() {
     assert!(matches!(
         parse_command("@Adudu REVIEW"),
-        Some(Command::Review)
+        Some(Command::Review { mode: None })
     ));
     assert!(matches!(
         parse_command("thanks! @adudu review please"),
-        Some(Command::Review)
+        Some(Command::Review { mode: None })
     ));
+}
+
+#[test]
+fn parse_review_deep_and_specialists() {
+    let specialists = Some(Command::Review {
+        mode: Some(ReviewMode::Specialists),
+    });
+    assert_eq!(parse_command("@adudu review deep"), specialists);
+    assert_eq!(parse_command("@adudu review specialists"), specialists);
+    assert_eq!(parse_command("@adudu REVIEW DEEP!"), specialists);
+    assert_eq!(
+        parse_command("@adudu review generalist"),
+        Some(Command::Review {
+            mode: Some(ReviewMode::Generalist)
+        })
+    );
+    let configured = Some(Command::Review { mode: None });
+    assert_eq!(parse_command("@adudu review"), configured);
+    assert_eq!(parse_command("@adudu review please"), configured);
+    assert_eq!(parse_command("@adudu review deeper"), configured);
 }
 
 #[test]
@@ -115,7 +135,7 @@ fn email_like_text_is_not_a_mention() {
     // Hanya mention sungguhan yang dihitung, walau ada teks mirip sebelumnya.
     assert!(matches!(
         parse_command("foo@adudu.com — @adudu review"),
-        Some(Command::Review)
+        Some(Command::Review { mode: None })
     ));
 }
 
@@ -341,6 +361,7 @@ async fn review_command_enqueues_job(pool: PgPool) {
             repository_id: s.repository_id,
             pr_number: 7,
             trigger: Trigger::Command,
+            mode_override: None,
         }]
     );
     let comments = s.git.state().comments.clone();
@@ -406,10 +427,35 @@ async fn non_comment_job_is_fatal(pool: PgPool) {
         repository_id: s.repository_id,
         pr_number: 7,
         trigger: Trigger::Command,
+        mode_override: None,
     };
 
     let result = s.engine.handle_comment(&queue, &job).await;
 
     assert_eq!(result, Err(EngineError::Fatal("not a comment job".into())));
+    cleanup_queue(&prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_deep_command_enqueues_specialists_override(pool: PgPool) {
+    let s = github_setup(&pool).await;
+    user(&pool, "octo@acme.test", Some("octocat")).await;
+    let (queue, prefix) = test_queue().await;
+
+    let result = s
+        .engine
+        .handle_comment(&queue, &comment(&s, "@adudu review deep"))
+        .await;
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        queued_jobs(&prefix).await,
+        vec![Job::ReviewPr {
+            repository_id: s.repository_id,
+            pr_number: 7,
+            trigger: Trigger::Command,
+            mode_override: Some(ReviewMode::Specialists),
+        }]
+    );
     cleanup_queue(&prefix).await;
 }

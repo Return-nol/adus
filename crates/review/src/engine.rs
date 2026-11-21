@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use adus_core::crypto::Cipher;
 use adus_core::job::Trigger;
-use adus_core::types::{ConnectionKind, Severity};
+use adus_core::types::{ConnectionKind, ReviewMode, Severity};
 use adus_db::connections::{self, Connection, ConnectionStatus};
 use adus_db::ignore::{IgnoreMatcher, default_ignore_paths, effective_ignore_paths, title_matches};
 use adus_db::repositories::{self, Repository};
@@ -77,6 +77,8 @@ impl Engine {
         repository_id: Uuid,
         pr_number: i64,
         trigger: Trigger,
+        // Accepted now, used once the review modes are wired into the engine.
+        _mode_override: Option<ReviewMode>,
     ) -> Result<Option<Uuid>, EngineError> {
         let Some(repo) = repositories::get(&self.db, repository_id)
             .await

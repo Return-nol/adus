@@ -50,8 +50,9 @@ impl JobRunner for Engine {
                 repository_id,
                 pr_number,
                 trigger,
+                mode_override,
             } => self
-                .review_pr(*repository_id, *pr_number, *trigger)
+                .review_pr(*repository_id, *pr_number, *trigger, *mode_override)
                 .await
                 .map(|_review_id| ()),
             Job::PrComment { .. } => self.handle_comment(queue, job).await,
@@ -65,6 +66,7 @@ impl JobRunner for Engine {
             repository_id,
             pr_number,
             trigger,
+            ..
         } = job
         else {
             return;

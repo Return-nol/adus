@@ -33,6 +33,18 @@ pub enum Severity {
     Critical,
 }
 
+/// How a PR is reviewed. Stored in `settings.review_mode` and `repositories.review_mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "review_mode", rename_all = "snake_case")]
+pub enum ReviewMode {
+    /// One reviewer pass over the whole diff.
+    #[default]
+    Generalist,
+    /// Several focused passes (bugs, security, performance, rules).
+    Specialists,
+}
+
 /// Path file di dalam Adus tidak punya `/` di depan (Azure mengembalikan `/src/a.rs`).
 pub fn normalize_path(path: &str) -> String {
     path.trim_start_matches('/').to_string()
@@ -62,5 +74,18 @@ mod tests {
             serde_json::to_string(&Severity::Critical).unwrap(),
             "\"critical\""
         );
+    }
+
+    #[test]
+    fn review_mode_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ReviewMode::Generalist).unwrap(),
+            "\"generalist\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReviewMode::Specialists).unwrap(),
+            "\"specialists\""
+        );
+        assert_eq!(ReviewMode::default(), ReviewMode::Generalist);
     }
 }

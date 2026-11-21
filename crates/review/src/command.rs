@@ -2,7 +2,7 @@
 //! `remember: <isi>` (simpan memory repo). Hanya user Adus terdaftar yang boleh memerintah.
 
 use adus_core::job::{CommentAuthor, Job, Trigger};
-use adus_core::types::ConnectionKind;
+use adus_core::types::{ConnectionKind, ReviewMode};
 use adus_db::connections::Connection;
 use adus_db::memories::{self, MemorySource, NewMemory};
 use adus_db::repositories;
@@ -20,11 +20,15 @@ const MENTION: &str = "@adudu";
 const MAX_MEMORY_CHARS: usize = 2000;
 const HELP: &str = "I didn't understand that. I know these commands:\n\n\
                     - `@adudu review` — run a full review of this pull request\n\
+                    - `@adudu review deep` — run a multi-specialist deep review (Bug, Security, Performance, Rules)\n\
                     - `@adudu remember: <text>` — save a convention for this repository";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    Review,
+    /// `mode` is `None` when the comment names no mode: use the configured one.
+    Review {
+        mode: Option<ReviewMode>,
+    },
     Remember(String),
     Unknown,
 }
@@ -36,8 +40,10 @@ pub fn parse_command(body: &str) -> Option<Command> {
         return None;
     }
     let rest = after_mention(body)?.trim_start();
-    if word(rest, "review").is_some() {
-        return Some(Command::Review);
+    if let Some(after) = word(rest, "review") {
+        return Some(Command::Review {
+            mode: review_mode(after.trim_start()),
+        });
     }
     let rest = word(rest, "please").map_or(rest, str::trim_start);
     let Some(text) = word(rest, "remember") else {
@@ -48,6 +54,17 @@ pub fn parse_command(body: &str) -> Option<Command> {
         return Some(Command::Unknown);
     }
     Some(Command::Remember(text.to_string()))
+}
+
+/// Mode named right after `review`; anything else (`please`, `deeper`, nothing) is `None`.
+fn review_mode(text: &str) -> Option<ReviewMode> {
+    if word(text, "deep").is_some() || word(text, "specialists").is_some() {
+        Some(ReviewMode::Specialists)
+    } else if word(text, "generalist").is_some() {
+        Some(ReviewMode::Generalist)
+    } else {
+        None
+    }
 }
 
 /// Teks setelah mention `@adudu` pertama yang berdiri sendiri: sebelumnya awal teks atau
@@ -142,11 +159,12 @@ impl Engine {
 
         // `done` = efek samping sudah terjadi; retry setelahnya akan menggandakannya.
         let (reply, done) = match command {
-            Command::Review => {
+            Command::Review { mode } => {
                 let review = Job::ReviewPr {
                     repository_id: *repository_id,
                     pr_number: *pr_number,
                     trigger: Trigger::Command,
+                    mode_override: mode,
                 };
                 queue
                     .enqueue(&review)

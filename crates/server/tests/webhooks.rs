@@ -186,6 +186,7 @@ async fn github_pr_opened_enqueues_review(pool: PgPool) {
             repository_id: hook.repo_id,
             pr_number: 2,
             trigger: Trigger::Opened,
+            mode_override: None,
         }]
     );
     common::cleanup_queue(&hook.prefix).await;
@@ -207,6 +208,7 @@ async fn github_draft_ready_for_review_enqueues(pool: PgPool) {
             repository_id: hook.repo_id,
             pr_number: 2,
             trigger: Trigger::Opened,
+            mode_override: None,
         }]
     );
     common::cleanup_queue(&hook.prefix).await;
@@ -329,6 +331,7 @@ async fn azure_pr_created_enqueues(pool: PgPool) {
             repository_id: hook.repo_id,
             pr_number: 1,
             trigger: Trigger::Opened,
+            mode_override: None,
         }]
     );
     // Notifikasi yang sama dikirim ulang: tidak di-enqueue lagi.
@@ -349,6 +352,7 @@ async fn azure_pr_updated_enqueues_updated_trigger(pool: PgPool) {
             repository_id: hook.repo_id,
             pr_number: 1,
             trigger: Trigger::Updated,
+            mode_override: None,
         }]
     );
     common::cleanup_queue(&hook.prefix).await;

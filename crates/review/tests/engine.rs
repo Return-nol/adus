@@ -39,7 +39,7 @@ async fn set_limits(pool: &PgPool, max_files: i32, max_lines: i32) {
 
 /// Review PR 7 di repo hasil `setup`; repo itu ada, jadi selalu ada baris review.
 async fn run(s: &Setup, trigger: Trigger) -> Result<Uuid, EngineError> {
-    let result = s.engine.review_pr(s.repository_id, 7, trigger).await;
+    let result = s.engine.review_pr(s.repository_id, 7, trigger, None).await;
     result.map(|id| id.expect("review row"))
 }
 
@@ -164,7 +164,7 @@ async fn disabled_or_missing_repo_is_skipped(pool: PgPool) {
 
     let missing = s
         .engine
-        .review_pr(Uuid::new_v4(), 7, Trigger::Command)
+        .review_pr(Uuid::new_v4(), 7, Trigger::Command, None)
         .await;
     assert_eq!(missing, Ok(None));
     assert!(s.git.state().created.is_empty());

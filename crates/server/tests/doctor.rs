@@ -58,6 +58,7 @@ async fn healthy_world(pool: PgPool) -> World {
             max_patch_lines_per_file: 2000,
             ignore_paths: None,
             ignored_title_keywords: vec![],
+            review_mode: Default::default(),
         },
     )
     .await
@@ -306,6 +307,7 @@ async fn doctor_warns_on_dead_letters(pool: PgPool) {
         repository_id: Uuid::new_v4(),
         pr_number: 1,
         trigger: Trigger::Opened,
+        mode_override: None,
     };
     w.state.queue.enqueue(&job).await.unwrap();
     let delivery = w

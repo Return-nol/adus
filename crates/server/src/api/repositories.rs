@@ -235,6 +235,8 @@ async fn update(
         review_model: body
             .review_model
             .map(|m| m.map(|m| m.trim().to_string()).filter(|m| !m.is_empty())),
+        // The API does not expose the review mode yet.
+        review_mode: None,
     };
     let repo = repositories::update(&state.db, id, patch)
         .await?

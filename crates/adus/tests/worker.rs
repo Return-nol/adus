@@ -104,6 +104,7 @@ fn review_job(repository_id: Uuid, pr_number: i64) -> Job {
         repository_id,
         pr_number,
         trigger: Trigger::Opened,
+        mode_override: None,
     }
 }
 

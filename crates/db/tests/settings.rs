@@ -1,4 +1,5 @@
 use adus_core::default_ignore::DEFAULT_IGNORE_PATHS;
+use adus_core::types::ReviewMode;
 use adus_db::{ignore::effective_ignore_paths, settings};
 use sqlx::PgPool;
 
@@ -22,4 +23,15 @@ async fn settings_ignore_paths_round_trip_and_reset(pool: PgPool) {
     new.ignore_paths = None;
     let reset = settings::update(&pool, &new).await.unwrap();
     assert_eq!(effective_ignore_paths(&reset), DEFAULT_IGNORE_PATHS);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn settings_review_mode_defaults_to_generalist_and_round_trips(pool: PgPool) {
+    let mut current = settings::get(&pool).await.unwrap();
+    assert_eq!(current.review_mode, ReviewMode::Generalist);
+
+    current.review_mode = ReviewMode::Specialists;
+    let saved = settings::update(&pool, &current).await.unwrap();
+    assert_eq!(saved.review_mode, ReviewMode::Specialists);
+    assert_eq!(settings::get(&pool).await.unwrap(), saved);
 }

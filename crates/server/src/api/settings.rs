@@ -174,6 +174,7 @@ async fn replace(
         max_patch_lines_per_file: body.max_patch_lines_per_file,
         ignore_paths,
         ignored_title_keywords,
+        review_mode: current.review_mode,
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }
