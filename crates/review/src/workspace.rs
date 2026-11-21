@@ -741,8 +741,10 @@ fn version_supported(version: (u32, u32)) -> bool {
     version >= MIN_GIT_VERSION
 }
 
-/// Creates `<root>/adus-{uuid}`. On Unix both `root` and the workspace are private (0700), so
-/// other local users can neither read the checkout nor plant files in it.
+/// Creates `<root>/adus-{uuid}` (0700 on Unix) and, on Unix, checks afterwards that `root` is
+/// still a private directory owned by the same user as the new workspace (see
+/// [`verify_workspace_parent`]). The check runs before any git command; on failure the
+/// `TempDir` is dropped and nothing is fetched.
 async fn create_workspace_dir(root: PathBuf) -> Result<TempDir, WorkspaceError> {
     tokio::task::spawn_blocking(move || {
         ensure_private_root(&root)?;
@@ -754,7 +756,9 @@ async fn create_workspace_dir(root: PathBuf) -> Result<TempDir, WorkspaceError> 
             use std::os::unix::fs::PermissionsExt;
             builder.permissions(std::fs::Permissions::from_mode(0o700));
         }
-        builder.tempdir_in(&root)
+        let dir = builder.tempdir_in(&root)?;
+        verify_workspace_parent(&root, dir.path())?;
+        Ok(dir)
     })
     .await
     .map_err(|_| WorkspaceError::Unavailable("cannot create workspace".into()))?
@@ -762,9 +766,9 @@ async fn create_workspace_dir(root: PathBuf) -> Result<TempDir, WorkspaceError> 
 }
 
 /// Creates `root` if missing. On Unix it must then be a real directory (not a symlink) without
-/// group or other permissions: a predictable path under a shared `/tmp` may have been created
-/// by another user first. A 0700 directory owned by someone else fails safe, because creating
-/// the workspace inside it is denied.
+/// group or other permissions. This is only an early rejection: a predictable path under a
+/// shared `/tmp` may belong to another user, who can change its mode or swap it for a symlink
+/// at any time. The binding check is [`verify_workspace_parent`], after the workspace exists.
 #[cfg(unix)]
 fn ensure_private_root(root: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -789,6 +793,49 @@ fn ensure_private_root(root: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn ensure_private_root(root: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(root)
+}
+
+/// Unix: after creating `workspace` inside `root`, both must be real directories without group
+/// or other permissions, and `root` must belong to the user that owns `workspace` (this
+/// process). Only that user (or the superuser) can then have changed `root` or its entries, so
+/// no one else can have redirected, replaced or planted files in the workspace.
+#[cfg(unix)]
+fn verify_workspace_parent(root: &Path, workspace: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let root_meta = std::fs::symlink_metadata(root)?;
+    let ws_meta = std::fs::symlink_metadata(workspace)?;
+    let ws_uid = ws_meta.uid();
+    let root_ok = is_private_dir_of(
+        root_meta.file_type().is_dir(),
+        root_meta.mode(),
+        root_meta.uid(),
+        ws_uid,
+    );
+    let ws_ok = is_private_dir_of(ws_meta.file_type().is_dir(), ws_meta.mode(), ws_uid, ws_uid);
+    if root_ok && ws_ok {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "clones root is not a private directory of this user",
+        ))
+    }
+}
+
+/// Windows: `%TEMP%` is already per user.
+#[cfg(not(unix))]
+fn verify_workspace_parent(_root: &Path, _workspace: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// True for a real directory (`is_dir` from `symlink_metadata`, so never a symlink) without
+/// group or other permission bits, owned by `uid`.
+#[cfg_attr(
+    all(not(unix), not(test)),
+    expect(dead_code, reason = "ownership is only checked on Unix")
+)]
+fn is_private_dir_of(is_dir: bool, mode: u32, owner_uid: u32, uid: u32) -> bool {
+    is_dir && mode & 0o077 == 0 && owner_uid == uid
 }
 
 /// Deletes a failed workspace now. Retries briefly because Windows releases the files of a
@@ -1374,6 +1421,41 @@ mod tests {
         for rel in ["link", "link/passwd", "link/missing.rs", "file-link"] {
             assert_eq!(ws.resolve(rel).err(), Some(PathError::EscapesRoot), "{rel}");
         }
+    }
+
+    #[test]
+    fn private_dir_check_requires_directory_mode_and_owner() {
+        assert!(is_private_dir_of(true, 0o40700, 1000, 1000));
+        assert!(is_private_dir_of(true, 0o700, 1000, 1000));
+        assert!(is_private_dir_of(true, 0o500, 1000, 1000));
+        // Owned by another user, even at 0700 (the race in which an owner flips the mode).
+        assert!(!is_private_dir_of(true, 0o700, 1001, 1000));
+        // Group or other bits.
+        assert!(!is_private_dir_of(true, 0o750, 1000, 1000));
+        assert!(!is_private_dir_of(true, 0o701, 1000, 1000));
+        assert!(!is_private_dir_of(true, 0o777, 1000, 1000));
+        // A symlink or file (`symlink_metadata` reports not-a-directory).
+        assert!(!is_private_dir_of(false, 0o700, 1000, 1000));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_workspace_parent_accepts_private_and_rejects_shared_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = private_root();
+        let ws = root.path().join("adus-ws");
+        fs::create_dir(&ws).unwrap();
+        fs::set_permissions(&ws, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(verify_workspace_parent(root.path(), &ws).is_ok());
+
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(verify_workspace_parent(root.path(), &ws).is_err());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        fs::set_permissions(&ws, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_workspace_parent(root.path(), &ws).is_err());
+        let missing = root.path().join("gone");
+        assert!(verify_workspace_parent(root.path(), &missing).is_err());
     }
 
     #[cfg(unix)]
