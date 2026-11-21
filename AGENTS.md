@@ -13,7 +13,7 @@ Repo: https://github.com/Return-nol/adus. The GHCR image name is `ghcr.io/return
 - **Agentic review engine (in progress on `feat/advanced-agentic-review-flow`):** `docs/superpowers/specs/2026-11-21-agentic-review-engine-design.md` and `docs/superpowers/plans/2026-11-21-agentic-review-engine.md` (10 tasks).
 - **Backlog of deferred minor findings:** `docs/superpowers/backlog.md`. (The local SDD ledgers used during execution were deleted after both plans finished; git history is the record.)
 
-If the spec and the plan conflict, the spec wins. For new work, start with superpowers `brainstorming`, then `writing-plans`, then `subagent-driven-development`.
+If the spec and the plan conflict, the spec wins. For new work, start with superpowers `brainstorming`, then `writing-plans`, then `subagent-driven-development`. Every plan and subagent prompt must carry the **Clean-room and no-assumption rule** (section below).
 
 ## Status (as of 2026-11-20)
 
@@ -153,3 +153,11 @@ On Windows, if `cargo` is not on PATH, it is in `%USERPROFILE%\.cargo\bin`. The 
 - **Rules vs memory.** Rules say what to flag (global or per repo, optional path glob, severity). Memory is always-injected context.
 - **Commands.** v1 supports only `@adudu review` and `@adudu remember: …`, matched case-insensitively on the literal text. They are accepted only from registered Adus users: Azure matches by email, GitHub by `users.github_login`. Unregistered authors are ignored silently. Conversational replies are future work.
 - **Enterprise code is clean-room.** Never open Kodus `libs/ee/**` or `*.ee.*`. Specify behavior only from public docs and observed behavior (spec 6.13). Non-EE Kodus code is AGPL and can be read as a behavioral reference, but do not port it.
+
+## Clean-room and no-assumption rule (binding for every plan and every agent)
+
+1. **Kodus community code** (https://github.com/kodustech/kodus-ai, anything outside `libs/ee/**` and not named `*.ee.*`) may be read as a behaviour reference and inspiration. Never port or translate it line by line: Adus code, prompts and schemas are written fresh. **Kodus enterprise code** (`libs/ee/**`, `*.ee.*`) is never opened, fetched or searched, not even to look.
+2. **Order of authority:** the task brief, then the spec, then this file and the existing Adus code. Kodus community behaviour (or public provider/git docs for wire formats) only fills a gap none of those settles. Never guess from memory of how Kodus or another tool works; if a gap remains, raise it instead of assuming.
+3. **Openness:** every implementer report lists its assumptions under an "Assumptions" heading and cites each Kodus community file consulted (path) and the behaviour taken from it.
+4. **Reviewers** flag as Important any line-by-line port or translation, anything that looks derived from Kodus enterprise code, uncited Kodus use, and unstated assumptions beyond the brief/spec.
+5. **Plans and prompts:** every new plan repeats this rule in its Global Constraints, and every implementer and reviewer subagent prompt carries it verbatim.

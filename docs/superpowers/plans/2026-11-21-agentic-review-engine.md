@@ -15,7 +15,7 @@
 ## Global Constraints & Rust Standards
 
 - **AGENTS.md baseline:** Runtime `sqlx::query` / `sqlx::query_as` only (never `query!` macros); `ApiJson<T>` / `ApiPath<T>` / `ApiQuery<T>` and `ApiError` JSON errors in `crates/server`; `#lib/*.js` / `#lib/*.svelte` imports and `DESIGN.md` tokens in `web/`; no browser automation; `cargo test --workspace -j 2` on Windows (and clean `target/debug/incremental` if disk space drops).
-- **Clean-room policy:** Strictly follow Section 6.13 of the base design spec (`2026-11-19-adus-design.md`) — zero code, prompts, or text derived from Kodus `libs/ee/**` or `*.ee.*`.
+- **Clean-room and no-assumption rule (`AGENTS.md`, binding):** Section 6.13 of the base design spec (`2026-11-19-adus-design.md`) — zero code, prompts, or text derived from Kodus `libs/ee/**` or `*.ee.*`. Kodus community code may inspire behaviour but is never ported line by line. Authority order: brief → spec → `AGENTS.md`/existing code → Kodus community behaviour (gaps only). No guessing; raise gaps. Reports list "Assumptions" and cite Kodus files consulted. Every implementer and reviewer prompt carries the rule verbatim.
 - **Rust Best Practices (spec Section 5):**
   - Idiomatic expressive Rust is encouraged over the original minimal learner subset whenever it improves safety or clarity.
   - **Borrowing & ownership:** Take `&str`, `&[T]`, `Cow<'_, str>` at boundaries; pass `Copy` enums (`ReviewMode`, `Severity`, `SpecialistKind`) by value; avoid `.clone()` inside hot search/loop iterations.
