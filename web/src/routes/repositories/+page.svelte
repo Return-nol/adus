@@ -19,6 +19,13 @@
 	import TableSkeleton from '#lib/components/table-skeleton.svelte';
 	import type { Provider } from '#lib/components/provider-dialog.svelte';
 
+	type ReviewMode = 'generalist' | 'specialists';
+
+	const reviewModeLabels: Record<ReviewMode, string> = {
+		generalist: 'Generalist',
+		specialists: 'Specialists'
+	};
+
 	type Repo = {
 		id: string;
 		connection_id: string;
@@ -27,6 +34,7 @@
 		enabled: boolean;
 		auto_review: boolean;
 		review_provider_id: string | null;
+		review_mode: ReviewMode | null;
 		webhook_count: number;
 	};
 
@@ -60,6 +68,10 @@
 			fail(e);
 		}
 		loaded = true;
+	}
+
+	function reviewModeLabel(mode: ReviewMode | null): string {
+		return mode ? reviewModeLabels[mode] : 'Default (global)';
 	}
 
 	function providerLabel(id: string | null): string {
@@ -98,7 +110,12 @@
 
 	async function patchRepo(
 		repo: Repo,
-		patch: { enabled?: boolean; auto_review?: boolean; review_provider_id?: string | null }
+		patch: {
+			enabled?: boolean;
+			auto_review?: boolean;
+			review_provider_id?: string | null;
+			review_mode?: ReviewMode | null;
+		}
 	) {
 		try {
 			await api('PATCH', `/repositories/${repo.id}`, patch);
@@ -157,7 +174,9 @@
 				{/if}
 			</Card.Header>
 			<Card.Content>
-				<TableSkeleton headers={['Repository', 'Enabled', 'Auto review', 'Provider', 'Actions']} />
+				<TableSkeleton
+					headers={['Repository', 'Enabled', 'Auto review', 'Provider', 'Review mode', 'Actions']}
+				/>
 			</Card.Content>
 		</Card.Root>
 	</div>
@@ -230,6 +249,7 @@
 							<Table.Head>Enabled</Table.Head>
 							<Table.Head>Auto review</Table.Head>
 							<Table.Head>Provider</Table.Head>
+							<Table.Head>Review mode</Table.Head>
 							<Table.Head class="text-right">Actions</Table.Head>
 						</Table.Row>
 					</Table.Header>
@@ -284,6 +304,35 @@
 										</span>
 									{/if}
 								</Table.Cell>
+								<Table.Cell>
+									{#if isAdmin}
+										<Select.Root
+											type="single"
+											bind:value={
+												() => repo.review_mode ?? '',
+												(v) => patchRepo(repo, { review_mode: (v || null) as ReviewMode | null })
+											}
+										>
+											<Select.Trigger
+												size="sm"
+												class="w-40"
+												aria-label={`Review mode: ${repo.display_name}`}
+											>
+												<span class="truncate">{reviewModeLabel(repo.review_mode)}</span>
+											</Select.Trigger>
+											<Select.Content>
+												<Select.Item value="" label="Default (global)">
+													Default (global)
+												</Select.Item>
+												{#each Object.entries(reviewModeLabels) as [value, label] (value)}
+													<Select.Item {value} {label}>{label}</Select.Item>
+												{/each}
+											</Select.Content>
+										</Select.Root>
+									{:else}
+										<span class="text-muted-foreground">{reviewModeLabel(repo.review_mode)}</span>
+									{/if}
+								</Table.Cell>
 								<Table.Cell class="text-right">
 									{#if isAdmin}
 										<Button
@@ -303,7 +352,7 @@
 							</Table.Row>
 						{:else}
 							<Table.Row>
-								<Table.Cell colspan={5} class="text-muted-foreground">
+								<Table.Cell colspan={6} class="text-muted-foreground">
 									No repositories yet.
 								</Table.Cell>
 							</Table.Row>

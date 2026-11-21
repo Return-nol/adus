@@ -14,8 +14,16 @@
 	import { Textarea } from '#lib/components/ui/textarea/index.js';
 	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
 
+	type ReviewMode = 'generalist' | 'specialists';
+
+	const reviewModeLabels: Record<ReviewMode, string> = {
+		generalist: 'Generalist — balanced single-pass review',
+		specialists: 'Specialists — parallel Bug, Security, Performance & Rules'
+	};
+
 	type Settings = {
 		default_provider_id: string | null;
+		review_mode: ReviewMode;
 		max_files_per_review: number;
 		max_patch_lines_per_file: number;
 		ignore_paths: string[];
@@ -30,6 +38,7 @@
 	let busy = $state(false);
 	// '' = no default provider.
 	let providerId = $state('');
+	let reviewMode = $state<ReviewMode>('generalist');
 	let maxFiles = $state(0);
 	let maxPatchLines = $state(0);
 	// Ignored files: the textarea text, plus what the server last gave us.
@@ -75,6 +84,7 @@
 		fillIgnore(s);
 		keywordsText = s.ignored_title_keywords.join('\n');
 		providerId = s.default_provider_id ?? '';
+		reviewMode = s.review_mode;
 		maxFiles = s.max_files_per_review;
 		maxPatchLines = s.max_patch_lines_per_file;
 	}
@@ -107,6 +117,7 @@
 			fill(
 				await api<Settings>('PUT', '/settings', {
 					default_provider_id: providerId || null,
+					review_mode: reviewMode,
 					max_files_per_review: maxFiles,
 					max_patch_lines_per_file: maxPatchLines,
 					// Omitted unless edited, so saving other settings never pins the defaults.
@@ -193,7 +204,7 @@
 	<Card.Root class="max-w-2xl" aria-busy="true">
 		<Card.Content class="grid gap-4">
 			<span class="sr-only" role="status">Loading…</span>
-			{#each ['w-28', 'w-44', 'w-52'] as w, i (i)}
+			{#each ['w-28', 'w-24', 'w-44', 'w-52'] as w, i (i)}
 				<div class="grid gap-2">
 					<Skeleton class={`h-4 ${w}`} />
 					<Skeleton class="h-9 w-full rounded-sm" />
@@ -219,6 +230,23 @@
 							{/each}
 						</Select.Content>
 					</Select.Root>
+				</div>
+				<div class="grid gap-2">
+					<Label>Review mode</Label>
+					<Select.Root type="single" bind:value={reviewMode}>
+						<Select.Trigger class="w-full" aria-label="Review mode">
+							{reviewModeLabels[reviewMode]}
+						</Select.Trigger>
+						<Select.Content>
+							{#each Object.entries(reviewModeLabels) as [value, label] (value)}
+								<Select.Item {value} {label}>{label}</Select.Item>
+							{/each}
+						</Select.Content>
+					</Select.Root>
+					<p class="text-xs text-muted-foreground">
+						Repositories can override this. <code class="font-mono">@adudu review deep</code> runs the
+						specialists on any pull request.
+					</p>
 				</div>
 				<div class="grid gap-2">
 					<Label for="s-files">Max files per review (1-500)</Label>
