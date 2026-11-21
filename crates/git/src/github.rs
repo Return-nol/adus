@@ -409,7 +409,21 @@ impl GitProvider for GithubProvider {
     ) -> Result<usize, GitError> {
         let inline: Vec<_> = comments
             .iter()
-            .map(|c| json!({ "path": c.path, "line": c.line, "side": "RIGHT", "body": c.body }))
+            .map(|c| {
+                let mut item = json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": "RIGHT",
+                    "body": c.body,
+                });
+                if let Some(start) = c.start_line.filter(|&s| s < c.line)
+                    && let Some(obj) = item.as_object_mut()
+                {
+                    obj.insert("start_line".into(), json!(start));
+                    obj.insert("start_side".into(), json!("RIGHT"));
+                }
+                item
+            })
             .collect();
         let body = json!({
             "commit_id": pr.head_sha,

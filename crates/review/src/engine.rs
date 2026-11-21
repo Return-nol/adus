@@ -2,7 +2,7 @@
 //! `reviews`. The Finder stage lives in `finder.rs`; this file keeps the review-row lifecycle,
 //! the clone and its fallback, the stage sequencing and the deadlines, and posting.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use adus_db::repositories::{self, Repository};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::rules::Rule;
 use adus_db::{ai, memories, rules, settings};
-use adus_git::diff::{added_line_count, commentable_lines};
+use adus_git::diff::{added_line_count, intersect_hunks, right_line_end_offset};
 use adus_git::{
     FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PullRequest,
     RepoRef,
@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::agent::AgentError;
 use crate::dedup::deduplicate_findings;
 use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
-use crate::parse::{Suggestion, keep_valid_batch};
+use crate::parse::{CommentableRange, Suggestion, keep_valid_batch};
 use crate::prompt::{
     DiffBatch, MARKER, MAX_BATCH_CHARS, batch_targets, build_manifest, format_inline,
     format_summary,
@@ -79,10 +79,16 @@ enum Outcome {
     Skipped(&'static str),
 }
 
-/// Satu file yang akan direview, beserta baris yang boleh dikomentari.
+/// Satu file yang akan direview, beserta baris dan rentang hunk yang boleh dikomentari.
 struct Target {
     file: FileDiff,
-    allowed: BTreeSet<u32>,
+    allowed: CommentableRange,
+}
+
+#[derive(Default)]
+struct ReviewOutput {
+    counts: BTreeMap<Severity, usize>,
+    comments: Vec<InlineComment>,
 }
 
 pub fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
@@ -338,8 +344,8 @@ impl Engine {
 
         let mut warnings: Vec<String> = Vec::new();
         // Only skipped files left: no clone and no LLM, just the summary.
-        let found = if targets.is_empty() {
-            Vec::new()
+        let output = if targets.is_empty() {
+            ReviewOutput::default()
         } else {
             let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
             let skipped_map: HashMap<&str, &'static str> = skipped
@@ -375,20 +381,11 @@ impl Engine {
                 .await?
         };
 
-        let mut counts: BTreeMap<Severity, usize> = BTreeMap::new();
-        for suggestion in &found {
-            *counts.entry(suggestion.severity).or_default() += 1;
-        }
-        let comments: Vec<InlineComment> = found
-            .iter()
-            .map(|s| InlineComment {
-                path: s.file.clone(),
-                line: s.line,
-                body: format_inline(s),
-            })
-            .collect();
-        let summary = format_summary(&counts, &skipped, ignored, &warnings);
-        match git.post_review(&repo_ref, &pr, &comments, &summary).await {
+        let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
+        match git
+            .post_review(&repo_ref, &pr, &output.comments, &summary)
+            .await
+        {
             Ok(posted) => Ok(Outcome::Done { posted }),
             Err(err) => Err(self.post_error(&conn, err).await),
         }
@@ -404,8 +401,8 @@ impl Engine {
         manifest: &str,
         skipped: &mut Vec<(String, &'static str)>,
         warnings: &mut Vec<String>,
-    ) -> Result<Vec<Suggestion>, EngineError> {
-        let mut allowed: HashMap<String, BTreeSet<u32>> = HashMap::new();
+    ) -> Result<ReviewOutput, EngineError> {
+        let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
         let files: Vec<FileDiff> = targets
             .into_iter()
             .map(|target| {
@@ -541,7 +538,31 @@ impl Engine {
             cache_write_tokens,
             "review stages finished"
         );
-        Ok(found)
+        let patches: HashMap<String, Option<&str>> = files
+            .iter()
+            .map(|file| (normalize_path(&file.path), file.patch.as_deref()))
+            .collect();
+        let mut counts: BTreeMap<Severity, usize> = BTreeMap::new();
+        for suggestion in &found {
+            *counts.entry(suggestion.severity).or_default() += 1;
+        }
+        let comments = found
+            .iter()
+            .map(|s| {
+                let end_offset = s.start_line.and_then(|_| {
+                    let patch = patches.get(&normalize_path(&s.file)).copied().flatten()?;
+                    right_line_end_offset(patch, s.line)
+                });
+                InlineComment {
+                    path: s.file.clone(),
+                    start_line: s.start_line,
+                    line: s.line,
+                    end_offset,
+                    body: format_inline(s),
+                }
+            })
+            .collect();
+        Ok(ReviewOutput { counts, comments })
     }
 
     /// Connection milik repo.
@@ -635,7 +656,7 @@ fn finder_cache_tokens(tasks: &[FinderTask]) -> (u32, u32) {
 fn collect_candidates(
     tasks: Vec<FinderTask>,
     batches: &[DiffBatch<'_>],
-    allowed: &HashMap<String, BTreeSet<u32>>,
+    allowed: &HashMap<String, CommentableRange>,
     skipped: &mut Vec<(String, &'static str)>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<CandidateFinding>, EngineError> {
@@ -647,7 +668,7 @@ fn collect_candidates(
         .filter(|task| task.result.is_ok())
         .map(|task| task.batch)
         .collect();
-    let batch_allowed: Vec<HashMap<String, BTreeSet<u32>>> = batches
+    let batch_allowed: Vec<HashMap<String, CommentableRange>> = batches
         .iter()
         .map(|batch| {
             batch
@@ -655,8 +676,8 @@ fn collect_candidates(
                 .iter()
                 .filter_map(|file| {
                     let path = normalize_path(&file.path);
-                    let lines = allowed.get(&path)?.clone();
-                    Some((path, lines))
+                    let range = allowed.get(&path)?.clone();
+                    Some((path, range))
                 })
                 .collect()
         })
@@ -779,7 +800,7 @@ fn ignore_matcher(patterns: &[String]) -> Option<IgnoreMatcher> {
 fn full_targets(full: Vec<FileDiff>) -> Vec<Target> {
     full.into_iter()
         .map(|file| {
-            let allowed = commentable_lines(file.patch.as_deref().unwrap_or(""));
+            let allowed = CommentableRange::from_patch(file.patch.as_deref().unwrap_or(""));
             Target { file, allowed }
         })
         .collect()
@@ -788,19 +809,26 @@ fn full_targets(full: Vec<FileDiff>) -> Vec<Target> {
 /// File dari commit baru yang masih ada di diff PR penuh. Baris yang boleh dikomentari harus
 /// baru di commit ini DAN masih berubah di PR (supaya posisinya valid untuk provider).
 fn incremental_targets(changed: Vec<FileDiff>, full: Vec<FileDiff>) -> Vec<Target> {
-    let full_lines: HashMap<String, BTreeSet<u32>> = full
+    let full_ranges: HashMap<String, CommentableRange> = full
         .into_iter()
         .map(|file| {
-            let lines = commentable_lines(file.patch.as_deref().unwrap_or(""));
-            (file.path, lines)
+            let range = CommentableRange::from_patch(file.patch.as_deref().unwrap_or(""));
+            (file.path, range)
         })
         .collect();
     changed
         .into_iter()
         .filter_map(|file| {
-            let in_pr = full_lines.get(&file.path)?;
-            let new_lines = commentable_lines(file.patch.as_deref().unwrap_or(""));
-            let allowed = new_lines.intersection(in_pr).copied().collect();
+            let in_pr = full_ranges.get(&file.path)?;
+            let new_range = CommentableRange::from_patch(file.patch.as_deref().unwrap_or(""));
+            let allowed = CommentableRange {
+                lines: new_range
+                    .lines
+                    .intersection(&in_pr.lines)
+                    .copied()
+                    .collect(),
+                hunks: intersect_hunks(&new_range.hunks, &in_pr.hunks),
+            };
             Some(Target { file, allowed })
         })
         .collect()

@@ -422,12 +422,16 @@ async fn post_review_sends_right_side_lines() {
     let comments = vec![
         InlineComment {
             path: "src/a.rs".into(),
+            start_line: None,
             line: 12,
+            end_offset: None,
             body: "perbaiki".into(),
         },
         InlineComment {
             path: "src/b.rs".into(),
+            start_line: None,
             line: 3,
+            end_offset: None,
             body: "oke?".into(),
         },
     ];
@@ -436,6 +440,73 @@ async fn post_review_sends_right_side_lines() {
         .await
         .unwrap();
     assert_eq!(n, 2);
+}
+
+#[tokio::test]
+async fn post_review_sends_multiline_start_line_and_drops_invalid_start_line() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/alpha/pulls/7/reviews"))
+        .and(body_json(json!({
+            "commit_id": "headsha",
+            "event": "COMMENT",
+            "body": "summary",
+            "comments": [
+                {
+                    "path": "src/a.rs",
+                    "start_line": 10,
+                    "start_side": "RIGHT",
+                    "line": 12,
+                    "side": "RIGHT",
+                    "body": "multi",
+                },
+                {
+                    "path": "src/b.rs",
+                    "line": 5,
+                    "side": "RIGHT",
+                    "body": "equal",
+                },
+                {
+                    "path": "src/c.rs",
+                    "line": 4,
+                    "side": "RIGHT",
+                    "body": "inverted",
+                },
+            ],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let comments = vec![
+        InlineComment {
+            path: "src/a.rs".into(),
+            start_line: Some(10),
+            line: 12,
+            end_offset: Some(18),
+            body: "multi".into(),
+        },
+        InlineComment {
+            path: "src/b.rs".into(),
+            start_line: Some(5),
+            line: 5,
+            end_offset: None,
+            body: "equal".into(),
+        },
+        InlineComment {
+            path: "src/c.rs".into(),
+            start_line: Some(8),
+            line: 4,
+            end_offset: None,
+            body: "inverted".into(),
+        },
+    ];
+    let n = provider(&server)
+        .post_review(&repo(), &pr(), &comments, "summary")
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
 }
 
 #[tokio::test]

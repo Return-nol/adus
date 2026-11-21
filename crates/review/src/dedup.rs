@@ -108,7 +108,7 @@ fn build_user_prompt(findings: &[CandidateFinding]) -> String {
         .enumerate()
         .map(|(index, finding)| {
             let s = &finding.suggestion;
-            json!({
+            let mut item = json!({
                 "index": index,
                 "file": s.file,
                 "line": s.line,
@@ -116,7 +116,13 @@ fn build_user_prompt(findings: &[CandidateFinding]) -> String {
                 "title": s.title,
                 "body": s.body,
                 "reported_by": format!("{} reviewer", finding.specialist.label()),
-            })
+            });
+            if let Some(start) = s.start_line
+                && let Some(obj) = item.as_object_mut()
+            {
+                obj.insert("start_line".into(), json!(start));
+            }
+            item
         })
         .collect();
     let list = json!(items);
@@ -195,6 +201,7 @@ mod tests {
         CandidateFinding {
             suggestion: Suggestion {
                 file: "src/a.rs".into(),
+                start_line: None,
                 line: 2,
                 severity: Severity::Warning,
                 title: title.into(),

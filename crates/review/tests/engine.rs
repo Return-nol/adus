@@ -1598,3 +1598,56 @@ async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
     assert_eq!(row.status, ReviewStatus::Failed);
     assert_eq!(row.error.as_deref(), Some("review timed out"));
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn multiline_finding_keeps_same_hunk_span_and_drops_cross_hunk_start_line(pool: PgPool) {
+    let patch = "@@ -1,2 +1,4 @@\n ctx\n+let a = 1;\n+let b = 2;\n tail\n\
+                 @@ -10,2 +12,3 @@\n x\n+let y = 3;\n z\n";
+    let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("src/a.rs", patch)])).await;
+    let findings = json!([
+        {
+            "file": "src/a.rs",
+            "start_line": 2,
+            "line": 3,
+            "severity": "warning",
+            "title": "Same hunk",
+            "body": "spans lines 2-3",
+        },
+        {
+            "file": "src/a.rs",
+            "start_line": 2,
+            "line": 13,
+            "severity": "info",
+            "title": "Cross hunk",
+            "body": "cannot span across hunks",
+        },
+    ]);
+    s.chat.push(Ok(&findings.to_string()));
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1]}"#));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 2);
+
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 2);
+    assert!(
+        verifier
+            .iter()
+            .any(|c| c.user.contains("\"start_line\": 2")),
+        "same-hunk finding retains start_line for verifier"
+    );
+
+    let git = s.git.state();
+    let posted = &git.reviews[0].comments;
+    assert_eq!(posted.len(), 2);
+    assert_eq!(posted[0].start_line, Some(2));
+    assert_eq!(posted[0].line, 3);
+    assert_eq!(posted[0].end_offset, Some(11));
+    assert_eq!(posted[1].start_line, None);
+    assert_eq!(posted[1].line, 13);
+    assert_eq!(posted[1].end_offset, None);
+}

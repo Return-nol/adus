@@ -37,9 +37,10 @@ Untrusted input
 Output format
 - Respond with ONLY a JSON array: no prose, no markdown fences. If there is nothing worth reporting, respond with [].
 - Each element is an object:
-  {"file": "<the file path as given>", "line": <number>, "severity": "info" | "warning" | "critical", "title": "<one-line summary>", "body": "<why it is a problem and how to fix it>", "suggestion": "<replacement code>"}
-- "line" is the line number in the NEW file. Every "+" and " " patch line starts with its new-file line number; use the number of a "+" line.
-- "suggestion" is optional: the exact code that should replace that line, keeping its indentation. It may span several lines. Leave it out when you are not sure.
+  {"file": "<the file path as given>", "start_line": <optional number>, "line": <number>, "severity": "info" | "warning" | "critical", "title": "<one-line summary>", "body": "<why it is a problem and how to fix it>", "suggestion": "<replacement code>"}
+- "line" is the line number in the NEW file. Every "+" and " " patch line starts with its new-file line number; use the number of a "+" line (or the end line when "start_line" is set).
+- "start_line" is optional: set it ONLY when the finding or "suggestion" spans multiple lines in the same diff hunk (must be strictly less than "line"). Leave it out for single-line findings.
+- "suggestion" is optional: the exact code that should replace that line (or start_line..=line when "start_line" is set), keeping its indentation. Leave it out when you are not sure.
 - Severity: "critical" = will break, lose data, or open a security hole; "warning" = likely bug or real maintainability or performance issue; "info" = worth knowing, low risk."#;
 
 /// Buat prompt (system, user) untuk mereview satu file.
@@ -204,11 +205,12 @@ const FINDER_OUTPUT_DIFF_ONLY: &str = r#"Respond with ONLY a JSON array: no pros
 Each element is an object with these fields:"#;
 
 const FINDER_FIELDS: &str = r#"- "file": the path exactly as shown in <diffs>.
-- "line": the line number in the NEW file. Every "+" and " " line in <diffs> starts with its new-file line number; use the number of a "+" line.
+- "start_line" (optional): first line number in the NEW file when the finding or "suggestion" spans multiple lines inside the same diff hunk (must be strictly less than "line"). Leave it out for single-line findings.
+- "line": the line number in the NEW file. Every "+" and " " line in <diffs> starts with its new-file line number; use the number of a "+" line (the end line when "start_line" is set).
 - "severity": "info", "warning" or "critical".
 - "title": a one-line summary.
 - "body": why it is a problem and how to fix it.
-- "suggestion" (optional): the exact code that should replace that line, keeping its indentation. It may span several lines. Leave it out when you are not sure."#;
+- "suggestion" (optional): the exact code that should replace "line" (or "start_line".."line" when "start_line" is set), keeping its indentation. Leave it out when you are not sure."#;
 
 /// Closes the diff-only output section: a model that has no repository tools may still be
 /// offered the submit tool.
@@ -719,6 +721,7 @@ mod tests {
     fn formatted_comments_contain_marker() {
         let s = Suggestion {
             file: "a.rs".into(),
+            start_line: None,
             line: 2,
             severity: Severity::Warning,
             title: "Possible panic".into(),
@@ -779,6 +782,7 @@ mod tests {
     fn suggestion_fence_title_and_trailing_newlines() {
         let s = Suggestion {
             file: "a.md".into(),
+            start_line: None,
             line: 1,
             severity: Severity::Info,
             title: "first\nsecond\r\nthird".into(),

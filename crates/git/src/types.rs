@@ -88,7 +88,11 @@ pub struct FileDiff {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InlineComment {
     pub path: String,
+    /// Inclusive first line for multi-line comments (must be `< line` and in the same diff hunk; `None` = single-line).
+    pub start_line: Option<u32>,
     pub line: u32,
+    /// 1-based UTF-16 end column offset on `line` for multi-line Azure DevOps threads (`None` defaults to `1`).
+    pub end_offset: Option<u32>,
     pub body: String,
 }
 

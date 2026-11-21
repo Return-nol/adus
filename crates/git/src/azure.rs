@@ -596,11 +596,14 @@ impl GitProvider for AzureProvider {
         summary: &str,
     ) -> Result<usize, GitError> {
         for c in comments {
-            let position = json!({ "line": c.line, "offset": 1 });
+            let (start_line, end_offset) = match c.start_line.filter(|&s| s < c.line) {
+                Some(start) => (start, c.end_offset.filter(|&o| o >= 1).unwrap_or(1)),
+                None => (c.line, 1),
+            };
             let context = json!({
                 "filePath": format!("/{}", normalize_path(&c.path)),
-                "rightFileStart": position,
-                "rightFileEnd": position,
+                "rightFileStart": { "line": start_line, "offset": 1 },
+                "rightFileEnd": { "line": c.line, "offset": end_offset },
             });
             self.post_thread(repo, pr.number, &thread_body(&c.body, Some(context)))
                 .await?;

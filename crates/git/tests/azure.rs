@@ -581,7 +581,9 @@ async fn post_review_thread_context_has_leading_slash() {
 
     let comments = [InlineComment {
         path: "src/a.rs".into(),
+        start_line: None,
         line: 12,
+        end_offset: None,
         body: "careful".into(),
     }];
     let n = provider(&server)
@@ -607,6 +609,74 @@ async fn post_review_thread_context_has_leading_slash() {
     assert_eq!(
         threads[1],
         json!({ "comments": [{ "content": "summary", "commentType": 1 }], "status": 1 })
+    );
+}
+
+#[tokio::test]
+async fn post_review_posts_multiline_thread_context() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
+        .and(query_param("api-version", "7.1"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 1 })))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let comments = [
+        InlineComment {
+            path: "src/a.rs".into(),
+            start_line: Some(10),
+            line: 12,
+            end_offset: Some(25),
+            body: "with offset".into(),
+        },
+        InlineComment {
+            path: "src/b.rs".into(),
+            start_line: Some(3),
+            line: 6,
+            end_offset: None,
+            body: "default offset".into(),
+        },
+        InlineComment {
+            path: "src/c.rs".into(),
+            start_line: Some(8),
+            line: 8,
+            end_offset: Some(25),
+            body: "invalid start_line".into(),
+        },
+    ];
+    let n = provider(&server)
+        .post_review(&repo(), &pr(), &comments, "summary")
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    let threads = captured_threads(&server).await;
+    assert_eq!(
+        threads[0]["threadContext"],
+        json!({
+            "filePath": "/src/a.rs",
+            "rightFileStart": { "line": 10, "offset": 1 },
+            "rightFileEnd": { "line": 12, "offset": 25 },
+        })
+    );
+    assert_eq!(
+        threads[1]["threadContext"],
+        json!({
+            "filePath": "/src/b.rs",
+            "rightFileStart": { "line": 3, "offset": 1 },
+            "rightFileEnd": { "line": 6, "offset": 1 },
+        })
+    );
+    assert_eq!(
+        threads[2]["threadContext"],
+        json!({
+            "filePath": "/src/c.rs",
+            "rightFileStart": { "line": 8, "offset": 1 },
+            "rightFileEnd": { "line": 8, "offset": 1 },
+        })
     );
 }
 

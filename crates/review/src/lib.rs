@@ -13,8 +13,8 @@ pub mod workspace;
 
 pub use dedup::{DedupResult, deduplicate_findings};
 pub use parse::{
-    ParseError, Suggestion, keep_valid, keep_valid_batch, parse_submit_findings, parse_suggestions,
-    submit_findings_tool_def,
+    CommentableRange, ParseError, Suggestion, keep_valid, keep_valid_batch, parse_submit_findings,
+    parse_suggestions, submit_findings_tool_def,
 };
 pub use prompt::{
     DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestEntry, batch_targets, build_finder_system_prompt,

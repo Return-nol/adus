@@ -449,7 +449,7 @@ fn build_user_prompt(
     with_tools: bool,
 ) -> String {
     let s = &candidate.suggestion;
-    let finding = json!({
+    let mut finding = json!({
         "file": s.file,
         "line": s.line,
         "severity": s.severity,
@@ -458,6 +458,11 @@ fn build_user_prompt(
         "suggestion": s.suggestion,
         "reported_by": format!("{} reviewer", candidate.specialist.label()),
     });
+    if let Some(start) = s.start_line
+        && let Some(obj) = finding.as_object_mut()
+    {
+        obj.insert("start_line".into(), json!(start));
+    }
     let finding = serde_json::to_string_pretty(&finding).unwrap_or_else(|_| finding.to_string());
     let rules: Vec<&Rule> = evidence
         .rules
@@ -684,6 +689,7 @@ mod tests {
         CandidateFinding {
             suggestion: Suggestion {
                 file: "src/a.rs".into(),
+                start_line: None,
                 line: 2,
                 severity,
                 title: title.into(),

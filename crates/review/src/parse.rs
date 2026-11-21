@@ -1,25 +1,52 @@
 //! Parsing dan validasi jawaban LLM menjadi daftar temuan review.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::RangeInclusive;
 
 use adus_core::types::{Severity, normalize_path};
 use adus_git::FileDiff;
+use adus_git::diff::{commentable_hunks, commentable_lines, same_hunk};
 use adus_llm::ToolDef;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-/// Satu temuan dari LLM untuk satu baris di file baru.
+/// Satu temuan dari LLM untuk satu baris (atau rentang baris) di file baru.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Suggestion {
     pub file: String,
+    pub start_line: Option<u32>,
     pub line: u32,
     pub severity: Severity,
     pub title: String,
     pub body: String,
-    /// Kode pengganti untuk baris itu (opsional).
+    /// Kode pengganti untuk baris/rentang itu (opsional).
     pub suggestion: Option<String>,
+}
+
+/// Baris dan rentang hunk sisi kanan pada satu file yang valid untuk dikomentari.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommentableRange {
+    pub lines: BTreeSet<u32>,
+    pub hunks: Vec<RangeInclusive<u32>>,
+}
+
+impl CommentableRange {
+    pub fn from_patch(patch: &str) -> Self {
+        Self {
+            lines: commentable_lines(patch),
+            hunks: commentable_hunks(patch),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    pub fn sanitize_start_line(&self, start_line: Option<u32>, line: u32) -> Option<u32> {
+        start_line.filter(|&s| same_hunk(&self.hunks, s, line))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -66,13 +93,22 @@ pub(crate) fn first_json_object<T: DeserializeOwned>(raw: &str) -> Option<T> {
     })
 }
 
-fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
-    let text = |key: &str| item.get(key)?.as_str().map(str::to_string);
-    let line = match item.get("line")? {
+fn parse_u32_field(val: &Value) -> Option<u32> {
+    let n = match val {
         Value::Number(n) => n.as_u64()?,
         Value::String(s) => s.trim().parse().ok()?,
         _ => return None,
     };
+    u32::try_from(n).ok()
+}
+
+fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
+    let text = |key: &str| item.get(key)?.as_str().map(str::to_string);
+    let line = parse_u32_field(item.get("line")?)?;
+    let start_line = item
+        .get("start_line")
+        .and_then(parse_u32_field)
+        .filter(|&s| s > 0 && s < line);
     let severity = match text("severity")
         .unwrap_or_default()
         .to_ascii_lowercase()
@@ -85,7 +121,8 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
     let file = text("file").filter(|f| !f.trim().is_empty())?;
     Some(Suggestion {
         file,
-        line: u32::try_from(line).ok()?,
+        start_line,
+        line,
         severity,
         title: text("title")?,
         body: text("body")?,
@@ -101,12 +138,16 @@ pub fn keep_valid(
     allowed_lines: &BTreeSet<u32>,
 ) -> Vec<Suggestion> {
     let path = normalize_path(&file.path);
+    let hunks = commentable_hunks(file.patch.as_deref().unwrap_or(""));
     let mut seen = HashSet::new();
     suggestions
         .into_iter()
         .filter(|s| normalize_path(&s.file) == path && allowed_lines.contains(&s.line))
         .map(|s| Suggestion {
             file: path.clone(),
+            start_line: s
+                .start_line
+                .filter(|&start| same_hunk(&hunks, start, s.line)),
             ..s
         })
         .filter(|s| seen.insert((s.file.clone(), s.line, s.title.clone())))
@@ -135,9 +176,13 @@ pub fn submit_findings_tool_def() -> ToolDef {
                                 "type": "string",
                                 "description": "Path of the changed file exactly as shown in <diffs>."
                             },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "Optional first new-file line number (strictly less than `line`, in the same diff hunk) when the finding or suggestion spans multiple lines. Omit for single-line findings."
+                            },
                             "line": {
                                 "type": "integer",
-                                "description": "New-file line number of a \"+\" line in that file's diff."
+                                "description": "New-file line number of a \"+\" line in that file's diff (the end line when `start_line` is set)."
                             },
                             "severity": {
                                 "type": "string",
@@ -154,7 +199,7 @@ pub fn submit_findings_tool_def() -> ToolDef {
                             },
                             "suggestion": {
                                 "type": "string",
-                                "description": "Optional exact replacement code for that line, keeping its indentation; may span several lines. Leave it out when unsure."
+                                "description": "Optional exact replacement code for `line` (or `start_line..=line` when `start_line` is set), keeping its indentation; may span several lines. Leave it out when unsure."
                             }
                         },
                         "required": ["file", "line", "severity", "title", "body"]
@@ -188,11 +233,12 @@ pub fn parse_submit_findings(args: &Value) -> Result<Vec<Suggestion>, String> {
 }
 
 /// [`keep_valid`] for a batch of files: keeps findings whose normalized file is a key of
-/// `allowed_by_file` (normalized paths) and whose line is in that file's set, then dedups
-/// `(file, line, title)`. `file` in the result is the normalized path.
+/// `allowed_by_file` (normalized paths) and whose line is in that file's set, sanitizing
+/// `start_line` to the same diff hunk, then dedups `(file, line, title)`. `file` in the result is
+/// the normalized path.
 pub fn keep_valid_batch(
     suggestions: Vec<Suggestion>,
-    allowed_by_file: &HashMap<String, BTreeSet<u32>>,
+    allowed_by_file: &HashMap<String, CommentableRange>,
 ) -> Vec<Suggestion> {
     let mut seen = HashSet::new();
     suggestions
@@ -200,9 +246,14 @@ pub fn keep_valid_batch(
         .filter_map(|s| {
             let file = normalize_path(&s.file);
             let allowed = allowed_by_file.get(&file)?;
-            allowed
-                .contains(&s.line)
-                .then_some(Suggestion { file, ..s })
+            allowed.lines.contains(&s.line).then(|| {
+                let start_line = allowed.sanitize_start_line(s.start_line, s.line);
+                Suggestion {
+                    file,
+                    start_line,
+                    ..s
+                }
+            })
         })
         .filter(|s| seen.insert((s.file.clone(), s.line, s.title.clone())))
         .collect()
@@ -225,11 +276,19 @@ mod tests {
     fn sugg(file: &str, line: u32, title: &str) -> Suggestion {
         Suggestion {
             file: file.into(),
+            start_line: None,
             line,
             severity: Severity::Warning,
             title: title.into(),
             body: "body".into(),
             suggestion: None,
+        }
+    }
+
+    fn sugg_span(file: &str, start_line: Option<u32>, line: u32, title: &str) -> Suggestion {
+        Suggestion {
+            start_line,
+            ..sugg(file, line, title)
         }
     }
 
@@ -242,6 +301,7 @@ mod tests {
             got,
             vec![Suggestion {
                 file: "src/a.rs".into(),
+                start_line: None,
                 line: 3,
                 severity: Severity::Critical,
                 title: "T".into(),
@@ -373,6 +433,7 @@ mod tests {
             vec![
                 Suggestion {
                     file: "src/a.rs".into(),
+                    start_line: None,
                     line: 3,
                     severity: Severity::Critical,
                     title: "T".into(),
@@ -381,6 +442,7 @@ mod tests {
                 },
                 Suggestion {
                     file: "src/b.rs".into(),
+                    start_line: None,
                     line: 4,
                     severity: Severity::Info,
                     title: "T2".into(),
@@ -401,6 +463,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_sanitizes_start_line() {
+        let raw = r#"[
+            {"file":"a.rs","start_line":2,"line":5,"title":"num","body":"B"},
+            {"file":"a.rs","start_line":"3","line":5,"title":"str","body":"B"},
+            {"file":"a.rs","start_line":5,"line":5,"title":"equal","body":"B"},
+            {"file":"a.rs","start_line":7,"line":5,"title":"inverted","body":"B"},
+            {"file":"a.rs","start_line":0,"line":5,"title":"zero","body":"B"},
+            {"file":"a.rs","start_line":"bad","line":5,"title":"bad_str","body":"B"},
+            {"file":"a.rs","start_line":null,"line":5,"title":"null","body":"B"}
+        ]"#;
+        let got = parse_suggestions(raw).unwrap();
+        assert_eq!(got.len(), 7);
+        assert_eq!(got[0].start_line, Some(2));
+        assert_eq!(got[1].start_line, Some(3));
+        for item in &got[2..] {
+            assert_eq!(item.start_line, None, "{}", item.title);
+        }
+
+        let args = serde_json::json!({"findings": [
+            {"file": "a.rs", "start_line": 2, "line": 4, "severity": "warning", "title": "T", "body": "B"},
+            {"file": "a.rs", "start_line": "bad", "line": 4, "severity": "warning", "title": "T2", "body": "B"}
+        ]});
+        let submitted = parse_submit_findings(&args).unwrap();
+        assert_eq!(submitted[0].start_line, Some(2));
+        assert_eq!(submitted[1].start_line, None);
+    }
+
+    #[test]
     fn submit_findings_tool_def_uses_portable_schema() {
         let def = submit_findings_tool_def();
         assert_eq!(def.name, "submit_findings");
@@ -410,6 +500,10 @@ mod tests {
         assert_eq!(
             item["required"],
             serde_json::json!(["file", "line", "severity", "title", "body"])
+        );
+        assert_eq!(
+            item["properties"]["start_line"]["type"],
+            serde_json::json!("integer")
         );
         assert_eq!(
             item["properties"]["severity"]["enum"],
@@ -422,10 +516,26 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::single_range_in_vec_init,
+        reason = "hunk list contains a single inclusive line range"
+    )]
     fn keep_valid_batch_filters_across_multiple_files_and_dedups() {
         let allowed = HashMap::from([
-            ("src/a.rs".to_string(), BTreeSet::from([2, 3])),
-            ("src/b.rs".to_string(), BTreeSet::from([5])),
+            (
+                "src/a.rs".to_string(),
+                CommentableRange {
+                    lines: BTreeSet::from([2, 3]),
+                    hunks: vec![1..=4],
+                },
+            ),
+            (
+                "src/b.rs".to_string(),
+                CommentableRange {
+                    lines: BTreeSet::from([5]),
+                    hunks: vec![4..=6],
+                },
+            ),
         ]);
         let got = keep_valid_batch(
             vec![
@@ -447,5 +557,34 @@ mod tests {
                 sugg("src/a.rs", 2, "other title"),
             ]
         );
+    }
+
+    #[test]
+    fn keep_valid_and_batch_enforce_same_hunk_start_line() {
+        let patch = "@@ -1,2 +1,3 @@\n ctx\n+a\n+b\n@@ -10,2 +11,3 @@\n x\n+y\n z\n";
+        let f = FileDiff {
+            path: "src/a.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            patch: Some(patch.into()),
+        };
+        let range = CommentableRange::from_patch(patch);
+
+        let inputs = vec![
+            sugg_span("src/a.rs", Some(1), 3, "context start in same hunk"),
+            sugg_span("src/a.rs", Some(2), 12, "cross hunk"),
+            sugg_span("src/a.rs", Some(9), 12, "before hunk"),
+        ];
+
+        let single = keep_valid(inputs.clone(), &f, &range.lines);
+        assert_eq!(single[0].start_line, Some(1));
+        assert_eq!(single[1].start_line, None);
+        assert_eq!(single[2].start_line, None);
+
+        let allowed = HashMap::from([("src/a.rs".to_string(), range)]);
+        let batch = keep_valid_batch(inputs, &allowed);
+        assert_eq!(batch[0].start_line, Some(1));
+        assert_eq!(batch[1].start_line, None);
+        assert_eq!(batch[2].start_line, None);
     }
 }
