@@ -10,7 +10,7 @@ Repo: https://github.com/Return-nol/adus. The GHCR image name is `ghcr.io/return
 - **Web visual design (binding for `web/`):** `DESIGN.md` — warm cream/coffee palette, `#ff4f00` orange CTA accent, shapes, and component chrome (applied across light and dark themes).
 - **Implementation plan v1 (27 tasks, 6 milestones, complete):** `docs/superpowers/plans/2026-11-19-adus-v1.md`
 - **Follow-up design + plan (in progress):** `docs/superpowers/specs/2026-11-20-ignored-files-and-azure-project-design.md` and `docs/superpowers/plans/2026-11-20-ignored-files-and-azure-project.md` (7 tasks)
-- **Agentic review engine (in progress on `feat/agentic-review`):** `docs/superpowers/specs/2026-11-21-agentic-review-engine-design.md` and `docs/superpowers/plans/2026-11-21-agentic-review-engine.md` (10 tasks).
+- **Agentic review engine (in progress on `feat/advanced-agentic-review-flow`):** `docs/superpowers/specs/2026-11-21-agentic-review-engine-design.md` and `docs/superpowers/plans/2026-11-21-agentic-review-engine.md` (10 tasks).
 - **Backlog of deferred minor findings:** `docs/superpowers/backlog.md`. (The local SDD ledgers used during execution were deleted after both plans finished; git history is the record.)
 
 If the spec and the plan conflict, the spec wins. For new work, start with superpowers `brainstorming`, then `writing-plans`, then `subagent-driven-development`.
