@@ -336,7 +336,7 @@ impl Engine {
                 body: format_inline(s),
             })
             .collect();
-        let summary = format_summary(&counts, &skipped, ignored);
+        let summary = format_summary(&counts, &skipped, ignored, &[]);
         match git.post_review(&repo_ref, &pr, &comments, &summary).await {
             Ok(posted) => Ok(Outcome::Done { posted }),
             Err(err) => Err(self.post_error(&conn, err).await),
