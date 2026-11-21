@@ -11,7 +11,8 @@ pub use adus_core::types::{ConnectionKind, normalize_path};
 pub use azure::AzureProvider;
 pub use github::GithubProvider;
 pub use types::{
-    FileDiff, FileStatus, GitError, InlineComment, PatOwner, PullRequest, RemoteRepo, RepoRef,
+    CloneSpec, FileDiff, FileStatus, GitError, InlineComment, PatOwner, PullRequest, RemoteRepo,
+    RepoRef,
 };
 
 #[async_trait]
@@ -57,6 +58,35 @@ pub trait GitProvider: Send + Sync {
         pr_number: i64,
         body: &str,
     ) -> Result<(), GitError>;
+    /// How to shallow-fetch the PR head with `git`. `None` when the provider cannot build one
+    /// (the review then falls back to diff-only).
+    fn clone_spec(&self, _repo: &RepoRef, _pr: &PullRequest) -> Option<CloneSpec> {
+        None
+    }
+}
+
+/// Builds `{base}/{segments...}` with every segment percent-encoded. `None` if `base` is not a
+/// usable base URL or any segment is empty, `.` or `..`.
+pub(crate) fn git_url(base: &str, segments: &[&str]) -> Option<String> {
+    if segments
+        .iter()
+        .any(|s| s.is_empty() || *s == "." || *s == "..")
+    {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(base).ok()?;
+    url.path_segments_mut()
+        .ok()?
+        .pop_if_empty()
+        .extend(segments);
+    Some(url.to_string())
+}
+
+/// `Basic base64(user:password)`.
+pub(crate) fn basic_auth_header(user: &str, password: &str) -> String {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+    format!("Basic {encoded}")
 }
 
 pub trait GitProviderFactory: Send + Sync {

@@ -366,6 +366,7 @@ pub fn pr(head_sha: &str) -> PullRequest {
         head_sha: head_sha.into(),
         base_sha: "base".into(),
         is_draft: false,
+        source_ref: None,
     }
 }
 

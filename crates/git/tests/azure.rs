@@ -50,6 +50,7 @@ fn pr() -> PullRequest {
         head_sha: "headsha".into(),
         base_sha: "mergebase".into(),
         is_draft: false,
+        source_ref: None,
     }
 }
 
@@ -204,6 +205,7 @@ async fn get_pr_reads_is_draft() {
     assert_eq!(got.head_sha, "headsha");
     // commonRefCommit dari iterasi terakhir (id 2), bukan iterasi 1.
     assert_eq!(got.base_sha, "mergebase");
+    assert_eq!(got.source_ref.as_deref(), Some("refs/heads/feature"));
 }
 
 #[tokio::test]
@@ -855,4 +857,41 @@ async fn rename_entries_and_submodules() {
         files[0].patch.as_deref(),
         Some("@@ -1,2 +1,2 @@\n 1\n-2\n+3\n")
     );
+}
+
+#[test]
+fn azure_clone_spec_uses_project_guid_and_basic_auth() {
+    use base64::Engine;
+    let p = AzureProvider::new(
+        reqwest::Client::new(),
+        "https://dev.azure.com/".into(),
+        "acme".into(),
+        "azpat".into(),
+    );
+    let mut r = repo();
+    r.name = "my repo".into();
+    let mut pull = pr();
+    pull.source_ref = Some("refs/heads/feature".into());
+
+    let spec = p.clone_spec(&r, &pull).unwrap();
+    assert_eq!(
+        spec.url,
+        format!("https://dev.azure.com/acme/{PROJECT}/_git/my%20repo")
+    );
+    assert_eq!(spec.refspec, "headsha");
+    assert_eq!(spec.fallback_refspec.as_deref(), Some("refs/heads/feature"));
+    assert_eq!(spec.expected_sha, "headsha");
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(":azpat")
+    );
+    assert_eq!(spec.auth_header, expected);
+    assert!(!format!("{spec:?}").contains(&spec.auth_header));
+
+    let mut no_project = repo();
+    no_project.project = None;
+    assert!(p.clone_spec(&no_project, &pull).is_none());
+    let mut empty_name = repo();
+    empty_name.name = String::new();
+    assert!(p.clone_spec(&empty_name, &pull).is_none());
 }

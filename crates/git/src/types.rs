@@ -36,6 +36,35 @@ pub struct PullRequest {
     /// Merge base.
     pub base_sha: String,
     pub is_draft: bool,
+    /// Source branch ref of the PR (Azure `sourceRefName`, e.g. `refs/heads/feature`).
+    /// GitHub: `None`.
+    pub source_ref: Option<String>,
+}
+
+/// Everything needed to shallow-fetch a PR head with `git`.
+#[derive(Clone)]
+pub struct CloneSpec {
+    pub url: String,
+    pub refspec: String,
+    /// Tried once when fetching `refspec` fails for a non-auth reason (Azure: the source branch ref).
+    pub fallback_refspec: Option<String>,
+    pub expected_sha: String,
+    /// Value for the `Authorization` HTTP header (e.g. `Basic <base64>`). Never embedded in
+    /// `url`, argv or `.git/config`.
+    pub auth_header: String,
+}
+
+/// Hand-written so the auth header never ends up in a log line through `{:?}`.
+impl std::fmt::Debug for CloneSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloneSpec")
+            .field("url", &self.url)
+            .field("refspec", &self.refspec)
+            .field("fallback_refspec", &self.fallback_refspec)
+            .field("expected_sha", &self.expected_sha)
+            .field("auth_header", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

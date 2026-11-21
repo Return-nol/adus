@@ -37,8 +37,9 @@ sha2 = "0.10"
 similar = "3"
 sqlx = { version = "0.8", default-features = false, features = ["derive", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls", "chrono", "uuid"] }
 subtle = "2.6"
+tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "process", "fs"] }
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"

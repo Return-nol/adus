@@ -7,8 +7,8 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::{
-    FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest, RemoteRepo,
-    RepoRef, normalize_path,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest,
+    RemoteRepo, RepoRef, basic_auth_header, git_url, normalize_path,
 };
 
 /// Batas halaman saat mengikuti header `Link` (30 x 100 = 3000 item).
@@ -371,6 +371,7 @@ impl GitProvider for GithubProvider {
             head_sha: pull.head.sha,
             base_sha: compare.merge_base_commit.sha,
             is_draft: pull.draft,
+            source_ref: None,
         })
     }
 
@@ -431,5 +432,28 @@ impl GitProvider for GithubProvider {
         self.send(self.post(&url).json(&json!({ "body": body })))
             .await?;
         Ok(())
+    }
+
+    /// `https://api.github.com` clones from `https://github.com`, GHES `{origin}/api/v3` from
+    /// `{origin}`, any other base (test servers) from the base itself.
+    fn clone_spec(&self, repo: &RepoRef, pr: &PullRequest) -> Option<CloneSpec> {
+        let git_base = if self.base_url == "https://api.github.com" {
+            "https://github.com"
+        } else {
+            self.base_url
+                .strip_suffix("/api/v3")
+                .unwrap_or(&self.base_url)
+        };
+        if repo.name.is_empty() {
+            return None;
+        }
+        let url = git_url(git_base, &[&repo.owner, &format!("{}.git", repo.name)])?;
+        Some(CloneSpec {
+            url,
+            refspec: format!("refs/pull/{}/head", pr.number),
+            fallback_refspec: None,
+            expected_sha: pr.head_sha.clone(),
+            auth_header: basic_auth_header("x-access-token", &self.token),
+        })
     }
 }

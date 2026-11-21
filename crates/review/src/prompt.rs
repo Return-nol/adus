@@ -285,6 +285,7 @@ mod tests {
             head_sha: "h".into(),
             base_sha: "b".into(),
             is_draft: false,
+            source_ref: None,
         }
     }
 

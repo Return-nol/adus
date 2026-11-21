@@ -38,6 +38,7 @@ fn pr() -> PullRequest {
         head_sha: "headsha".into(),
         base_sha: "mergebase".into(),
         is_draft: false,
+        source_ref: None,
     }
 }
 
@@ -343,6 +344,7 @@ async fn get_pr_uses_merge_base_from_compare() {
     assert_eq!(got.head_sha, "headsha");
     assert_eq!(got.base_sha, "mergebase");
     assert!(got.is_draft);
+    assert_eq!(got.source_ref, None);
 }
 
 #[tokio::test]
@@ -617,4 +619,56 @@ async fn ensure_webhooks_keeps_live_hook_and_drops_missing_one() {
         .await
         .unwrap();
     assert_eq!(ids, vec!["56".to_string()]);
+}
+
+fn basic(user_pass: &str) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(user_pass)
+    )
+}
+
+#[test]
+fn github_clone_spec_uses_pr_ref_and_x_access_token() {
+    let p = GithubProvider::new(
+        reqwest::Client::new(),
+        "https://api.github.com".into(),
+        "ghp_secret".into(),
+    );
+    let spec = p.clone_spec(&repo(), &pr()).unwrap();
+    assert_eq!(spec.url, "https://github.com/octocat/alpha.git");
+    assert_eq!(spec.refspec, "refs/pull/7/head");
+    assert_eq!(spec.fallback_refspec, None);
+    assert_eq!(spec.expected_sha, "headsha");
+    assert_eq!(spec.auth_header, basic("x-access-token:ghp_secret"));
+    assert!(!format!("{spec:?}").contains(&spec.auth_header));
+}
+
+#[test]
+fn github_clone_spec_maps_ghes_and_test_servers_and_encodes_segments() {
+    let ghes = GithubProvider::new(
+        reqwest::Client::new(),
+        "https://ghe.example.com/api/v3/".into(),
+        "t".into(),
+    );
+    let spec = ghes.clone_spec(&repo(), &pr()).unwrap();
+    assert_eq!(spec.url, "https://ghe.example.com/octocat/alpha.git");
+
+    let local = GithubProvider::new(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9999".into(),
+        "t".into(),
+    );
+    let mut odd = repo();
+    odd.name = "my repo#1".into();
+    let spec = local.clone_spec(&odd, &pr()).unwrap();
+    assert_eq!(spec.url, "http://127.0.0.1:9999/octocat/my%20repo%231.git");
+
+    let mut empty = repo();
+    empty.owner = String::new();
+    assert!(local.clone_spec(&empty, &pr()).is_none());
+    let mut dots = repo();
+    dots.owner = "..".into();
+    assert!(local.clone_spec(&dots, &pr()).is_none());
 }

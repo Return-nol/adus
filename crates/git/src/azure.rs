@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use crate::diff::unified_patch;
 use crate::{
-    FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest, RemoteRepo,
-    RepoRef, normalize_path,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest,
+    RemoteRepo, RepoRef, basic_auth_header, git_url, normalize_path,
 };
 
 const API_VERSION: &str = "7.1";
@@ -307,6 +307,7 @@ struct AzPull {
     #[serde(default)]
     is_draft: bool,
     last_merge_source_commit: AzCommit,
+    source_ref_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -540,6 +541,7 @@ impl GitProvider for AzureProvider {
             head_sha: pull.last_merge_source_commit.commit_id,
             base_sha: iteration.common_ref_commit.commit_id,
             is_draft: pull.is_draft,
+            source_ref: pull.source_ref_name,
         })
     }
 
@@ -616,5 +618,21 @@ impl GitProvider for AzureProvider {
     ) -> Result<(), GitError> {
         self.post_thread(repo, pr_number, &thread_body(body, None))
             .await
+    }
+
+    /// Fetches the head commit by SHA; servers that refuse a bare SHA get the source branch.
+    fn clone_spec(&self, repo: &RepoRef, pr: &PullRequest) -> Option<CloneSpec> {
+        let project = repo.project.as_deref()?;
+        let url = git_url(
+            &self.base_url,
+            &[&self.organization, project, "_git", &repo.name],
+        )?;
+        Some(CloneSpec {
+            url,
+            refspec: pr.head_sha.clone(),
+            fallback_refspec: pr.source_ref.clone(),
+            expected_sha: pr.head_sha.clone(),
+            auth_header: basic_auth_header("", &self.token),
+        })
     }
 }
