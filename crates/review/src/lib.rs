@@ -2,6 +2,8 @@ pub mod command;
 pub mod engine;
 pub mod parse;
 pub mod prompt;
+pub mod repo_instructions;
+pub mod tools;
 pub mod workspace;
 
 pub use parse::{ParseError, Suggestion, keep_valid, parse_suggestions};
