@@ -57,6 +57,8 @@
 | 8 | Full `Engine` pipeline wiring, `ToolsUnsupported`/clone fallback, startup sweep, `doctor`, `Dockerfile` | `review/engine`, `adus/main`, `server/doctor`, `Dockerfile` |
 | 9 | Settings & Repository `review_mode` REST APIs + server integration tests | `server/api/settings`, `server/api/repositories` |
 | 10 | Dashboard UI for `review_mode` (`Settings` + `Repositories`) & full workspace verification | `web/routes/settings`, `web/routes/repositories` |
+| 11 | Small PR → diff-only: `settings.small_pr_max_lines` (merged into migration `0008`), small-PR check before clone, risky-path exceptions, summary note, API + UI field | `migrations`, `db/settings`, `review/engine`, `review/small_pr`, `server/api/settings`, `web/routes/settings` |
+| 12 | Multi-line anchoring (`start_line..=line`) for committable suggestions: parse, validate per hunk, Verifier/Dedup, GitHub + Azure posting | `git/diff`, `git/types`, `git/github`, `git/azure`, `review/parse`, `review/prompt`, `review/engine`, `review/verifier`, `review/dedup` |
 
 ---
 
@@ -325,7 +327,7 @@
 - In `crates/review/src/parse.rs`:
   - `pub fn submit_findings_tool_def() -> ToolDef` (JSON schema for `{"findings": [...]}`).
   - `pub fn parse_submit_findings(args: &serde_json::Value) -> Result<Vec<Suggestion>, String>` (reads `"findings"` array, parses per-element leniently like `parse_suggestions`).
-  - `pub fn keep_valid_batch(suggestions: Vec<Suggestion>, allowed_by_file: &HashMap<String, BTreeSet<u32>>) -> Vec<Suggestion>` (filters to files in `allowed_by_file` and lines in that file's `BTreeSet<u32>`, normalizes paths, deduplicates exact `(file, line, title)`).
+  - `pub fn keep_valid_batch(suggestions: Vec<Suggestion>, allowed_by_file: &HashMap<String, BTreeSet<u32>>) -> Vec<Suggestion>` (filters to files in `allowed_by_file` and lines in that file's `BTreeSet<u32>`, normalizes paths, deduplicates exact `(file, line, title)`). Superseded by Task 12: the map value is now a `CommentableRange` (lines + hunks) so `start_line` can be validated.
 
 **Edge Cases & Pitfalls:**
 - **Prefix-cache ordering:** Every specialist (`Bug`, `Security`, `Performance`, `Rules`, `Generalist`) must share **byte-identical** prefixes up through `</ReviewInstructions>` (and `</Workflow>`/`</Scope>`/`</UntrustedInput>`), with only `<Role>` differing at the end of the system prompt! Add a unit test asserting identical leading prefix bytes across all 4 specialists.
@@ -530,3 +532,79 @@
   - `cargo test --workspace -j 2`
 - [ ] **Step 4:** Run `git status` and review full diff against the **Review Focus** checklist above.
 - [ ] **Step 5:** Commit `feat(web): add review_mode controls to settings and repositories pages`
+
+---
+
+### Task 11: Small PR → Diff-Only Review (`settings.small_pr_max_lines`)
+
+Added 2026-11-22 after the final review (user decision). A small, low-risk PR skips the clone and the repository tools and is reviewed diff-only; the Verifier and Dedup still run (their own diff-only path). Spec: add a "Small PR" subsection to `docs/superpowers/specs/2026-11-21-agentic-review-engine-design.md` §3/§4 and a decisions-table row in the same change (the spec stays the binding authority).
+
+**Files:**
+- Create: `crates/review/src/small_pr.rs`
+- Modify: `migrations/0008_review_mode_and_provider_models.sql`, `crates/db/src/settings.rs`, `crates/review/src/engine.rs`, `crates/review/src/lib.rs`, `crates/review/src/prompt.rs` (note text), `crates/server/src/api/settings.rs`, `web/src/routes/settings/+page.svelte`, `AGENTS.md`, the spec
+- Test: `crates/review/src/small_pr.rs` (`mod tests`), `crates/review/tests/engine.rs`, `crates/server/tests/review_mode.rs` (or a new `small_pr.rs`)
+
+**Interfaces:**
+- Migration `0008_review_mode_and_provider_models.sql` (unreleased, alpha — merge, don't add `0009`): add `ALTER TABLE settings ADD COLUMN small_pr_max_lines INTEGER NOT NULL DEFAULT 50 CHECK (small_pr_max_lines BETWEEN 0 AND 10000)` next to the existing `review_mode` column. `0` = never treat a PR as small (always full review). Dev DBs that already applied `0008` are adapted by hand (controller step after the commit, same as the provider-models merge): add the column with the same definition, then set `_sqlx_migrations` row 8 `checksum` to the SHA-384 of the new file (`description` unchanged) and confirm `adus doctor` shows migrations ✓. The implementer must not touch any database outside `#[sqlx::test]`.
+- `adus_db::settings::Settings.small_pr_max_lines: i32` (+ update SQL).
+- `crates/review/src/small_pr.rs`:
+  - `pub const SMALL_PR_MAX_FILES: usize = 3;`
+  - `pub fn is_small_pr(targets: &[FileDiff], rules: &[Rule], max_lines: u32) -> bool` — true only when `max_lines > 0`, `1 <= targets.len() <= SMALL_PR_MAX_FILES`, total changed lines (`+` and `-` inside hunks, over `targets`) `<= max_lines`, no target matches a risky path, and no target is covered (`rule_matches_path`) by an enabled `critical` rule.
+  - `fn is_risky_path(path: &str) -> bool` over `normalize_path(path)`, case-insensitive:
+    - security/access: any path segment or file stem containing `auth`, `security`, `crypto`, `permission`, `secret`, `token`, `session`, `password`;
+    - data/schema: under `migrations/`, `*.sql`, file stem `schema`;
+    - shared contracts: `*.proto`, `openapi.*`, `*.graphql`, file name `lib.rs`, `mod.rs`, `index.ts`, `index.js`;
+    - build/deploy: `Dockerfile*`, `.github/workflows/**`, `Cargo.toml`, `package.json`.
+- `crates/review/src/engine.rs`: after targets/skipped are computed and before the clone, compute `small = trigger != Trigger::Command && is_small_pr(&targets, &rules, settings.small_pr_max_lines as u32)`. When `small`: no `clone_spec`/`clone_pr`, `toolbox = None`, mode forced to `Generalist`, Finder `with_tools = false`, Verifier diff-only, warning note `"Small change — reviewed diff only"`, log `fallback_reason = "small_pr"`. `@adudu review` / `@adudu review deep` (`Trigger::Command`) always get the full review.
+- `crates/server/src/api/settings.rs`: `SettingsJson.small_pr_max_lines: i32`; `SettingsBody.small_pr_max_lines: Option<i32>` (absent → keep current); out of `0..=10000` → 422 `validation_error`.
+- `web/src/routes/settings/+page.svelte`: number field **Small PR threshold (changed lines)** in the Review settings form with helper text "PRs with at most this many changed lines in up to 3 files, outside sensitive paths, are reviewed from the diff only, in one Generalist pass. 0 = always full review. `@adudu review` always runs the full review."; send it in `PUT /settings`; add it to the page skeleton.
+
+**Edge Cases & Pitfalls:**
+- Count lines over **reviewed targets only** (ignored and skipped files never count, and an all-ignored PR never reaches this check).
+- Renames: check both `path` and `old_path` against the risky list.
+- The rule check uses only rules that are enabled and apply to this repository (the same list the engine passes to batching).
+- Specialists mode: a small PR is always reviewed with `ReviewMode::Generalist` (one diff-only Finder call, `finder_effort(Generalist)`), whatever the repo or global mode (user decision 2026-11-22, keeps small PRs cheap). Log the effective mode. `@adudu review deep` is a `Trigger::Command`, so it never takes the small-PR path and always runs the specialists.
+- Small-PR diff-only is **not** a fallback failure: no "Codebase context unavailable" note, only the small-change note.
+- AGENTS.md: document the threshold, the risky list and the command bypass in the Settings and Worker bullets.
+
+- [ ] **Step 1: Write failing tests**
+  - `small_pr.rs`: `small_when_few_lines_and_files_outside_risky_paths`, `not_small_above_line_or_file_limit`, `zero_threshold_disables_small_pr`, `risky_paths_force_full_review` (one case per category, incl. a rename whose `old_path` is risky), `critical_rule_forces_full_review`.
+  - `engine.rs` tests: `small_pr_skips_clone_and_tools_but_still_verifies` (FakeCloner never called, Finder request has no tools, Verifier called, note in summary), `command_review_of_small_pr_runs_full_review`, `small_pr_in_specialists_mode_runs_generalist_once`, `risky_small_pr_gets_full_review`.
+  - Server: `settings_small_pr_max_lines_defaults_to_50_and_validates_range`.
+- [ ] **Step 2:** Run `cargo test -j 2 -p adus-review -p adus-server` → FAIL.
+- [ ] **Step 3:** Implement migration, DB, `small_pr.rs`, engine wiring, API, UI, spec and AGENTS.md text.
+- [ ] **Step 4:** `pnpm -C web check && pnpm -C web build`, then `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -j 2` → PASS.
+- [ ] **Step 5:** Commit `feat(review): review small low-risk PRs diff-only`
+
+---
+
+### Task 12: Multi-Line Anchoring for Committable Suggestions (`start_line..=line`)
+
+Added 2026-11-22 (user decision). The first implementation was written by the user (uncommitted on the branch at `d8583ff`) and reviewed; this task records it and the fixes from that review. Spec: §1 row 9, pipeline step 7, §4.8 Steps 1–3 and §4.12 of `docs/superpowers/specs/2026-11-21-agentic-review-engine-design.md` (binding). Problem: a multi-line ` ```suggestion ` fence anchored to one line makes GitHub's "Apply suggestion" insert duplicate lines.
+
+**Files:**
+- Modify: `crates/git/src/diff.rs`, `crates/git/src/types.rs`, `crates/git/src/github.rs`, `crates/git/src/azure.rs`, `crates/review/src/parse.rs`, `crates/review/src/prompt.rs`, `crates/review/src/engine.rs`, `crates/review/src/verifier.rs`, `crates/review/src/dedup.rs`, `crates/review/src/lib.rs`, `AGENTS.md`
+- Test: `crates/git/tests/github.rs`, `crates/git/tests/azure.rs`, `crates/review/src/parse.rs` (`mod tests`), `crates/review/tests/engine.rs`
+
+**Interfaces (as implemented):**
+- `adus_git`: `commentable_hunks(patch) -> Vec<RangeInclusive<u32>>`, `intersect_hunks`, `right_line_end_offset(patch, line) -> Option<u32>` (UTF-16 length + 1); `InlineComment { .., start_line: Option<u32>, end_offset: Option<u32> }`.
+- GitHub `post_review`: `start_line` + `start_side: "RIGHT"` only when `start_line < line`. Azure thread context `rightFileStart {line: start_line, offset: 1}` / `rightFileEnd {line, offset: end_offset}`.
+- `adus_review`: `Suggestion.start_line: Option<u32>` (lenient parse; `>= line` or `0` → `None`); `CommentableRange { lines: BTreeSet<u32>, hunks: Vec<RangeInclusive<u32>> }` with `from_patch`; `keep_valid_batch(suggestions, &HashMap<String, CommentableRange>)`; `submit_findings` schema gains optional `start_line` (Gemini-safe subset).
+- `keep_valid` / `build_prompt` / `SYSTEM_PROMPT` are removed in the fix wave (user decision 2026-11-22: small PRs use the Finder in diff-only mode, Task 11, so nothing calls them); their unit tests and `lib.rs` re-exports go too.
+
+**Fixes from the review (`.superpowers/sdd/.../multiline-anchoring-review.md`), part of the postponed fix wave:**
+- I1: when a supplied `start_line` is dropped (cross-hunk, outside a hunk, inverted, zero), also set `suggestion: None`, so a multi-line fence is never posted on one line. Test.
+- I2: prompt and schema tie `start_line` to the span of existing lines the suggestion replaces; never for insertions or a suggestion that rewrites only `line`.
+- I4: engine test for a multi-line range in an incremental (`Trigger::Updated`) review via `intersect_hunks`.
+- M1: resolved by removing `keep_valid` (see above).
+- M2: on exact `(file, line, title)` duplicates prefer the entry with a valid `start_line`.
+- M3: Verifier snippet covers the whole span (centre on the span or widen); one sentence in the Verifier prompt on what `start_line` means.
+- M4 (optional): one private right-side diff walker shared by `commentable_lines`, `commentable_hunks`, `right_line_end_offset`, `annotate_patch`.
+- M5/M6: rename `lines` → `range` in `collect_candidates`, fix its doc, document `InlineComment.end_offset` (GitHub ignores it) and `Suggestion.start_line` (equal = single-line).
+- AGENTS.md "Git providers": inline comments may span `start_line..=line` (same hunk, RIGHT side); GitHub sends `start_line`/`start_side`, Azure `rightFileStart`/`rightFileEnd` with a UTF-16 end offset.
+
+**Unverified offline (user click-test):** GitHub same-hunk acceptance and Apply behaviour; Azure offset semantics and whether Azure renders suggestion fences.
+
+- [x] **Step 1–4:** Implemented by the user; `cargo fmt --check`, `clippy -D warnings` clean; `adus-git` + `adus-review` tests pass.
+- [ ] **Step 5:** Apply the review fixes above in the fix wave; full verification.
+- [ ] **Step 6:** Commit `feat(review): anchor multi-line suggestions with start_line`

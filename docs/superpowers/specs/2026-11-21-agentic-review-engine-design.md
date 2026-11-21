@@ -49,7 +49,7 @@ This wave brings **Point 1 (Cross-file PR & codebase awareness)**, **Point 2 (Tw
 | 6 | **Mode configuration** | `settings.review_mode` global default + nullable `repositories.review_mode` override + `@adudu review deep` (`specialists` alias). `Specialists` runs `Bug`, `Security`, `Performance` + conditional `Rules` (only if matching enabled rules exist) |
 | 7 | **Verifier & Dedup** | Per-finding tool-enabled Verifier (concurrency 4, max 6 steps, max 25 candidates sorted `Critical → Warning → Info`, refute-to-drop / keep-by-default) → 1 single-turn PR-wide Semantic Dedup call when `verified.len() >= 2` |
 | 8 | **Partial failure policy** | Specialists: partial results allowed with summary warning; retry only if all specialists fail retryably. Verifier: **fail-closed** (drop unverified finding + summary warning). Dedup: safe fallback (keep verified findings as-is) |
-| 9 | **Output funnel** | 2-stage: Finder outputs full `Suggestion` (`file`, `line`, `severity`, `title`, `body`, optional `suggestion`), Verifier keeps/drops without rewriting, Dedup merges |
+| 9 | **Output funnel** | 2-stage: Finder outputs full `Suggestion` (`file`, optional `start_line`, `line`, `severity`, `title`, `body`, optional `suggestion`; `start_line..=line` is the span of existing new-file lines a `suggestion` replaces, and `start_line` is set only when that span has more than one line — see §4.12), Verifier keeps/drops without rewriting, Dedup merges |
 | 10 | **Model & prompt caching** | One provider per review (`repo.review_provider_id` → `settings.default_provider_id`). Finder uses its `primary_model` with effort by mode (`Generalist` → `Medium`, `Specialists` → `High`, `finder_effort`); Verifier and Dedup use `effective_fast_model()` (the `fast_model`, else `primary_model`) with `Low` effort. Shared static prompt sections placed before specialist `<Role>` for implicit prefix caching; Anthropic `cache_control: ephemeral` breakpoints + cache token accounting |
 | 11 | **Context & budgets** | Batch diffs up to ~40K chars (full PR manifest in every batch); tool outputs capped (`read_file` ≤ 200 lines / 8K chars, `grep` ≤ 40 match groups / 8K chars, `list_dir`/`find_files` ≤ 150 entries / 4K chars); compact older tool results above ~160K chars; one-shot overflow recovery |
 | 12 | **Time budget** | Stage deadlines as fractions of `review_timeout`: Finder (incl. clone) by 60 %, Verifier by 90 %, Dedup + post in the rest. Work cut by a deadline is handled like a failure of that stage (Section 4.11), so a large PR still posts a partial review instead of timing out with nothing |
@@ -83,7 +83,7 @@ Webhook / @adudu review [deep]
         │     ├─ Specialists: Bug, Security, Performance (+ Rules if matching rules exist) in parallel within a batch
         │     ├─ If `ToolsUnsupported` -> retry Finder once in diff-only self-contained mode + Summary Warning
         │     └─ Partial specialist failures -> keep surviving findings + Summary Warning
-        ├─ 7. Deterministic Filter (`keep_valid_batch`: path in batch, line in commentable `+` lines) + Exact Dedup
+        ├─ 7. Deterministic Filter (`keep_valid_batch`: path in batch, `line` in commentable `+` lines, `start_line` kept only when it is in the same diff hunk as `line`) + Exact Dedup
         ├─ 8. Verifier Pass (when candidates > 0; must finish by the Verifier deadline, 90 % of review_timeout)
         │     ├─ Prioritize Critical -> Warning -> Info; cap at 25 (warn if truncated)
         │     ├─ Tool-enabled mode: 1 Verifier loop per candidate (concurrency 4, max 6 steps, shared ToolCache)
@@ -405,16 +405,17 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 ### 4.8 Verifier & Semantic Deduplication (`crates/review/src/verifier.rs`, `crates/review/src/dedup.rs`)
 
 #### Step 1: Deterministic Filter (`parse.rs`)
-- Add `keep_valid_batch(suggestions: Vec<Suggestion>, targets: &[Target]) -> Vec<Suggestion>`:
-  - Normalizes `s.file` (`normalize_path`) and keeps only findings whose file is in `targets` and whose `s.line` is in that target's `allowed` (`+` lines) `BTreeSet<u32>`.
-  - Deduplicates exact `(file, line, title)` tuples.
+- Add `keep_valid_batch(suggestions: Vec<Suggestion>, allowed_by_file: &HashMap<String, CommentableRange>) -> Vec<Suggestion>`. `CommentableRange { lines: BTreeSet<u32>, hunks: Vec<RangeInclusive<u32>> }` is built from the patch (`commentable_lines`, `commentable_hunks`); in incremental reviews both are the intersection of the commit diff and the PR diff (`intersect_hunks`).
+  - Normalizes `s.file` (`normalize_path`) and keeps only findings whose file is in the batch and whose `s.line` is in `lines`.
+  - Keeps `s.start_line` only when `0 < start_line < line` and both lie in one hunk of `hunks` (`same_hunk`). When a supplied `start_line` is dropped, the finding is kept single-line and its `suggestion` is removed, because a multi-line replacement anchored to one line duplicates code on "Apply suggestion" (§4.12).
+  - Deduplicates exact `(file, line, title)` tuples; when two duplicates differ only in range, the one with a valid `start_line` wins.
 
 #### Step 2: Per-Finding Tool-Enabled Verifier (`verifier.rs`)
 - **Cap & prioritization:** If more than `MAX_VERIFY_CANDIDATES = 25` candidates survive deterministic filtering, sort by severity (`Critical > Warning > Info`, preserving original order on ties), verify the top 25, and record a summary warning (`"N lower-priority findings exceeded the verification cap and were omitted"`).
 - **Model:** the provider's `effective_fast_model()` with `ReasoningEffort::Low` (decision 10). The fast model may lack tool support even when the primary model has it: a `ToolsUnsupported` from the Verifier switches the remaining candidates to the diff-only path below.
 - **Concurrency:** Run up to `VERIFY_CONCURRENCY = 4` verifier tasks concurrently using `futures::stream::iter(...).buffer_unordered(VERIFY_CONCURRENCY)` (preserving deterministic ordering afterwards).
 - **Evidence bundle per candidate:**
-  - The candidate finding JSON (`file`, `line`, `severity`, `title`, `body`, `suggestion`)
+  - The candidate finding JSON (`file`, `start_line` when set, `line`, `severity`, `title`, `body`, `suggestion`); the snippet covers the whole `start_line..=line` span
   - Surrounding lines / patch hunk for the cited file
   - Applicable rules for that file + team memories + repo instructions (if present)
 - **Verification prompt rules:**
@@ -428,7 +429,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 
 #### Step 3: PR-Wide Semantic Deduplication (`dedup.rs`)
 - Runs **only when `verified.len() >= 2`**.
-- One single-turn `ChatRequest::text` call (`effective_fast_model()`, `ReasoningEffort::Low`) listing all surviving findings indexed `0..N` (with `file`, `line`, `severity`, `title`, `body`, `specialist`).
+- One single-turn `ChatRequest::text` call (`effective_fast_model()`, `ReasoningEffort::Low`) listing all surviving findings indexed `0..N` (with `file`, `start_line` when set, `line`, `severity`, `title`, `body`, `specialist`).
 - Instructs the model to identify semantic duplicates (findings describing the same underlying root cause at the same or related location—especially common when `Bug` and `Security` both flag the same flaw) and return JSON `{"keep_indices": [0, 2, ...]}` selecting the single clearest/highest-severity finding per root cause.
 - **Validation & safe fallback:** Validate indices are in bounds `0..N` and unique (reject empty `keep_indices` if input was non-empty!). On any LLM error, parse error, or invalid output, log a warning and keep all `verified` findings unchanged.
 
@@ -468,6 +469,22 @@ Cancelling an agent future drops its pending tool futures; `spawn_blocking` work
 - **Repositories (`GET /api/v1/repositories`, `PATCH /api/v1/repositories/{id}`):**
   - Add `review_mode: Option<ReviewMode>` (`null` = inherit global default) to `RepositoryJson` and `UpdateRepository` (using `present_or_null` so `null` clears override).
   - UI (`web/src/routes/repositories/+page.svelte`): add a **Review mode** table column (`Select` for admin: `Default (global)`, `Generalist`, `Specialists`; read-only label for `user` role, matching `DESIGN.md` and `#lib` import conventions).
+
+---
+
+### 4.12 Multi-Line Inline Comments (`crates/git` + `crates/review`)
+
+Added 2026-11-22 (user decision). A multi-line ` ```suggestion ` fence anchored to a single line makes GitHub's "Apply suggestion" insert duplicate lines; the comment must cover the span it replaces.
+
+- **Meaning of the span:** `start_line..=line` is the span of **existing** new-file lines (RIGHT side) that the `suggestion` replaces. The Finder sets `start_line` only when that span has more than one line; an insertion or a finding whose suggestion rewrites only `line` leaves it unset. The Finder prompt and the `submit_findings` schema say this (schema stays in the Gemini-safe subset).
+- **Parsing:** `start_line` is optional and lenient (number or numeric string); `start_line >= line` or `0` means single-line (`None`).
+- **Validation:** §4.8 Step 1 — kept only when `start_line` and `line` lie in one hunk of the file's `CommentableRange` (incremental reviews use the intersected hunks). A dropped `start_line` also removes the finding's `suggestion` (the finding is still posted, single-line, without a committable fence).
+- **Verifier & Dedup:** both see `start_line` when set; the Verifier's code snippet covers the whole span; the Verifier prompt says what the span means.
+- **Posting:** `InlineComment` carries optional `start_line` and `end_offset`.
+  - GitHub: when `start_line < line`, the review comment adds `start_line` and `start_side: "RIGHT"` next to `line` and `side: "RIGHT"`; otherwise both are omitted.
+  - Azure DevOps: thread context `rightFileStart {line: start_line, offset: 1}` and `rightFileEnd {line, offset: end_offset}`, where `end_offset` is the UTF-16 length of the end line + 1 (`right_line_end_offset`); single-line threads keep `offset: 1` on both ends. `end_offset` is ignored by GitHub.
+  - Providers re-check `start_line < line` and fall back to single-line.
+- **Unverified offline:** live GitHub same-hunk acceptance and Apply behaviour, and Azure offset semantics — user click-test.
 
 ---
 
