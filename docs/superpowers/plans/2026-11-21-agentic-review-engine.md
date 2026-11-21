@@ -15,7 +15,12 @@
 ## Global Constraints & Rust Standards
 
 - **AGENTS.md baseline:** Runtime `sqlx::query` / `sqlx::query_as` only (never `query!` macros); `ApiJson<T>` / `ApiPath<T>` / `ApiQuery<T>` and `ApiError` JSON errors in `crates/server`; `#lib/*.js` / `#lib/*.svelte` imports and `DESIGN.md` tokens in `web/`; no browser automation; `cargo test --workspace -j 2` on Windows (and clean `target/debug/incremental` if disk space drops).
-- **Clean-room and no-assumption rule (`AGENTS.md`, binding):** Section 6.13 of the base design spec (`2026-11-19-adus-design.md`) — zero code, prompts, or text derived from Kodus `libs/ee/**` or `*.ee.*`. Kodus community code may inspire behaviour but is never ported line by line. Authority order: brief → spec → `AGENTS.md`/existing code → Kodus community behaviour (gaps only). No guessing; raise gaps. Reports list "Assumptions" and cite Kodus files consulted. Every implementer and reviewer prompt carries the rule verbatim.
+- **Clean-room and no-assumption rule (binding, verbatim from `AGENTS.md`):**
+  1. **Kodus community code** (https://github.com/kodustech/kodus-ai, anything outside `libs/ee/**` and not named `*.ee.*`) may be read as a behaviour reference and inspiration. Never port or translate it line by line: Adus code, prompts and schemas are written fresh. **Kodus enterprise code** (`libs/ee/**`, `*.ee.*`) is never opened, fetched or searched, not even to look.
+  2. **Order of authority:** the task brief, then the spec, then this file and the existing Adus code. Kodus community behaviour (or public provider/git docs for wire formats) only fills a gap none of those settles. Never guess from memory of how Kodus or another tool works; if a gap remains, raise it instead of assuming.
+  3. **Openness:** every implementer report lists its assumptions under an "Assumptions" heading and cites each Kodus community file consulted (path) and the behaviour taken from it.
+  4. **Reviewers** flag as Important any line-by-line port or translation, anything that looks derived from Kodus enterprise code, uncited Kodus use, and unstated assumptions beyond the brief/spec.
+  5. **Plans and prompts:** every new plan repeats this rule in its Global Constraints, and every implementer and reviewer subagent prompt carries it verbatim.
 - **Rust Best Practices (spec Section 5):**
   - Idiomatic expressive Rust is encouraged over the original minimal learner subset whenever it improves safety or clarity.
   - **Borrowing & ownership:** Take `&str`, `&[T]`, `Cow<'_, str>` at boundaries; pass `Copy` enums (`ReviewMode`, `Severity`, `SpecialistKind`) by value; avoid `.clone()` inside hot search/loop iterations.
@@ -606,5 +611,5 @@ Added 2026-11-22 (user decision). The first implementation was written by the us
 **Unverified offline (user click-test):** GitHub same-hunk acceptance and Apply behaviour; Azure offset semantics and whether Azure renders suggestion fences.
 
 - [x] **Step 1–4:** Implemented by the user; `cargo fmt --check`, `clippy -D warnings` clean; `adus-git` + `adus-review` tests pass.
-- [ ] **Step 5:** Apply the review fixes above in the fix wave; full verification.
+- [x] **Step 5:** Apply the review fixes above in the fix wave; full verification (I1, I2, I4, M1–M3, M5, M6 done; M4 stays in the backlog).
 - [ ] **Step 6:** Commit `feat(review): anchor multi-line suggestions with start_line`

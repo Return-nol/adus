@@ -48,7 +48,7 @@ This wave brings **Point 1 (Cross-file PR & codebase awareness)**, **Point 2 (Tw
 | 5 | **Finder modes** | `ReviewMode::Generalist` (default) and `ReviewMode::Specialists` |
 | 6 | **Mode configuration** | `settings.review_mode` global default + nullable `repositories.review_mode` override + `@adudu review deep` (`specialists` alias). `Specialists` runs `Bug`, `Security`, `Performance` + conditional `Rules` (only if matching enabled rules exist) |
 | 7 | **Verifier & Dedup** | Per-finding tool-enabled Verifier (concurrency 4, max 6 steps, max 25 candidates sorted `Critical → Warning → Info`, refute-to-drop / keep-by-default) → 1 single-turn PR-wide Semantic Dedup call when `verified.len() >= 2` |
-| 8 | **Partial failure policy** | Specialists: partial results allowed with summary warning; retry only if all specialists fail retryably. Verifier: **fail-closed** (drop unverified finding + summary warning). Dedup: safe fallback (keep verified findings as-is) |
+| 8 | **Partial failure policy** | Specialists: partial results allowed with summary warning; retry only if all specialists fail retryably. Generalist (one agent per batch, so a failure leaves files unreviewed): when some Finder task failed and every failure was retryable (`AllKeysFailed`, `NoKeys`, `Internal`; a deadline cut never is), the review is retried (`Retryable`, waiting for the first `AllKeysFailed`'s `retry_after`) instead of posting with those files skipped. Verifier: **fail-closed** (drop unverified finding + summary warning). Dedup: safe fallback (keep verified findings as-is) |
 | 9 | **Output funnel** | 2-stage: Finder outputs full `Suggestion` (`file`, optional `start_line`, `line`, `severity`, `title`, `body`, optional `suggestion`; `start_line..=line` is the span of existing new-file lines a `suggestion` replaces, and `start_line` is set only when that span has more than one line — see §4.12), Verifier keeps/drops without rewriting, Dedup merges |
 | 10 | **Model & prompt caching** | One provider per review (`repo.review_provider_id` → `settings.default_provider_id`). Finder uses its `primary_model` with effort by mode (`Generalist` → `Medium`, `Specialists` → `High`, `finder_effort`); Verifier and Dedup use `effective_fast_model()` (the `fast_model`, else `primary_model`) with `Low` effort. Shared static prompt sections placed before specialist `<Role>` for implicit prefix caching; Anthropic `cache_control: ephemeral` breakpoints + cache token accounting |
 | 11 | **Context & budgets** | Batch diffs up to ~40K chars (full PR manifest in every batch); tool outputs capped (`read_file` ≤ 200 lines / 8K chars, `grep` ≤ 40 match groups / 8K chars, `list_dir`/`find_files` ≤ 150 entries / 4K chars); compact older tool results above ~160K chars; one-shot overflow recovery |
@@ -82,7 +82,7 @@ Webhook / @adudu review [deep]
         │     ├─ Generalist: 1 agent per batch (max 20 steps)
         │     ├─ Specialists: Bug, Security, Performance (+ Rules if matching rules exist) in parallel within a batch
         │     ├─ If `ToolsUnsupported` -> retry Finder once in diff-only self-contained mode + Summary Warning
-        │     └─ Partial specialist failures -> keep surviving findings + Summary Warning
+        │     └─ Partial specialist failures -> keep surviving findings + Summary Warning; Generalist: when every failed task failed retryably -> Retryable (no post)
         ├─ 7. Deterministic Filter (`keep_valid_batch`: path in batch, `line` in commentable `+` lines, `start_line` kept only when it is in the same diff hunk as `line`) + Exact Dedup
         ├─ 8. Verifier Pass (when candidates > 0; must finish by the Verifier deadline, 90 % of review_timeout)
         │     ├─ Prioritize Critical -> Warning -> Info; cap at 25 (warn if truncated)
@@ -306,7 +306,7 @@ pub struct CloneSpec {
   - `cleanup_orphaned_workspaces()` scans `<std::env::temp_dir()>/adus-clones/` on `adus serve` startup (before spawning workers) and deletes stale directories older than 1 hour (or all directories inside `adus-clones/` since `adus serve` owns this process's clone namespace).
 - **Hardened `git` invocation (`GitCliCloner`):**
   - Timeout: `CLONE_TIMEOUT = 60 s` (aborts child process with `kill_on_drop(true)`).
-  - Env hardening: `env_clear()`, passing only safe minimal vars (`PATH`, `HOME`/`USERPROFILE` pointed to the temp dir or empty, `SystemRoot`/`SYSTEM32` on Windows), `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` (or `NUL` on Windows / temp empty config).
+  - Env hardening: `env_clear()`, passing only safe minimal vars (`PATH`, `HOME`/`USERPROFILE` pointed to the temp dir or empty, `SystemRoot`/`SYSTEM32` on Windows, plus the operator's proxy and CA variables `http_proxy`/`https_proxy`/`HTTPS_PROXY`/`all_proxy`/`ALL_PROXY`/`no_proxy`/`NO_PROXY`/`GIT_SSL_CAINFO`/`GIT_SSL_CAPATH`/`SSL_CERT_FILE`/`SSL_CERT_DIR`/`CURL_CA_BUNDLE`; never `GIT_TRACE*`/`GIT_CURL_VERBOSE`), `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` (or `NUL` on Windows / temp empty config).
   - Step 0: `git --version` once per process (cached); below **2.31** (no `GIT_CONFIG_COUNT` support) → `WorkspaceError::Unavailable("git 2.31 or newer is required")`, so the review falls back to diff-only instead of failing auth.
   - Step 1: `git init` inside temp dir.
   - Step 2: `git -c core.hooksPath=/dev/null -c core.symlinks=false -c core.fsmonitor=false -c filter.lfs.smudge= -c filter.lfs.process= -c protocol.file.allow=never fetch --depth=1 --no-tags --no-recurse-submodules -- <url> <refspec>`. The PAT goes **only** in this command's environment: `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=http.extraHeader`, `GIT_CONFIG_VALUE_0=Authorization: <auth_header>`. It never appears in argv (visible in the process list), the URL, or `.git/config`. If the fetch fails for a non-auth reason and `fallback_refspec` is `Some`, retry the fetch once with it. `--` always precedes `<url> <refspec>`.
@@ -322,7 +322,7 @@ pub struct CloneSpec {
 
 ### 4.4 Pure-Rust Read-Only Tools & Shared Cache (`crates/review/src/tools.rs`)
 
-Tools execute inside `tokio::task::spawn_blocking` against `Arc<RepoWorkspace>`, with a per-review `Arc<ToolCache>` (`std::sync::RwLock<HashMap<ToolCacheKey, String>>`—never held across `.await`).
+Tools execute inside `tokio::task::spawn_blocking` against `Arc<RepoWorkspace>`, with a per-review `Arc<ToolCache>` (`std::sync::RwLock<HashMap<ToolCacheKey, String>>`—never held across `.await`). A `grep`/`find_files` result cut by its time budget is not cached, so a later identical call gets a fresh try.
 
 | Tool | Typed Input (`Deserialize`) | Behavior & Caps | Cached? |
 |---|---|---|---|
@@ -418,6 +418,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
   - The candidate finding JSON (`file`, `start_line` when set, `line`, `severity`, `title`, `body`, `suggestion`); the snippet covers the whole `start_line..=line` span
   - Surrounding lines / patch hunk for the cited file
   - Applicable rules for that file + team memories + repo instructions (if present)
+  - Order in the user prompt: rules, memories, repo instructions, diff, code context, then the candidate and the task line, so candidates on the same file share a cacheable prefix (decision 10)
 - **Verification prompt rules:**
   - Skeptical surgical verifier: **refute-to-drop, keep-by-default**.
   - Must actively check definitions, types, callers, upstream guards, or tests via `read_file`/`grep`/`list_dir`/`find_files` (max `6` steps) before dropping.
@@ -451,7 +452,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 
 | Stage | Deadline | When it is hit |
 |---|---|---|
-| Clone + Finder | `start + 60 %` | Finder tasks still running are cancelled (`tokio::time::timeout_at`) and count as failed specialists with the note `"{label} reviewer did not finish in time"`. If **no** Finder task finished, the review fails `Fatal("review timed out")`, as today. |
+| Clone + Finder | `start + 60 %` | A clone still running is abandoned and the review continues diff-only (`fallback_reason = "clone_timed_out"`). Finder tasks still running are cancelled (`tokio::time::timeout_at`) and count as failed specialists with the note `"{label} reviewer did not finish in time"`; the files of a batch no agent finished are listed under **Skipped files** (`timed_out`, "review did not finish in time"). A deadline cut is never retryable, also not under the Generalist retry rule of decision 8. If **no** Finder task finished, the review fails `Fatal("review timed out")`, as today. |
 | Verifier | `start + 90 %` | Candidates without a verdict are dropped as unverified (fail-closed, never retryable). |
 | Dedup | `start + 97 %` (the last 3 %, ~20 s in production, is reserved for posting) | Dedup is cut and falls back safely (keep the verified list). |
 
