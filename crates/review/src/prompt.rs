@@ -447,8 +447,9 @@ pub fn format_inline(s: &Suggestion) -> String {
 }
 
 /// Komentar ringkasan review. `skipped` = (path, alasan) dengan alasan `no_patch` |
-/// `too_large` | `file_limit` | `unparseable` | `llm_error` | `timed_out`. `ignored` = jumlah
-/// file yang cocok dengan daftar ignore (hanya jumlahnya yang ditampilkan, bukan namanya).
+/// `too_large` | `file_limit` | `unparseable` | `llm_error` | `timed_out` | `token_budget`.
+/// `ignored` = jumlah file yang cocok dengan daftar ignore (hanya jumlahnya yang ditampilkan,
+/// bukan namanya).
 /// `warnings` are listed last under **Notes** (e.g. a fallback to diff-only review).
 pub fn format_summary(
     counts: &BTreeMap<Severity, usize>,
@@ -497,6 +498,7 @@ fn skip_reason_label(reason: &str) -> &str {
         "unparseable" => "review output could not be parsed",
         "llm_error" => "LLM error",
         "timed_out" => "review did not finish in time",
+        "token_budget" => "token budget reached",
         other => other,
     }
 }

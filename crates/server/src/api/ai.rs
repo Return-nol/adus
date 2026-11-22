@@ -587,6 +587,8 @@ async fn test_key(
         model: &model,
         input_tokens: outcome.as_ref().map_or(0, |r| tokens(r.input_tokens)),
         output_tokens: outcome.as_ref().map_or(0, |r| tokens(r.output_tokens)),
+        cache_read_tokens: outcome.as_ref().map_or(0, |r| tokens(r.cache_read_tokens)),
+        cache_write_tokens: outcome.as_ref().map_or(0, |r| tokens(r.cache_write_tokens)),
         latency_ms,
         success: outcome.is_ok(),
         error_kind: outcome.as_ref().err().map(|(kind, _)| *kind),

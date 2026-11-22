@@ -31,6 +31,7 @@ pub fn routes() -> Router<AppState> {
 const FILES_RANGE: RangeInclusive<i32> = 1..=500;
 const PATCH_LINES_RANGE: RangeInclusive<i32> = 1..=100_000;
 const SMALL_PR_RANGE: RangeInclusive<i32> = 0..=10_000;
+const INPUT_TOKENS_RANGE: RangeInclusive<i32> = 0..=100_000_000;
 const MAX_KEYWORD_LEN: usize = 100;
 const MAX_KEYWORDS: usize = 500;
 const MAX_TEST_PATH_LEN: usize = 1000;
@@ -47,6 +48,7 @@ struct SettingsJson {
     ignored_title_keywords: Vec<String>,
     review_mode: ReviewMode,
     small_pr_max_lines: i32,
+    max_review_input_tokens: i32,
 }
 
 impl From<Settings> for SettingsJson {
@@ -60,6 +62,7 @@ impl From<Settings> for SettingsJson {
             ignored_title_keywords: s.ignored_title_keywords,
             review_mode: s.review_mode,
             small_pr_max_lines: s.small_pr_max_lines,
+            max_review_input_tokens: s.max_review_input_tokens,
         }
     }
 }
@@ -78,6 +81,8 @@ struct SettingsBody {
     review_mode: Option<ReviewMode>,
     /// Tidak ada = biarkan.
     small_pr_max_lines: Option<i32>,
+    /// Tidak ada = biarkan.
+    max_review_input_tokens: Option<i32>,
 }
 
 impl From<IgnoreError> for ApiError {
@@ -149,6 +154,13 @@ async fn replace(
             "small_pr_max_lines must be between 0 and 10000",
         ));
     }
+    if let Some(tokens) = body.max_review_input_tokens
+        && !INPUT_TOKENS_RANGE.contains(&tokens)
+    {
+        return Err(ApiError::validation(
+            "max_review_input_tokens must be between 0 and 100000000",
+        ));
+    }
     if let Some(provider_id) = body.default_provider_id
         && ai::get_provider(&state.db, provider_id).await?.is_none()
     {
@@ -180,6 +192,9 @@ async fn replace(
         small_pr_max_lines: body
             .small_pr_max_lines
             .unwrap_or(current.small_pr_max_lines),
+        max_review_input_tokens: body
+            .max_review_input_tokens
+            .unwrap_or(current.max_review_input_tokens),
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }

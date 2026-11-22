@@ -19,10 +19,13 @@ pub struct Settings {
     /// PRs with at most this many changed lines (and few, non-sensitive files) are reviewed
     /// diff-only. 0 = never.
     pub small_pr_max_lines: i32,
+    /// Input tokens (cached included) one review may send to the model. 0 = no limit.
+    pub max_review_input_tokens: i32,
 }
 
 const COLUMNS: &str = "default_provider_id, max_files_per_review, \
-     max_patch_lines_per_file, ignore_paths, ignored_title_keywords, review_mode, \n     small_pr_max_lines";
+     max_patch_lines_per_file, ignore_paths, ignored_title_keywords, review_mode, \
+     small_pr_max_lines, max_review_input_tokens";
 
 pub async fn get(pool: &PgPool) -> Result<Settings> {
     sqlx::query_as(&format!("SELECT {COLUMNS} FROM settings WHERE id = 1"))
@@ -35,7 +38,8 @@ pub async fn update(pool: &PgPool, new: &Settings) -> Result<Settings> {
     sqlx::query_as(&format!(
         "UPDATE settings SET default_provider_id = $1, \
          max_files_per_review = $2, max_patch_lines_per_file = $3, \
-         ignore_paths = $4, ignored_title_keywords = $5, review_mode = $6, small_pr_max_lines = $7 WHERE id = 1 \
+         ignore_paths = $4, ignored_title_keywords = $5, review_mode = $6, small_pr_max_lines = $7, \
+         max_review_input_tokens = $8 WHERE id = 1 \
          RETURNING {COLUMNS}"
     ))
     .bind(new.default_provider_id)
@@ -45,6 +49,7 @@ pub async fn update(pool: &PgPool, new: &Settings) -> Result<Settings> {
     .bind(&new.ignored_title_keywords)
     .bind(new.review_mode)
     .bind(new.small_pr_max_lines)
+    .bind(new.max_review_input_tokens)
     .fetch_one(pool)
     .await
 }

@@ -94,19 +94,19 @@ Unverified live: final-step history (tool calls kept while only submit is offere
 | Dedicated bot account + fine-grained PAT | user | to do |
 | Worker count vs 30-min deep reviews | user | to do |
 | Gradual rollout + click-test multi-line Apply | user | to do |
-| **Cap PR size defaults:** `max_files_per_review` 50 → 30, `max_patch_lines_per_file` 2000 → 1500 | Claude, Task 14 | planned |
-| **Small-PR threshold default** 50 → 100 lines | Claude, Task 14 | planned |
+| **Cap PR size defaults:** `max_files_per_review` 50 → 30, `max_patch_lines_per_file` 2000 → 1500 | Claude, Task 14 | done |
+| **Small-PR threshold default** 50 → 100 lines | Claude, Task 14 | done |
 
-Defaults change only through `ALTER … SET DEFAULT` inside unreleased migration 0008 (0003 is already on `origin/feat/adus-v1`, never edit it). Existing installs keep their values; the dev DB row is updated by hand after the commit (plus the row-8 checksum repair).
+Defaults change in the new migration 0009 (0003 is already on `origin/feat/adus-v1` and 0008 stays as it is, so no checksum repair is needed): `SET DEFAULT` plus an `UPDATE` of the settings row where it still holds the old default, so a value an admin changed is kept. The dev DB gets it on the next server start.
 
 ### Tier 2 (code)
 
 | # | Mitigation | Task | Status |
 |---|---|---|---|
 | — | Deadline-aware wrap-up (time or last 2 steps) + one step-budget note; 30-min Specialists budget; worker chain 31/35/35 | 13 | implementing |
-| 1 | Per-review input-token ceiling: setting `max_review_input_tokens` (default 2,000,000, 0 = off); when crossed, Finder agents wrap up and remaining Verifier candidates are dropped with a note | 14 | planned |
+| 1 | Per-review input-token ceiling: setting `max_review_input_tokens` (default 2,000,000, 0 = off); when crossed, Finder agents wrap up and remaining Verifier candidates are dropped with a note | 14 | done |
 | 2 | Secret redaction: mask API keys, tokens, private keys, `password=`-style values in tool outputs and repo instructions before the LLM, and in posted comment bodies; PR diffs are not masked so a hardcoded secret can still be flagged | 15 | planned |
-| 3 | Record `cache_read_tokens` / `cache_write_tokens` in `llm_usage` and show them in usage totals | 14 | planned |
+| 3 | Record `cache_read_tokens` / `cache_write_tokens` in `llm_usage` and show them in usage totals | 14 | done |
 | 4 | Skip a review whose PR head changed while queued (check whether already done) | — | not chosen yet |
 | 5 | Log every webhook Adus rejects or ignores (event, reason, never the body) | — | not chosen yet |
 | 6 | Cheaper Specialists (Performance at Medium, step cap ~14) | — | not chosen yet |

@@ -2,6 +2,7 @@
 //! result through one terminal tool. Context compaction and a one-shot context-overflow
 //! recovery keep long runs within the model's window. Used by the Finder and the Verifier.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use adus_llm::router::{ChatError, ChatService, UsageContext};
@@ -14,6 +15,7 @@ use serde_json::Value;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::budget::TokenBudget;
 use crate::tools::{ToolOutput, Toolbox};
 
 /// Default `AgentConfig::compaction_char_limit`.
@@ -43,7 +45,7 @@ const OVERFLOW_TOOL_CHARS: usize = 500;
 const TRUNCATED_MARKER: &str = "\n[output truncated]";
 
 /// Limits of one agent run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// LLM calls allowed in one run (Finder 20, Verifier 6).
     pub max_steps: usize,
@@ -58,6 +60,9 @@ pub struct AgentConfig {
     /// [`WRAP_UP_STEP_FACTOR`] × its slowest step so far (LLM call plus tools), so it submits
     /// before a caller's hard cut at this instant.
     pub deadline: Option<Instant>,
+    /// The review's shared input-token budget. Every successful response adds its
+    /// `input_tokens`; once the budget is exhausted the run wraps up (after its first step).
+    pub token_budget: Option<Arc<TokenBudget>>,
 }
 
 impl AgentConfig {
@@ -70,6 +75,7 @@ impl AgentConfig {
             max_concurrent_tools: DEFAULT_MAX_CONCURRENT_TOOLS,
             wrap_up_steps: DEFAULT_WRAP_UP_STEPS,
             deadline: None,
+            token_budget: None,
         }
     }
 }
@@ -142,8 +148,9 @@ pub struct AgentLlm<'a> {
 /// once more (`cut_short`).
 ///
 /// **Wrap-up:** from the last `wrap_up_steps` steps on, or earlier once `deadline` is closer
-/// than 2 × the slowest whole step of this run (never before one step was measured), only
-/// the terminal tool is offered, and one reminder to submit is sent when that starts. Halfway
+/// than 2 × the slowest whole step of this run (never before one step was measured), or once
+/// the review's `token_budget` is exhausted (also not before the first step), only the
+/// terminal tool is offered, and one reminder to submit is sent when that starts. Halfway
 /// through a budget of at least 4 steps with the repository tools, one note tells the model
 /// how many steps it has used.
 ///
@@ -204,6 +211,9 @@ pub async fn run_react_loop<S: SubmitSpec>(
         )
         .await?;
         tally.add(&response);
+        if let Some(budget) = &config.token_budget {
+            budget.add(response.input_tokens);
+        }
         tracing::debug!(
             step = tally.steps_used,
             tools = ?response.tool_calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
@@ -266,7 +276,7 @@ pub async fn run_react_loop<S: SubmitSpec>(
 /// When a run stops investigating and only submits (see `run_react_loop`).
 #[derive(Default)]
 struct WrapUp {
-    /// Why wrap-up started (`"steps"` or `"deadline"`); once set it stays set.
+    /// Why wrap-up started (`"steps"`, `"deadline"` or `"token_budget"`); once set it stays set.
     reason: Option<&'static str>,
     /// The slowest whole step (LLM call plus tools) of this run so far.
     slowest: Option<Duration>,
@@ -288,6 +298,13 @@ impl WrapUp {
             Some("steps")
         } else if self.deadline_close(config.deadline) {
             Some("deadline")
+        } else if steps_used > 0
+            && config
+                .token_budget
+                .as_ref()
+                .is_some_and(|budget| budget.exhausted())
+        {
+            Some("token_budget")
         } else {
             None
         };
@@ -1620,6 +1637,57 @@ mod tests {
             assert!(reqs.iter().all(|r| count_notes(r) == 0), "{steps} steps");
             assert_eq!(count_user(&reqs[steps - 1], WRAP_UP), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_switches_agent_to_submit_only() {
+        let tb = default_toolbox();
+        // Every turn reports 100 input tokens; the ceiling is crossed by the third step.
+        let mut script: Vec<_> = (1..=3)
+            .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
+            .collect();
+        script.push(tools_turn(vec![submit("c4", "within budget")]));
+        let chat = ScriptedChat::new(script);
+        let budget = Arc::new(TokenBudget::new(250));
+        let mut config = AgentConfig::new(20);
+        config.token_budget = Some(Arc::clone(&budget));
+        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        assert_eq!(out.result, "within budget");
+        assert_eq!(out.steps_used, 4);
+        assert_eq!(budget.used(), 400, "every response is counted once");
+
+        let reqs = chat.requests();
+        for req in &reqs[..3] {
+            assert_eq!(tool_names(req).len(), 5);
+            assert_eq!(count_user(req, WRAP_UP), 0);
+        }
+        assert_eq!(tool_names(&reqs[3]), [SUBMIT]);
+        assert_eq!(user_text(reqs[3].messages.last().unwrap()), Some(WRAP_UP));
+        assert_eq!(count_user(&reqs[3], WRAP_UP), 1);
+        assert_paired(&reqs[3].messages);
+
+        // A budget another agent of the review already used up: this agent still takes one
+        // investigating step, then only submits.
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![read("c1", "src/a.rs")]),
+            tools_turn(vec![submit("c2", "late")]),
+        ]);
+        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        assert_eq!(out.result, "late");
+        let reqs = chat.requests();
+        assert_eq!(tool_names(&reqs[0]).len(), 5);
+        assert_eq!(tool_names(&reqs[1]), [SUBMIT]);
+        assert_eq!(count_user(&reqs[1], WRAP_UP), 1);
+
+        // A failed call adds nothing.
+        let chat = ScriptedChat::new(vec![Err(ChatError::NoKeys)]);
+        let fresh = Arc::new(TokenBudget::new(250));
+        let mut config = AgentConfig::new(20);
+        config.token_budget = Some(Arc::clone(&fresh));
+        run(&chat, AgentTools::Full(&tb), &config)
+            .await
+            .unwrap_err();
+        assert_eq!(fresh.used(), 0);
     }
 
     #[test]

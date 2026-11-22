@@ -133,6 +133,8 @@ impl LlmRouter {
             model: &req.model,
             input_tokens: response.map_or(0, |r| tokens(r.input_tokens)),
             output_tokens: response.map_or(0, |r| tokens(r.output_tokens)),
+            cache_read_tokens: response.map_or(0, |r| tokens(r.cache_read_tokens)),
+            cache_write_tokens: response.map_or(0, |r| tokens(r.cache_write_tokens)),
             latency_ms,
             success: error_kind.is_none(),
             error_kind,

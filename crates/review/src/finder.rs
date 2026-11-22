@@ -3,6 +3,9 @@
 //! agent must finish by the Finder deadline: it wraps up (submits) when the deadline gets
 //! close, and one still running at the deadline counts as a failed task.
 //! When the model rejects tool calling, the whole Finder is run again without tools.
+//! A batch that would start once the review's token budget is exhausted is not started.
+
+use std::sync::Arc;
 
 use adus_core::types::ReviewMode;
 use adus_db::memories::Memory;
@@ -17,6 +20,7 @@ use uuid::Uuid;
 
 use crate::agent::run_react_loop;
 use crate::agent::{AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec};
+use crate::budget::TokenBudget;
 use crate::parse::{
     Suggestion, parse_submit_findings, parse_suggestions, submit_findings_tool_def,
 };
@@ -39,6 +43,8 @@ pub struct FinderLlm<'a> {
     pub model: &'a str,
     pub effort: ReasoningEffort,
     pub usage: &'a UsageContext,
+    /// The review's shared input-token budget, if any.
+    pub token_budget: Option<&'a Arc<TokenBudget>>,
 }
 
 /// What every Finder agent of one review is shown.
@@ -56,6 +62,8 @@ pub struct FinderInput<'a> {
 pub enum FinderFailure {
     /// The Finder deadline passed first.
     TimedOut,
+    /// The batch was not started: the review's token budget was already exhausted.
+    TokenBudget,
     Agent(AgentError),
 }
 
@@ -133,6 +141,18 @@ async fn run_all(
             let kinds = active_specialists(input.mode, !batch.rules.is_empty());
             let submit = &submit;
             async move {
+                // Checked when the batch starts (the stream polls it), not when it is built.
+                if llm.token_budget.is_some_and(|budget| budget.exhausted()) {
+                    tracing::debug!(batch = index, "token budget exhausted; batch not started");
+                    return kinds
+                        .into_iter()
+                        .map(|kind| FinderTask {
+                            batch: index,
+                            kind,
+                            result: Err(FinderFailure::TokenBudget),
+                        })
+                        .collect::<Vec<_>>();
+                }
                 let agents: Vec<_> = kinds
                     .into_iter()
                     .map(|kind| run_one(llm, kind, prompt.clone(), tools, submit, deadline))
@@ -182,6 +202,7 @@ async fn run_one(
     let config = AgentConfig {
         wrap_up_steps: FINDER_WRAP_UP_STEPS,
         deadline: Some(deadline),
+        token_budget: llm.token_budget.cloned(),
         ..AgentConfig::new(FINDER_MAX_STEPS)
     };
     let run = run_react_loop(&agent, tools, submit, &config, prompt);

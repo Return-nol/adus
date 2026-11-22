@@ -20,6 +20,8 @@
 		date: string;
 		input_tokens: number;
 		output_tokens: number;
+		cache_read_tokens: number;
+		cache_write_tokens: number;
 		calls: number;
 		failed_calls: number;
 	};
@@ -28,6 +30,8 @@
 		label: string;
 		input_tokens: number;
 		output_tokens: number;
+		cache_read_tokens: number;
+		cache_write_tokens: number;
 		calls: number;
 	};
 
@@ -135,7 +139,8 @@
 					<Skeleton class="mt-1 h-4 w-72" />
 				{:else}
 					{n(sum((d) => d.input_tokens))} input · {n(sum((d) => d.output_tokens))} output ·
-					{n(sum((d) => d.calls))} calls ({n(sum((d) => d.failed_calls))} failed)
+					{n(sum((d) => d.calls))} calls ({n(sum((d) => d.failed_calls))} failed) ·
+					{n(sum((d) => d.cache_read_tokens))} cache read
 				{/if}
 			</Card.Description>
 		</Card.Header>
@@ -176,8 +181,8 @@
 			</Tabs.Root>
 			{#if !loaded}
 				<TableSkeleton
-					headers={[by, 'Input', 'Output', 'Total', 'Calls']}
-					right={['Input', 'Output', 'Total', 'Calls']}
+					headers={[by, 'Input', 'Cache read', 'Output', 'Total', 'Calls']}
+					right={['Input', 'Cache read', 'Output', 'Total', 'Calls']}
 				/>
 			{:else}
 				<Table.Root>
@@ -185,6 +190,7 @@
 						<Table.Row>
 							<Table.Head>{by}</Table.Head>
 							<Table.Head class="text-right">Input</Table.Head>
+							<Table.Head class="text-right">Cache read</Table.Head>
 							<Table.Head class="text-right">Output</Table.Head>
 							<Table.Head class="text-right">Total</Table.Head>
 							<Table.Head class="text-right">Calls</Table.Head>
@@ -195,6 +201,7 @@
 							<Table.Row>
 								<Table.Cell>{r.label}</Table.Cell>
 								<Table.Cell class="text-right tabular-nums">{n(r.input_tokens)}</Table.Cell>
+								<Table.Cell class="text-right tabular-nums">{n(r.cache_read_tokens)}</Table.Cell>
 								<Table.Cell class="text-right tabular-nums">{n(r.output_tokens)}</Table.Cell>
 								<Table.Cell class="text-right tabular-nums">
 									{n(r.input_tokens + r.output_tokens)}
@@ -203,7 +210,7 @@
 							</Table.Row>
 						{:else}
 							<Table.Row>
-								<Table.Cell colspan={5} class="text-muted-foreground">
+								<Table.Cell colspan={6} class="text-muted-foreground">
 									No usage in this range.
 								</Table.Cell>
 							</Table.Row>

@@ -330,7 +330,7 @@ async fn delete_provider_in_use_409(pool: PgPool) {
 
     let put = json!({
         "default_provider_id": by_settings,
-        "max_files_per_review": 50, "max_patch_lines_per_file": 2000
+        "max_files_per_review": 30, "max_patch_lines_per_file": 1500
     });
     assert_eq!(
         call(&app, "PUT", "/api/v1/settings", &put, &admin)
@@ -407,8 +407,8 @@ async fn settings_roundtrip_and_validation(pool: PgPool) {
     let initial = send(&app, get("/api/v1/settings", Some(&admin))).await;
     assert_eq!(initial.status, StatusCode::OK);
     assert_eq!(initial.body["default_provider_id"], Value::Null);
-    assert_eq!(initial.body["max_files_per_review"], 50);
-    assert_eq!(initial.body["max_patch_lines_per_file"], 2000);
+    assert_eq!(initial.body["max_files_per_review"], 30);
+    assert_eq!(initial.body["max_patch_lines_per_file"], 1500);
 
     let put = |provider: Value, files: i64, lines: i64| {
         json!({

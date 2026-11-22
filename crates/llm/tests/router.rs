@@ -674,8 +674,8 @@ async fn deleting_key_and_provider_keeps_usage_history(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn settings_row_exists_with_defaults(pool: PgPool) {
     let current = adus_db::settings::get(&pool).await.unwrap();
-    assert_eq!(current.max_files_per_review, 50);
-    assert_eq!(current.max_patch_lines_per_file, 2000);
+    assert_eq!(current.max_files_per_review, 30);
+    assert_eq!(current.max_patch_lines_per_file, 1500);
     assert_eq!(current.default_provider_id, None);
 
     let provider = ai::insert_provider(
@@ -696,6 +696,7 @@ async fn settings_row_exists_with_defaults(pool: PgPool) {
         ignored_title_keywords: vec!["wip".into()],
         review_mode: adus_core::types::ReviewMode::Specialists,
         small_pr_max_lines: 120,
+        max_review_input_tokens: 500_000,
     };
     assert_eq!(adus_db::settings::update(&pool, &new).await.unwrap(), new);
     // Hapus provider -> default_provider_id di-NULL-kan.
@@ -716,4 +717,32 @@ fn internal_error_display_text() {
         err.to_string(),
         "internal error: cannot decrypt API keys — check ADUS_SECRET_KEY"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn router_writes_cache_tokens_to_usage(pool: PgPool) {
+    let s = setup(&pool, ProviderKind::Anthropic, 2).await;
+    ai::mark_used(&pool, s.keys[1].id, Utc::now())
+        .await
+        .unwrap();
+    let cached = ChatResponse {
+        input_tokens: 100,
+        cache_read_tokens: 60,
+        cache_write_tokens: 30,
+        ..ok_response()
+    };
+    s.fake.script("key-0", vec![rate_limited(30)]);
+    s.fake.script("key-1", vec![Ok(cached)]);
+
+    chat(&s).await.unwrap();
+
+    let rows: Vec<(bool, i32, i32, i32)> = sqlx::query_as(
+        "SELECT success, input_tokens, cache_read_tokens, cache_write_tokens \
+         FROM llm_usage ORDER BY created_at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    // The failed attempt records no tokens; the success records its cache tokens as well.
+    assert_eq!(rows, vec![(false, 0, 0, 0), (true, 100, 60, 30)]);
 }

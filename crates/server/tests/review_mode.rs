@@ -27,7 +27,7 @@ async fn login_user(app: &Router, admin: &str) -> String {
 async fn put_settings(app: &Router, cookie: &str, extra: Value) -> common::Reply {
     let mut body = json!({
         "default_provider_id": null,
-        "max_files_per_review": 50, "max_patch_lines_per_file": 2000
+        "max_files_per_review": 30, "max_patch_lines_per_file": 1500
     });
     body.as_object_mut()
         .unwrap()
@@ -114,10 +114,10 @@ async fn put_settings_omitting_review_mode_keeps_existing_value(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn settings_small_pr_max_lines_defaults_to_50_and_validates_range(pool: PgPool) {
+async fn settings_small_pr_max_lines_defaults_to_100_and_validates_range(pool: PgPool) {
     let (app, _git) = app_and_git(pool).await;
     let admin = setup_admin(&app).await;
-    assert_eq!(read_settings(&app, &admin).await["small_pr_max_lines"], 50);
+    assert_eq!(read_settings(&app, &admin).await["small_pr_max_lines"], 100);
 
     let reply = put_settings(&app, &admin, json!({ "small_pr_max_lines": 120 })).await;
     assert_eq!(reply.status, StatusCode::OK);

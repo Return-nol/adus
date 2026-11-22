@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::budget::TokenBudget;
 use crate::parse::{Suggestion, first_json_object};
 use crate::prompt::wrap;
 use crate::verifier::CandidateFinding;
@@ -35,12 +36,14 @@ Respond with ONLY a JSON object, no prose and no markdown fences: {"keep_indices
 /// provider's `effective_fast_model()`; the call uses `ReasoningEffort::Low`.
 ///
 /// Fewer than two findings need no call. An LLM error, an unparseable answer, an index out of
-/// range or an empty list keeps every finding (logged as a warning).
+/// range or an empty list keeps every finding (logged as a warning). The call's input tokens
+/// are added to `token_budget`; it runs even when the budget is exhausted (one small call).
 pub async fn deduplicate_findings(
     chat: &dyn ChatService,
     provider_id: Uuid,
     model: &str,
     usage_ctx: &UsageContext,
+    token_budget: Option<&TokenBudget>,
     findings: Vec<CandidateFinding>,
 ) -> DedupResult {
     let unchanged = |findings: Vec<CandidateFinding>| DedupResult {
@@ -59,7 +62,12 @@ pub async fn deduplicate_findings(
     )
     .with_effort(ReasoningEffort::Low);
     let response = match chat.chat(provider_id, request, usage_ctx.clone()).await {
-        Ok(response) => response,
+        Ok(response) => {
+            if let Some(budget) = token_budget {
+                budget.add(response.input_tokens);
+            }
+            response
+        }
         Err(err) => {
             tracing::warn!(error = %err, "semantic dedup failed; keeping all findings");
             return unchanged(findings);
@@ -225,7 +233,7 @@ mod tests {
 
     async fn dedup(chat: &ScriptedChat, findings: Vec<CandidateFinding>) -> DedupResult {
         let usage = UsageContext::default();
-        deduplicate_findings(chat, Uuid::from_u128(1), FAST_MODEL, &usage, findings).await
+        deduplicate_findings(chat, Uuid::from_u128(1), FAST_MODEL, &usage, None, findings).await
     }
 
     fn user_text(req: &ChatRequest) -> &str {

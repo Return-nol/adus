@@ -3,6 +3,7 @@
 //! short ReAct loop with the read-only repository tools; without one it is a single call
 //! against the file's diff. Fail-closed: a candidate without a verdict is dropped.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use adus_core::types::normalize_path;
@@ -20,6 +21,7 @@ use uuid::Uuid;
 use crate::agent::{
     AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec, run_react_loop,
 };
+use crate::budget::TokenBudget;
 use crate::parse::{Suggestion, first_json_object};
 use crate::prompt::{diff_block, format_memories, format_rules, or_none, wrap};
 use crate::specialists::SpecialistKind;
@@ -56,7 +58,8 @@ pub struct VerificationReport {
     pub kept: Vec<CandidateFinding>,
     /// Findings the Verifier refuted.
     pub dropped_refuted: usize,
-    /// Findings without a verdict (error, unparseable answer or deadline); fail-closed.
+    /// Findings without a verdict (error, unparseable answer, deadline, or not started once the
+    /// token budget was exhausted); fail-closed.
     pub dropped_unverified: usize,
     /// Findings beyond [`MAX_VERIFY_CANDIDATES`] that were never verified.
     pub truncated_by_cap: usize,
@@ -72,6 +75,8 @@ pub struct VerifyContext<'a> {
     pub provider_id: Uuid,
     pub model: &'a str,
     pub usage: &'a UsageContext,
+    /// The review's shared input-token budget, if any.
+    pub token_budget: Option<&'a Arc<TokenBudget>>,
 }
 
 /// Verifies `candidates` and returns the confirmed ones in their original order.
@@ -80,7 +85,8 @@ pub struct VerifyContext<'a> {
 /// [`MAX_VERIFY_CANDIDATES`]; up to [`VERIFY_CONCURRENCY`] are verified at a time. With a
 /// `toolbox` each one runs a tool-enabled loop of at most [`VERIFY_MAX_STEPS`] steps; without
 /// one (or once the model rejected tool calling) each one is a single diff-only call. Work
-/// still running at `deadline` is dropped as unverified, never as retryable.
+/// still running at `deadline` is dropped as unverified, never as retryable, and so is a
+/// candidate that would start once the token budget is exhausted.
 #[expect(
     clippy::too_many_arguments,
     reason = "the brief fixes this signature; Task 8 calls it once from the engine"
@@ -115,8 +121,11 @@ pub async fn verify_candidates(
             let evidence = &evidence;
             let diff_only = &diff_only;
             async move {
+                // Checked when the candidate starts (the stream polls it), not when it is built.
                 let outcome = if Instant::now() >= deadline {
                     Outcome::Unverified(Failure::Deadline)
+                } else if ctx.token_budget.is_some_and(|budget| budget.exhausted()) {
+                    Outcome::Unverified(Failure::TokenBudget)
                 } else {
                     tokio::time::timeout_at(
                         deadline,
@@ -165,6 +174,8 @@ enum Failure {
     Other,
     /// The Verifier deadline passed first.
     Deadline,
+    /// Not started: the review's token budget was already exhausted.
+    TokenBudget,
 }
 
 fn summarize(
@@ -187,7 +198,9 @@ fn summarize(
                     Failure::Retryable(err) => {
                         first_retryable.get_or_insert(err);
                     }
-                    Failure::Other | Failure::Deadline => only_retryable_failures = false,
+                    Failure::Other | Failure::Deadline | Failure::TokenBudget => {
+                        only_retryable_failures = false
+                    }
                 }
             }
         }
@@ -275,6 +288,7 @@ async fn verify_with_tools(
         &SubmitVerdict::new(),
         &AgentConfig {
             deadline: Some(deadline),
+            token_budget: ctx.token_budget.cloned(),
             ..AgentConfig::new(VERIFY_MAX_STEPS)
         },
         prompt,
@@ -312,14 +326,23 @@ async fn verify_diff_only(ctx: VerifyContext<'_>, prompt: String) -> Outcome {
         .chat(ctx.provider_id, request, ctx.usage.clone())
         .await
     {
-        Ok(response) => match first_json_object::<SubmitVerdictArgs>(&response.text) {
-            Some(args) => verdict(args.keep),
-            None => {
-                tracing::debug!("diff-only verifier answer has no verdict; dropping the candidate");
-                Outcome::Unverified(Failure::Other)
+        Ok(response) => {
+            if let Some(budget) = ctx.token_budget {
+                budget.add(response.input_tokens);
             }
-        },
+            diff_only_verdict(&response.text)
+        }
         Err(err) => chat_failure(err),
+    }
+}
+
+fn diff_only_verdict(text: &str) -> Outcome {
+    match first_json_object::<SubmitVerdictArgs>(text) {
+        Some(args) => verdict(args.keep),
+        None => {
+            tracing::debug!("diff-only verifier answer has no verdict; dropping the candidate");
+            Outcome::Unverified(Failure::Other)
+        }
     }
 }
 
@@ -774,6 +797,7 @@ mod tests {
             provider_id: PROVIDER,
             model: FAST_MODEL,
             usage: &usage,
+            token_budget: None,
         };
         verify_candidates(
             ctx,
@@ -1113,6 +1137,7 @@ mod tests {
             provider_id: PROVIDER,
             model: FAST_MODEL,
             usage: &usage,
+            token_budget: None,
         };
         let refuted = candidate("refuted-one", Severity::Info, SpecialistKind::Rules);
         let report = verify_candidates(
@@ -1270,6 +1295,7 @@ mod tests {
             provider_id: PROVIDER,
             model: FAST_MODEL,
             usage: &usage,
+            token_budget: None,
         };
         let tb = toolbox();
         assert_send(verify_candidates(
@@ -1287,6 +1313,7 @@ mod tests {
             PROVIDER,
             FAST_MODEL,
             &usage,
+            None,
             Vec::new(),
         ));
     }

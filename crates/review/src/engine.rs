@@ -28,6 +28,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::agent::AgentError;
+use crate::budget::TokenBudget;
 use crate::dedup::deduplicate_findings;
 use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
@@ -149,6 +150,9 @@ struct Stages<'a> {
     /// A small, low-risk PR: reviewed diff-only in one Generalist pass (`mode` is already
     /// `Generalist`).
     small: bool,
+    /// Input tokens this run may send (`settings.max_review_input_tokens`), shared by every
+    /// Finder, Verifier and Dedup call.
+    token_budget: Arc<TokenBudget>,
 }
 
 impl Engine {
@@ -426,6 +430,9 @@ impl Engine {
                     usage: &usage,
                     deadlines: Deadlines::new(start, budget),
                     small,
+                    token_budget: Arc::new(TokenBudget::new(
+                        u64::try_from(settings.max_review_input_tokens).unwrap_or(0),
+                    )),
                 };
                 let review = self.review_targets(
                     &stages,
@@ -536,6 +543,7 @@ impl Engine {
             model: s.primary_model,
             effort: finder_effort(mode),
             usage: s.usage,
+            token_budget: Some(&s.token_budget),
         };
         let finder = run_finder(llm, &input, toolbox.as_ref(), s.deadlines.finder).await;
         // Without tool support the Verifier works from the diff as well.
@@ -560,6 +568,7 @@ impl Engine {
                 provider_id: s.provider_id,
                 model: s.fast_model,
                 usage: s.usage,
+                token_budget: Some(&s.token_budget),
             };
             let report = verify_candidates(
                 ctx,
@@ -601,6 +610,7 @@ impl Engine {
                 s.provider_id,
                 s.fast_model,
                 s.usage,
+                Some(s.token_budget.as_ref()),
                 verified,
             );
             match tokio::time::timeout_at(s.deadlines.dedup, dedup).await {
@@ -612,6 +622,14 @@ impl Engine {
             }
         };
 
+        let budget = s.token_budget.as_ref();
+        if budget.exhausted() {
+            warnings.push(format!(
+                "Token budget reached ({} of {} input tokens): some files or findings were not reviewed.",
+                budget.used(),
+                budget.limit()
+            ));
+        }
         tracing::info!(
             review_mode = ?mode,
             clone_ms,
@@ -623,6 +641,8 @@ impl Engine {
             dedup_dropped = verified_kept.saturating_sub(found.len()),
             cache_read_tokens,
             cache_write_tokens,
+            input_tokens = budget.used(),
+            token_budget_reached = budget.exhausted(),
             "review stages finished"
         );
         let patches: HashMap<String, Option<&str>> = files
@@ -740,7 +760,8 @@ fn finder_cache_tokens(tasks: &[FinderTask]) -> (u32, u32) {
 ///
 /// A failed task becomes a summary note when another agent reviewed its batch; when no agent
 /// reviewed a batch, its files are listed as skipped (reason `timed_out` when the Finder
-/// deadline cut every agent of it). When no task succeeded at all, the review fails (see
+/// deadline cut every agent of it, `token_budget` when the batch was never started because
+/// the token budget was exhausted). When no task succeeded at all, the review fails (see
 /// [`all_failed`]); in `Generalist` mode it is also retried when every failure was retryable
 /// (see [`generalist_retry`]).
 fn collect_candidates(
@@ -801,6 +822,8 @@ fn collect_candidates(
                 push_once(warnings, format!("{label} reviewer did not finish in time"));
                 "timed_out"
             }
+            // The summary's token-budget note covers it; no per-reviewer note.
+            Err(FinderFailure::TokenBudget) => "token_budget",
             Err(FinderFailure::Agent(_)) if reviewed.contains(&task.batch) => {
                 push_once(warnings, format!("{label} reviewer did not complete"));
                 continue;
@@ -869,6 +892,10 @@ fn all_failed(tasks: Vec<FinderTask>) -> EngineError {
         let error = match task.result {
             Ok(_) => continue,
             Err(FinderFailure::TimedOut) => timed_out(),
+            // Never retryable: a retry would spend the same tokens again.
+            Err(FinderFailure::TokenBudget) => {
+                EngineError::Fatal("review stopped: token budget reached".into())
+            }
             Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(&err) => {
                 retryable.get_or_insert(err);
                 continue;

@@ -26,7 +26,7 @@ async fn login_user(app: &Router, admin: &str) -> String {
 async fn put_settings(app: &Router, cookie: &str, extra: Value) -> common::Reply {
     let mut body = json!({
         "default_provider_id": null,
-        "max_files_per_review": 50, "max_patch_lines_per_file": 2000
+        "max_files_per_review": 30, "max_patch_lines_per_file": 1500
     });
     body.as_object_mut()
         .unwrap()

@@ -53,12 +53,13 @@ async fn healthy_world(pool: PgPool) -> World {
         &pool,
         &Settings {
             default_provider_id: Some(provider.id),
-            max_files_per_review: 50,
-            max_patch_lines_per_file: 2000,
+            max_files_per_review: 30,
+            max_patch_lines_per_file: 1500,
             ignore_paths: None,
             ignored_title_keywords: vec![],
             review_mode: Default::default(),
-            small_pr_max_lines: 50,
+            small_pr_max_lines: 100,
+            max_review_input_tokens: 2_000_000,
         },
     )
     .await

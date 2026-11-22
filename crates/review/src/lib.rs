@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod budget;
 pub mod command;
 pub mod dedup;
 pub mod engine;

@@ -35,3 +35,21 @@ async fn settings_review_mode_defaults_to_generalist_and_round_trips(pool: PgPoo
     assert_eq!(saved.review_mode, ReviewMode::Specialists);
     assert_eq!(settings::get(&pool).await.unwrap(), saved);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn settings_defaults_are_30_files_1500_lines_100_small_pr_2m_tokens(pool: PgPool) {
+    let current = settings::get(&pool).await.unwrap();
+    assert_eq!(current.max_files_per_review, 30);
+    assert_eq!(current.max_patch_lines_per_file, 1500);
+    assert_eq!(current.small_pr_max_lines, 100);
+    assert_eq!(current.max_review_input_tokens, 2_000_000);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn settings_max_review_input_tokens_round_trips(pool: PgPool) {
+    let mut current = settings::get(&pool).await.unwrap();
+    current.max_review_input_tokens = 0;
+    let saved = settings::update(&pool, &current).await.unwrap();
+    assert_eq!(saved.max_review_input_tokens, 0);
+    assert_eq!(settings::get(&pool).await.unwrap(), saved);
+}
