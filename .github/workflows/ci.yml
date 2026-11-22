@@ -2,7 +2,11 @@ name: ci
 
 on:
   push:
+    branches:
+      - feat/adus-v1
   pull_request:
+    branches:
+      - feat/adus-v1
 
 concurrency:
   group: ci-${{ github.ref }}
