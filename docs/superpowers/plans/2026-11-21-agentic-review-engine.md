@@ -65,6 +65,8 @@
 | 11 | Small PR → diff-only: `settings.small_pr_max_lines` (merged into migration `0008`), small-PR check before clone, risky-path exceptions, summary note, API + UI field | `migrations`, `db/settings`, `review/engine`, `review/small_pr`, `server/api/settings`, `web/routes/settings` |
 | 12 | Multi-line anchoring (`start_line..=line`) for committable suggestions: parse, validate per hunk, Verifier/Dedup, GitHub + Azure posting | `git/diff`, `git/types`, `git/github`, `git/azure`, `review/parse`, `review/prompt`, `review/engine`, `review/verifier`, `review/dedup` |
 | 13 | Deadline-aware wrap-up (time or last 2 steps) + step-budget note; 30 min budget for Specialists reviews, worker timeout chain raised | `review/agent`, `review/finder`, `review/verifier`, `review/engine`, `adus/worker`, `adus/main`, `db/reviews` |
+| 14 | Cost controls: PR-size and small-PR defaults (30 files / 1,500 lines / 100 lines), per-review input-token ceiling `settings.max_review_input_tokens`, cache tokens in `llm_usage` and usage totals | `migrations` (0009), `db/settings`, `db/usage`, `llm/router`, `review/budget`, `review/agent`, `review/finder`, `review/verifier`, `review/engine`, `server/api/settings`, `server/api/usage`, `web/routes/settings`, `web/routes/usage` |
+| 15 | Secret redaction: mask secret-like values in tool outputs and repo instructions before the LLM, and in posted comment/summary bodies; PR diffs stay unmasked | `review/redact`, `review/tools`, `review/repo_instructions`, `review/prompt`, `review/verifier`, `review/engine` |
 
 ---
 
@@ -653,3 +655,100 @@ Added 2026-11-22 (user decision) after a live `@adudu review deep` run: the Bug 
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -j 2` → PASS.
 - [ ] **Step 5:** Commit `feat(review): deadline-aware wrap-up and a 30-minute budget for specialists reviews`
+
+---
+
+### Task 14: Cost Controls — PR-Size Defaults, Input-Token Ceiling & Cache Tokens
+
+Added 2026-11-22 (user decisions, see `docs/superpowers/agentic-engine-risk-and-cost.md` §3). A live `@adudu review deep` on an 8-file PR sent ~1.23M input tokens in 7 min; with the 30-min Specialists budget (Task 13) the worst case is bounded only by time. No Kodus code is needed for this task.
+
+**Files:**
+- Create: `migrations/0009_review_cost_controls.sql`, `crates/review/src/budget.rs`
+- Modify: `crates/db/src/settings.rs`, `crates/db/src/usage.rs`, `crates/llm/src/router.rs`, `crates/review/src/{lib,agent,finder,verifier,dedup,engine}.rs`, `crates/server/src/api/settings.rs`, the usage API handlers in `crates/server/src/api/`, `web/src/routes/settings/+page.svelte`, `web/src/routes/usage/+page.svelte`, `AGENTS.md`, the spec (§1 table: new decision row for the ceiling; the small-PR default in row 14 and §4.13; the settings lines), `docs/superpowers/agentic-engine-risk-and-cost.md` (mark the Task 14 items done)
+- Test: `crates/db` tests for settings/usage, `crates/llm/tests/router.rs`, `crates/review/src/budget.rs` (`mod tests`), `crates/review/src/agent.rs` (`mod tests`), `crates/review/tests/engine.rs`, `crates/server/tests/settings.rs`, `crates/server/tests/usage.rs`
+
+**Interfaces:**
+- **Migration `0009_review_cost_controls.sql`** (new file; never edit 0003, and leave 0008 as it is so no checksum repair is needed):
+  - The `settings` row already exists (inserted by 0003), so a new column default alone changes nothing. Change both the default and the row while it still holds the old default:
+    - `max_files_per_review`: `SET DEFAULT 30`; `UPDATE settings SET max_files_per_review = 30 WHERE max_files_per_review = 50`.
+    - `max_patch_lines_per_file`: `SET DEFAULT 1500`; `UPDATE … = 1500 WHERE … = 2000`.
+    - `small_pr_max_lines`: `SET DEFAULT 100`; `UPDATE … = 100 WHERE … = 50`.
+    - A value an admin already changed is kept. A comment in the file says why the `UPDATE`s exist.
+  - `ALTER TABLE settings ADD COLUMN max_review_input_tokens INTEGER NOT NULL DEFAULT 2000000 CHECK (max_review_input_tokens BETWEEN 0 AND 100000000)`; comment: input tokens one review may send (cached included), `0` = no limit.
+  - `ALTER TABLE llm_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0, ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0`. `input_tokens` keeps meaning "total input, cached included".
+- **`crates/db`:** `Settings` / its update struct gain `max_review_input_tokens: i32`. `NewUsage` gains `cache_read_tokens: i32` and `cache_write_tokens: i32`. `DailyUsage` and the breakdown rows gain `cache_read_tokens: i64` and `cache_write_tokens: i64` (`SUM`, zero-filled like the other columns). Update every Rust default and test literal that still says 50 / 2000 / 50 for these settings.
+- **`crates/llm/src/router.rs`:** writes `response.cache_read_tokens` / `cache_write_tokens` into the usage row on success (0 on failure).
+- **`crates/review/src/budget.rs`:** `pub struct TokenBudget` with `new(limit: u64)` (0 = unlimited), `add(&self, input_tokens: u32)`, `used(&self) -> u64`, `limit(&self) -> u64`, `exhausted(&self) -> bool` (`limit > 0 && used >= limit`). Backed by an `AtomicU64` (`Relaxed` is enough: it is a soft cap); shared as `Arc<TokenBudget>`, one per review run.
+- **`crates/review/src/agent.rs`:** `AgentConfig` gains `pub token_budget: Option<Arc<TokenBudget>>` (default `None`). After every successful chat response the agent calls `budget.add(response.input_tokens)`. **Wrap-up** (Task 13) also starts when the budget is exhausted and at least one step has finished; same submit-only behaviour and the same single reminder.
+- **Engine / stages:** `run()` builds one `TokenBudget` from `settings.max_review_input_tokens` and passes it to every Finder, Verifier and Dedup call of that run (small-PR runs too).
+  - **Finder:** a batch whose agents have not started when the budget is already exhausted is not started; its files go under **Skipped files** with reason `token_budget`. Running agents wrap up through the agent rule. A `token_budget` skip is never retryable (the Generalist retry rule is unchanged for real `ChatError`s).
+  - **Verifier:** candidates not started once the budget is exhausted are dropped (fail-closed, like a missing verdict); running Verifier agents wrap up. Dedup still runs (one small call) and its input tokens are added too.
+  - **Summary:** when the ceiling was reached, one warning line: "Token budget reached ({used} of {limit} input tokens): some files or findings were not reviewed." Dropped Verifier candidates are counted in the existing "not verified" note.
+  - **Log:** the `review stages finished` line gains `input_tokens = budget.used()` and `token_budget_reached` (bool).
+- **Server API:** settings response gains `max_review_input_tokens`; the update body takes `max_review_input_tokens: Option<i32>` (absent = keep current, like `small_pr_max_lines`), validated `0..=100_000_000`, else 422 `validation_error` "max_review_input_tokens must be between 0 and 100000000". Usage daily and breakdown rows gain `cache_read_tokens` and `cache_write_tokens`.
+- **Web:**
+  - Settings page: a "Max input tokens per review" number field next to the other review limits, helper text "Input tokens one review may send to the model, cached tokens included. When reached, the review stops reading and posts what it has. 0 = no limit." Update any helper text that states the old defaults, and the page skeleton for the new field.
+  - Token Usage page: the totals line adds "· {n} cache read" and the breakdown table gains a right-aligned "Cache read" column; update the table skeleton `headers`/`right`.
+  - Follow `DESIGN.md`, `#lib` imports, no browser automation (verify with `pnpm -C web check` and by reading).
+
+**Edge Cases & Pitfalls:**
+- `0` disables the ceiling; `TokenBudget::exhausted` is never true for limit 0.
+- The ceiling is soft: in-flight calls finish, so a review may exceed the limit by the calls already running (≤ 2 batches × 4 agents + 4 Verifier calls). Say so in the spec line.
+- Count per response received, so the overflow retry never counts twice; failed calls add nothing.
+- Provider `input_tokens` already include cached tokens (see `ChatResponse` docs); do not add `cache_read_tokens` on top.
+- Server tests that send a settings body without the new field must keep passing (it is optional in the update body).
+- After this task the controller restarts nothing; migration 0009 applies to the dev DB on the user's next start (no checksum repair).
+
+- [ ] **Step 1: Write failing tests**
+  - db/server: `settings_defaults_are_30_files_1500_lines_100_small_pr_2m_tokens` (fresh DB), `update_settings_validates_max_review_input_tokens`, `update_without_max_review_input_tokens_keeps_current`, `usage_rows_record_cache_tokens`, `daily_and_breakdown_sum_cache_tokens`.
+  - llm router: `router_writes_cache_tokens_to_usage`.
+  - review: `token_budget_zero_never_exhausts`, `token_budget_exhausts_at_limit`, `exhausted_budget_switches_agent_to_submit_only`, `batches_not_started_after_budget_exhausted_are_skipped_as_token_budget`, `verifier_drops_unstarted_candidates_after_budget_exhausted`, `budget_reached_adds_summary_warning`.
+- [ ] **Step 2:** `cargo test -j 2 -p adus-db -p adus-llm -p adus-review -p adus-server` → FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `pnpm -C web check` (0 errors), `pnpm -C web build`, `cargo test --workspace -j 2` → PASS.
+- [ ] **Step 5:** Commit `feat(review): token ceiling, cache token usage and smaller default review limits`
+
+---
+
+### Task 15: Secret Redaction Before the LLM and in Posted Comments
+
+Added 2026-11-22 (user decision, risk breakdown §2 "Bot quotes a committed credential"). Tools can read any non-secret-named file of the PR head; a credential committed in an ordinary file (`config.ts`, `settings.py`) reaches the model and can be quoted back into a PR comment. No Kodus code is needed for this task; write the patterns fresh from the public token formats named below.
+
+**Files:**
+- Create: `crates/review/src/redact.rs`
+- Modify: `crates/review/src/{lib,tools,repo_instructions,prompt,specialists,verifier,engine}.rs` (the exact set the code requires), `AGENTS.md` (Clone & tools bullet), the spec (§4.4 tools, §4.11 posting), `docs/superpowers/agentic-engine-risk-and-cost.md` (mark Task 15 done)
+- Test: `crates/review/src/redact.rs` (`mod tests`), `crates/review/src/tools.rs` tests, `crates/review/src/repo_instructions.rs` tests, `crates/review/tests/engine.rs`
+
+**Interfaces:**
+- `crates/review/src/redact.rs`:
+  - `pub const REDACTED: &str = "[REDACTED]";`
+  - `pub fn redact_secrets(text: &str) -> Cow<'_, str>`: `Cow::Borrowed` when nothing matched. Patterns compiled once (`std::sync::LazyLock`).
+  - `pub fn contains_secret(text: &str) -> bool`.
+  - Patterns (each with a positive and a negative unit test):
+    1. PEM private keys: `-----BEGIN … PRIVATE KEY-----` … `-----END … PRIVATE KEY-----` (multi-line): the BEGIN/END lines stay, every line between becomes `[REDACTED]` (line count unchanged).
+    2. Provider token shapes (the whole token is replaced): AWS access key id `\b(AKIA|ASIA)[0-9A-Z]{16}\b`; GitHub `\bgh[pousr]_[A-Za-z0-9]{36,}\b` and `\bgithub_pat_[A-Za-z0-9_]{22,}\b`; OpenAI/Anthropic-style `\bsk-[A-Za-z0-9_-]{20,}`; Google API key `\bAIza[0-9A-Za-z_-]{35}\b`; Slack `\bxox[abposr]-[A-Za-z0-9-]{10,}`; Stripe `\b[rs]k_(live|test)_[A-Za-z0-9]{16,}\b`; JWT `\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`.
+    3. Credentials in URLs: `scheme://user:password@host` → `scheme://user:[REDACTED]@host`.
+    4. Named assignments: a key whose name contains `password`, `passwd`, `secret`, `api_key`/`apikey`/`api-key`, `access_token`, `auth_token`, `client_secret` or `private_key` (case-insensitive), followed by `=` or `:` and either a **quoted literal of 8+ chars**, or, on an env-style line (`KEY=value`, optional `export `), an unquoted value of 8+ non-space chars. Only the value is replaced; quotes are kept.
+  - Never redact (negative tests required): `password = get_password()`, `api_key: ${API_KEY}`, `secret: <your-secret>`, `"password": ""`, `token_count = 12`, a 40-char git SHA, a UUID, an `sk-` value shorter than 20 chars, prose containing the word "password".
+- **Where it applies:**
+  - `RepoTools::execute_read_only`: the successful content of every read-only tool is redacted **before** it is cached and returned (one choke point; cached entries hold redacted text).
+  - `load_repo_instructions`: the loaded text is redacted before it goes into any prompt.
+  - **Not** redacted: the PR diff (Finder batches, small-PR prompt, manifest) and the Verifier's per-finding snippet, so a hardcoded secret in the PR can still be found and verified.
+  - Finder and Verifier system prompts gain one sentence: "`[REDACTED]` in tool output marks a value Adus masked because it looked like a secret; a hardcoded secret is still a finding when the diff shows it."
+  - **Posting** (`engine.rs`, after Dedup, before `post_review`): every inline comment body and the summary body go through `redact_secrets`. When a finding's `suggestion` contains a secret (`contains_secret`), the suggestion is dropped (posted without a suggestion block) so "Apply suggestion" can never write `[REDACTED]` into code.
+  - **Logs:** one `debug!` per review with the number of redacted tool outputs and comments; never the matched text.
+
+**Edge Cases & Pitfalls:**
+- Redaction must not break `read_file` line numbering: replace within a line, never add or remove lines.
+- Keep regexes linear-time (`regex` crate) and bounded with a size limit.
+- Comment bodies are Markdown: redaction must not touch the `<!-- adudu -->` marker or code-fence backticks.
+
+- [ ] **Step 1: Write failing tests**
+  - `redact.rs`: one positive and one negative test per pattern; `pem_block_keeps_line_count`; `no_match_returns_borrowed`.
+  - `tools.rs`: `read_file_masks_a_committed_aws_key`, `grep_masks_a_github_token_in_matches`, `cached_result_is_the_redacted_one`.
+  - `repo_instructions.rs`: `repo_instructions_are_redacted`.
+  - engine: `posted_comment_body_is_redacted`, `suggestion_containing_a_secret_is_dropped`, `summary_body_is_redacted`, `finder_still_sees_the_raw_diff`.
+- [ ] **Step 2:** `cargo test -j 2 -p adus-review` → FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -j 2` → PASS.
+- [ ] **Step 5:** Commit `feat(review): redact secrets in tool output, repo instructions and posted comments`
