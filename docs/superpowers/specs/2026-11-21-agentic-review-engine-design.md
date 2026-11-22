@@ -54,8 +54,8 @@ This wave brings **Point 1 (Cross-file PR & codebase awareness)**, **Point 2 (Tw
 | 11 | **Context & budgets** | Batch diffs up to ~40K chars (full PR manifest in every batch); tool outputs capped (`read_file` ≤ 200 lines / 8K chars, `grep` ≤ 40 match groups / 8K chars, `list_dir`/`find_files` ≤ 150 entries / 4K chars); compact older tool results above ~160K chars; one-shot overflow recovery |
 | 12 | **Time budget** | A review's budget follows its effective mode: 12 min (`REVIEW_TIMEOUT`) for Generalist, small PRs included, 30 min (`SPECIALISTS_REVIEW_TIMEOUT`) for Specialists. Stage deadlines are fractions of that budget: Finder (incl. clone) by 60 %, Verifier by 90 %, Dedup + post in the rest. Agents wrap up (submit) before their stage deadline when it gets close (Section 4.6 step 6); work still cut by a deadline is handled like a failure of that stage (Section 4.11), so a large PR still posts a partial review instead of timing out with nothing |
 | 13 | **Wave scope** | Point 1 + Point 2 + auto-loading repo instruction files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/*.mdc`) from the clone. Point 3 deferred |
-| 14 | **Small PR** | A small, low-risk PR (`settings.small_pr_max_lines`, default 100 since migration 0009, `0` = off; at most 3 reviewed files; no risky path, no covering enabled `critical` rule) skips the clone and the tools and is reviewed diff-only in one Generalist pass; Verifier and Dedup still run. `@adudu review` / `review deep` always get the full review (Section 4.13) |
-| 15 | **Token ceiling** | `settings.max_review_input_tokens` (default 2,000,000, range `0..=100,000,000`, `0` = no limit) caps the input tokens (cached included) one review run sends. One shared `TokenBudget` per run counts every successful Finder, Verifier and Dedup response. Once reached: running agents wrap up (Section 4.6 step 6), batches not yet started are skipped (`token_budget`, never retryable), Verifier candidates not yet started are verified **diff-only** (one fast-model call, no tools; still fail-closed, and their tokens still count) instead of with the repository tools, and Dedup still runs. The summary gets "Token budget reached ({used} of {limit} input tokens): {details}." only when the ceiling changed something, where details lists only what happened ("N batches not reviewed", "some reviewers stopped early" for Finder agents that wrapped up for `token_budget`, "N findings verified from the diff only"); a limit crossed only by calls that cut nothing adds no note. It is a soft cap: the overshoot is the calls already in flight plus at most one wrap-up call per running agent (≤ 8 Finder agents or ≤ 4 Verifier agents, each with its full context), plus the diff-only verification of remaining candidates. Migration 0009 also lowers the PR-size defaults to `max_files_per_review` 30 and `max_patch_lines_per_file` 1500 (Section 4.10) |
+| 14 | **Small PR** | A small, low-risk PR (`settings.small_pr_max_lines`, default 100, `0` = off; at most 3 reviewed files; no risky path, no covering enabled `critical` rule) skips the clone and the tools and is reviewed diff-only in one Generalist pass; Verifier and Dedup still run. `@adudu review` / `review deep` always get the full review (Section 4.13) |
+| 15 | **Token ceiling** | `settings.max_review_input_tokens` (default 2,000,000, range `0..=100,000,000`, `0` = no limit) caps the input tokens (cached included) one review run sends. One shared `TokenBudget` per run counts every successful Finder, Verifier and Dedup response. Once reached: running agents wrap up (Section 4.6 step 6), batches not yet started are skipped (`token_budget`, never retryable), Verifier candidates not yet started are verified **diff-only** (one fast-model call, no tools; still fail-closed, and their tokens still count) instead of with the repository tools, and Dedup still runs. The summary gets "Token budget reached ({used} of {limit} input tokens): {details}." only when the ceiling changed something, where details lists only what happened ("N batches not reviewed", "some reviewers stopped early" for Finder agents that wrapped up for `token_budget`, "N findings verified from the diff only"); a limit crossed only by calls that cut nothing adds no note. It is a soft cap: the overshoot is the calls already in flight plus at most one wrap-up call per running agent (≤ 8 Finder agents or ≤ 4 Verifier agents, each with its full context), plus the diff-only verification of remaining candidates. Migration 0008 also lowers the PR-size defaults to `max_files_per_review` 30 and `max_patch_lines_per_file` 1500 (Section 4.10) |
 
 ---
 
@@ -135,15 +135,14 @@ ALTER TABLE settings
     ADD COLUMN review_mode review_mode NOT NULL DEFAULT 'generalist';
 
 ALTER TABLE settings
-    ADD COLUMN small_pr_max_lines INTEGER NOT NULL DEFAULT 50
+    ADD COLUMN small_pr_max_lines INTEGER NOT NULL DEFAULT 100
         CHECK (small_pr_max_lines BETWEEN 0 AND 10000);
 
 ALTER TABLE repositories
     ADD COLUMN review_mode review_mode NULL;
 ```
 
-#### Migration `migrations/0009_review_cost_controls.sql`
-Cost controls (decision 15). The `settings` row already exists, so each new default is also written to the row while it still holds the old default (an admin's own value is kept): `max_files_per_review` 50 → 30, `max_patch_lines_per_file` 2000 → 1500, `small_pr_max_lines` 50 → 100. It adds `settings.max_review_input_tokens INTEGER NOT NULL DEFAULT 2000000 CHECK (0..=100000000)` and `llm_usage.cache_read_tokens` / `cache_write_tokens INTEGER NOT NULL DEFAULT 0` (`input_tokens` keeps meaning total input, cached included).
+The same migration carries the cost controls (decision 15). The `settings` row already exists, so each new default is also written to the row while it still holds the old default (an admin's own value is kept): `max_files_per_review` 50 → 30, `max_patch_lines_per_file` 2000 → 1500. It adds `settings.max_review_input_tokens INTEGER NOT NULL DEFAULT 2000000 CHECK (0..=100000000)` and `llm_usage.cache_read_tokens` / `cache_write_tokens INTEGER NOT NULL DEFAULT 0` (`input_tokens` keeps meaning total input, cached included).
 
 #### Queue Backwards Compatibility (`crates/core/src/job.rs`)
 `Job::ReviewPr` adds:
@@ -481,7 +480,7 @@ Cancelling an agent future drops its pending tool futures; `spawn_blocking` work
 - **Settings (`GET`/`PUT /api/v1/settings`):**
   - Add `review_mode: "generalist" | "specialists"` (`SettingsJson` & optional `SettingsBody.review_mode: Option<ReviewMode>` so partial callers without the field remain backwards compatible).
   - Add `small_pr_max_lines: i32` (optional in `SettingsBody`, absent keeps the value; outside `0..=10000` is a 422 `validation_error`) and a **Small PR threshold (changed lines)** number field (Section 4.13).
-  - Add `max_review_input_tokens: i32` (decision 15; optional in `SettingsBody`, absent keeps the value; outside `0..=100000000` is a 422 `validation_error` "max_review_input_tokens must be between 0 and 100000000") and a **Max input tokens per review** number field. Defaults after migration 0009: `max_files_per_review` 30, `max_patch_lines_per_file` 1500, `small_pr_max_lines` 100, `max_review_input_tokens` 2,000,000.
+  - Add `max_review_input_tokens: i32` (decision 15; optional in `SettingsBody`, absent keeps the value; outside `0..=100000000` is a 422 `validation_error` "max_review_input_tokens must be between 0 and 100000000") and a **Max input tokens per review** number field. Defaults after migration 0008: `max_files_per_review` 30, `max_patch_lines_per_file` 1500, `small_pr_max_lines` 100, `max_review_input_tokens` 2,000,000.
 - **Usage (`GET /api/v1/usage/daily`, `/usage/breakdown`):** rows carry `cache_read_tokens` and `cache_write_tokens` (sums, zero-filled). The Token Usage page adds "· {n} cache read" to the totals line and a right-aligned **Cache read** breakdown column.
   - UI (`web/src/routes/settings/+page.svelte`): add a **Review mode** `<Select>` ("Generalist (balanced)" / "Specialists (deep: Bug, Security, Performance & Rules)") with helper copy mentioning `@adudu review deep`.
 - **Repositories (`GET /api/v1/repositories`, `PATCH /api/v1/repositories/{id}`):**
@@ -509,7 +508,7 @@ Added 2026-11-22 (user decision). A multi-line ` ```suggestion ` fence anchored 
 Added 2026-11-22 (user decision). A small, low-risk PR does not need a clone or an agent that walks the repository, so it takes the cheap path.
 
 - **Predicate:** `is_small_pr(targets, rules, max_lines)` over the **reviewed targets only** (ignored and skipped files never count; an all-ignored PR never gets here). True only when all hold:
-  - `max_lines > 0` (`settings.small_pr_max_lines`, default 100 since migration 0009, range `0..=10000`; `0` = never);
+  - `max_lines > 0` (`settings.small_pr_max_lines`, default 100, range `0..=10000`; `0` = never);
   - `1 <= targets.len() <= SMALL_PR_MAX_FILES` (3);
   - changed lines (`+` and `-` inside hunks, summed over the targets) `<= max_lines`;
   - no target is on a **risky path**, checked on `normalize_path`, case-insensitive, for both `path` and `old_path` (renames):

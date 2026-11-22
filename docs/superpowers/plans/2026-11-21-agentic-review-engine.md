@@ -65,7 +65,7 @@
 | 11 | Small PR → diff-only: `settings.small_pr_max_lines` (merged into migration `0008`), small-PR check before clone, risky-path exceptions, summary note, API + UI field | `migrations`, `db/settings`, `review/engine`, `review/small_pr`, `server/api/settings`, `web/routes/settings` |
 | 12 | Multi-line anchoring (`start_line..=line`) for committable suggestions: parse, validate per hunk, Verifier/Dedup, GitHub + Azure posting | `git/diff`, `git/types`, `git/github`, `git/azure`, `review/parse`, `review/prompt`, `review/engine`, `review/verifier`, `review/dedup` |
 | 13 | Deadline-aware wrap-up (time or last 2 steps) + step-budget note; 30 min budget for Specialists reviews, worker timeout chain raised | `review/agent`, `review/finder`, `review/verifier`, `review/engine`, `adus/worker`, `adus/main`, `db/reviews` |
-| 14 | Cost controls: PR-size and small-PR defaults (30 files / 1,500 lines / 100 lines), per-review input-token ceiling `settings.max_review_input_tokens`, cache tokens in `llm_usage` and usage totals | `migrations` (0009), `db/settings`, `db/usage`, `llm/router`, `review/budget`, `review/agent`, `review/finder`, `review/verifier`, `review/engine`, `server/api/settings`, `server/api/usage`, `web/routes/settings`, `web/routes/usage` |
+| 14 | Cost controls: PR-size and small-PR defaults (30 files / 1,500 lines / 100 lines), per-review input-token ceiling `settings.max_review_input_tokens`, cache tokens in `llm_usage` and usage totals | `migrations` (0008), `db/settings`, `db/usage`, `llm/router`, `review/budget`, `review/agent`, `review/finder`, `review/verifier`, `review/engine`, `server/api/settings`, `server/api/usage`, `web/routes/settings`, `web/routes/usage` |
 | 15 | Secret redaction: mask secret-like values in tool outputs and repo instructions before the LLM, and in posted comment/summary bodies; PR diffs stay unmasked | `review/redact`, `review/tools`, `review/repo_instructions`, `review/prompt`, `review/verifier`, `review/engine` |
 
 ---
@@ -663,12 +663,12 @@ Added 2026-11-22 (user decision) after a live `@adudu review deep` run: the Bug 
 Added 2026-11-22 (user decisions, see `docs/superpowers/agentic-engine-risk-and-cost.md` §3). A live `@adudu review deep` on an 8-file PR sent ~1.23M input tokens in 7 min; with the 30-min Specialists budget (Task 13) the worst case is bounded only by time. No Kodus code is needed for this task.
 
 **Files:**
-- Create: `migrations/0009_review_cost_controls.sql`, `crates/review/src/budget.rs`
+- Create: `crates/review/src/budget.rs` (the migration changes were first written as `0009_review_cost_controls.sql` and later folded into `0008`, see below)
 - Modify: `crates/db/src/settings.rs`, `crates/db/src/usage.rs`, `crates/llm/src/router.rs`, `crates/review/src/{lib,agent,finder,verifier,dedup,engine}.rs`, `crates/server/src/api/settings.rs`, the usage API handlers in `crates/server/src/api/`, `web/src/routes/settings/+page.svelte`, `web/src/routes/usage/+page.svelte`, `AGENTS.md`, the spec (§1 table: new decision row for the ceiling; the small-PR default in row 14 and §4.13; the settings lines), `docs/superpowers/agentic-engine-risk-and-cost.md` (mark the Task 14 items done)
 - Test: `crates/db` tests for settings/usage, `crates/llm/tests/router.rs`, `crates/review/src/budget.rs` (`mod tests`), `crates/review/src/agent.rs` (`mod tests`), `crates/review/tests/engine.rs`, `crates/server/tests/settings.rs`, `crates/server/tests/usage.rs`
 
 **Interfaces:**
-- **Migration `0009_review_cost_controls.sql`** (new file; never edit 0003, and leave 0008 as it is so no checksum repair is needed):
+- **Migration** (built as a new `0009_review_cost_controls.sql`; on 2026-11-22 the user had it folded into the unreleased `0008`, with `small_pr_max_lines` added at `DEFAULT 100` directly and the dev DB adapted by hand; never edit 0003):
   - The `settings` row already exists (inserted by 0003), so a new column default alone changes nothing. Change both the default and the row while it still holds the old default:
     - `max_files_per_review`: `SET DEFAULT 30`; `UPDATE settings SET max_files_per_review = 30 WHERE max_files_per_review = 50`.
     - `max_patch_lines_per_file`: `SET DEFAULT 1500`; `UPDATE … = 1500 WHERE … = 2000`.
@@ -697,7 +697,7 @@ Added 2026-11-22 (user decisions, see `docs/superpowers/agentic-engine-risk-and-
 - Count per response received, so the overflow retry never counts twice; failed calls add nothing.
 - Provider `input_tokens` already include cached tokens (see `ChatResponse` docs); do not add `cache_read_tokens` on top.
 - Server tests that send a settings body without the new field must keep passing (it is optional in the update body).
-- After this task the controller restarts nothing; migration 0009 applies to the dev DB on the user's next start (no checksum repair).
+- After the fold into 0008 the controller adapts the dev DB by hand (apply the new statements, drop any `_sqlx_migrations` row 9, set row 8 `checksum` to the SHA-384 of the new file).
 
 - [ ] **Step 1: Write failing tests**
   - db/server: `settings_defaults_are_30_files_1500_lines_100_small_pr_2m_tokens` (fresh DB), `update_settings_validates_max_review_input_tokens`, `update_without_max_review_input_tokens_keeps_current`, `usage_rows_record_cache_tokens`, `daily_and_breakdown_sum_cache_tokens`.

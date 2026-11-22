@@ -53,3 +53,6 @@ wiremock = "0.6"
 # Graf dependensi antar crate dideklarasikan dari awal; sebagian belum dipakai sampai task berikutnya.
 [workspace.lints.cargo]
 unused_dependencies = "allow"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"

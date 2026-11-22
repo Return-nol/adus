@@ -97,7 +97,7 @@ Unverified live: final-step history (tool calls kept while only submit is offere
 | **Cap PR size defaults:** `max_files_per_review` 50 → 30, `max_patch_lines_per_file` 2000 → 1500 | Claude, Task 14 | done |
 | **Small-PR threshold default** 50 → 100 lines | Claude, Task 14 | done |
 
-Defaults change in the new migration 0009 (0003 is already on `origin/feat/adus-v1` and 0008 stays as it is, so no checksum repair is needed): `SET DEFAULT` plus an `UPDATE` of the settings row where it still holds the old default, so a value an admin changed is kept. The dev DB gets it on the next server start.
+Defaults change in the unreleased migration 0008 (0003 is already on `origin/feat/adus-v1` and is never edited): `SET DEFAULT` plus an `UPDATE` of the settings row where it still holds the old default, so a value an admin changed is kept. The cost-control changes were first written as a separate 0009 and then folded into 0008; the dev DB was adapted by hand (row-8 checksum repair).
 
 ### Tier 2 (code)
 
@@ -127,7 +127,7 @@ Kill git's helper child on clone timeout; runtime orphan-workspace sweep; Verifi
 
 ## 5. Resume pointer
 
-- Branch `feat/advanced-agentic-review-flow`; Tasks 1–15 are committed (latest feature commits `7d12f25` Task 14, `79e9573`/`5059fce` Task 15), and final review #2 is fixed on top (`04e02dc` code, followed by a docs commit). `origin` has the branch up to `144a0a5`; later commits stay local until the user pushes. `.cargo/config.toml` stays uncommitted.
-- Dev DB: no 0008 checksum repair is needed. Migration 0009 moves the defaults (30/1500/100) and applies on the next server start.
+- Branch `feat/advanced-agentic-review-flow`; Tasks 1–15 are committed (latest feature commits `7d12f25` Task 14, `79e9573`/`5059fce` Task 15), and final review #2 is fixed on top (`04e02dc` code, followed by a docs commit). `.cargo/config.toml` stays uncommitted.
+- Dev DB: the cost-control changes live in 0008 (no 0009); the dev DB was adapted by hand and its row-8 checksum repaired.
 - Deferred minors of this plan live in `docs/superpowers/backlog.md` under "Agentic review engine (plan 2026-11-21)".
 - Next: merge review, then the Linux gate only if Unix code changed.
