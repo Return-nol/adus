@@ -298,8 +298,9 @@
 						bind:value={maxInputTokens}
 					/>
 					<p class="text-xs text-muted-foreground">
-						Input tokens one review may send to the model, cached tokens included. When reached, the
-						review stops reading and posts what it has. 0 = no limit.
+						Input tokens one review may send to the model, cached tokens included. When reached,
+						reviewers stop reading the repository, remaining findings are verified from the diff
+						only, and the review posts what it has. 0 = no limit.
 					</p>
 				</div>
 				<div class="grid gap-2">

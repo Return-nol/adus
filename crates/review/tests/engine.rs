@@ -2182,10 +2182,9 @@ async fn set_token_limit(pool: &PgPool, limit: i32) {
     settings::update(pool, &current).await.unwrap();
 }
 
-fn budget_warning(used: u64, limit: u64) -> String {
-    format!(
-        "Token budget reached ({used} of {limit} input tokens): some files or findings were not reviewed."
-    )
+/// The summary note when the token ceiling cut something: `details` lists what it cut.
+fn budget_warning(used: u64, limit: u64, details: &str) -> String {
+    format!("Token budget reached ({used} of {limit} input tokens): {details}.")
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -2213,78 +2212,199 @@ async fn batches_not_started_after_budget_exhausted_are_skipped_as_token_budget(
         "{summary}"
     );
     assert!(!summary.contains("`a.rs`"), "{summary}");
-    assert!(summary.contains(&budget_warning(2, 1)), "{summary}");
+    assert!(
+        summary.contains(&budget_warning(2, 1, "1 batch not reviewed")),
+        "{summary}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn verifier_drops_unstarted_candidates_after_budget_exhausted(pool: PgPool) {
+async fn all_failed_with_a_token_budget_skip_is_fatal(pool: PgPool) {
+    let files = vec![big_file("a.rs"), big_file("b.rs"), big_file("c.rs")];
+    let s = setup(&pool, FakeGit::new(pr("h1"), files)).await;
+    set_token_limit(&pool, 1).await;
+    // a.rs and b.rs answer prose (1 token each, past the ceiling), then fail retryably after
+    // the nudge; c.rs is never started.
+    for path in ["a.rs", "b.rs"] {
+        let needle = diff_header(path);
+        s.chat
+            .push_for(Stage::Finder, &needle, Reply::text("thinking"));
+        s.chat.push_for(
+            Stage::Finder,
+            &needle,
+            Reply::Err(ChatError::AllKeysFailed { retry_after: None }),
+        );
+    }
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert!(
+        matches!(&err, EngineError::Fatal(m) if m == "review stopped: token budget reached"),
+        "{err:?}"
+    );
+    let row = latest(&pool).await;
+    assert_eq!(row.status, ReviewStatus::Failed);
+    assert_eq!(
+        row.error.as_deref(),
+        Some("review stopped: token budget reached")
+    );
+    assert!(s.git.state().reviews.is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn exhausted_budget_verifies_remaining_candidates_diff_only(pool: PgPool) {
     let patch = "@@ -1,1 +1,6 @@\n a\n+b\n+c\n+d\n+e\n+f\n";
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", patch)])).await;
-    // The Finder spends 1 token; the first four candidates start before the ceiling of 2 is
-    // reached (VERIFY_CONCURRENCY 4), the fifth only after a verdict came back.
-    set_token_limit(&pool, 2).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[("a.rs", "a\nb\nc\nd\ne\nf\n")]);
+    // The Finder's single call spends the whole ceiling of 1, before the Verifier starts.
+    set_token_limit(&pool, 1).await;
     let findings: Vec<_> = (2..=6)
         .map(|line| finding_json("a.rs", line, "warning", &format!("Finding {line}")))
         .collect();
-    s.chat.push(Ok(&json!(findings).to_string()));
+    s.chat
+        .push_stage(Stage::Finder, Reply::submit(json!(findings)));
 
     let id = run(&s, Trigger::Opened).await.unwrap();
 
     let row = review(&pool, id).await;
     assert_eq!(row.status, ReviewStatus::Done);
-    assert_eq!(row.comments_posted, 4);
-    assert_eq!(s.chat.verifier_calls().len(), 4);
-    assert!(
-        s.chat
-            .verifier_calls()
-            .iter()
-            .all(|c| !c.user.contains("Finding 6"))
+    assert_eq!(
+        row.comments_posted, 5,
+        "every finding is verified and posted"
     );
-    // Dedup still runs once over the verified findings.
+    // One diff-only call per candidate instead of a tool loop.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 5);
+    for call in &verifier {
+        assert!(call.tools.is_empty(), "{:?}", call.tools);
+        assert!(call.system.contains("ONLY a JSON object"));
+        assert_eq!(call.model, "gpt-fast");
+    }
     assert_eq!(s.chat.dedup_calls().len(), 1);
     let git = s.git.state();
     let summary = &git.reviews[0].summary;
+    assert!(!summary.contains("could not be verified"), "{summary}");
+    // Finder 1 + Verifier 5 + Dedup 1 input tokens.
     assert!(
-        summary.contains("- 1 candidate finding(s) could not be verified and were omitted"),
+        summary.contains(&budget_warning(
+            7,
+            1,
+            "5 findings verified from the diff only"
+        )),
         "{summary}"
     );
-    assert!(summary.contains(&budget_warning(6, 2)), "{summary}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn budget_reached_adds_summary_warning(pool: PgPool) {
+async fn tool_enabled_verifier_wraps_up_when_the_token_budget_runs_out(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_2)]),
+    )
+    .await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[("src/a.rs", "a\nb\n")]);
+    // Finder 1 token: the Verifier starts under the ceiling of 2 with its tools, and its
+    // first step reaches it.
+    set_token_limit(&pool, 2).await;
+    s.chat.push_stage(
+        Stage::Finder,
+        Reply::submit(json!([finding_json(
+            "src/a.rs",
+            2,
+            "warning",
+            "Off by one"
+        )])),
+    );
+    s.chat.push_for(
+        Stage::Verifier,
+        "Off by one",
+        Reply::tool("read_file", json!({"path": "src/a.rs"})),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.comments_posted, 1);
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 2);
+    assert!(verifier[0].tools.contains(&"read_file".to_string()));
+    assert_eq!(verifier[1].tools, vec!["submit_verdict"], "wrapped up");
+    // A Verifier wrap-up is none of the cuts the summary names.
+    let git = s.git.state();
+    let summary = &git.reviews[0].summary;
+    assert!(!summary.contains("Token budget reached"), "{summary}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn finder_wrap_up_for_token_budget_is_named_in_the_warning(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_2)]),
+    )
+    .await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[("src/a.rs", "a\nb\n")]);
+    set_token_limit(&pool, 1).await;
+    s.chat.explore_until_wrap_up(
+        GENERALIST_ROLE,
+        "src/a.rs",
+        json!([finding_json("src/a.rs", 2, "warning", "Bug")]),
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.comments_posted, 1);
+    // One investigating step reaches the ceiling; the next one only submits.
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 2);
+    assert_eq!(finder[1].tools, vec!["submit_findings"]);
+    let git = s.git.state();
+    let summary = &git.reviews[0].summary;
+    assert!(
+        summary.contains(&budget_warning(
+            3,
+            1,
+            "some reviewers stopped early, 1 finding verified from the diff only"
+        )),
+        "{summary}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn budget_warning_only_when_something_was_cut(pool: PgPool) {
     let s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_234)])).await;
 
     // 0 = no limit: no warning, the finding is verified and posted.
     set_token_limit(&pool, 0).await;
     s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
     run(&s, Trigger::Opened).await.unwrap();
-    {
-        let git = s.git.state();
-        let summary = &git.reviews[0].summary;
-        assert_eq!(git.reviews[0].comments.len(), 1);
-        assert!(!summary.contains("Token budget reached"), "{summary}");
-    }
 
-    // A limit of 1 is used up by the Finder: the candidate is never verified.
+    // Finder 1 + Verifier 1: only the last call crosses the ceiling of 2.
+    set_token_limit(&pool, 2).await;
+    s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
+    run(&s, Trigger::Opened).await.unwrap();
+
+    // The Finder alone reaches the ceiling of 1, but the Verifier was diff-only anyway (no
+    // checkout): nothing changes, so nothing is reported.
     set_token_limit(&pool, 1).await;
     s.chat.push(Ok(&finding("a.rs", 2, "Bug")));
-    let verifier_before = s.chat.verifier_calls().len();
-    let id = run(&s, Trigger::Opened).await.unwrap();
+    run(&s, Trigger::Opened).await.unwrap();
 
-    let row = review(&pool, id).await;
-    assert_eq!(row.status, ReviewStatus::Done);
-    assert_eq!(row.comments_posted, 0);
-    assert_eq!(s.chat.verifier_calls().len(), verifier_before);
+    assert_eq!(s.chat.verifier_calls().len(), 3);
     let git = s.git.state();
-    let summary = &git.reviews[1].summary;
-    assert!(
-        summary.contains(
-            "**Notes**\n- 1 candidate finding(s) could not be verified and were omitted\n- "
-        ),
-        "{summary}"
-    );
-    assert!(summary.contains(&budget_warning(1, 1)), "{summary}");
+    assert_eq!(git.reviews.len(), 3);
+    for posted in &git.reviews {
+        assert_eq!(posted.comments.len(), 1);
+        assert!(
+            !posted.summary.contains("Token budget reached"),
+            "{}",
+            posted.summary
+        );
+        assert!(!posted.summary.contains("**Notes**"), "{}", posted.summary);
+    }
 }
 
 /// Obviously fake credentials in the provider formats.
@@ -2363,6 +2483,14 @@ async fn suggestion_containing_a_secret_is_dropped(pool: PgPool) {
     );
     assert!(!posted[0].body.contains(FAKE_AWS_KEY), "{}", posted[0].body);
     assert!(!posted[0].body.contains("[REDACTED]"), "{}", posted[0].body);
+    assert!(
+        posted[0].body.ends_with(
+            "move it to the environment\n\n_Suggested code omitted: it contained a value that looks like a secret._"
+        ),
+        "{}",
+        posted[0].body
+    );
+    assert!(!posted[1].body.contains("Suggested code omitted"));
     assert!(
         posted[1]
             .body

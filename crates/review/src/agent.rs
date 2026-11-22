@@ -179,7 +179,7 @@ pub async fn run_react_loop<S: SubmitSpec>(
         // A nudge sent just before already asks for the result; one request is enough.
         if starts_wrap_up && !nudged_last_step && !matches!(tools, AgentTools::NoTools) {
             messages.push(user_message(format!(
-                "You are near the end of your step or time budget. Submit your final result now using {submit_name}."
+                "You are near the end of your budget. Submit your final result now using {submit_name}."
             )));
         } else if with_repo_tools
             && !wrap_up.active()
@@ -299,11 +299,13 @@ impl WrapUp {
         } else if self.deadline_close(config.deadline) {
             Some("deadline")
         } else if steps_used > 0
-            && config
+            && let Some(budget) = config
                 .token_budget
                 .as_ref()
-                .is_some_and(|budget| budget.exhausted())
+                .filter(|budget| budget.exhausted())
         {
+            // Counted so the review summary can say some reviewers stopped early.
+            budget.note_wrap_up();
             Some("token_budget")
         } else {
             None
@@ -608,7 +610,8 @@ mod tests {
     const SUBMIT: &str = "submit_answer";
     const NUDGE: &str =
         "Please submit your result by calling submit_answer (or return the JSON directly).";
-    const WRAP_UP: &str = "You are near the end of your step or time budget. Submit your final result now using submit_answer.";
+    const WRAP_UP: &str =
+        "You are near the end of your budget. Submit your final result now using submit_answer.";
     const READ_ONLY: [&str; 4] = ["read_file", "grep", "list_dir", "find_files"];
 
     /// Toy terminal tool: `{"answer": "<text>"}`.
@@ -1655,6 +1658,7 @@ mod tests {
         assert_eq!(out.result, "within budget");
         assert_eq!(out.steps_used, 4);
         assert_eq!(budget.used(), 400, "every response is counted once");
+        assert_eq!(budget.wrap_ups(), 1, "a token-budget wrap-up is counted");
 
         let reqs = chat.requests();
         for req in &reqs[..3] {
@@ -1678,6 +1682,18 @@ mod tests {
         assert_eq!(tool_names(&reqs[0]).len(), 5);
         assert_eq!(tool_names(&reqs[1]), [SUBMIT]);
         assert_eq!(count_user(&reqs[1], WRAP_UP), 1);
+        assert_eq!(budget.wrap_ups(), 2);
+
+        // A wrap-up for the step budget is not a token-budget one.
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![read("c1", "src/a.rs")]),
+            tools_turn(vec![submit("c2", "by steps")]),
+        ]);
+        let unused = Arc::new(TokenBudget::new(0));
+        let mut config = AgentConfig::new(2);
+        config.token_budget = Some(Arc::clone(&unused));
+        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        assert_eq!(unused.wrap_ups(), 0);
 
         // A failed call adds nothing.
         let chat = ScriptedChat::new(vec![Err(ChatError::NoKeys)]);

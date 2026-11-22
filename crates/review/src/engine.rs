@@ -56,6 +56,9 @@ const CODEBASE_UNAVAILABLE: &str = "Codebase context unavailable — reviewed di
 const SMALL_PR_NOTE: &str = "Small change — reviewed diff only";
 /// Summary note when the model rejected tool calling.
 const TOOLS_UNSUPPORTED: &str = "Model does not support tool calling — reviewed diff only";
+/// Last line of a comment whose suggestion was dropped because it held a secret.
+const SUGGESTION_OMITTED: &str =
+    "_Suggested code omitted: it contained a value that looks like a secret._";
 
 pub struct Engine {
     pub db: PgPool,
@@ -558,6 +561,16 @@ impl Engine {
             token_budget: Some(&s.token_budget),
         };
         let finder = run_finder(llm, &input, toolbox.as_ref(), s.deadlines.finder).await;
+        // Read now: the summary names Finder wrap-ups only, not the Verifier's.
+        let finder_wrap_ups = s.token_budget.wrap_ups();
+        // From the final tasks, so a re-run without tools does not count a batch twice.
+        let budget_skipped_batches = finder
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.result, Err(FinderFailure::TokenBudget)))
+            .map(|task| task.batch)
+            .collect::<HashSet<_>>()
+            .len();
         // Without tool support the Verifier works from the diff as well.
         let verifier_toolbox = if finder.tools_unsupported {
             warnings.push(TOOLS_UNSUPPORTED.into());
@@ -635,12 +648,9 @@ impl Engine {
         };
 
         let budget = s.token_budget.as_ref();
-        if budget.exhausted() {
-            warnings.push(format!(
-                "Token budget reached ({} of {} input tokens): some files or findings were not reviewed.",
-                budget.used(),
-                budget.limit()
-            ));
+        // Only when the ceiling changed something (spec decision 15).
+        if let Some(warning) = budget.warning(budget_skipped_batches, finder_wrap_ups) {
+            warnings.push(warning);
         }
         tracing::info!(
             review_mode = ?mode,
@@ -761,8 +771,9 @@ impl Engine {
 }
 
 /// The posted body of one finding with secrets masked. A suggestion that holds a secret, or a
-/// value already masked as [`REDACTED`], is dropped (the comment keeps its span), so "Apply
-/// suggestion" never writes `[REDACTED]` into code. The flag: something was masked or dropped.
+/// value already masked as [`REDACTED`], is dropped (the comment keeps its span, and its body
+/// ends with [`SUGGESTION_OMITTED`]), so "Apply suggestion" never writes `[REDACTED]` into
+/// code. The flag: something was masked or dropped.
 fn inline_body(s: &Suggestion) -> (String, bool) {
     let leaks = s
         .suggestion
@@ -776,7 +787,11 @@ fn inline_body(s: &Suggestion) -> (String, bool) {
     } else {
         format_inline(s)
     };
-    let (body, masked) = redact_owned(body);
+    let (mut body, masked) = redact_owned(body);
+    if leaks {
+        body.push_str("\n\n");
+        body.push_str(SUGGESTION_OMITTED);
+    }
     (body, masked || leaks)
 }
 

@@ -58,8 +58,7 @@ pub struct VerificationReport {
     pub kept: Vec<CandidateFinding>,
     /// Findings the Verifier refuted.
     pub dropped_refuted: usize,
-    /// Findings without a verdict (error, unparseable answer, deadline, or not started once the
-    /// token budget was exhausted); fail-closed.
+    /// Findings without a verdict (error, unparseable answer or deadline); fail-closed.
     pub dropped_unverified: usize,
     /// Findings beyond [`MAX_VERIFY_CANDIDATES`] that were never verified.
     pub truncated_by_cap: usize,
@@ -84,9 +83,9 @@ pub struct VerifyContext<'a> {
 /// Candidates are sorted by severity (stable, `Critical` first) and cut at
 /// [`MAX_VERIFY_CANDIDATES`]; up to [`VERIFY_CONCURRENCY`] are verified at a time. With a
 /// `toolbox` each one runs a tool-enabled loop of at most [`VERIFY_MAX_STEPS`] steps; without
-/// one (or once the model rejected tool calling) each one is a single diff-only call. Work
-/// still running at `deadline` is dropped as unverified, never as retryable, and so is a
-/// candidate that would start once the token budget is exhausted.
+/// one (or once the model rejected tool calling, or for a candidate that starts once the
+/// review's token budget is exhausted) each one is a single diff-only call. Work still running
+/// at `deadline` is dropped as unverified, never as retryable.
 #[expect(
     clippy::too_many_arguments,
     reason = "the brief fixes this signature; Task 8 calls it once from the engine"
@@ -124,8 +123,6 @@ pub async fn verify_candidates(
                 // Checked when the candidate starts (the stream polls it), not when it is built.
                 let outcome = if Instant::now() >= deadline {
                     Outcome::Unverified(Failure::Deadline)
-                } else if ctx.token_budget.is_some_and(|budget| budget.exhausted()) {
-                    Outcome::Unverified(Failure::TokenBudget)
                 } else {
                     tokio::time::timeout_at(
                         deadline,
@@ -174,8 +171,6 @@ enum Failure {
     Other,
     /// The Verifier deadline passed first.
     Deadline,
-    /// Not started: the review's token budget was already exhausted.
-    TokenBudget,
 }
 
 fn summarize(
@@ -198,9 +193,7 @@ fn summarize(
                     Failure::Retryable(err) => {
                         first_retryable.get_or_insert(err);
                     }
-                    Failure::Other | Failure::Deadline | Failure::TokenBudget => {
-                        only_retryable_failures = false
-                    }
+                    Failure::Other | Failure::Deadline => only_retryable_failures = false,
                 }
             }
         }
@@ -223,8 +216,9 @@ struct Evidence<'a> {
     deadline: Instant,
 }
 
-/// Verifies one candidate: tool-enabled while the model supports tools, diff-only otherwise.
-/// A `ToolsUnsupported` switches every later candidate to diff-only and re-runs this one there.
+/// Verifies one candidate: tool-enabled while the model supports tools and the review's token
+/// budget lasts, diff-only otherwise. A `ToolsUnsupported` switches every later candidate to
+/// diff-only and re-runs this one there.
 async fn verify_one(
     ctx: VerifyContext<'_>,
     candidate: &CandidateFinding,
@@ -241,15 +235,22 @@ async fn verify_one(
     };
     // Checked after the snippet read so a candidate never starts with tools once they failed.
     if let (Some(toolbox), false) = (evidence.toolbox, diff_only.load(Ordering::Relaxed)) {
-        let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), true);
-        match verify_with_tools(ctx, toolbox, prompt, evidence.deadline).await {
-            Err(AgentError::ToolsUnsupported(_)) => {
-                tracing::warn!(
-                    "verifier model rejected tool calling; verifying the rest diff-only"
-                );
-                diff_only.store(true, Ordering::Relaxed);
+        // Checked when the candidate starts: once the budget is exhausted, one small diff-only
+        // call replaces the tool loop, so the finding is still verified (and counted).
+        if let Some(budget) = ctx.token_budget.filter(|budget| budget.exhausted()) {
+            tracing::debug!("token budget exhausted; verifying the candidate diff-only");
+            budget.note_diff_only();
+        } else {
+            let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), true);
+            match verify_with_tools(ctx, toolbox, prompt, evidence.deadline).await {
+                Err(AgentError::ToolsUnsupported(_)) => {
+                    tracing::warn!(
+                        "verifier model rejected tool calling; verifying the rest diff-only"
+                    );
+                    diff_only.store(true, Ordering::Relaxed);
+                }
+                result => return agent_outcome(result),
             }
-            result => return agent_outcome(result),
         }
     }
     let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), false);
@@ -1219,6 +1220,84 @@ mod tests {
             );
         }
     }
+
+    /// Runs the Verifier like [`verify`] with the review's token budget.
+    async fn verify_with_budget(
+        chat: &RoutedChat,
+        candidates: Vec<CandidateFinding>,
+        toolbox: Option<&Toolbox>,
+        budget: &Arc<TokenBudget>,
+    ) -> VerificationReport {
+        let usage = UsageContext::default();
+        let ctx = VerifyContext {
+            chat,
+            provider_id: PROVIDER,
+            model: FAST_MODEL,
+            usage: &usage,
+            token_budget: Some(budget),
+        };
+        verify_candidates(
+            ctx,
+            candidates,
+            &[target_a()],
+            &[],
+            &[],
+            None,
+            toolbox,
+            later(30_000),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_verifies_candidates_diff_only() {
+        // Tool mode: every candidate that starts after the ceiling gets one diff-only call,
+        // keeps its code context, and is counted as switched.
+        let tb = toolbox();
+        let budget = Arc::new(TokenBudget::new(1));
+        budget.add(1);
+        let chat = RoutedChat::new(vec![
+            ("kept", vec![answer(text_turn(r#"{"keep": true}"#))]),
+            ("refuted", vec![answer(text_turn(r#"{"keep": false}"#))]),
+            ("garbage", vec![answer(text_turn("not sure"))]),
+        ]);
+        let report = verify_with_budget(
+            &chat,
+            bugs(&["kept", "refuted", "garbage"]),
+            Some(&tb),
+            &budget,
+        )
+        .await;
+        assert_eq!(
+            report,
+            VerificationReport {
+                kept: vec![bug("kept")],
+                dropped_refuted: 1,
+                // Fail-closed still holds for a diff-only answer without a verdict.
+                dropped_unverified: 1,
+                ..VerificationReport::default()
+            }
+        );
+        let reqs = chat.requests();
+        assert_eq!(reqs.len(), 3, "one call per candidate");
+        assert_fast_and_low(&reqs);
+        for req in &reqs {
+            assert!(req.tools.is_empty());
+            assert!(req.system.contains("ONLY a JSON object"));
+            assert!(first_user_text(req).contains("<code_context>"));
+        }
+        assert_eq!(budget.diff_only_verifications(), 3);
+        assert_eq!(budget.used(), 1 + 300, "diff-only calls still count");
+
+        // Already diff-only: exhaustion changes nothing and nothing is counted.
+        let budget = Arc::new(TokenBudget::new(1));
+        budget.add(1);
+        let chat = RoutedChat::keeping_everything();
+        let report = verify_with_budget(&chat, bugs(&["a", "b"]), None, &budget).await;
+        assert_eq!(titles(&report.kept), ["a", "b"]);
+        assert_eq!(budget.diff_only_verifications(), 0);
+    }
+
     #[test]
     fn user_prompt_puts_shared_sections_first_and_the_candidate_last() {
         let rules = [rule("Use tracing", "src/**")];
