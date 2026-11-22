@@ -64,6 +64,7 @@
 | 10 | Dashboard UI for `review_mode` (`Settings` + `Repositories`) & full workspace verification | `web/routes/settings`, `web/routes/repositories` |
 | 11 | Small PR → diff-only: `settings.small_pr_max_lines` (merged into migration `0008`), small-PR check before clone, risky-path exceptions, summary note, API + UI field | `migrations`, `db/settings`, `review/engine`, `review/small_pr`, `server/api/settings`, `web/routes/settings` |
 | 12 | Multi-line anchoring (`start_line..=line`) for committable suggestions: parse, validate per hunk, Verifier/Dedup, GitHub + Azure posting | `git/diff`, `git/types`, `git/github`, `git/azure`, `review/parse`, `review/prompt`, `review/engine`, `review/verifier`, `review/dedup` |
+| 13 | Deadline-aware wrap-up (time or last 2 steps) + step-budget note; 30 min budget for Specialists reviews, worker timeout chain raised | `review/agent`, `review/finder`, `review/verifier`, `review/engine`, `adus/worker`, `adus/main`, `db/reviews` |
 
 ---
 
@@ -613,3 +614,42 @@ Added 2026-11-22 (user decision). The first implementation was written by the us
 - [x] **Step 1–4:** Implemented by the user; `cargo fmt --check`, `clippy -D warnings` clean; `adus-git` + `adus-review` tests pass.
 - [x] **Step 5:** Apply the review fixes above in the fix wave; full verification (I1, I2, I4, M1–M3, M5, M6 done; M4 stays in the backlog).
 - [ ] **Step 6:** Commit `feat(review): anchor multi-line suggestions with start_line`
+
+---
+
+### Task 13: Deadline-Aware Wrap-Up & 30-Minute Specialists Budget
+
+Added 2026-11-22 (user decision) after a live `@adudu review deep` run: the Bug specialist (High effort, ~60 s per step) was cut by the Finder deadline at step 15/20 and all its work was lost ("Bug reviewer did not finish in time"). Kodus community code was consulted as behaviour reference only (clean-room rule 1–3): `libs/agent-harness/infrastructure/policies/force-finalize.policy.ts` (submit-only tools in the last 2 steps), `libs/agent-harness/infrastructure/policies/budget.policy.ts` (step-budget notes), `libs/llm/llm-call.ts` (time budgets sized from production durations; p99 ≈ 30 min). Kodus has no time-based wrap-up; Adus adds one. Write everything fresh.
+
+**Files:**
+- Modify: `crates/review/src/agent.rs`, `crates/review/src/finder.rs`, `crates/review/src/verifier.rs`, `crates/review/src/engine.rs`, `crates/adus/src/worker.rs`, `crates/adus/src/main.rs`, `crates/db/src/reviews.rs`, `AGENTS.md`, the spec (decision 12, §4.6 step 6, §4.11)
+- Test: `crates/review/src/agent.rs` (`mod tests`), `crates/review/tests/engine.rs`, `crates/adus/tests/worker.rs` if a timing constant is asserted there
+
+**Interfaces:**
+- `crates/review/src/engine.rs`:
+  - `REVIEW_TIMEOUT` stays 12 min (Generalist, incl. small PRs and `@adudu review generalist`); new `pub const SPECIALISTS_REVIEW_TIMEOUT: Duration = 30 min`. `Engine` gains `pub specialists_review_timeout: Duration` (wired in `main.rs` and every test `Engine` literal).
+  - The budget of a run is chosen **after** the effective Finder mode is known (override → repo → settings, then the small-PR force to Generalist): Specialists → `specialists_review_timeout`, else `review_timeout`. `Deadlines::new(start, budget)` uses that budget (60/90/97 % unchanged); `start` is still taken at the top of `run()`, so the clone keeps counting.
+  - The overall cut is `start + budget` (`Fatal("review timed out")`, row `failed`, as today). The outer `tokio::time::timeout` in `review_pr` uses the larger of the two budgets as a backstop; the per-run budget is enforced inside `run()`.
+- `crates/adus/src/worker.rs` / `crates/db/src/reviews.rs`: `JOB_TIMEOUT` = 31 min, `LOCK_TTL` = 35 min, `reviews::STALE_AFTER` = 35 min. The compile-time asserts compare against `max(REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT)` (a `const fn` max or two asserts). The stale-sweep message text follows the constant.
+- `crates/review/src/agent.rs`:
+  - `AgentConfig` gains `pub deadline: Option<tokio::time::Instant>` (default `None`) and `pub wrap_up_steps: usize` (default 1; the Finder uses 2).
+  - **Wrap-up mode** starts when `steps_used + wrap_up_steps >= max_steps`, **or** when `deadline` is set, at least one step has finished, and the time left is less than 1.5 × the slowest step so far. Once entered it stays on: only the submit tool is offered (read-only tool calls get the existing `is_error` "not available" result), and one reminder ("Submit your final result now using …") is sent when it starts. NoTools runs keep their current behaviour (no reminder).
+  - **Budget note:** once, when `steps_used` reaches `max_steps / 2` with `AgentTools::Full` and not yet in wrap-up, append one user note: "Step budget: {used} of {max} steps used. Gather only the evidence you still need, then call {submit}." No other notes.
+  - Everything else is unchanged: pairing invariant, nudge, prose recovery (`cut_short`), overflow retry, cancel-safety.
+- `crates/review/src/finder.rs`: Finder agents run with `wrap_up_steps = 2` and `deadline = Some(deadlines.finder)`; the existing `timeout_at` stays as the hard cut.
+- `crates/review/src/verifier.rs`: tool-mode Verifier runs keep `wrap_up_steps = 1` and set `deadline = Some(verifier deadline)`.
+
+**Edge Cases & Pitfalls:**
+- Use `tokio::time::Instant` everywhere so tests can use `tokio::time::pause()` / `advance` instead of real sleeps.
+- The slowest-step estimate is per agent run (its own LLM latencies); the first step never triggers the time rule.
+- A wrap-up started by time still allows the nudge once if the model replies in prose without submitting; a run that still cannot submit returns its prose recovery as `cut_short: true` (Finder) as today.
+- Specialists runs now hold the PR lock up to ~30 min; a second event for the same PR waits (lock-busy retry every 30 s). Stale `queued`/`running` rows are now failed after 35 min instead of 15.
+- AGENTS.md worker bullet: 12 min Generalist / 30 min Specialists budget, JOB_TIMEOUT 31, LOCK_TTL 35, STALE_AFTER 35, the wrap-up rule and the budget note.
+
+- [ ] **Step 1: Write failing tests**
+  - `agent.rs`: `wrap_up_window_offers_only_submit_for_the_last_two_steps`, `deadline_close_switches_to_submit_only_early`, `first_step_never_triggers_time_wrap_up`, `budget_note_sent_once_at_half_budget`.
+  - `engine.rs` tests: `specialists_review_uses_the_30_minute_budget`, `generalist_and_small_pr_keep_the_12_minute_budget`, `slow_specialist_submits_before_the_finder_deadline` (FakeChat latency + paused time: the slow agent's findings are posted, no "did not finish in time" note).
+- [ ] **Step 2:** `cargo test -j 2 -p adus-review -p adus` → FAIL.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -j 2` → PASS.
+- [ ] **Step 5:** Commit `feat(review): deadline-aware wrap-up and a 30-minute budget for specialists reviews`
