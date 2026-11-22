@@ -41,8 +41,11 @@ use crate::tools::{ToolCache, Toolbox};
 use crate::verifier::{CandidateFinding, VerifyContext, verify_candidates};
 use crate::workspace::{RepoCloner, WorkspaceError};
 
-/// Batas waktu bawaan satu review (`Engine::review_timeout`).
+/// Budget of one Generalist review (`Engine::review_timeout`), small PRs included.
 pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(12 * 60);
+/// Budget of one Specialists review (`Engine::specialists_review_timeout`): up to four agents
+/// per batch at `High` effort need more time than one Generalist agent.
+pub const SPECIALISTS_REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Summary note when the clone failed (not for auth) and the review saw only the diff.
 const CODEBASE_UNAVAILABLE: &str = "Codebase context unavailable — reviewed diff only";
@@ -58,9 +61,14 @@ pub struct Engine {
     pub chat: Arc<dyn ChatService>,
     /// Shallow-clones the PR head for the agentic tools (`GitCliCloner` in production).
     pub cloner: Arc<dyn RepoCloner>,
-    /// Review yang lebih lama dari ini dihentikan dan dicatat gagal (Fatal). Produksi:
-    /// `REVIEW_TIMEOUT`; test memakai nilai pendek. The stage deadlines are fractions of it.
+    /// Budget of a Generalist review (small PRs and `@adudu review generalist` included): a
+    /// review still running when it is used up is stopped and recorded as failed (Fatal).
+    /// Production: `REVIEW_TIMEOUT`; tests use short values. The stage deadlines are fractions
+    /// of it.
     pub review_timeout: Duration,
+    /// Budget of a Specialists review, used like `review_timeout`. Production:
+    /// `SPECIALISTS_REVIEW_TIMEOUT`.
+    pub specialists_review_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -101,8 +109,9 @@ pub fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
     }
 }
 
-/// When each stage must be done, as fractions of `review_timeout` from the run's start
-/// (spec 4.11): Finder (clone included) 60 %, Verifier 90 %, Dedup 97 %; the rest is for posting.
+/// When each stage must be done, as fractions of the run's budget (`review_timeout` or
+/// `specialists_review_timeout`) from the run's start (spec 4.11): Finder (clone included)
+/// 60 %, Verifier 90 %, Dedup 97 %; the rest is for posting.
 #[derive(Debug, Clone, Copy)]
 struct Deadlines {
     finder: Instant,
@@ -137,9 +146,9 @@ struct Stages<'a> {
     memories: &'a [Memory],
     usage: &'a UsageContext,
     deadlines: Deadlines,
-    /// `settings.small_pr_max_lines`; 0 when the PR must get the full review (a `Command`
-    /// trigger, or the feature is off).
-    small_pr_max_lines: u32,
+    /// A small, low-risk PR: reviewed diff-only in one Generalist pass (`mode` is already
+    /// `Generalist`).
+    small: bool,
 }
 
 impl Engine {
@@ -170,10 +179,12 @@ impl Engine {
         // Timeout di sini, bukan di worker, supaya baris review tetap dicatat gagal. Fatal:
         // mengulang PR yang sama hanya menghabiskan token LLM lagi sampai timeout lagi.
         // The clone lives inside `run`, so a timeout (or an aborted job) drops and deletes it.
+        // `run` cuts itself at its own budget once the mode is known; this is the backstop.
+        let backstop = self.review_timeout.max(self.specialists_review_timeout);
         let run = self.run(&repo, review_id, pr_number, trigger, mode_override);
-        let outcome = match tokio::time::timeout(self.review_timeout, run).await {
+        let outcome = match tokio::time::timeout(backstop, run).await {
             Ok(outcome) => outcome,
-            Err(_elapsed) => Err(EngineError::Fatal("review timed out".into())),
+            Err(_elapsed) => Err(timed_out()),
         };
         let (status, posted, skip_reason) = match outcome {
             Ok(Outcome::Done { posted }) => (ReviewStatus::Done, posted, None),
@@ -210,7 +221,8 @@ impl Engine {
         trigger: Trigger,
         mode_override: Option<ReviewMode>,
     ) -> Result<Outcome, EngineError> {
-        let deadlines = Deadlines::new(Instant::now(), self.review_timeout);
+        // Every budget counts from here, so the fetches and the clone count too.
+        let start = Instant::now();
         if !repo.enabled {
             return Ok(Outcome::Skipped("repository_disabled"));
         }
@@ -275,7 +287,7 @@ impl Engine {
             }
             return Err(EngineError::Fatal("no review model configured".into()));
         };
-        let mode = mode_override
+        let mut mode = mode_override
             .or(repo.review_mode)
             .unwrap_or(settings.review_mode);
 
@@ -353,6 +365,14 @@ impl Engine {
         let output = if targets.is_empty() {
             ReviewOutput::default()
         } else {
+            let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
+            let files: Vec<FileDiff> = targets
+                .into_iter()
+                .map(|target| {
+                    allowed.insert(normalize_path(&target.file.path), target.allowed);
+                    target.file
+                })
+                .collect();
             let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
             let skipped_map: HashMap<&str, &'static str> = skipped
                 .iter()
@@ -369,6 +389,18 @@ impl Engine {
                 review_id: Some(review_id),
                 repository_id: Some(repo.id),
             };
+            // A small, low-risk PR is reviewed from the diff alone, in one Generalist pass: no
+            // clone and no tools (the same diff-only path as a failed clone, but not a failure).
+            // A `Command` (`@adudu review`) always gets the full review.
+            let small_pr_max_lines = match trigger {
+                Trigger::Command => 0,
+                _ => u32::try_from(settings.small_pr_max_lines).unwrap_or(0),
+            };
+            let small = is_small_pr(&files, &rules, small_pr_max_lines);
+            if small {
+                mode = ReviewMode::Generalist;
+            }
+            let budget = self.budget(mode);
             let stages = Stages {
                 conn: &conn,
                 git: git.as_ref(),
@@ -381,23 +413,37 @@ impl Engine {
                 rules: &rules,
                 memories: &memories,
                 usage: &usage,
-                deadlines,
-                small_pr_max_lines: match trigger {
-                    Trigger::Command => 0,
-                    _ => u32::try_from(settings.small_pr_max_lines).unwrap_or(0),
-                },
+                deadlines: Deadlines::new(start, budget),
+                small,
             };
-            self.review_targets(&stages, targets, &manifest, &mut skipped, &mut warnings)
-                .await?
+            let review = self.review_targets(
+                &stages,
+                files,
+                allowed,
+                &manifest,
+                &mut skipped,
+                &mut warnings,
+            );
+            match tokio::time::timeout_at(start + budget, review).await {
+                Ok(output) => output?,
+                Err(_elapsed) => return Err(timed_out()),
+            }
         };
 
         let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
-        match git
-            .post_review(&repo_ref, &pr, &output.comments, &summary)
-            .await
-        {
-            Ok(posted) => Ok(Outcome::Done { posted }),
-            Err(err) => Err(self.post_error(&conn, err).await),
+        let post = git.post_review(&repo_ref, &pr, &output.comments, &summary);
+        match tokio::time::timeout_at(start + self.budget(mode), post).await {
+            Ok(Ok(posted)) => Ok(Outcome::Done { posted }),
+            Ok(Err(err)) => Err(self.post_error(&conn, err).await),
+            Err(_elapsed) => Err(timed_out()),
+        }
+    }
+
+    /// The time budget of a review in `mode` (the effective mode, after the small-PR force).
+    fn budget(&self, mode: ReviewMode) -> Duration {
+        match mode {
+            ReviewMode::Generalist => self.review_timeout,
+            ReviewMode::Specialists => self.specialists_review_timeout,
         }
     }
 
@@ -407,36 +453,21 @@ impl Engine {
     async fn review_targets(
         &self,
         s: &Stages<'_>,
-        targets: Vec<Target>,
+        files: Vec<FileDiff>,
+        allowed: HashMap<String, CommentableRange>,
         manifest: &str,
         skipped: &mut Vec<(String, &'static str)>,
         warnings: &mut Vec<String>,
     ) -> Result<ReviewOutput, EngineError> {
-        let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
-        let files: Vec<FileDiff> = targets
-            .into_iter()
-            .map(|target| {
-                allowed.insert(normalize_path(&target.file.path), target.allowed);
-                target.file
-            })
-            .collect();
         let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS);
-
-        // A small, low-risk PR is reviewed from the diff alone, in one Generalist pass: no
-        // clone and no tools (the same diff-only path as a failed clone, but not a failure).
-        let small = is_small_pr(&files, s.rules, s.small_pr_max_lines);
-        let mode = if small {
-            ReviewMode::Generalist
-        } else {
-            s.mode
-        };
+        let mode = s.mode;
 
         // Clone: auth failure is fatal; anything else, or a clone still running at the Finder
         // deadline (spec decision 12: the clone is part of the Finder budget), falls back to
         // the diff only.
         let clone_started = Instant::now();
         let mut fallback_reason = None;
-        let clone_spec = if small {
+        let clone_spec = if s.small {
             warnings.push(SMALL_PR_NOTE.into());
             fallback_reason = Some("small_pr");
             None
@@ -821,7 +852,7 @@ fn all_failed(tasks: Vec<FinderTask>) -> EngineError {
     for task in tasks {
         let error = match task.result {
             Ok(_) => continue,
-            Err(FinderFailure::TimedOut) => EngineError::Fatal("review timed out".into()),
+            Err(FinderFailure::TimedOut) => timed_out(),
             Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(&err) => {
                 retryable.get_or_insert(err);
                 continue;
@@ -839,7 +870,7 @@ fn all_failed(tasks: Vec<FinderTask>) -> EngineError {
     match (fatal, retryable) {
         (Some(error), _) => error,
         (None, Some(err)) => chat_error(err),
-        (None, None) => EngineError::Fatal("review timed out".into()),
+        (None, None) => timed_out(),
     }
 }
 
@@ -903,6 +934,11 @@ fn incremental_targets(changed: Vec<FileDiff>, full: Vec<FileDiff>) -> Vec<Targe
             Some(Target { file, allowed })
         })
         .collect()
+}
+
+/// A review cut by its time budget. Fatal: a retry would spend the same LLM tokens again.
+fn timed_out() -> EngineError {
+    EngineError::Fatal("review timed out".into())
 }
 
 pub(crate) fn db_error(err: sqlx::Error) -> EngineError {

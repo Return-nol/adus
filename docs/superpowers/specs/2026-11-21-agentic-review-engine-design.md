@@ -52,7 +52,7 @@ This wave brings **Point 1 (Cross-file PR & codebase awareness)**, **Point 2 (Tw
 | 9 | **Output funnel** | 2-stage: Finder outputs full `Suggestion` (`file`, optional `start_line`, `line`, `severity`, `title`, `body`, optional `suggestion`; `start_line..=line` is the span of existing new-file lines a `suggestion` replaces, and `start_line` is set only when that span has more than one line — see §4.12), Verifier keeps/drops without rewriting, Dedup merges |
 | 10 | **Model & prompt caching** | One provider per review (`repo.review_provider_id` → `settings.default_provider_id`). Finder uses its `primary_model` with effort by mode (`Generalist` → `Medium`, `Specialists` → `High`, `finder_effort`); Verifier and Dedup use `effective_fast_model()` (the `fast_model`, else `primary_model`) with `Low` effort. Shared static prompt sections placed before specialist `<Role>` for implicit prefix caching; Anthropic `cache_control: ephemeral` breakpoints + cache token accounting |
 | 11 | **Context & budgets** | Batch diffs up to ~40K chars (full PR manifest in every batch); tool outputs capped (`read_file` ≤ 200 lines / 8K chars, `grep` ≤ 40 match groups / 8K chars, `list_dir`/`find_files` ≤ 150 entries / 4K chars); compact older tool results above ~160K chars; one-shot overflow recovery |
-| 12 | **Time budget** | Stage deadlines as fractions of `review_timeout`: Finder (incl. clone) by 60 %, Verifier by 90 %, Dedup + post in the rest. Work cut by a deadline is handled like a failure of that stage (Section 4.11), so a large PR still posts a partial review instead of timing out with nothing |
+| 12 | **Time budget** | A review's budget follows its effective mode: 12 min (`REVIEW_TIMEOUT`) for Generalist, small PRs included, 30 min (`SPECIALISTS_REVIEW_TIMEOUT`) for Specialists. Stage deadlines are fractions of that budget: Finder (incl. clone) by 60 %, Verifier by 90 %, Dedup + post in the rest. Agents wrap up (submit) before their stage deadline when it gets close (Section 4.6 step 6); work still cut by a deadline is handled like a failure of that stage (Section 4.11), so a large PR still posts a partial review instead of timing out with nothing |
 | 13 | **Wave scope** | Point 1 + Point 2 + auto-loading repo instruction files (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/*.mdc`) from the clone. Point 3 deferred |
 | 14 | **Small PR** | A small, low-risk PR (`settings.small_pr_max_lines`, default 50, `0` = off; at most 3 reviewed files; no risky path, no covering enabled `critical` rule) skips the clone and the tools and is reviewed diff-only in one Generalist pass; Verifier and Dedup still run. `@adudu review` / `review deep` always get the full review (Section 4.13) |
 
@@ -66,7 +66,7 @@ This wave brings **Point 1 (Cross-file PR & codebase awareness)**, **Point 2 (Tw
 Webhook / @adudu review [deep]
         │
         ▼
-  Engine::review_pr (12m REVIEW_TIMEOUT < 13m JOB_TIMEOUT < 15m LOCK_TTL)
+  Engine::review_pr (12m REVIEW_TIMEOUT / 30m SPECIALISTS_REVIEW_TIMEOUT < 31m JOB_TIMEOUT < 35m LOCK_TTL)
         │
         ├─ 1. Check repo enabled, auto_review, draft, ignored_title_keywords, head_sha dedup
         ├─ 2. Resolve provider (repo override -> settings default; must be enabled with a
@@ -79,19 +79,19 @@ Webhook / @adudu review [deep]
         │     ├─ Auth error -> Connection Invalid + Fatal
         │     ├─ Non-auth error / timeout -> fallback to diff-only mode + Summary Warning
         │     └─ Ok -> RepoWorkspace (RAII TempDir) + load RepoInstructions + build Arc<Toolbox> (with shared ToolCache)
-        ├─ 6. Finder Pass (must finish by the Finder deadline, 60 % of review_timeout)
+        ├─ 6. Finder Pass (must finish by the Finder deadline, 60 % of the run's budget)
         │     ├─ Batches run up to BATCH_CONCURRENCY = 2 at a time
         │     ├─ Generalist: 1 agent per batch (max 20 steps)
         │     ├─ Specialists: Bug, Security, Performance (+ Rules if matching rules exist) in parallel within a batch
         │     ├─ If `ToolsUnsupported` -> retry Finder once in diff-only self-contained mode + Summary Warning
         │     └─ Partial specialist failures -> keep surviving findings + Summary Warning; Generalist: when every failed task failed retryably -> Retryable (no post)
         ├─ 7. Deterministic Filter (`keep_valid_batch`: path in batch, `line` in commentable `+` lines, `start_line` kept only when it is in the same diff hunk as `line`) + Exact Dedup
-        ├─ 8. Verifier Pass (when candidates > 0; must finish by the Verifier deadline, 90 % of review_timeout)
+        ├─ 8. Verifier Pass (when candidates > 0; must finish by the Verifier deadline, 90 % of the run's budget)
         │     ├─ Prioritize Critical -> Warning -> Info; cap at 25 (warn if truncated)
         │     ├─ Tool-enabled mode: 1 Verifier loop per candidate (concurrency 4, max 6 steps, shared ToolCache)
         │     ├─ Diff-only fallback mode: 1 single-turn Verifier per candidate against diff + rules + memories
         │     └─ Fail-closed: Verifier error or unparseable verdict drops the candidate + adds warning count
-        ├─ 9. Semantic Dedup Pass (when verified >= 2; cut at 97 % of review_timeout)
+        ├─ 9. Semantic Dedup Pass (when verified >= 2; cut at 97 % of the run's budget)
         │     └─ 1 single-turn LLM call to merge overlapping root causes; safe fallback on error
         └─ 10. Post Review (`format_inline`, `format_summary` with counts + warnings + ignored + skipped) & record `reviews`
 ```
@@ -361,7 +361,7 @@ Limits & Safety:
 ### 4.6 ReAct Agent Loop & Context Compaction (`crates/review/src/agent.rs`)
 
 #### Typed Engine Loop
-- `AgentConfig`: `max_steps: usize` (Finder: `20`, Verifier: `6`), `compaction_char_limit: usize` (`160_000`), `max_output_tokens: u32` (`8_192`), `max_concurrent_tools: usize` (`4`).
+- `AgentConfig`: `max_steps: usize` (Finder: `20`, Verifier: `6`), `compaction_char_limit: usize` (`160_000`), `max_output_tokens: u32` (`8_192`), `max_concurrent_tools: usize` (`4`), `wrap_up_steps: usize` (default `1`, Finder `2`), `deadline: Option<tokio::time::Instant>` (default `None`; the Finder sets its stage deadline, the tool-enabled Verifier its own).
 - `AgentOutcome<T>`: `{ result: T, steps_used: usize, cache_read_tokens: u32, cache_write_tokens: u32, cut_short: bool }` (cache tokens summed over every turn, for the completion log).
 - `AgentError`: `ToolsUnsupported(String)`, `Chat(ChatError)`, `Unparseable(String)`.
 
@@ -375,7 +375,7 @@ Limits & Safety:
    - Attempt prose-JSON fallback parsing from `response.text` (reusing `first_json_array` / JSON extraction). If valid → return `Ok(AgentOutcome { result, cut_short: false })`.
    - Otherwise, if steps remain, append one corrective user prompt asking the model to call the submit tool (max 1 retry), else return `AgentError::Unparseable`.
 5. Otherwise, execute the non-submit read-only tool calls concurrently (up to `max_concurrent_tools`), append `Message::Tool { results }`, and advance step counter.
-6. **Budget wrap-up turn:** On `step == max_steps - 1` (last turn), **drop read-only tools** and keep only the submit tool (or prompt to submit now without more tool calls) so the model outputs its accumulated findings instead of hitting the wall empty-handed. If it still doesn't submit cleanly, return partial/unparseable handling (`cut_short: true` for Finder if prose recovers anything, `AgentError` for Verifier).
+6. **Wrap-up:** Wrap-up mode starts when `steps_used + wrap_up_steps >= max_steps` (the last step, or the last 2 for the Finder; a window larger than `max_steps` makes every step a wrap-up step), **or** when `deadline` is set, at least one step has finished, and the time left is less than 1.5 × the slowest LLM call of this run so far (only the `chat` request is timed with `tokio::time::Instant`, not tool execution; the first step never triggers it). Once entered it stays on: read-only tools are **dropped** and only the submit tool is offered (a read-only call still gets the `is_error` "not available" result, so call/result pairing holds), and one reminder ("… Submit your final result now using `<submit>`.") is sent when it starts (not right after a nudge; never in `NoTools` runs), so the model outputs its accumulated findings instead of hitting the wall (or the stage deadline) empty-handed. If it still doesn't submit cleanly, the nudge rule still applies once, then partial/unparseable handling (`cut_short: true` for Finder if prose recovers anything, `AgentError` for Verifier). The caller's `timeout_at` stays the hard cut. **Budget note:** with the repository tools and `max_steps >= 4`, one user note is sent before the step where `steps_used == max_steps / 2` (unless wrap-up starts at that step): "Step budget: {used} of {max} steps used. Gather only the evidence you still need, then call {submit}."
 7. **Context compaction & overflow recovery:**
    - Before each LLM call, compute total chars across `messages` (tool-call `provider_meta`, which replays thinking blocks, counts too). While `total_chars > compaction_char_limit`, walk from the oldest `Message::Tool` forward (preserving `messages[0]` initial prompt and the **last 4 messages**, i.e., 2 turns) and replace each `ToolResult.content` longer than 120 chars with `"[earlier tool output omitted to save context]"`.
    - If `ChatService::chat` returns `ChatError::ContextOverflow(_)`: perform **one-shot aggressive compaction** (keep only `messages[0]`, the latest assistant message + tool results truncated to 500 chars) and retry once; if it overflows again, surface `AgentError::Chat(ChatError::ContextOverflow(...))`.
@@ -454,7 +454,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 
 ### 4.11 Time Budget
 
-`Engine::review_pr` already runs inside `tokio::time::timeout(review_timeout)` (12 min in production). An agentic review of a large PR could exceed that and end `failed` with nothing posted, so each stage gets its own deadline, computed from the run's start as fractions of `review_timeout` (so short test timeouts scale too):
+A review's budget is chosen once its effective Finder mode is known (command override → repo → settings, then the small-PR force to Generalist): `specialists_review_timeout` (`SPECIALISTS_REVIEW_TIMEOUT`, 30 min in production) for Specialists, else `review_timeout` (`REVIEW_TIMEOUT`, 12 min; small PRs and `@adudu review generalist` included). It counts from the start of the run (fetches and clone included); the run is cut at `start + budget` (`Fatal("review timed out")`, row `failed`), and `Engine::review_pr`'s outer `tokio::time::timeout` uses the larger of the two budgets only as a backstop. The worker chain is `JOB_TIMEOUT` 31 min < `LOCK_TTL` 35 min, with the queue take-over (`RECLAIM_IDLE`) and `reviews::STALE_AFTER` at 35 min. An agentic review of a large PR could exceed its budget and end `failed` with nothing posted, so each stage gets its own deadline, computed from the run's start as fractions of the budget (so short test timeouts scale too):
 
 | Stage | Deadline | When it is hit |
 |---|---|---|
@@ -462,7 +462,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 | Verifier | `start + 90 %` | Candidates without a verdict are dropped as unverified (fail-closed, never retryable). |
 | Dedup | `start + 97 %` (the last 3 %, ~20 s in production, is reserved for posting) | Dedup is cut and falls back safely (keep the verified list). |
 
-Reasoning makes each call slower: a request with an effort set gets a 300 s per-request timeout instead of 120 s, and its output cap grows by a reserve for reasoning tokens (provider-models spec §3.2). The stage deadlines above still bound the whole run; `Specialists` mode at `High` effort is the case most likely to hit the Finder deadline on a large PR, which ends in a partial review with notes, never a silent timeout.
+Reasoning makes each call slower: a request with an effort set gets a 300 s per-request timeout instead of 120 s, and its output cap grows by a reserve for reasoning tokens (provider-models spec §3.2). The stage deadlines above still bound the whole run; `Specialists` mode at `High` effort (~60 s per step observed live) is the case most likely to hit the Finder deadline, which is why it gets the 30 min budget and why Finder and Verifier agents wrap up early when their deadline is closer than 1.5 × their slowest step (Section 4.6 step 6). An agent cut anyway ends in a partial review with notes, never a silent timeout.
 
 Cancelling an agent future drops its pending tool futures; `spawn_blocking` work already started runs to completion against its `Arc<RepoWorkspace>` clone. The directory is removed when the last `Arc` drops (at the latest when `run()` ends or is cancelled by the outer timeout).
 

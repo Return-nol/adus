@@ -17,7 +17,7 @@ use adus_llm::router::{ChatError, ChatService, UsageContext};
 use adus_llm::{
     ChatRequest, ChatResponse, Message, ReasoningEffort, StopReason, ToolCall, UserPart,
 };
-use adus_review::engine::{Engine, REVIEW_TIMEOUT};
+use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
 use adus_review::workspace::{RepoCloner, RepoWorkspace, WorkspaceError};
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -288,6 +288,18 @@ pub struct ChatCall {
     pub ctx: UsageContext,
 }
 
+/// A Finder agent that keeps reading `read_path` while the repository tools are offered and
+/// submits `findings` once only `submit_findings` is (what a model does after the wrap-up
+/// reminder). Its first call takes `first_delay`, every later call `delay`.
+struct Explorer {
+    needle: String,
+    read_path: String,
+    findings: serde_json::Value,
+    first_delay: Duration,
+    delay: Duration,
+    calls: usize,
+}
+
 /// LLM palsu. Jawaban diambil dari skrip: entri pertama untuk stage itu yang `needle`-nya cocok.
 /// Tanpa entri: Finder `[]`, Verifier `{"keep": true}`, Dedup jawaban tak valid (semua
 /// dipertahankan). Panggilan Finder yang memuat `needle` dari `delay` dijawab setelah jeda itu
@@ -300,6 +312,7 @@ pub struct FakeChat {
     /// Per stage: (running now, most at once).
     in_flight: Mutex<HashMap<Stage, (usize, usize)>>,
     next_call_id: Mutex<usize>,
+    explorers: Mutex<Vec<Explorer>>,
 }
 
 impl FakeChat {
@@ -361,6 +374,50 @@ impl FakeChat {
             .push((needle.to_string(), delay));
     }
 
+    /// Every Finder call containing `needle` answers like an agent that investigates until
+    /// it is told to wrap up: a `read_file` of `read_path` while `read_file` is offered, else
+    /// `submit_findings` with `findings`. The first such call takes `first_delay`, later ones
+    /// `delay`. Takes precedence over scripted replies and `delay`.
+    pub fn explore_until_wrap_up(
+        &self,
+        needle: &str,
+        read_path: &str,
+        findings: serde_json::Value,
+        first_delay: Duration,
+        delay: Duration,
+    ) {
+        self.explorers.lock().unwrap().push(Explorer {
+            needle: needle.to_string(),
+            read_path: read_path.to_string(),
+            findings,
+            first_delay,
+            delay,
+            calls: 0,
+        });
+    }
+
+    fn explore(&self, haystack: &str, offered: &[String]) -> Option<(Reply, Duration)> {
+        let mut explorers = self.explorers.lock().unwrap();
+        let explorer = explorers
+            .iter_mut()
+            .find(|e| haystack.contains(e.needle.as_str()))?;
+        explorer.calls += 1;
+        let delay = if explorer.calls == 1 {
+            explorer.first_delay
+        } else {
+            explorer.delay
+        };
+        let reply = if offered.iter().any(|t| t == "read_file") {
+            Reply::tool(
+                "read_file",
+                serde_json::json!({ "path": explorer.read_path }),
+            )
+        } else {
+            Reply::submit(explorer.findings.clone())
+        };
+        Some((reply, delay))
+    }
+
     /// Most calls of `stage` that ever ran at the same time.
     pub fn max_in_flight(&self, stage: Stage) -> usize {
         self.in_flight
@@ -415,6 +472,11 @@ impl ChatService for FakeChat {
             })
             .collect();
         let haystack = format!("{}\n{user}", req.system);
+        let offered: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
+        let explored = match stage {
+            Stage::Finder => self.explore(&haystack, &offered),
+            _ => None,
+        };
         let delay = match stage {
             Stage::Finder => self
                 .delays
@@ -431,13 +493,16 @@ impl ChatService for FakeChat {
             model: req.model,
             system: req.system,
             user,
-            tools: req.tools.iter().map(|t| t.name.clone()).collect(),
+            tools: offered,
             tool_results,
             max_tokens: req.max_tokens,
             effort: req.effort,
             ctx,
         });
-        let reply = self.next_reply(stage, &haystack);
+        let (reply, delay) = match explored {
+            Some((reply, delay)) => (reply, Some(delay)),
+            None => (self.next_reply(stage, &haystack), delay),
+        };
         {
             let mut in_flight = self.in_flight.lock().unwrap();
             let entry = in_flight.entry(stage).or_default();
@@ -639,6 +704,7 @@ pub async fn setup(pool: &PgPool, git: FakeGit) -> Setup {
             chat: chat.clone(),
             cloner: cloner.clone(),
             review_timeout: REVIEW_TIMEOUT,
+            specialists_review_timeout: SPECIALISTS_REVIEW_TIMEOUT,
         },
         git,
         chat,

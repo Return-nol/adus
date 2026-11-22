@@ -27,7 +27,7 @@ use tokio::process::Command;
 pub const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Largest checkout (excluding `.git`) a review may work on.
 pub const MAX_WORKSPACE_BYTES: u64 = 500 * 1024 * 1024;
-/// Orphaned workspaces older than this are swept at startup. A clone lives ~15 min at most.
+/// Orphaned workspaces older than this are swept at startup. A clone lives ~35 min at most.
 const ORPHAN_MAX_AGE: Duration = Duration::from_secs(3600);
 /// Oldest git with `GIT_CONFIG_COUNT` support.
 const MIN_GIT_VERSION: (u32, u32) = (2, 31);

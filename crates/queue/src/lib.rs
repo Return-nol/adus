@@ -25,8 +25,11 @@ use uuid::Uuid;
 pub const MAX_ATTEMPTS: u32 = 5;
 
 const GROUP: &str = "adus-workers";
-/// Entri yang belum di-ack selama ini dianggap milik worker yang mati, lalu diambil alih.
-const RECLAIM_IDLE_MS: u64 = 15 * 60 * 1000;
+/// An entry not acked for this long is taken to belong to a dead worker and is taken over.
+/// Longer than the worker's job backstop (a Specialists review runs up to 30 min), checked at
+/// compile time in `adus::worker`.
+pub const RECLAIM_IDLE: Duration = Duration::from_secs(35 * 60);
+const RECLAIM_IDLE_MS: u64 = RECLAIM_IDLE.as_secs() * 1000;
 const DEDUP_TTL_SECS: u64 = 86_400;
 /// Batas job yang dipindah satu kali `promote_due`.
 const PROMOTE_BATCH: u32 = 100;
@@ -209,14 +212,14 @@ impl Queue {
 
     /// Ambil job berikutnya untuk `consumer`, menunggu paling lama `block`.
     ///
-    /// Entri yang belum di-ack lebih dari 15 menit dianggap milik worker yang mati dan
-    /// diambil alih lebih dulu. Tiap pengambilalihan menambah `attempt` satu; lewat dari
+    /// Entri yang belum di-ack lebih dari `RECLAIM_IDLE` (35 menit) dianggap milik worker yang
+    /// mati dan diambil alih lebih dulu. Tiap pengambilalihan menambah `attempt` satu; lewat dari
     /// `MAX_ATTEMPTS` job masuk stream dead. Artinya job wajib di-`ack`, di-`retry` atau
-    /// di-`dead_letter` dalam 15 menit (TTL lock juga diukur di bawah batas itu), kalau
+    /// di-`dead_letter` dalam 35 menit (TTL lock juga diukur di bawah batas itu), kalau
     /// tidak worker lain ikut mengerjakannya.
     ///
     /// Jika future ini dibatalkan tepat saat Redis sudah mengirim entri, entri itu tetap di
-    /// daftar pending (PEL) dan diambil alih setelah 15 menit. Entri dengan JSON rusak
+    /// daftar pending (PEL) dan diambil alih setelah 35 menit. Entri dengan JSON rusak
     /// dipindah ke stream dead lalu dilewati.
     pub async fn next(
         &self,
@@ -242,7 +245,7 @@ impl Queue {
         }
     }
 
-    /// Tandai job selesai dan hapus dari stream. Harus dalam 15 menit sejak `next`
+    /// Tandai job selesai dan hapus dari stream. Harus dalam 35 menit sejak `next`
     /// (lihat `next`), kalau tidak job sudah bisa diambil alih worker lain.
     pub async fn ack(&self, delivery: &Delivery) -> Result<(), QueueError> {
         let _: () = redis::pipe()
@@ -404,7 +407,7 @@ impl Queue {
         Ok(count)
     }
 
-    /// XAUTOCLAIM satu entri yang idle lebih dari 15 menit.
+    /// XAUTOCLAIM satu entri yang idle lebih dari `RECLAIM_IDLE`.
     async fn reclaim_stale(&self, consumer: &str) -> Result<Option<StreamId>, QueueError> {
         let reply: StreamAutoClaimReply = redis::cmd("XAUTOCLAIM")
             .arg(self.jobs_key())

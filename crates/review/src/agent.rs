@@ -2,6 +2,8 @@
 //! result through one terminal tool. Context compaction and a one-shot context-overflow
 //! recovery keep long runs within the model's window. Used by the Finder and the Verifier.
 
+use std::time::Duration;
+
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use adus_llm::{
     AssistantPart, ChatRequest, ChatResponse, Message, ReasoningEffort, ToolCall, ToolDef,
@@ -9,6 +11,7 @@ use adus_llm::{
 };
 use futures::{StreamExt, stream};
 use serde_json::Value;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::tools::{ToolOutput, Toolbox};
@@ -19,6 +22,8 @@ pub const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 160_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
 /// Default `AgentConfig::max_concurrent_tools`.
 pub const DEFAULT_MAX_CONCURRENT_TOOLS: usize = 4;
+/// Default `AgentConfig::wrap_up_steps`: only the final step is a wrap-up step.
+pub const DEFAULT_WRAP_UP_STEPS: usize = 1;
 
 /// Replaces old tool output when the conversation grows past the compaction limit.
 pub const OMITTED_TOOL_OUTPUT: &str = "[earlier tool output omitted to save context]";
@@ -26,6 +31,8 @@ pub const OMITTED_TOOL_OUTPUT: &str = "[earlier tool output omitted to save cont
 const COMPACT_MIN_CHARS: usize = 120;
 /// The newest messages (two turns) are never compacted.
 const COMPACT_KEEP_TAIL: usize = 4;
+/// The halfway budget note is only sent to runs with at least this many steps.
+const BUDGET_NOTE_MIN_STEPS: usize = 4;
 /// Tool outputs kept after a context overflow are cut to this many chars.
 const OVERFLOW_TOOL_CHARS: usize = 500;
 /// Appended to a tool output cut after a context overflow.
@@ -41,6 +48,11 @@ pub struct AgentConfig {
     pub max_output_tokens: u32,
     /// Read-only tool calls of one turn that run at the same time.
     pub max_concurrent_tools: usize,
+    /// The last steps that offer only the terminal tool (Finder 2, otherwise 1). 0 counts as 1.
+    pub wrap_up_steps: usize,
+    /// When set, the run wraps up early once the time left is less than 1.5 × its slowest
+    /// LLM call so far, so it submits before a caller's hard cut at this instant.
+    pub deadline: Option<Instant>,
 }
 
 impl AgentConfig {
@@ -51,6 +63,8 @@ impl AgentConfig {
             compaction_char_limit: DEFAULT_COMPACTION_CHAR_LIMIT,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_concurrent_tools: DEFAULT_MAX_CONCURRENT_TOOLS,
+            wrap_up_steps: DEFAULT_WRAP_UP_STEPS,
+            deadline: None,
         }
     }
 }
@@ -118,9 +132,15 @@ pub struct AgentLlm<'a> {
 
 /// Runs the agent on `prompt` (the first user message) until it submits a result.
 ///
-/// Every step is one LLM call. The last step offers only the terminal tool (with a reminder),
-/// a reply without tool calls is read with `parse_prose` (and nudged once if that fails), and
-/// when the budget runs out the last reply's prose is tried once more (`cut_short`).
+/// Every step is one LLM call. A reply without tool calls is read with `parse_prose` (and
+/// nudged once if that fails), and when the budget runs out the last reply's prose is tried
+/// once more (`cut_short`).
+///
+/// **Wrap-up:** from the last `wrap_up_steps` steps on, or earlier once `deadline` is closer
+/// than 1.5 × the slowest LLM call of this run (never before one call was measured), only
+/// the terminal tool is offered, and one reminder to submit is sent when that starts. Halfway
+/// through a budget of at least 4 steps with the repository tools, one note tells the model
+/// how many steps it has used.
 ///
 /// Cancel-safe: all state is local to the future, so dropping it (a deadline) ends the run.
 /// Tool work already handed to `spawn_blocking` finishes on its own.
@@ -139,23 +159,36 @@ pub async fn run_react_loop<S: SubmitSpec>(
     let mut nudged = false;
     let mut nudged_last_step = false;
     let mut last_text = String::new();
+    let mut wrap_up = WrapUp::default();
 
     while tally.steps_used < config.max_steps {
-        let final_step = tally.steps_used + 1 == config.max_steps;
+        let starts_wrap_up = wrap_up.check(tally.steps_used, config);
+        let with_repo_tools = matches!(tools, AgentTools::Full(_));
         // A nudge sent just before already asks for the result; one request is enough.
-        if final_step && !nudged_last_step && !matches!(tools, AgentTools::NoTools) {
+        if starts_wrap_up && !nudged_last_step && !matches!(tools, AgentTools::NoTools) {
             messages.push(user_message(format!(
-                "You are at the final step. Submit your final result now using {submit_name}."
+                "You are near the end of your step or time budget. Submit your final result now using {submit_name}."
+            )));
+        } else if with_repo_tools
+            && !wrap_up.active()
+            && config.max_steps >= BUDGET_NOTE_MIN_STEPS
+            && tally.steps_used == config.max_steps / 2
+        {
+            messages.push(user_message(format!(
+                "Step budget: {} of {} steps used. Gather only the evidence you still need, then call {submit_name}.",
+                tally.steps_used, config.max_steps
             )));
         }
         nudged_last_step = false;
         let read_only = match tools {
-            AgentTools::Full(toolbox) if !final_step => Some(toolbox),
+            AgentTools::Full(toolbox) if !wrap_up.active() => Some(toolbox),
             _ => None,
         };
         let offered = offered_tools(tools, read_only, submit_def);
 
         compact(&mut messages, config.compaction_char_limit);
+        // Only the LLM call is timed (not the tools): the slowest one sizes the deadline margin.
+        let started = Instant::now();
         let response = request(
             llm,
             &mut messages,
@@ -164,11 +197,13 @@ pub async fn run_react_loop<S: SubmitSpec>(
             &mut overflow_retried,
         )
         .await?;
+        wrap_up.record(started.elapsed());
         tally.add(&response);
         tracing::debug!(
             step = tally.steps_used,
             tools = ?response.tool_calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             stop_reason = ?response.stop_reason,
+            wrap_up = wrap_up.reason,
             "agent step"
         );
         let ChatResponse {
@@ -218,6 +253,52 @@ pub async fn run_react_loop<S: SubmitSpec>(
     match submit.parse_prose(&last_text) {
         Ok(result) => Ok(tally.finish(result, true)),
         Err(_) => Err(unparseable(submit_name, tally.steps_used)),
+    }
+}
+
+/// When a run stops investigating and only submits (see `run_react_loop`).
+#[derive(Default)]
+struct WrapUp {
+    /// Why wrap-up started (`"steps"` or `"deadline"`); once set it stays set.
+    reason: Option<&'static str>,
+    /// The slowest LLM call of this run so far.
+    slowest: Option<Duration>,
+}
+
+impl WrapUp {
+    fn active(&self) -> bool {
+        self.reason.is_some()
+    }
+
+    /// Called before each step; returns true when wrap-up starts at this step.
+    fn check(&mut self, steps_used: usize, config: &AgentConfig) -> bool {
+        if self.active() {
+            return false;
+        }
+        // At least the final step always wraps up.
+        let window = config.wrap_up_steps.max(1);
+        self.reason = if steps_used.saturating_add(window) >= config.max_steps {
+            Some("steps")
+        } else if self.deadline_close(config.deadline) {
+            Some("deadline")
+        } else {
+            None
+        };
+        self.active()
+    }
+
+    /// The time left is less than 1.5 × the slowest call, so one more investigating step would
+    /// leave too little time to submit. False until one call was measured.
+    fn deadline_close(&self, deadline: Option<Instant>) -> bool {
+        let (Some(deadline), Some(slowest)) = (deadline, self.slowest) else {
+            return false;
+        };
+        let needed = slowest.saturating_add(slowest / 2);
+        deadline.saturating_duration_since(Instant::now()) < needed
+    }
+
+    fn record(&mut self, latency: Duration) {
+        self.slowest = Some(self.slowest.map_or(latency, |slowest| slowest.max(latency)));
     }
 }
 
@@ -485,6 +566,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use adus_llm::{
         AssistantPart, ChatRequest, ChatResponse, ReasoningEffort, StopReason, ToolCall,
@@ -501,8 +583,7 @@ mod tests {
     const SUBMIT: &str = "submit_answer";
     const NUDGE: &str =
         "Please submit your result by calling submit_answer (or return the JSON directly).";
-    const WRAP_UP: &str =
-        "You are at the final step. Submit your final result now using submit_answer.";
+    const WRAP_UP: &str = "You are near the end of your step or time budget. Submit your final result now using submit_answer.";
     const READ_ONLY: [&str; 4] = ["read_file", "grep", "list_dir", "find_files"];
 
     /// Toy terminal tool: `{"answer": "<text>"}`.
@@ -554,6 +635,8 @@ mod tests {
     #[derive(Default)]
     struct ScriptedChat {
         script: Mutex<VecDeque<Result<ChatResponse, ChatError>>>,
+        /// How long each call takes, in call order (on the paused test clock); none = instant.
+        latencies: Mutex<VecDeque<Duration>>,
         requests: Mutex<Vec<ChatRequest>>,
         calls: Mutex<Vec<(Uuid, UsageContext)>>,
     }
@@ -562,6 +645,18 @@ mod tests {
         fn new(script: Vec<Result<ChatResponse, ChatError>>) -> Self {
             Self {
                 script: Mutex::new(script.into()),
+                ..Self::default()
+            }
+        }
+
+        /// Like `new`, but call `i` sleeps `latencies[i]` before it answers.
+        fn with_latencies(
+            script: Vec<Result<ChatResponse, ChatError>>,
+            latencies: Vec<Duration>,
+        ) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+                latencies: Mutex::new(latencies.into()),
                 ..Self::default()
             }
         }
@@ -581,6 +676,10 @@ mod tests {
         ) -> Result<ChatResponse, ChatError> {
             self.requests.lock().unwrap().push(req);
             self.calls.lock().unwrap().push((provider_id, ctx));
+            let latency = self.latencies.lock().unwrap().pop_front();
+            if let Some(latency) = latency {
+                tokio::time::sleep(latency).await;
+            }
             self.script
                 .lock()
                 .unwrap()
@@ -1258,6 +1357,208 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, AgentError::Chat(ChatError::NoKeys));
         assert_eq!(chat.requests().len(), 1);
+    }
+
+    fn budget_note(used: usize, max: usize) -> String {
+        format!(
+            "Step budget: {used} of {max} steps used. Gather only the evidence you still need, then call submit_answer."
+        )
+    }
+
+    /// How many user messages of `req` are exactly `text`.
+    fn count_user(req: &ChatRequest, text: &str) -> usize {
+        req.messages
+            .iter()
+            .filter(|m| user_text(m) == Some(text))
+            .count()
+    }
+
+    /// Budget notes of any step count in `req`.
+    fn count_notes(req: &ChatRequest) -> usize {
+        req.messages
+            .iter()
+            .filter(|m| user_text(m).is_some_and(|t| t.starts_with("Step budget: ")))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn wrap_up_window_offers_only_submit_for_the_last_two_steps() {
+        let tb = default_toolbox();
+        let mut script: Vec<_> = (1..=5)
+            .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
+            .collect();
+        script.push(tools_turn(vec![submit("c6", "wrapped")]));
+        let chat = ScriptedChat::new(script);
+        let mut config = AgentConfig::new(6);
+        config.wrap_up_steps = 2;
+        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        assert_eq!(out.result, "wrapped");
+        assert_eq!(out.steps_used, 6);
+        assert!(!out.cut_short);
+
+        let reqs = chat.requests();
+        assert_eq!(reqs.len(), 6);
+        for (step, req) in reqs.iter().enumerate() {
+            let wrap_up = step >= 4;
+            let expected = if wrap_up { 1 } else { 5 };
+            assert_eq!(tool_names(req).len(), expected, "step {step}");
+            // One reminder, sent when the window starts, then kept in the history.
+            assert_eq!(
+                count_user(req, WRAP_UP),
+                usize::from(wrap_up),
+                "step {step}"
+            );
+            assert_paired(&req.messages);
+        }
+        assert_eq!(user_text(reqs[4].messages.last().unwrap()), Some(WRAP_UP));
+        assert_eq!(tool_names(&reqs[4]), [SUBMIT]);
+        // The read call made inside the window is refused, still paired with its call.
+        let refused = tool_results(reqs[5].messages.last().unwrap());
+        assert_eq!(refused[0].call_id, "c5");
+        assert!(refused[0].is_error);
+        assert_eq!(
+            refused[0].content,
+            "Error: tool read_file is not available now; call submit_answer with your result"
+        );
+
+        // A window larger than the budget makes every step a wrap-up step.
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![read("c1", "src/a.rs")]),
+            tools_turn(vec![submit("c2", "ok")]),
+        ]);
+        let mut config = AgentConfig::new(3);
+        config.wrap_up_steps = 5;
+        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        let reqs = chat.requests();
+        assert!(reqs.iter().all(|r| tool_names(r) == [SUBMIT]));
+        assert_eq!(user_text(reqs[0].messages.last().unwrap()), Some(WRAP_UP));
+        assert!(reqs.iter().all(|r| count_user(r, WRAP_UP) == 1));
+        assert_paired(&reqs[1].messages);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_close_switches_to_submit_only_early() {
+        let tb = default_toolbox();
+        let mut script: Vec<_> = (1..=4)
+            .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
+            .collect();
+        script.push(tools_turn(vec![submit("c5", "in time")]));
+        let secs = Duration::from_secs;
+        let chat = ScriptedChat::with_latencies(
+            script,
+            vec![secs(30), secs(10), secs(10), secs(10), secs(10)],
+        );
+        let deadline = Instant::now() + secs(100);
+        let mut config = AgentConfig::new(20);
+        config.deadline = Some(deadline);
+        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        assert_eq!(out.result, "in time");
+        assert_eq!(out.steps_used, 5);
+        assert!(!out.cut_short);
+        assert!(Instant::now() <= deadline, "submitted before the deadline");
+
+        // Steps end at 30, 40, 50 and 60 s. Before step 5, 40 s are left: less than 1.5 × the
+        // slowest step (45 s), so step 5 offers only the submit tool, with one reminder.
+        let reqs = chat.requests();
+        assert_eq!(reqs.len(), 5);
+        for req in &reqs[..4] {
+            assert_eq!(tool_names(req).len(), 5);
+            assert_eq!(count_user(req, WRAP_UP), 0);
+        }
+        assert_eq!(tool_names(&reqs[4]), [SUBMIT]);
+        assert_eq!(user_text(reqs[4].messages.last().unwrap()), Some(WRAP_UP));
+        assert_eq!(count_user(&reqs[4], WRAP_UP), 1);
+        assert_paired(&reqs[4].messages);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_step_never_triggers_time_wrap_up() {
+        let tb = default_toolbox();
+        let chat = ScriptedChat::with_latencies(
+            vec![
+                tools_turn(vec![read("c1", "src/a.rs")]),
+                tools_turn(vec![submit("c2", "late")]),
+            ],
+            vec![Duration::from_secs(5), Duration::from_secs(5)],
+        );
+        // Far too close for any step, but no step has a measured latency yet.
+        let mut config = AgentConfig::new(20);
+        config.deadline = Some(Instant::now() + Duration::from_millis(1));
+        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        assert_eq!(out.result, "late");
+
+        let reqs = chat.requests();
+        assert_eq!(tool_names(&reqs[0]).len(), 5);
+        assert_eq!(reqs[0].messages, vec![user("PROMPT")]);
+        // After one measured step the deadline rule applies.
+        assert_eq!(tool_names(&reqs[1]), [SUBMIT]);
+        assert_eq!(count_user(&reqs[1], WRAP_UP), 1);
+        assert_paired(&reqs[1].messages);
+    }
+
+    #[tokio::test]
+    async fn budget_note_sent_once_at_half_budget() {
+        let tb = default_toolbox();
+        let reads = |n: usize| -> Vec<_> {
+            (1..=n)
+                .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
+                .collect()
+        };
+
+        // Verifier-like budget: the note goes before step 4 (3 of 6 used), once.
+        let mut script = reads(5);
+        script.push(tools_turn(vec![submit("c6", "ok")]));
+        let chat = ScriptedChat::new(script);
+        run(&chat, AgentTools::Full(&tb), &AgentConfig::new(6))
+            .await
+            .unwrap();
+        let reqs = chat.requests();
+        let note = budget_note(3, 6);
+        for (step, req) in reqs.iter().enumerate() {
+            assert_eq!(count_notes(req), usize::from(step >= 3), "step {step}");
+            assert_paired(&req.messages);
+        }
+        assert_eq!(
+            user_text(reqs[3].messages.last().unwrap()),
+            Some(note.as_str())
+        );
+        // The wrap-up reminder comes later, on its own step.
+        assert_eq!(count_user(&reqs[3], WRAP_UP), 0);
+        assert_eq!(count_user(&reqs[5], WRAP_UP), 1);
+
+        // Finder budget: 10 of 20, before the two-step wrap-up window.
+        let mut script = reads(19);
+        script.push(tools_turn(vec![submit("c20", "ok")]));
+        let chat = ScriptedChat::new(script);
+        let mut config = AgentConfig::new(20);
+        config.wrap_up_steps = 2;
+        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        let reqs = chat.requests();
+        assert_eq!(
+            user_text(reqs[10].messages.last().unwrap()),
+            Some(budget_note(10, 20).as_str())
+        );
+        assert_eq!(count_notes(&reqs[9]), 0);
+        assert_eq!(count_notes(&reqs[19]), 1);
+
+        // No note when the half-way step already starts the wrap-up (the reminder wins),
+        // for budgets under 4 steps, or without the repository tools.
+        let mut window = AgentConfig::new(4);
+        window.wrap_up_steps = 2;
+        let cases = [
+            (AgentTools::Full(&tb), window, 4),
+            (AgentTools::Full(&tb), AgentConfig::new(3), 3),
+            (AgentTools::SubmitOnly, AgentConfig::new(6), 6),
+        ];
+        for (tools, config, steps) in cases {
+            let chat = ScriptedChat::new(reads(steps));
+            let err = run(&chat, tools, &config).await.unwrap_err();
+            assert!(matches!(err, AgentError::Unparseable(_)), "{err:?}");
+            let reqs = chat.requests();
+            assert_eq!(reqs.len(), steps);
+            assert!(reqs.iter().all(|r| count_notes(r) == 0), "{steps} steps");
+            assert_eq!(count_user(&reqs[steps - 1], WRAP_UP), 1);
+        }
     }
 
     #[test]

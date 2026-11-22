@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use adus_core::job::{CommentAuthor, Job, Trigger};
-use adus_queue::{MAX_ATTEMPTS, Queue, backoff};
+use adus_queue::{MAX_ATTEMPTS, Queue, RECLAIM_IDLE, backoff};
 use redis::AsyncCommands;
 use uuid::Uuid;
 
@@ -75,7 +75,7 @@ async fn enqueue_then_next_then_ack() {
     assert_eq!(delivery.job, job);
     assert_eq!(delivery.attempt, 1);
 
-    // Belum di-ack: konsumen lain tidak menerimanya lagi (belum idle 15 menit).
+    // Belum di-ack: konsumen lain tidak menerimanya lagi (belum idle 35 menit).
     assert!(queue.next("worker-2", SHORT_BLOCK).await.unwrap().is_none());
 
     queue.ack(&delivery).await.unwrap();
@@ -264,7 +264,8 @@ async fn malformed_entry_is_dead_lettered_and_queue_continues() {
     cleanup(&prefix).await;
 }
 
-/// Pura-pura pemilik entri mati 16 menit lalu: XCLAIM dengan IDLE mengatur waktu idle entri.
+/// Pura-pura pemilik entri mati semenit lebih lama dari `RECLAIM_IDLE`: XCLAIM dengan IDLE
+/// mengatur waktu idle entri.
 /// JUSTID membuat XCLAIM tidak menaikkan hitungan delivery; RETRYCOUNT menimpanya.
 async fn make_stale(prefix: &str, entry_id: &str, retry_count: Option<u32>) {
     let mut conn = raw_connection().await;
@@ -275,7 +276,7 @@ async fn make_stale(prefix: &str, entry_id: &str, retry_count: Option<u32>) {
         .arg(0)
         .arg(entry_id)
         .arg("IDLE")
-        .arg(16 * 60 * 1000);
+        .arg((RECLAIM_IDLE.as_secs() + 60) * 1000);
     if let Some(count) = retry_count {
         cmd.arg("RETRYCOUNT").arg(count);
     }

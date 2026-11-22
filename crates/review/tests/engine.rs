@@ -12,7 +12,8 @@ use adus_db::settings;
 use adus_git::{ConnectionKind, FileStatus, GitError};
 use adus_llm::ReasoningEffort;
 use adus_llm::router::ChatError;
-use adus_review::engine::EngineError;
+use adus_review::engine::{EngineError, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
+use adus_review::finder::FINDER_MAX_STEPS;
 use adus_review::workspace::WorkspaceError;
 use common::{
     CloneBehavior, FakeGit, PAT, Reply, Setup, Stage, big_file, clone_spec, diff_header, file,
@@ -1096,6 +1097,7 @@ async fn slow_review_times_out_and_is_marked_failed(pool: PgPool) {
     .await;
     s.git.state().get_pr_delay = Duration::from_secs(5);
     s.engine.review_timeout = Duration::from_millis(100);
+    s.engine.specialists_review_timeout = Duration::from_millis(100);
 
     let err = run(&s, Trigger::Opened).await.unwrap_err();
 
@@ -1748,7 +1750,7 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
 async fn finder_deadline_cuts_slow_specialist_and_posts_survivors_with_note(pool: PgPool) {
     let mut s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
     // Finder deadline at 60 % = 1.8 s; the Performance reviewer would answer after 30 s.
-    s.engine.review_timeout = Duration::from_secs(3);
+    s.engine.specialists_review_timeout = Duration::from_secs(3);
     s.chat.delay(PERFORMANCE_ROLE, Duration::from_secs(30));
     s.chat.push_for(
         Stage::Finder,
@@ -1853,6 +1855,134 @@ async fn clone_is_bounded_by_the_finder_deadline(pool: PgPool) {
         assert_eq!(call.tools, vec!["submit_findings"], "no repository tools");
         assert!(call.system.contains("You cannot open other files"));
     }
+}
+
+async fn set_review_mode(pool: &PgPool, mode: ReviewMode) {
+    let mut current = settings::get(pool).await.unwrap();
+    current.review_mode = mode;
+    settings::update(pool, &current).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn specialists_review_uses_the_30_minute_budget(pool: PgPool) {
+    assert_eq!(SPECIALISTS_REVIEW_TIMEOUT, Duration::from_secs(30 * 60));
+    let mut s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    // No Generalist budget at all: a Specialists review can only finish on its own budget.
+    s.engine.review_timeout = Duration::ZERO;
+
+    // `@adudu review deep`.
+    s.chat.push_for(
+        Stage::Finder,
+        BUG_ROLE,
+        Reply::text(&finding("a.rs", 2, "Bug")),
+    );
+    let id = run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+
+    // Specialists as the settings default.
+    set_review_mode(&pool, ReviewMode::Specialists).await;
+    let id = run(&s, Trigger::Opened).await.unwrap();
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+
+    // Control: a Generalist review on the same engine is cut at once by its own budget.
+    let err = run_mode(&s, Trigger::Command, Some(ReviewMode::Generalist))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EngineError::Fatal("review timed out".into()));
+    let row = latest(&pool).await;
+    assert_eq!(row.status, ReviewStatus::Failed);
+    assert_eq!(row.error.as_deref(), Some("review timed out"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn generalist_and_small_pr_keep_the_12_minute_budget(pool: PgPool) {
+    assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(12 * 60));
+    let mut s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    // No Specialists budget at all: everything below only finishes on the Generalist budget.
+    s.engine.specialists_review_timeout = Duration::ZERO;
+
+    // Generalist as the settings default.
+    let id = run(&s, Trigger::Opened).await.unwrap();
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+
+    // `@adudu review generalist` over a Specialists default.
+    set_review_mode(&pool, ReviewMode::Specialists).await;
+    let id = run_mode(&s, Trigger::Command, Some(ReviewMode::Generalist))
+        .await
+        .unwrap();
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+
+    // A small PR under a Specialists default is forced to Generalist, budget included.
+    enable_small_pr(&pool).await;
+    let before = s.chat.finder_calls().len();
+    let id = run(&s, Trigger::Opened).await.unwrap();
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len() - before, 1);
+    assert!(finder[before].system.contains(GENERALIST_ROLE));
+
+    // Control: a full Specialists review is cut at once by its own budget.
+    let err = run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EngineError::Fatal("review timed out".into()));
+    assert_eq!(latest(&pool).await.status, ReviewStatus::Failed);
+}
+
+/// The live failure this guards against: a slow specialist cut by the Finder deadline lost all
+/// its work. The agent now wraps up when the deadline gets close and its findings are posted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn slow_specialist_submits_before_the_finder_deadline(pool: PgPool) {
+    let mut s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
+    s.git.state().clone_spec = Some(clone_spec());
+    s.cloner.files(&[("a.rs", "a\nb\n")]);
+    // Finder deadline at 60 % = 1.2 s. The Bug reviewer's first step takes 300 ms and every
+    // later one 60 ms, and it keeps reading files while it may: running all 20 steps would end
+    // at ~1.44 s, after the deadline. With less than 1.5 × 300 ms left it must submit instead.
+    s.engine.specialists_review_timeout = Duration::from_secs(2);
+    s.chat.explore_until_wrap_up(
+        BUG_ROLE,
+        "a.rs",
+        json!([finding_json("a.rs", 2, "warning", "Slow bug")]),
+        Duration::from_millis(300),
+        Duration::from_millis(60),
+    );
+
+    let id = run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert!(posted.comments[0].body.contains("Slow bug"));
+    assert!(
+        !posted.summary.contains("did not finish in time"),
+        "{}",
+        posted.summary
+    );
+    let bug: Vec<_> = s
+        .chat
+        .finder_calls()
+        .into_iter()
+        .filter(|c| c.system.contains(BUG_ROLE))
+        .collect();
+    // It investigated, then wrapped up early on time, not in the last steps of its budget.
+    assert!(bug.len() > 2, "{} steps", bug.len());
+    assert!(bug.len() < FINDER_MAX_STEPS - 2, "{} steps", bug.len());
+    let (last, earlier) = bug.split_last().unwrap();
+    assert_eq!(last.tools, vec!["submit_findings"]);
+    assert!(
+        earlier
+            .iter()
+            .all(|c| c.tools.contains(&"read_file".to_string()))
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

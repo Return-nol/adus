@@ -102,6 +102,7 @@ pub async fn verify_candidates(
         memories,
         repo_instructions,
         toolbox,
+        deadline,
     };
     // Set once the fast model rejects tool calling; candidates that start later skip the tools.
     let diff_only = AtomicBool::new(toolbox.is_none());
@@ -205,6 +206,8 @@ struct Evidence<'a> {
     memories: &'a [Memory],
     repo_instructions: Option<&'a str>,
     toolbox: Option<&'a Toolbox>,
+    /// The Verifier deadline; a tool-enabled loop wraps up before it.
+    deadline: Instant,
 }
 
 /// Verifies one candidate: tool-enabled while the model supports tools, diff-only otherwise.
@@ -226,7 +229,7 @@ async fn verify_one(
     // Checked after the snippet read so a candidate never starts with tools once they failed.
     if let (Some(toolbox), false) = (evidence.toolbox, diff_only.load(Ordering::Relaxed)) {
         let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), true);
-        match verify_with_tools(ctx, toolbox, prompt).await {
+        match verify_with_tools(ctx, toolbox, prompt, evidence.deadline).await {
             Err(AgentError::ToolsUnsupported(_)) => {
                 tracing::warn!(
                     "verifier model rejected tool calling; verifying the rest diff-only"
@@ -255,6 +258,7 @@ async fn verify_with_tools(
     ctx: VerifyContext<'_>,
     toolbox: &Toolbox,
     prompt: String,
+    deadline: Instant,
 ) -> Result<AgentOutcome<bool>, AgentError> {
     let system = build_system_prompt(true);
     let llm = AgentLlm {
@@ -269,7 +273,10 @@ async fn verify_with_tools(
         &llm,
         AgentTools::Full(toolbox),
         &SubmitVerdict::new(),
-        &AgentConfig::new(VERIFY_MAX_STEPS),
+        &AgentConfig {
+            deadline: Some(deadline),
+            ..AgentConfig::new(VERIFY_MAX_STEPS)
+        },
         prompt,
     )
     .await
@@ -1197,6 +1204,7 @@ mod tests {
             memories: &memories,
             repo_instructions: Some("Keep handlers thin"),
             toolbox: None,
+            deadline: Instant::now(),
         };
         let prompt = build_user_prompt(
             &bug("ordered"),

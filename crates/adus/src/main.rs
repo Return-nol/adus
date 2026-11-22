@@ -8,7 +8,7 @@ use adus_core::{
 use adus_git::{GitProviderFactory, HttpGitProviderFactory};
 use adus_llm::router::{ChatService, LlmRouter};
 use adus_queue::Queue;
-use adus_review::engine::{Engine, REVIEW_TIMEOUT};
+use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
 use adus_review::workspace::{GitCliCloner, cleanup_orphaned_workspaces};
 use adus_server::{
     AppState,
@@ -127,6 +127,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         chat: state.chat.clone(),
         cloner: Arc::new(GitCliCloner::default()),
         review_timeout: REVIEW_TIMEOUT,
+        specialists_review_timeout: SPECIALISTS_REVIEW_TIMEOUT,
     });
 
     let shutdown = CancellationToken::new();

@@ -1,6 +1,7 @@
 //! First pass of the review: Finder agents look for defects in each diff batch. Batches run
 //! [`BATCH_CONCURRENCY`] at a time and the specialists of one batch run in parallel. Every
-//! agent must finish by the Finder deadline; one that does not counts as a failed task.
+//! agent must finish by the Finder deadline: it wraps up (submits) when the deadline gets
+//! close, and one still running at the deadline counts as a failed task.
 //! When the model rejects tool calling, the whole Finder is run again without tools.
 
 use adus_core::types::ReviewMode;
@@ -27,6 +28,8 @@ use crate::tools::Toolbox;
 pub const BATCH_CONCURRENCY: usize = 2;
 /// LLM calls one Finder agent may make.
 pub const FINDER_MAX_STEPS: usize = 20;
+/// The last Finder steps that offer only `submit_findings`.
+pub const FINDER_WRAP_UP_STEPS: usize = 2;
 
 /// Where the Finder talks to the model: the provider's `primary_model` at `finder_effort(mode)`.
 #[derive(Clone, Copy)]
@@ -175,7 +178,12 @@ async fn run_one(
         effort: Some(llm.effort),
         usage: llm.usage,
     };
-    let config = AgentConfig::new(FINDER_MAX_STEPS);
+    // The agent wraps up on its own before the deadline; `timeout_at` stays the hard cut.
+    let config = AgentConfig {
+        wrap_up_steps: FINDER_WRAP_UP_STEPS,
+        deadline: Some(deadline),
+        ..AgentConfig::new(FINDER_MAX_STEPS)
+    };
     let run = run_react_loop(&agent, tools, submit, &config, prompt);
     let result = match tokio::time::timeout_at(deadline, run).await {
         Ok(Ok(outcome)) => {
