@@ -343,6 +343,8 @@ Tools execute inside `tokio::task::spawn_blocking` against `Arc<RepoWorkspace>`,
 | `submit_findings` | `{ findings: Vec<RawFinding> }` | Used by Finder agent loop to terminate cleanly with structured findings (each item validated/parsed leniently per-element like `parse.rs`) | No (terminates loop) |
 | `submit_verdict` | `{ keep: bool, rationale: String }` | Used by Verifier agent loop to terminate cleanly with structured verdict | No (terminates loop) |
 
+**Secret redaction (`crates/review/src/redact.rs`):** the successful content of every read-only tool is passed through `redact_secrets` on the blocking thread before it is cached and returned, so cached entries hold the redacted text. Masked as `[REDACTED]`: lines between a private-key PEM `BEGIN`/`END` pair (the marker lines stay; a block cut by a tool window is still masked), provider token shapes (AWS access key id, GitHub `gh[pousr]_`/`github_pat_`, `sk-…`, Google `AIza…`, Slack `xox?-`, Stripe `[rs]k_live|test_`, JWT), the password of `scheme://user:password@host`, and the value of a secret-named key (`password`, `passwd`, `secret`, `api_key`/`apikey`/`api-key`, `access_token`, `auth_token`, `client_secret`, `private_key`) assigned a quoted literal of 8+ chars or, on an env-style `KEY=value` line, an unquoted value of 8+ chars. Placeholders (`${X}`, `<x>`, `{{x}}`, `$X`, calls) are left alone. Redaction replaces within a line, never adds or removes one, so line numbers stay correct. The PR diff and the Verifier's `<code_context>` snippet (read raw, outside the cache) are **not** redacted, so a hardcoded secret in the PR can still be found and verified. Finder and Verifier system prompts say: "`[REDACTED]` in tool output marks a value Adus masked because it looked like a secret; a hardcoded secret is still a finding when the diff shows it."
+
 **Tool Error Handling:** Recoverable tool input errors (bad path, missing file, bad regex, secret-file refusal) return `ToolResult { is_error: true, content: "..." }` back to the LLM so the model can adjust its query on the next step rather than aborting the review.
 
 ---
@@ -356,6 +358,7 @@ When `RepoWorkspace` is present, scan a deterministic ordered list of well-known
 4. `.cursor/rules/*.mdc` (sorted lexicographically by path)
 
 Limits & Safety:
+- Each file is passed through `redact_secrets` (Section 4.4) before it is capped and before it goes into any prompt.
 - Cap total concatenated instruction text at **8,000 chars** (`[truncated]` marker when cut).
 - Wrapped inside `<repository_instructions>...</repository_instructions>` with closing tags neutralized via the same `neutralize_close_tag` helper in `prompt.rs`.
 - Placed in the **user/task prompt** (marked strictly as repository conventions to verify code against—never overriding system instructions, output format, or security constraints).
@@ -451,6 +454,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 - **Summary comment (`format_summary`):**
   - Retains `<!-- adudu -->`, severity breakdown (`Critical`, `Warning`, `Info`), `"No issues found."`, `N files ignored`, and `**Skipped files**`.
   - Adds optional `**Notes**` / `warnings: &[String]` section (e.g., `"Codebase context unavailable — reviewed diff only"`, `"Performance reviewer did not complete"`, `"2 candidate findings could not be verified and were omitted"`, `"5 lower-priority findings exceeded the verification cap and were omitted"`).
+- **Secret redaction on posting:** after Dedup and before `post_review`, every inline comment body and the summary body go through `redact_secrets` (Section 4.4). A finding whose `suggestion` contains a secret (or an already masked `[REDACTED]` value) is posted without its suggestion block, keeping its line span, so "Apply suggestion" never writes `[REDACTED]` into code. One `debug!` per review logs `redacted_tool_outputs` and `redacted_comments` (summary included), never the matched text.
 - **Structured logging:** Log `review_mode`, `clone_ms`, `fallback_reason`, per-specialist `steps_used` / `candidates`, `verified_kept`, `verifier_dropped`, `dedup_dropped`, total `cache_read_tokens` / `cache_write_tokens`, and the run's `input_tokens` (the token budget's count) and `token_budget_reached` on completion. When the ceiling was reached the summary adds the note "Token budget reached ({used} of {limit} input tokens): some files or findings were not reviewed."; Verifier candidates dropped by it count in the "could not be verified" note.
 - **`Dockerfile` & `adus doctor`:**
   - `Dockerfile`: install `git` alongside `ca-certificates` (`apt-get install -y --no-install-recommends ca-certificates git`).

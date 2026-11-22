@@ -53,7 +53,7 @@ Up to 500 MB temp disk per running review × workers; CPU for in-process grep (1
 | Malicious PR code on the host | shallow fetch only, nothing executed; hooks, symlinks, fsmonitor, LFS filters, submodules, `file://`, credential helpers disabled | Low (Unix symlink/uid tests pass in Linux container) |
 | PAT leak | PAT only in `GIT_CONFIG_*` env of `fetch`, scrubbed from errors | git helper child can keep the PAT env ~5 s after a timeout (backlog) |
 | Path escape via tools | `RepoPath` containment, no `.git`, secret-file denylist | Low |
-| **Bot quotes a committed credential in a comment** (prompt injection or plain mistake) | read-only tools, untrusted sections escaped, comments only on the same PR | **Medium → mitigated by Task 15 (redaction)** |
+| **Bot quotes a committed credential in a comment** (prompt injection or plain mistake) | read-only tools, untrusted sections escaped, comments only on the same PR; Task 15 masks secret-like values in tool output, repo instructions and posted comments (the PR diff stays raw) | Low (pattern-based: a secret in an unknown format can still pass) |
 | Proxy/CA env passed to git | fixed allowlist, no `GIT_*` trace vars | Low |
 | Webhooks blocked upstream (seen: Cloudflare 403) | — | user adds a WAF skip rule for `/webhooks/*`; Adus never sees these requests |
 
@@ -105,7 +105,7 @@ Defaults change in the new migration 0009 (0003 is already on `origin/feat/adus-
 |---|---|---|---|
 | — | Deadline-aware wrap-up (time or last 2 steps) + one step-budget note; 30-min Specialists budget; worker chain 31/35/35 | 13 | implementing |
 | 1 | Per-review input-token ceiling: setting `max_review_input_tokens` (default 2,000,000, 0 = off); when crossed, Finder agents wrap up and remaining Verifier candidates are dropped with a note | 14 | done |
-| 2 | Secret redaction: mask API keys, tokens, private keys, `password=`-style values in tool outputs and repo instructions before the LLM, and in posted comment bodies; PR diffs are not masked so a hardcoded secret can still be flagged | 15 | planned |
+| 2 | Secret redaction: mask API keys, tokens, private keys, `password=`-style values in tool outputs and repo instructions before the LLM, and in posted comment bodies; PR diffs are not masked so a hardcoded secret can still be flagged | 15 | done |
 | 3 | Record `cache_read_tokens` / `cache_write_tokens` in `llm_usage` and show them in usage totals | 14 | done |
 | 4 | Skip a review whose PR head changed while queued (check whether already done) | — | not chosen yet |
 | 5 | Log every webhook Adus rejects or ignores (event, reason, never the body) | — | not chosen yet |

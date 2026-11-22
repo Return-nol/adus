@@ -2,6 +2,7 @@
 //! `reviews`. The Finder stage lives in `finder.rs`; this file keeps the review-row lifecycle,
 //! the clone and its fallback, the stage sequencing and the deadlines, and posting.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,7 @@ use crate::prompt::{
     DiffBatch, MARKER, MAX_BATCH_CHARS, batch_targets, build_manifest, format_inline,
     format_summary,
 };
+use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
 use crate::small_pr::is_small_pr;
 use crate::tools::{ToolCache, Toolbox};
@@ -101,6 +103,10 @@ struct Target {
 struct ReviewOutput {
     counts: BTreeMap<Severity, usize>,
     comments: Vec<InlineComment>,
+    /// Tool results that had a secret masked.
+    redacted_tool_outputs: u64,
+    /// Inline comments that had a secret masked or their suggestion dropped.
+    redacted_comments: usize,
 }
 
 pub fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
@@ -449,6 +455,12 @@ impl Engine {
             };
 
             let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
+            let (summary, summary_redacted) = redact_owned(summary);
+            tracing::debug!(
+                redacted_tool_outputs = output.redacted_tool_outputs,
+                redacted_comments = output.redacted_comments + usize::from(summary_redacted),
+                "secret redaction"
+            );
             let post = git.post_review(&repo_ref, &pr, &output.comments, &summary);
             match tokio::time::timeout_at(start + self.budget(mode), post).await {
                 Ok(Ok(posted)) => Ok(Outcome::Done { posted }),
@@ -653,6 +665,7 @@ impl Engine {
         for suggestion in &found {
             *counts.entry(suggestion.severity).or_default() += 1;
         }
+        let mut redacted_comments = 0;
         let comments = found
             .iter()
             .map(|s| {
@@ -660,16 +673,23 @@ impl Engine {
                     let patch = patches.get(&normalize_path(&s.file)).copied().flatten()?;
                     right_line_end_offset(patch, s.line)
                 });
+                let (body, redacted) = inline_body(s);
+                redacted_comments += usize::from(redacted);
                 InlineComment {
                     path: s.file.clone(),
                     start_line: s.start_line,
                     line: s.line,
                     end_offset,
-                    body: format_inline(s),
+                    body,
                 }
             })
             .collect();
-        Ok(ReviewOutput { counts, comments })
+        Ok(ReviewOutput {
+            counts,
+            comments,
+            redacted_tool_outputs: toolbox.as_ref().map_or(0, Toolbox::redacted_outputs),
+            redacted_comments,
+        })
     }
 
     /// Connection milik repo.
@@ -738,6 +758,34 @@ impl Engine {
             conn.name
         ))
     }
+}
+
+/// The posted body of one finding with secrets masked. A suggestion that holds a secret, or a
+/// value already masked as [`REDACTED`], is dropped (the comment keeps its span), so "Apply
+/// suggestion" never writes `[REDACTED]` into code. The flag: something was masked or dropped.
+fn inline_body(s: &Suggestion) -> (String, bool) {
+    let leaks = s
+        .suggestion
+        .as_deref()
+        .is_some_and(|code| contains_secret(code) || code.contains(REDACTED));
+    let body = if leaks {
+        format_inline(&Suggestion {
+            suggestion: None,
+            ..s.clone()
+        })
+    } else {
+        format_inline(s)
+    };
+    let (body, masked) = redact_owned(body);
+    (body, masked || leaks)
+}
+
+/// `text` with secrets masked, and whether anything was.
+fn redact_owned(text: String) -> (String, bool) {
+    if let Cow::Owned(masked) = redact_secrets(&text) {
+        return (masked, true);
+    }
+    (text, false)
 }
 
 /// Cache tokens summed over the Finder agents that finished.

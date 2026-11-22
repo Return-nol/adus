@@ -5,6 +5,7 @@
 //! [`RepoWorkspace`] validation, walks skip `.git` and secret files, and every result is capped.
 //! Failures are returned to the model as `Error: ...` text so it can adjust its next call.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -21,6 +22,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::redact::redact_secrets;
 use crate::workspace::{PathError, RepoPath, RepoWorkspace, is_secret_path};
 
 /// Files larger than this are never read.
@@ -35,9 +37,9 @@ const GREP_CONTEXT_LINES: usize = 2;
 const GREP_MAX_FILES: usize = 20_000;
 /// Longest line `grep` prints; longer lines (minified code) are cut.
 const GREP_MAX_LINE_CHARS: usize = 500;
-const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const LIST_MAX_ENTRIES: usize = 150;
 const LIST_MAX_CHARS: usize = 4_000;
+pub(crate) const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 /// Room kept for the trailing truncation notes under a character cap.
 const NOTE_RESERVE_CHARS: usize = 300;
 const LINE_TRUNCATED: &str = " [line truncated]";
@@ -202,6 +204,8 @@ enum CacheKey {
 pub struct ToolCache {
     entries: RwLock<HashMap<CacheKey, String>>,
     hits: AtomicU64,
+    /// Fresh results that had a secret masked (cache hits are not counted again).
+    redacted: AtomicU64,
 }
 
 impl ToolCache {
@@ -212,6 +216,11 @@ impl ToolCache {
     /// How many calls were answered from the cache.
     pub fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
+    }
+
+    /// How many fresh tool results had a secret masked.
+    pub fn redacted(&self) -> u64 {
+        self.redacted.load(Ordering::Relaxed)
     }
 
     fn get(&self, key: &CacheKey) -> Option<String> {
@@ -346,6 +355,11 @@ impl Toolbox {
         }
     }
 
+    /// How many fresh tool results of this review had a secret masked.
+    pub fn redacted_outputs(&self) -> u64 {
+        self.cache.redacted()
+    }
+
     /// Definitions of `read_file`, `grep`, `list_dir` and `find_files`, in that order.
     pub fn read_only_tool_defs(&self) -> &[ToolDef] {
         &self.read_only_defs
@@ -378,6 +392,9 @@ impl Toolbox {
 
     /// Lines `center_line ± radius` of `path` in the `read_file` format, or `None` on any
     /// failure (bad path, secret, binary, too large, line out of range). Blocking.
+    ///
+    /// The text is raw: never redacted and never cached, so the Verifier sees a hardcoded
+    /// secret the finding is about.
     pub fn read_file_snippet_sync(
         &self,
         path: &str,
@@ -389,8 +406,12 @@ impl Toolbox {
             start_line: Some(center_line.saturating_sub(radius).max(1)),
             end_line: Some(center_line.saturating_add(radius)),
         };
-        let call = ReadOnlyCall::ReadFile(args);
-        run_cached(&self.workspace, &self.cache, &call, self.limits).ok()
+        let key = ReadOnlyCall::ReadFile(args)
+            .normalize(&self.workspace)
+            .ok()?;
+        run_uncached(&self.workspace, &key, self.limits)
+            .ok()
+            .map(|found| found.text)
     }
 
     /// [`Self::read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
@@ -415,6 +436,8 @@ impl Toolbox {
     }
 }
 
+/// Runs `call` through the cache. Fresh content is redacted before it is cached, so cached
+/// entries hold the redacted text.
 fn run_cached(
     ws: &RepoWorkspace,
     cache: &ToolCache,
@@ -425,7 +448,25 @@ fn run_cached(
     if let Some(hit) = cache.get(&key) {
         return Ok(hit);
     }
-    let found = match &key {
+    let mut found = run_uncached(ws, &key, limits)?;
+    if let Cow::Owned(redacted) = redact_secrets(&found.text) {
+        found.text = redacted;
+        cache.redacted.fetch_add(1, Ordering::Relaxed);
+    }
+    // A cut caused by load is not deterministic: a later identical call gets a fresh try.
+    if !found.time_cut {
+        cache.insert(key, found.text.clone());
+    }
+    Ok(found.text)
+}
+
+/// Runs one normalized call against the workspace: raw text, no cache.
+fn run_uncached(
+    ws: &RepoWorkspace,
+    key: &CacheKey,
+    limits: SearchLimits,
+) -> Result<ToolText, ToolError> {
+    let found = match key {
         CacheKey::ReadFile { path, start, end } => {
             ToolText::complete(read_file(ws, path, *start, *end)?)
         }
@@ -438,11 +479,7 @@ fn run_cached(
         CacheKey::ListDir { path } => ToolText::complete(list_dir(ws, path)?),
         CacheKey::FindFiles { pattern, path } => find_files(ws, pattern, path, limits)?,
     };
-    // A cut caused by load is not deterministic: a later identical call gets a fresh try.
-    if !found.time_cut {
-        cache.insert(key, found.text.clone());
-    }
-    Ok(found.text)
+    Ok(found)
 }
 
 /// The text of a read-only call, and whether the search time budget cut it short.
@@ -1748,6 +1785,65 @@ mod tests {
         ] {
             assert_eq!(tb.read_file_snippet_sync(path, line, 2), None, "{path}");
         }
+    }
+
+    /// Obviously fake credentials in the provider formats.
+    const FAKE_AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+    const FAKE_GITHUB_TOKEN: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[tokio::test]
+    async fn read_file_masks_a_committed_aws_key() {
+        let body = format!("const REGION = 1;\nconst KEY = \"{FAKE_AWS_KEY}\";\nfn f() {{}}\n");
+        let tb = toolbox(&[("src/config.ts", body.as_bytes())]);
+        let out = ok(&tb, "read_file", json!({"path": "src/config.ts"})).await;
+        assert_eq!(
+            out,
+            "[src/config.ts: lines 1-3 of 3]\n1: const REGION = 1;\n2: const KEY = \"[REDACTED]\";\n3: fn f() {}"
+        );
+        assert_eq!(tb.redacted_outputs(), 1);
+    }
+
+    #[tokio::test]
+    async fn grep_masks_a_github_token_in_matches() {
+        let body = format!("a\nlet token = \"{FAKE_GITHUB_TOKEN}\";\nb\n");
+        let tb = toolbox(&[("src/client.rs", body.as_bytes())]);
+        let out = ok(&tb, "grep", json!({"pattern": "token"})).await;
+        assert!(!out.contains(FAKE_GITHUB_TOKEN), "{out}");
+        assert!(out.contains("2> let token = \"[REDACTED]\";"), "{out}");
+        assert!(out.contains("1- a") && out.contains("3- b"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn cached_result_is_the_redacted_one() {
+        let body = format!("key = {FAKE_AWS_KEY}\n");
+        let tb = toolbox(&[("settings.py", body.as_bytes())]);
+        let first = ok(&tb, "read_file", json!({"path": "settings.py"})).await;
+        let entries: Vec<String> = tb.cache.entries.read().unwrap().values().cloned().collect();
+        assert_eq!(entries, vec![first.clone()]);
+        assert!(!entries[0].contains(FAKE_AWS_KEY), "{}", entries[0]);
+        let again = ok(&tb, "read_file", json!({"path": "./settings.py"})).await;
+        assert_eq!(again, first);
+        assert_eq!(tb.cache.hits(), 1);
+        // A cache hit is not counted again.
+        assert_eq!(tb.redacted_outputs(), 1);
+    }
+
+    #[tokio::test]
+    async fn verifier_snippet_stays_raw_and_bypasses_the_cache() {
+        let body = format!("key = {FAKE_AWS_KEY}\n");
+        let tb = toolbox(&[("settings.py", body.as_bytes())]);
+        ok(
+            &tb,
+            "read_file",
+            json!({"path": "settings.py", "end_line": 3}),
+        )
+        .await;
+        let snippet = tb.read_file_snippet("settings.py", 1, 2).await.unwrap();
+        assert_eq!(
+            snippet,
+            format!("[settings.py: lines 1-1 of 1]\n1: key = {FAKE_AWS_KEY}")
+        );
+        assert_eq!(tb.cache.hits(), 0);
     }
 
     fn assert_portable_schema(schema: &Value) {

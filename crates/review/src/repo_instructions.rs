@@ -1,9 +1,11 @@
 //! Loads repository instruction files (`AGENTS.md` and friends) from a review workspace.
 //!
-//! Returns the raw text only; the prompt code wraps it and neutralizes tags.
+//! Values that look like secrets are masked ([`redact_secrets`]); the prompt code wraps the
+//! text and neutralizes tags.
 
 use std::sync::Arc;
 
+use crate::redact::redact_secrets;
 use crate::tools::read_text;
 use crate::workspace::RepoWorkspace;
 
@@ -39,6 +41,8 @@ fn load_sync(ws: &RepoWorkspace) -> Option<String> {
             continue;
         };
         let text = text.replace("\r\n", "\n");
+        // Each whole file is redacted before the cap, so a cut never leaves part of a secret.
+        let text = redact_secrets(&text);
         let text = text.trim();
         if text.is_empty() {
             continue;
@@ -139,5 +143,23 @@ mod tests {
         assert!(text.starts_with("--- AGENTS.md ---\n\u{e9}\u{e9}"));
         assert!(text.ends_with("\n[truncated]"));
         assert!(!text.contains("CLAUDE.md"));
+    }
+
+    #[tokio::test]
+    async fn repo_instructions_are_redacted() {
+        let ws = workspace(&[
+            (
+                "AGENTS.md",
+                b"Deploy with:\nexport DEPLOY_API_KEY=abcdefgh12345\nThe CI token is ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.\n",
+            ),
+            ("CLAUDE.md", b"Use tracing."),
+        ]);
+        assert_eq!(
+            load_repo_instructions(ws).await.as_deref(),
+            Some(
+                "--- AGENTS.md ---\nDeploy with:\nexport DEPLOY_API_KEY=[REDACTED]\n\
+                 The CI token is [REDACTED].\n\n--- CLAUDE.md ---\nUse tracing."
+            )
+        );
     }
 }

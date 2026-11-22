@@ -2286,3 +2286,175 @@ async fn budget_reached_adds_summary_warning(pool: PgPool) {
     );
     assert!(summary.contains(&budget_warning(1, 1)), "{summary}");
 }
+
+/// Obviously fake credentials in the provider formats.
+const FAKE_AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+const FAKE_GITHUB_TOKEN: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn posted_comment_body_is_redacted(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_2)]),
+    )
+    .await;
+    let findings = json!([{
+        "file": "src/a.rs", "line": 2, "severity": "critical",
+        "title": format!("Hardcoded key {FAKE_AWS_KEY}"),
+        "body": format!("The token `{FAKE_GITHUB_TOKEN}` is committed; load it from the environment."),
+    }]);
+    s.chat.push(Ok(&findings.to_string()));
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let git = s.git.state();
+    let posted = &git.reviews[0].comments;
+    assert_eq!(posted.len(), 1);
+    let body = &posted[0].body;
+    assert!(body.starts_with(ADUDU_MARKER), "{body}");
+    assert!(
+        !body.contains(FAKE_AWS_KEY) && !body.contains(FAKE_GITHUB_TOKEN),
+        "{body}"
+    );
+    assert!(body.contains("Hardcoded key [REDACTED]"), "{body}");
+    assert!(
+        body.contains("The token `[REDACTED]` is committed"),
+        "{body}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn suggestion_containing_a_secret_is_dropped(pool: PgPool) {
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_234)]),
+    )
+    .await;
+    let findings = json!([
+        {
+            "file": "src/a.rs", "start_line": 2, "line": 3, "severity": "critical",
+            "title": "Leaked key", "body": "move it to the environment",
+            "suggestion": format!("let key = \"{FAKE_AWS_KEY}\";\nlet c = 1;"),
+        },
+        {
+            "file": "src/a.rs", "line": 4, "severity": "info",
+            "title": "Clean", "body": "plain fix",
+            "suggestion": "let d = 2;",
+        },
+    ]);
+    s.chat.push(Ok(&findings.to_string()));
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1]}"#));
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let git = s.git.state();
+    let posted = &git.reviews[0].comments;
+    assert_eq!(posted.len(), 2);
+    // The comment keeps its span; only the suggestion block goes.
+    assert_eq!(posted[0].start_line, Some(2));
+    assert_eq!(posted[0].line, 3);
+    assert!(posted[0].body.contains("move it to the environment"));
+    assert!(
+        !posted[0].body.contains("```suggestion"),
+        "{}",
+        posted[0].body
+    );
+    assert!(!posted[0].body.contains(FAKE_AWS_KEY), "{}", posted[0].body);
+    assert!(!posted[0].body.contains("[REDACTED]"), "{}", posted[0].body);
+    assert!(
+        posted[1].body.ends_with("```suggestion\nlet d = 2;\n```"),
+        "{}",
+        posted[1].body
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn summary_body_is_redacted(pool: PgPool) {
+    let secret_path = format!("keys/{FAKE_AWS_KEY}.bin");
+    let mut binary = file(&secret_path, "");
+    binary.patch = None;
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![binary, file("ok.rs", PATCH_2)]),
+    )
+    .await;
+    set_ignore(&pool, Some(&[]), &[]).await;
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let summary = s.git.state().reviews[0].summary.clone();
+    assert!(summary.starts_with(ADUDU_MARKER), "{summary}");
+    assert!(!summary.contains(FAKE_AWS_KEY), "{summary}");
+    assert!(
+        summary.contains("`keys/[REDACTED].bin`: no diff available"),
+        "{summary}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn finder_still_sees_the_raw_diff(pool: PgPool) {
+    let patch = format!("@@ -1,1 +1,2 @@\n a\n+let key = \"{FAKE_AWS_KEY}\";\n");
+    let s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", &patch)]),
+    )
+    .await;
+    s.git.state().clone_spec = Some(clone_spec());
+    let content = format!("a\nlet key = \"{FAKE_AWS_KEY}\";\n");
+    s.cloner.files(&[("src/a.rs", content.as_str())]);
+    s.chat.push_stage(
+        Stage::Finder,
+        Reply::tool("read_file", json!({"path": "src/a.rs"})),
+    );
+    s.chat.push_stage(
+        Stage::Finder,
+        Reply::submit(json!([finding_json(
+            "src/a.rs",
+            2,
+            "critical",
+            "Hardcoded key"
+        )])),
+    );
+
+    run(&s, Trigger::Command).await.unwrap();
+
+    let finder = s.chat.finder_calls();
+    assert!(
+        finder[0].user.contains(FAKE_AWS_KEY),
+        "the diff is not redacted"
+    );
+    assert!(
+        finder[0]
+            .system
+            .contains("`[REDACTED]` in tool output marks a value Adus masked"),
+        "{}",
+        finder[0].system
+    );
+    // Tool output is masked.
+    let last = finder.last().unwrap();
+    assert!(
+        last.tool_results
+            .iter()
+            .any(|r| r.contains("2: let key = \"[REDACTED]\";")),
+        "{:?}",
+        last.tool_results
+    );
+    assert!(last.tool_results.iter().all(|r| !r.contains(FAKE_AWS_KEY)));
+    // The Verifier sees the raw diff and the raw snippet around the finding.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 1);
+    assert!(
+        verifier[0]
+            .user
+            .contains(&format!("2: let key = \"{FAKE_AWS_KEY}\";"))
+    );
+    assert!(
+        verifier[0]
+            .system
+            .contains("`[REDACTED]` in tool output marks a value Adus masked")
+    );
+    // The posted comment never carries the key.
+    let git = s.git.state();
+    assert!(!git.reviews[0].comments[0].body.contains(FAKE_AWS_KEY));
+}
