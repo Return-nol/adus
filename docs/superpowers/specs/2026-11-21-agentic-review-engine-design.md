@@ -367,7 +367,7 @@ Limits & Safety:
 ### 4.6 ReAct Agent Loop & Context Compaction (`crates/review/src/agent.rs`)
 
 #### Typed Engine Loop
-- `AgentConfig`: `max_steps: usize` (Finder: `20`, Verifier: `6`), `compaction_char_limit: usize` (`160_000`), `max_output_tokens: u32` (`8_192`), `max_concurrent_tools: usize` (`4`), `wrap_up_steps: usize` (default `1`, Finder `2`), `deadline: Option<tokio::time::Instant>` (default `None`; the Finder sets its stage deadline, the tool-enabled Verifier its own), `token_budget: Option<Arc<TokenBudget>>` (default `None`; the engine passes the run's shared budget, decision 15, and the agent adds each successful response's `input_tokens` to it).
+- `AgentConfig`: `max_steps: usize` (Finder: `20`, Verifier: `6`), `compaction_char_limit: usize` (`160_000`), `max_concurrent_tools: usize` (`4`) (with constant `MAX_OUTPUT_TOKENS: u32 = 8_192`), `wrap_up_steps: usize` (default `1`, Finder `2`), `deadline: Option<tokio::time::Instant>` (default `None`; the Finder sets its stage deadline, the tool-enabled Verifier its own), `token_budget: Option<Arc<TokenBudget>>` (default `None`; the engine passes the run's shared budget, decision 15, and the agent adds each successful response's `input_tokens` to it).
 - `AgentOutcome<T>`: `{ result: T, steps_used: usize, cache_read_tokens: u32, cache_write_tokens: u32, cut_short: bool }` (cache tokens summed over every turn, for the completion log).
 - `AgentError`: `ToolsUnsupported(String)`, `Chat(ChatError)`, `Unparseable(String)`.
 
@@ -417,7 +417,7 @@ In **self-contained diff-only fallback mode**, `<ReviewInstructions>` omits tool
 ### 4.8 Verifier & Semantic Deduplication (`crates/review/src/verifier.rs`, `crates/review/src/dedup.rs`)
 
 #### Step 1: Deterministic Filter (`parse.rs`)
-- Add `keep_valid_batch(suggestions: Vec<Suggestion>, allowed_by_file: &HashMap<String, CommentableRange>) -> Vec<Suggestion>`. `CommentableRange { lines: BTreeSet<u32>, hunks: Vec<RangeInclusive<u32>> }` is built from the patch (`commentable_lines`, `commentable_hunks`); in incremental reviews both are the intersection of the commit diff and the PR diff (`intersect_hunks`).
+- Add `keep_valid_batch(suggestions: Vec<Suggestion>, allowed_by_file: &HashMap<String, &CommentableRange>) -> Vec<Suggestion>`. `CommentableRange { lines: BTreeSet<u32>, hunks: Vec<RangeInclusive<u32>> }` is built from the patch (`commentable_lines`, `commentable_hunks`); in incremental reviews both are the intersection of the commit diff and the PR diff (`intersect_hunks`).
   - Normalizes `s.file` (`normalize_path`) and keeps only findings whose file is in the batch and whose `s.line` is in `lines`.
   - Keeps `s.start_line` only when `0 < start_line < line` and both lie in one hunk of `hunks` (`same_hunk`). When a supplied `start_line` is dropped, the finding is kept single-line and its `suggestion` is removed, because a multi-line replacement anchored to one line duplicates code on "Apply suggestion" (§4.12).
   - Deduplicates exact `(file, line, title)` tuples; when two duplicates differ only in range, the one with a valid `start_line` wins.

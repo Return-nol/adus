@@ -221,7 +221,7 @@
 
 **Interfaces:**
 - In `crates/review/src/tools.rs`:
-  - `Toolbox`: holds `workspace: Arc<RepoWorkspace>`, `cache: Arc<ToolCache>`, `read_only_defs: Vec<ToolDef>` (cached once).
+  - `Toolbox`: holds `workspace: Arc<RepoWorkspace>`, `cache: Arc<ToolCache>`, `limits: SearchLimits` (`Toolbox::new(workspace: Arc<RepoWorkspace>)` creates its own `Arc<ToolCache>`, and `read_only_tool_defs()` returns `&READ_ONLY_DEFS` from a `LazyLock`).
   - `ToolCache`: thread-safe `std::sync::RwLock<HashMap<CacheKey, String>>` shared across all specialists and verifiers of a single review.
   - Typed input structs (`#[derive(Deserialize)]`):
     - `ReadFileArgs { path: String, start_line: Option<u32>, end_line: Option<u32> }`
@@ -230,9 +230,9 @@
     - `FindFilesArgs { pattern: String, path: Option<String> }`
   - `ToolOutput { pub content: String, pub is_error: bool }`
   - `impl Toolbox`:
-    - `pub fn read_only_tool_defs(&self) -> &[ToolDef]`
-    - `pub async fn execute_read_only(&self, name: &str, args: &serde_json::Value) -> ToolOutput`
-    - `pub fn read_file_snippet_sync(&self, path: &str, center_line: u32, radius: u32) -> Option<String>` (used by Verifier to build initial evidence bundle!).
+    - `pub(crate) fn read_only_tool_defs(&self) -> &[ToolDef]`
+    - `pub(crate) async fn execute_read_only(&self, name: &str, args: &serde_json::Value) -> ToolOutput`
+    - `pub(crate) async fn read_file_snippet(&self, path: &str, center_line: u32, radius: u32) -> Option<String>` (backed by `read_file_snippet_sync(&RepoWorkspace, ...)`, used by Verifier to build initial evidence bundle!).
 - In `crates/review/src/repo_instructions.rs`:
   - `pub async fn load_repo_instructions(workspace: Arc<RepoWorkspace>) -> Option<String>` (runs in `spawn_blocking`, reads `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and lexicographically sorted `.cursor/rules/*.mdc` via `workspace.resolve_existing_file`, skips missing/binary, formats each with `--- <path> ---`, caps total at `8_000` chars).
 
@@ -268,8 +268,8 @@
 - `AgentConfig`:
   - `pub max_steps: usize`
   - `pub compaction_char_limit: usize` (default `160_000`)
-  - `pub max_output_tokens: u32` (default `8_192`)
   - `pub max_concurrent_tools: usize` (default `4`)
+  - (with module constant `const MAX_OUTPUT_TOKENS: u32 = 8_192`)
 - `AgentOutcome<T>`:
   - `pub result: T`
   - `pub steps_used: usize`
@@ -317,25 +317,25 @@
 
 **Interfaces:**
 - In `crates/review/src/specialists.rs`:
-  - `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub enum SpecialistKind { Generalist, Bug, Security, Performance, Rules }`
-  - `impl SpecialistKind`: `label(&self) -> &'static str`, `role_block(&self) -> &'static str`, `excludes_pure_style(&self) -> bool`.
-  - `pub fn active_specialists(mode: ReviewMode, batch_has_rules: bool) -> Vec<SpecialistKind>`:
+  - `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)] pub(crate) enum SpecialistKind { Generalist, Bug, Security, Performance, Rules }`
+  - `impl SpecialistKind`: `label(&self) -> &'static str`, `role_block(&self) -> &'static str`.
+  - `pub(crate) fn active_specialists(mode: ReviewMode, batch_has_rules: bool) -> Vec<SpecialistKind>`:
     - `Generalist` → `[Generalist]`
     - `Specialists` → `[Bug, Security, Performance]` + `Rules` if `batch_has_rules`
 - In `crates/review/src/prompt.rs`:
   - `MAX_BATCH_CHARS: usize = 40_000`.
-  - `ManifestEntry { path: String, old_path: Option<String>, status: FileStatus, added: usize, removed: usize, note: Option<&'static str> }`
+  - `ManifestFile { path: String, old_path: Option<String>, status: FileStatus, added: usize, removed: usize }` (constructed via `ManifestFile::from_diff(&FileDiff)`).
   - `DiffBatch<'a> { files: Vec<&'a FileDiff>, rules: Vec<&'a Rule> }`
-  - `pub fn build_manifest(all_files: &[FileDiff], ignored_paths: &HashSet<&str>, skipped_reasons: &HashMap<&str, &'static str>) -> String`
-  - `pub fn batch_targets<'a>(targets: &'a [FileDiff], rules: &'a [Rule], max_chars: usize) -> Vec<DiffBatch<'a>>` (sorts by directory prefix / path, packs contiguous batches up to `max_chars`; single large file goes in solo batch).
-  - `pub fn build_finder_system_prompt(kind: SpecialistKind, with_tools: bool) -> String` (static shared `<ReviewInstructions>` FIRST for prefix caching, `<Role>` at end!).
-  - `pub fn build_finder_user_prompt(pr: &PullRequest, manifest: &str, batch: &DiffBatch<'_>, memories: &[Memory], repo_instructions: Option<&str>, with_tools: bool) -> String` (neutralizes closing tags on every untrusted block: `pr_title`, `pr_description`, `pr_manifest`, `rules`, `memories`, `repository_instructions`, `diffs`).
+  - `pub(crate) fn build_manifest(files: &[ManifestFile], ignored_paths: &HashSet<&str>, skipped_reasons: &HashMap<&str, &'static str>) -> String`
+  - `pub(crate) fn batch_targets<'a>(targets: &'a [FileDiff], rules: &'a [Rule], max_chars: usize) -> Vec<DiffBatch<'a>>` (sorts by directory prefix / path, packs contiguous batches up to `max_chars`; single large file goes in solo batch).
+  - `pub(crate) fn build_finder_system_prompt(kind: SpecialistKind, with_tools: bool) -> String` (static shared `<ReviewInstructions>` FIRST for prefix caching, `<Role>` at end!).
+  - `pub(crate) fn build_finder_user_prompt(pr: &PullRequest, manifest: &str, batch: &DiffBatch<'_>, memories: &[Memory], repo_instructions: Option<&str>, with_tools: bool) -> String` (neutralizes closing tags on every untrusted block: `pr_title`, `pr_description`, `pr_manifest`, `rules`, `memories`, `repository_instructions`, `diffs`).
   - Keep `build_prompt` (or alias/retain unit compatibility if tests use it, or update `prompt.rs` tests cleanly).
   - Update `format_summary(counts: &BTreeMap<Severity, usize>, skipped: &[(String, &'static str)], ignored: usize, warnings: &[String]) -> String` to render `**Notes**\n- ...` when `!warnings.is_empty()`.
 - In `crates/review/src/parse.rs`:
-  - `pub fn submit_findings_tool_def() -> ToolDef` (JSON schema for `{"findings": [...]}`).
-  - `pub fn parse_submit_findings(args: &serde_json::Value) -> Result<Vec<Suggestion>, String>` (reads `"findings"` array, parses per-element leniently like `parse_suggestions`).
-  - `pub fn keep_valid_batch(suggestions: Vec<Suggestion>, allowed_by_file: &HashMap<String, BTreeSet<u32>>) -> Vec<Suggestion>` (filters to files in `allowed_by_file` and lines in that file's `BTreeSet<u32>`, normalizes paths, deduplicates exact `(file, line, title)`). Superseded by Task 12: the map value is now a `CommentableRange` (lines + hunks) so `start_line` can be validated.
+  - `pub(crate) fn submit_findings_tool_def() -> ToolDef` (JSON schema for `{"findings": [...]}`).
+  - `pub(crate) fn parse_submit_findings(args: &serde_json::Value) -> Result<Vec<Suggestion>, String>` (reads `"findings"` array, parses per-element leniently like `parse_suggestions`).
+  - `pub(crate) fn keep_valid_batch(suggestions: Vec<Suggestion>, allowed_by_file: &HashMap<String, &CommentableRange>) -> Vec<Suggestion>` (filters to files in `allowed_by_file` and lines in that file's `CommentableRange`, normalizes paths, validates same-hunk `start_line`, deduplicates exact `(file, line, title)`).
 
 **Edge Cases & Pitfalls:**
 - **Prefix-cache ordering:** Every specialist (`Bug`, `Security`, `Performance`, `Rules`, `Generalist`) must share **byte-identical** prefixes up through `</ReviewInstructions>` (and `</Workflow>`/`</Scope>`/`</UntrustedInput>`), with only `<Role>` differing at the end of the system prompt! Add a unit test asserting identical leading prefix bytes across all 4 specialists.
@@ -370,26 +370,25 @@
 
 **Interfaces:**
 - In `crates/review/src/verifier.rs`:
-  - `pub const VERIFY_CONCURRENCY: usize = 4;`
-  - `pub const VERIFY_MAX_STEPS: usize = 6;`
-  - `pub const MAX_VERIFY_CANDIDATES: usize = 25;`
+  - `const VERIFY_CONCURRENCY: usize = 4;`
+  - `const VERIFY_MAX_STEPS: usize = 6;`
+  - `const MAX_VERIFY_CANDIDATES: usize = 25;`
   - `CandidateFinding { pub suggestion: Suggestion, pub specialist: SpecialistKind }`
   - `VerificationReport { pub kept: Vec<CandidateFinding>, pub dropped_refuted: usize, pub dropped_unverified: usize, pub truncated_by_cap: usize, pub all_retryable_error: Option<ChatError> }`
-  - `pub async fn verify_candidates(ctx: VerifyContext<'_>, candidates: Vec<CandidateFinding>, targets: &[FileDiff], rules: &[Rule], memories: &[Memory], repo_instructions: Option<&str>, toolbox: Option<&Toolbox>, deadline: tokio::time::Instant) -> VerificationReport`:
+  - `pub(crate) async fn verify_candidates(ctx: VerifyContext<'_>, input: VerifyInput<'_>) -> VerificationReport`:
     - Each candidate's verification runs under `tokio::time::timeout_at(deadline, ...)`; a candidate cut by the deadline is dropped as unverified and is **not** a retryable failure (spec 4.11).
     - `ctx.model` is the provider's `effective_fast_model()`; every verifier call uses `ReasoningEffort::Low` (`AgentLlm.effort` / `.with_effort`). A `ToolsUnsupported` from the fast model switches the remaining candidates to the diff-only path.
     - When `toolbox.is_some()`, runs per-finding `run_react_loop` (`VERIFY_MAX_STEPS = 6`) with `submit_verdict` tool (`{ keep: bool, rationale: String }`) + read-only tools.
-    - When `toolbox.is_none()` (diff-only fallback), runs 1 single-turn `ChatRequest::text` per candidate against the annotated file diff + rules + memories, parsing `{"keep": bool, "rationale": ...}` from JSON.
+    - When `toolbox.is_none()` (diff-only fallback), runs 1 single-turn `chat_low_effort` call per candidate against the annotated file diff + rules + memories, parsing `{"keep": bool, "rationale": ...}` from JSON.
 - In `crates/review/src/dedup.rs`:
-  - `pub struct DedupResult { pub kept: Vec<Suggestion>, pub dropped_duplicates: usize }`
-  - `pub async fn deduplicate_findings(chat: &dyn ChatService, provider_id: Uuid, model: &str, usage_ctx: &UsageContext, findings: Vec<CandidateFinding>) -> DedupResult`:
+  - `pub(crate) async fn deduplicate_findings(chat: &dyn ChatService, provider_id: Uuid, model: &str, usage_ctx: &UsageContext, token_budget: Option<&TokenBudget>, findings: Vec<CandidateFinding>) -> Vec<Suggestion>` (no `DedupResult` wrapper; `Engine` computes `dedup_dropped = verified_kept.saturating_sub(found.len())`):
     - `model` is the provider's `effective_fast_model()`; the call uses `ReasoningEffort::Low`.
     - When `findings.len() < 2`, returns unchanged immediately (0 LLM calls).
-    - Otherwise makes 1 `ChatRequest::text` call asking for `{"keep_indices": [0, ...]}`, validates bounds (`< findings.len()`), deduplicates indices while preserving ascending order, rejects empty `keep_indices` (falling back safely to all findings), and on any `ChatError`/parse failure logs a warning and returns all `findings` unchanged.
+    - Otherwise makes 1 `chat_low_effort` call asking for `{"keep_indices": [0, ...]}`, validates bounds (`< findings.len()`), deduplicates indices while preserving ascending order, rejects empty `keep_indices` (falling back safely to all findings), and on any `ChatError`/parse failure logs a warning and returns all `findings` unchanged.
 
 **Edge Cases & Pitfalls:**
 - **Severity prioritization before cap:** Sort stable descending by `Severity` (`Critical > Warning > Info`) before truncating at `MAX_VERIFY_CANDIDATES = 25`, recording `truncated_by_cap` so lower-priority info findings never crowd out criticals.
-- **Evidence bundle per candidate:** Include the candidate JSON, the file's annotated patch hunk, plus (when `toolbox.is_some()`) an expanded ±40-line snippet around `candidate.suggestion.line` from `toolbox.read_file_snippet_sync(...)` so the Verifier often doesn't even need a tool call for local checks, while still having `read_file`/`grep` to verify callers & guards!
+- **Evidence bundle per candidate:** Include the candidate JSON, the file's annotated patch hunk, plus (when `toolbox.is_some()`) an expanded ±40-line snippet around `candidate.suggestion.line` from `toolbox.read_file_snippet(...)` so the Verifier often doesn't even need a tool call for local checks, while still having `read_file`/`grep` to verify callers & guards!
 - **Rules / repo instructions awareness in Verifier:** Pass matching rules for that file and `repo_instructions`; tell the Verifier that if `specialist == SpecialistKind::Rules` (or a finding explicitly cites a team rule or repo instruction), do NOT drop it under the "pure style/formatting" exclusion—verify instead whether the rule applies to the file and whether the changed line breaks it.
 - **Fail-closed semantics + retryable edge case (Review Focus #5):**
   - Individual candidate failure (`Invalid`, `Unparseable`, `ContextOverflow`, or `ToolsUnsupported`) drops that candidate and increments `dropped_unverified`.
@@ -437,7 +436,7 @@
 - **Clone attempt & fallback orchestration (Review Focus #4):**
   - Only clone when `git.clone_spec(&repo_ref, &pr)` returns `Some(spec)` AND `targets` is non-empty.
   - If `cloner.clone_pr(&spec).await` returns:
-    - `Ok(ws)` → load `repo_instructions` + construct `Toolbox` with `Arc::new(ws)` and shared `Arc::new(ToolCache::default())`.
+    - `Ok(ws)` → load `repo_instructions` + construct `Toolbox::new(Arc::new(ws))` (with its own shared `Arc<ToolCache>`).
     - `Err(WorkspaceError::Unauthorized)` → mark connection `invalid` via `self.unauthorized(&conn).await` and return `Err(EngineError::Fatal(...))`.
     - `Err(WorkspaceError::TimedOut | TooLarge | Unavailable(_))` → log warning, push `"Codebase context unavailable — reviewed diff only"` to `warnings`, and proceed in diff-only fallback (`toolbox = None`).
 - **Finder execution & `ToolsUnsupported` mid-run fallback (Review Focus #4 & #6):**
@@ -461,7 +460,7 @@
   - Update `FakeChat` in `crates/review/tests/common/mod.rs` (its `ChatCall` already records `effort`; `setup` creates the provider with `primary_model` `gpt-test` and `fast_model` `gpt-fast`) to inspect/respond to multi-turn `ChatRequest` (`messages`, `tools`); assert Finder calls use `gpt-test` and Verifier/Dedup calls use `gpt-fast` + `Low` and keep helper methods so existing engine tests (adapted for Finder → Verifier → Dedup flow) stay readable.
   - Add `FakeCloner` over a `TempDir` repo fixture.
   - New tests in `crates/review/tests/engine.rs`:
-    - `agentic_generalist_uses_tools_verifies_and_dedups` (Finder reads helper file, emits 2 findings; Verifier refutes 1 and keeps 1; 1 comment posted).
+    - `agentic_generalist_uses_tools_and_verifies` (Finder reads helper file, emits 2 findings; Verifier refutes 1 and keeps 1; 1 comment posted).
     - `specialists_mode_runs_bug_security_performance_and_rules_and_dedups` (Bug & Security both flag same flaw → Verifier keeps both → Dedup merges to 1).
     - `partial_specialist_failure_publishes_surviving_with_warning`.
     - `clone_failure_falls_back_to_diff_only_with_summary_note`.
@@ -483,7 +482,7 @@
 
 **Files:**
 - Modify: `crates/server/src/api/settings.rs`, `crates/server/src/api/repositories.rs`
-- Test: `crates/server/tests/settings_ignore.rs` (or new `crates/server/tests/review_mode.rs`), `crates/server/tests/connections.rs`
+- Test: `crates/server/tests/settings.rs` (originally `settings_ignore.rs` and `review_mode.rs`, later consolidated into `settings.rs`), `crates/server/tests/connections.rs`
 
 **Interfaces:**
 - `GET /api/v1/settings` & `PUT /api/v1/settings`:
@@ -499,13 +498,13 @@
 - **No model fields:** `settings.default_model` and `repositories.review_model` no longer exist (models live on AI providers); test bodies must not send them. Repository PATCH already validates `review_provider_id` (404 for an unknown provider).
 - **Null clearing on repository PATCH:** Sending `{"review_mode": null}` resets repo override back to `None` (inherit global default), while omitting `review_mode` leaves it unchanged.
 
-- [ ] **Step 1: Write failing tests** (`crates/server/tests/review_mode.rs`):
+- [ ] **Step 1: Write failing tests** (originally `crates/server/tests/review_mode.rs`, later consolidated into `crates/server/tests/settings.rs`):
   - `get_settings_defaults_to_generalist_and_put_updates_it`
   - `put_settings_omitting_review_mode_keeps_existing_value`
   - `patch_repo_sets_and_clears_review_mode_override`
   - `invalid_review_mode_returns_422`
   - `user_role_cannot_change_review_mode_403`
-- [ ] **Step 2:** Run `cargo test -j 2 -p adus-server --test review_mode --test settings_ignore --test connections` → FAIL.
+- [ ] **Step 2:** Run `cargo test -j 2 -p adus-server --test settings --test connections` → FAIL.
 - [ ] **Step 3:** Implement `crates/server/src/api/settings.rs` and `crates/server/src/api/repositories.rs`.
 - [ ] **Step 4:** Run `cargo test -j 2 -p adus-server` → PASS.
 - [ ] **Step 5:** Commit `feat(server): expose review_mode in settings and repositories APIs`
@@ -615,7 +614,7 @@ Added 2026-11-22 (user decision). The first implementation was written by the us
 
 - [x] **Step 1–4:** Implemented by the user; `cargo fmt --check`, `clippy -D warnings` clean; `adus-git` + `adus-review` tests pass.
 - [x] **Step 5:** Apply the review fixes above in the fix wave; full verification (I1, I2, I4, M1–M3, M5, M6 done; M4 stays in the backlog).
-- [ ] **Step 6:** Commit `feat(review): anchor multi-line suggestions with start_line`
+- [x] **Step 6:** Commit `feat(review): anchor multi-line suggestions with start_line`
 
 ---
 
@@ -678,7 +677,7 @@ Added 2026-11-22 (user decisions, see `docs/superpowers/agentic-engine-risk-and-
   - `ALTER TABLE llm_usage ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0, ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0`. `input_tokens` keeps meaning "total input, cached included".
 - **`crates/db`:** `Settings` / its update struct gain `max_review_input_tokens: i32`. `NewUsage` gains `cache_read_tokens: i32` and `cache_write_tokens: i32`. `DailyUsage` and the breakdown rows gain `cache_read_tokens: i64` and `cache_write_tokens: i64` (`SUM`, zero-filled like the other columns). Update every Rust default and test literal that still says 50 / 2000 / 50 for these settings.
 - **`crates/llm/src/router.rs`:** writes `response.cache_read_tokens` / `cache_write_tokens` into the usage row on success (0 on failure).
-- **`crates/review/src/budget.rs`:** `pub struct TokenBudget` with `new(limit: u64)` (0 = unlimited), `add(&self, input_tokens: u32)`, `used(&self) -> u64`, `limit(&self) -> u64`, `exhausted(&self) -> bool` (`limit > 0 && used >= limit`). Backed by an `AtomicU64` (`Relaxed` is enough: it is a soft cap); shared as `Arc<TokenBudget>`, one per review run.
+- **`crates/review/src/budget.rs`:** `pub(crate) struct TokenBudget` with `new(limit: u64)` (0 = unlimited), `add(&self, input_tokens: u32)`, `used(&self) -> u64`, `exhausted(&self) -> bool` (`limit > 0 && used >= limit`). Backed by an `AtomicU64` (`Relaxed` is enough: it is a soft cap); shared as `Arc<TokenBudget>`, one per review run.
 - **`crates/review/src/agent.rs`:** `AgentConfig` gains `pub token_budget: Option<Arc<TokenBudget>>` (default `None`). After every successful chat response the agent calls `budget.add(response.input_tokens)`. **Wrap-up** (Task 13) also starts when the budget is exhausted and at least one step has finished; same submit-only behaviour and the same single reminder.
 - **Engine / stages:** `run()` builds one `TokenBudget` from `settings.max_review_input_tokens` and passes it to every Finder, Verifier and Dedup call of that run (small-PR runs too).
   - **Finder:** a batch whose agents have not started when the budget is already exhausted is not started; its files go under **Skipped files** with reason `token_budget`. Running agents wrap up through the agent rule. A `token_budget` skip is never retryable (the Generalist retry rule is unchanged for real `ChatError`s).

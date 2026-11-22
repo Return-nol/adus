@@ -79,7 +79,7 @@ Unverified live: final-step history (tool calls kept while only submit is offere
 
 ### Maintenance
 
-~+16K lines over ~32 commits, ~600 tests; 12-module review pipeline; logs are content-free by design (use `RUST_LOG=info,adus_review=debug` for per-step tool names and agent outcomes). Backlog: `tools.rs`/`workspace.rs` ~800 lines each, four diff walkers, regex size limit, runtime orphan sweep, test gaps.
+~+16K lines over ~32 commits, 555 tests across 43 suites (after the post-implementation tidy-up in `docs/superpowers/2026-11-22-test-cleanup-summary.md`); 12-module review pipeline; logs are content-free by design (use `RUST_LOG=info,adus_review=debug` for per-step tool names and agent outcomes). Backlog: `tools.rs`/`workspace.rs` ~800 lines each, four diff walkers, regex size limit, runtime orphan sweep, test gaps.
 
 ## 3. Mitigations — status
 
@@ -127,7 +127,7 @@ Kill git's helper child on clone timeout; runtime orphan-workspace sweep; Verifi
 
 ## 5. Resume pointer
 
-- Branch `feat/advanced-agentic-review-flow`; Tasks 1–15 are committed (latest feature commits `7d12f25` Task 14, `79e9573`/`5059fce` Task 15), and final review #2 is fixed on top (`04e02dc` code, followed by a docs commit). `.cargo/config.toml` stays uncommitted.
+- Branch `feat/advanced-agentic-review-flow`; Tasks 1–15 are committed (latest feature commits `7d12f25` Task 14, `79e9573`/`5059fce` Task 15), final review #2 is fixed on top (`04e02dc` code, followed by a docs commit), and the post-implementation code & test tidy-up (`docs/superpowers/2026-11-22-test-cleanup-summary.md`) is ready to be committed on the branch. `.cargo/config.toml` stays uncommitted.
 - Dev DB: the cost-control changes live in 0008 (no 0009); the dev DB was adapted by hand and its row-8 checksum repaired.
 - Deferred minors of this plan live in `docs/superpowers/backlog.md` under "Agentic review engine (plan 2026-11-21)".
 - Next: merge review, then the Linux gate only if Unix code changed.

@@ -69,7 +69,7 @@
   - `ChatRequest::text(...)` initializes `effort: None`.
   - `ChatRequest::with_effort(mut self, effort: ReasoningEffort) -> Self` sets `self.effort = Some(effort)`.
   - `LlmClient` trait adds `async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError>;`.
-  - `pub(crate) fn is_reasoning_unsupported(err: &LlmError) -> bool` (returns `true` when `err` is `LlmError::Invalid(msg)` whose lowercased text matches reasoning/thinking rejection markers: `"reasoning_effort"`, `"reasoning effort"`, `"thinking"`, `"thinking_config"`, `"thinkingconfig"`, `"thinking_budget"`, `"thinkingbudget"`, `"budget_tokens"`, `"does not support reasoning"`).
+  - `fn is_reasoning_unsupported(err: &LlmError) -> bool` (returns `true` when `err` is `LlmError::Invalid(msg)` whose lowercased text matches reasoning/thinking rejection markers: `"reasoning_effort"`, `"reasoning effort"`, `"thinking"` (also matching `"thinking_config"`, `"thinkingconfig"`, `"thinking_budget"`, `"thinkingbudget"`), `"budget_tokens"`, `"does not support reasoning"`), used by `pub(crate) async fn chat_with_effort_fallback(...)`.
 - Produces in `crates/review/src/agent.rs`:
   - `AgentLlm<'a>` adds `pub effort: Option<ReasoningEffort>` and passes `effort: llm.effort` into `ChatRequest` inside `request()`.
 
@@ -154,7 +154,7 @@
 **Interfaces:**
 - Consumes: `AiProvider` (`primary_model`, `fast_model`, `effective_fast_model()`), `Settings` (`default_provider_id`, `review_mode`), `Repository` (`review_provider_id`, `review_mode`) from `adus_db`; `ReasoningEffort` from `adus_llm`.
 - Produces in `crates/review/src/engine.rs`:
-  - `pub fn finder_effort(mode: ReviewMode) -> ReasoningEffort` (`ReviewMode::Generalist` → `ReasoningEffort::Medium`, `ReviewMode::Specialists` → `ReasoningEffort::High`).
+  - `fn finder_effort(mode: ReviewMode) -> ReasoningEffort` (`ReviewMode::Generalist` → `ReasoningEffort::Medium`, `ReviewMode::Specialists` → `ReasoningEffort::High`).
   - Provider & model resolution in `Engine::run`:
     - `let provider_id = repo.review_provider_id.or(settings.default_provider_id);`
     - Load `provider` via `adus_db::ai::get_provider(&self.db, id).await.map_err(db_error)?`, requiring `provider.enabled && !provider.primary_model.trim().is_empty()`.

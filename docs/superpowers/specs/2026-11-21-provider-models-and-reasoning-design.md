@@ -66,7 +66,8 @@ The provider model columns share migration 0008 with `review_mode` (agentic revi
   - Adds `pub primary_model: Option<String>` (`None` = needs setup) and `pub fast_model: Option<String>`.
   - Helpers (blank counts as unset):
     - `pub fn primary_model(&self) -> Option<&str>`
-    - `pub fn effective_fast_model(&self) -> Option<&str>`: the `fast_model`, else `primary_model()`.
+    - `pub fn fast_model(&self) -> Option<&str>`
+    - `pub fn effective_fast_model(&self) -> Option<&str>`: `self.fast_model()`, else `self.primary_model()`.
 - `adus_db::ai::insert_provider(pool, kind, name, base_url, primary_model, fast_model: Option<&str>) -> Result<AiProvider>`.
 - `adus_db::ai::update_provider(pool, id, name, base_url, primary_model: Option<&str>, fast_model: Option<&str>, enabled) -> Result<Option<AiProvider>>` (a needs-setup provider can still be renamed or toggled).
 - `adus_db::settings::Settings`: drops `default_model: Option<String>`.
@@ -122,7 +123,7 @@ pub struct ChatRequest {
 
 #### Reasoning Effort Wire Specifics & Transparent Retry
 - `REASONING_UNSUPPORTED_MARKERS`:
-  - `"reasoning_effort"`, `"reasoning effort"`, `"thinking"`, `"thinking_config"`, `"thinkingconfig"`, `"thinking_budget"`, `"thinkingbudget"`, `"budget_tokens"`, `"does not support reasoning"`.
+  - `"reasoning_effort"`, `"reasoning effort"`, `"thinking"` (also matches `"thinking_config"`, `"thinkingconfig"`, `"thinking_budget"`, `"thinkingbudget"`), `"budget_tokens"`, `"does not support reasoning"`.
 - When `req.effort.is_some()` and a call returns `LlmError::Invalid(msg)` whose lowercase message contains any `REASONING_UNSUPPORTED_MARKERS`, `LlmClient::chat` transparently retries **once** with `effort: None`.
 - **Output headroom:** every provider counts reasoning tokens against the same output cap as the answer, so a request with an effort asks for `max_tokens + reserve`. `ReasoningEffort::output_reserve()` is `Low => 2_048`, `Medium => 4_096`, `High => 8_192` (OpenAI/compatible and Anthropic); Gemini adds its own thinking budget. Without this, `High` on Gemini (budget 8192 = the engine's 8192 cap) or on OpenAI reasoning models can spend the whole cap thinking and return no answer.
 - **Timeout:** a request with an effort uses a 300 s per-request timeout instead of 120 s (`types::request_timeout`), since a long think plus the answer can run past two minutes. The retry without effort uses 120 s.
@@ -142,7 +143,7 @@ pub struct ChatRequest {
 ### 3.3 `AgentLlm` & `Engine` Model/Effort Resolution (`crates/review`)
 
 - `AgentLlm<'a>` in `crates/review/src/agent.rs` adds `pub effort: Option<ReasoningEffort>` and passes `effort: llm.effort` into `ChatRequest` in `request()`.
-- Helper `pub fn finder_effort(mode: ReviewMode) -> ReasoningEffort`:
+- Helper `fn finder_effort(mode: ReviewMode) -> ReasoningEffort`:
   - `ReviewMode::Generalist` → `ReasoningEffort::Medium`
   - `ReviewMode::Specialists` → `ReasoningEffort::High`
 - **Provider resolution in `Engine::run` (`crates/review/src/engine.rs`):**
