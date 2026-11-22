@@ -11,7 +11,8 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Match, Regex, RegexBuilder};
 
-use crate::tools::REGEX_SIZE_LIMIT;
+/// Compiled-size limit of each pattern (the same bound the `grep` tool uses).
+const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 
 /// What a masked value is replaced with.
 pub const REDACTED: &str = "[REDACTED]";
@@ -47,7 +48,8 @@ struct Patterns {
     url_credentials: Regex,
     /// A secret key name, `=`/`:` (or `:=`, `=>`, `==`) and a quoted literal.
     quoted_assignment: Regex,
-    /// An env-style line `KEY=value` (optional `export `, optional tool line-number prefix).
+    /// An env-style line `KEY=value` at the start of the line (optional `export `, optional
+    /// tool line-number prefix; no indentation, so keyword arguments and props never match).
     env_assignment: Regex,
 }
 
@@ -57,7 +59,7 @@ impl Patterns {
             r#"(?i){SECRET_KEY_NAME}["']?[ \t]*(?::=|=>|==|[:=])[ \t]*(?:"(?P<dq>[^"\r\n]*)"|'(?P<sq>[^'\r\n]*)')"#
         );
         let env = format!(
-            r"(?mi)^(?:\d+[:>-] )?[ \t]*(?:export[ \t]+)?{SECRET_KEY_NAME}=(?P<value>[^\s'\x22]\S*)[ \t\r]*$"
+            r"(?mi)^(?:\d+[:>-] )?(?:export[ \t]+)?{SECRET_KEY_NAME}=(?P<value>[^\s'\x22]\S*)[ \t\r]*$"
         );
         let patterns = Self {
             pem_begin: build(PEM_BEGIN)?,
@@ -104,9 +106,8 @@ pub fn redact_secrets(text: &str) -> Cow<'_, str> {
         c.name("dq").or_else(|| c.name("sq"))
     });
     apply(&mut out, &edits);
-    // An unquoted value with a call in it is code, not a literal.
     let edits = value_edits(&p.env_assignment, &out, MIN_VALUE_CHARS, |c| {
-        c.name("value").filter(|v| !v.as_str().contains('('))
+        c.name("value").filter(|v| !is_code_value(v.as_str()))
     });
     apply(&mut out, &edits);
     out
@@ -141,6 +142,12 @@ fn value_edits<'t>(
         .collect()
 }
 
+/// An unquoted value that is code rather than a literal: a call (`f(x)`), a JSX expression
+/// (`{x}`) or an argument-list item (`x,`, `x)`).
+fn is_code_value(value: &str) -> bool {
+    value.contains('(') || value.starts_with('{') || value.ends_with([',', ')'])
+}
+
 /// Template variables, environment references and already-masked values.
 fn is_placeholder(value: &str) -> bool {
     let v = value.trim();
@@ -171,11 +178,16 @@ struct Line {
     prefixed: bool,
 }
 
-/// Every line between a private-key BEGIN and END line, and the text between both markers on
-/// one line. A block cut by a tool window is still masked: lines after a BEGIN with no END
-/// (up to the end, or the end of a prefixed tool block), and base64 lines right before an END
-/// with no BEGIN.
+/// The key lines after a private-key BEGIN line, and the text between both markers on one line.
+/// After BEGIN only lines that look like a PEM body are masked (base64, `Proc-Type:` /
+/// `DEK-Info:` headers; blank lines are passed over); the block ends at END, at the first other
+/// line, or, when BEGIN carried a tool line-number prefix, at the first unprefixed line. So a
+/// key cut by a tool window is still masked, while a BEGIN marker quoted in prose or code leaves
+/// the following lines alone. Base64 lines right before an END with no BEGIN are masked too.
 fn pem_edits(p: &Patterns, text: &str) -> Vec<Range<usize>> {
+    if !text.contains("PRIVATE KEY") {
+        return Vec::new();
+    }
     let mut edits = Vec::new();
     let mut lines: Vec<Line> = Vec::new();
     let mut in_key = false;
@@ -217,11 +229,14 @@ fn pem_edits(p: &Patterns, text: &str) -> Vec<Range<usize>> {
                 }
                 in_key = false;
             }
-            (None, None) => {
-                if in_key && !body.trim().is_empty() && body != REDACTED {
+            (None, None) if in_key => {
+                if is_pem_body_line(body) {
                     edits.push(start..start + body.len());
+                } else if !body.trim().is_empty() {
+                    in_key = false;
                 }
             }
+            (None, None) => {}
         }
         lines.push(Line {
             body: start..start + body.len(),
@@ -230,6 +245,12 @@ fn pem_edits(p: &Patterns, text: &str) -> Vec<Range<usize>> {
     }
     edits.sort_by_key(|r| r.start);
     edits
+}
+
+/// A base64 line or a legacy PEM header (`Proc-Type: 4,ENCRYPTED`, `DEK-Info: …`).
+fn is_pem_body_line(body: &str) -> bool {
+    let body = body.trim_end();
+    is_base64_line(body) || body.starts_with("Proc-Type:") || body.starts_with("DEK-Info:")
 }
 
 fn is_base64_line(body: &str) -> bool {
@@ -326,6 +347,37 @@ mod tests {
         assert_eq!(
             redacted(json),
             r#"{"key": "-----BEGIN PRIVATE KEY-----[REDACTED]-----END PRIVATE KEY-----\n"}"#
+        );
+    }
+
+    #[test]
+    fn comment_body_quoting_the_marker_keeps_its_fences_and_code() {
+        assert_untouched(
+            "<!-- adudu -->\n**Critical:** Private key committed\n\nThe file holds a `-----BEGIN RSA PRIVATE KEY-----` block. Rotate it.\n\nMove it to a secret store.\n\n```suggestion\nlet k = load_key()?;\n```",
+        );
+    }
+
+    #[test]
+    fn code_with_a_begin_literal_leaves_the_following_lines_alone() {
+        assert_untouched(
+            "if line.starts_with(\"-----BEGIN PRIVATE KEY-----\") {\n    parse(line);\n}\nfn other() { x() }",
+        );
+        assert_untouched(
+            "[src/pem.rs: lines 4-7 of 9]\n4: if line.starts_with(\"-----BEGIN PRIVATE KEY-----\") {\n5:     parse(line);\n6: }\n7: fn other() { x() }",
+        );
+    }
+
+    #[test]
+    fn key_cut_at_the_window_end_and_legacy_headers_are_masked() {
+        let cut = "[k.pem: lines 1-3 of 30]\n1: -----BEGIN PRIVATE KEY-----\n2: MIIEvQIBADANBgkqhkiG9w0B\n3: Zm9vYmFyZm9vYmFy";
+        assert_eq!(
+            redacted(cut),
+            "[k.pem: lines 1-3 of 30]\n1: -----BEGIN PRIVATE KEY-----\n2: [REDACTED]\n3: [REDACTED]"
+        );
+        let legacy = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\nZm9vYmFyZm9vYmFy\n-----END RSA PRIVATE KEY-----";
+        assert_eq!(
+            redacted(legacy),
+            "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n[REDACTED]\n\n[REDACTED]\n-----END RSA PRIVATE KEY-----"
         );
     }
 
@@ -485,6 +537,16 @@ mod tests {
             "Reset your password: it must be at least 12 characters.",
             r#"password = "[REDACTED]""#,
             "API_KEY=[REDACTED]",
+            // Keyword arguments and JSX props: indented, or code-shaped values.
+            "    password=password,",
+            "    api_key=settings.API_KEY,",
+            "  apiKey={process.env.API_KEY}",
+            "conn = connect(\n    host=host,\n    password=password,\n    api_key=settings.API_KEY,\n)\n",
+            "<Client\n  apiKey={process.env.API_KEY}\n/>",
+            "api_key=settings.API_KEY,",
+            "apiKey={process.env.API_KEY}",
+            "client(password=settings.PASSWORD)",
+            "12: password=password,",
         ] {
             assert_untouched(text);
         }

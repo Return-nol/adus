@@ -2338,8 +2338,9 @@ async fn suggestion_containing_a_secret_is_dropped(pool: PgPool) {
         },
         {
             "file": "src/a.rs", "line": 4, "severity": "info",
-            "title": "Clean", "body": "plain fix",
-            "suggestion": "let d = 2;",
+            "title": "Clean", "body": "pass the settings value",
+            // Keyword arguments name a variable, not a secret: the block stays.
+            "suggestion": "    password=password,\n    api_key=settings.API_KEY,",
         },
     ]);
     s.chat.push(Ok(&findings.to_string()));
@@ -2363,7 +2364,9 @@ async fn suggestion_containing_a_secret_is_dropped(pool: PgPool) {
     assert!(!posted[0].body.contains(FAKE_AWS_KEY), "{}", posted[0].body);
     assert!(!posted[0].body.contains("[REDACTED]"), "{}", posted[0].body);
     assert!(
-        posted[1].body.ends_with("```suggestion\nlet d = 2;\n```"),
+        posted[1]
+            .body
+            .ends_with("```suggestion\n    password=password,\n    api_key=settings.API_KEY,\n```"),
         "{}",
         posted[1].body
     );

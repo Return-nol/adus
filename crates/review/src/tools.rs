@@ -37,9 +37,9 @@ const GREP_CONTEXT_LINES: usize = 2;
 const GREP_MAX_FILES: usize = 20_000;
 /// Longest line `grep` prints; longer lines (minified code) are cut.
 const GREP_MAX_LINE_CHARS: usize = 500;
+const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const LIST_MAX_ENTRIES: usize = 150;
 const LIST_MAX_CHARS: usize = 4_000;
-pub(crate) const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 /// Room kept for the trailing truncation notes under a character cap.
 const NOTE_RESERVE_CHARS: usize = 300;
 const LINE_TRUNCATED: &str = " [line truncated]";
