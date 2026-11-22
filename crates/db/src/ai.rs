@@ -35,9 +35,14 @@ impl AiProvider {
         non_blank(self.primary_model.as_deref())
     }
 
+    /// The optional fast model configured on this provider, if non-blank.
+    pub fn fast_model(&self) -> Option<&str> {
+        non_blank(self.fast_model.as_deref())
+    }
+
     /// The model for cheaper follow-up work: `fast_model`, else the primary model.
     pub fn effective_fast_model(&self) -> Option<&str> {
-        non_blank(self.fast_model.as_deref()).or_else(|| self.primary_model())
+        self.fast_model().or_else(|| self.primary_model())
     }
 }
 

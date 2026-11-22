@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::diff::unified_patch;
 use crate::{
     CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest,
-    RemoteRepo, RepoRef, basic_auth_header, git_url, normalize_path,
+    RemoteRepo, RepoRef, basic_auth_header, decode, git_url, normalize_path,
 };
 
 const API_VERSION: &str = "7.1";
@@ -231,12 +231,6 @@ impl AzureProvider {
         self.send(self.post(&url).json(body)).await?;
         Ok(())
     }
-}
-
-async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, GitError> {
-    resp.json::<T>()
-        .await
-        .map_err(|e| GitError::Decode(e.without_url().to_string()))
 }
 
 /// Thread status `1` = active; `commentType` 1 = text.

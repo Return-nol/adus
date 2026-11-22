@@ -4,10 +4,11 @@
 use adus_core::types::{Severity, normalize_path};
 use adus_db::rules::{Rule, rule_matches_path};
 use adus_git::FileDiff;
-use adus_git::diff::hunk_right_start;
+
+use crate::prompt::changed_line_counts;
 
 /// A PR with more reviewed files than this is never small.
-pub const SMALL_PR_MAX_FILES: usize = 3;
+const SMALL_PR_MAX_FILES: usize = 3;
 
 /// Path segments (directories and the file name) that contain one of these words are
 /// security or access code. Conservative on purpose: `author.rs` matches `auth`.
@@ -29,11 +30,18 @@ const CONTRACT_FILES: [&str; 4] = ["lib.rs", "mod.rs", "index.ts", "index.js"];
 /// above 0, there are one to `SMALL_PR_MAX_FILES` reviewed files, their changed lines (`+`
 /// and `-` inside hunks) fit in `max_lines`, none is on a risky path (renames: old path too)
 /// and none is covered by an enabled `critical` rule.
-pub fn is_small_pr(targets: &[FileDiff], rules: &[Rule], max_lines: u32) -> bool {
+pub(crate) fn is_small_pr(targets: &[FileDiff], rules: &[Rule], max_lines: u32) -> bool {
     if max_lines == 0 || targets.is_empty() || targets.len() > SMALL_PR_MAX_FILES {
         return false;
     }
-    let changed: usize = targets.iter().map(changed_lines).sum();
+    let changed: usize = targets
+        .iter()
+        .filter_map(|file| file.patch.as_deref())
+        .map(|patch| {
+            let (added, removed) = changed_line_counts(patch);
+            added + removed
+        })
+        .sum();
     if changed > max_lines as usize {
         return false;
     }
@@ -48,23 +56,6 @@ pub fn is_small_pr(targets: &[FileDiff], rules: &[Rule], max_lines: u32) -> bool
                 .any(|file| rule_matches_path(rule, &file.path))
     });
     !risky && !critical
-}
-
-/// Number of `+` and `-` lines inside the hunks of one file's patch.
-fn changed_lines(file: &FileDiff) -> usize {
-    let Some(patch) = &file.patch else {
-        return 0;
-    };
-    let mut in_hunk = false;
-    let mut count = 0;
-    for line in patch.lines() {
-        if hunk_right_start(line).is_some() {
-            in_hunk = true;
-        } else if in_hunk && (line.starts_with('+') || line.starts_with('-')) {
-            count += 1;
-        }
-    }
-    count
 }
 
 /// Paths where a mistake costs more than the diff shows: security, data, shared contracts and
@@ -98,10 +89,8 @@ fn is_risky_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adus_db::rules::KnowledgeScope;
+    use crate::test_support::rule;
     use adus_git::FileStatus;
-    use chrono::Utc;
-    use uuid::Uuid;
 
     fn target(path: &str, plus: usize, minus: usize) -> FileDiff {
         let mut patch = format!("@@ -1,{minus} +1,{plus} @@\n");
@@ -115,43 +104,20 @@ mod tests {
         }
     }
 
-    fn rule(severity: Severity, glob: Option<&str>, enabled: bool) -> Rule {
-        Rule {
-            id: Uuid::nil(),
-            scope: KnowledgeScope::Global,
-            repository_id: None,
-            title: "t".into(),
-            body: "b".into(),
-            path_glob: glob.map(str::to_string),
-            severity,
-            enabled,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
     #[test]
-    fn small_when_few_lines_and_files_outside_risky_paths() {
+    fn small_pr_respects_file_line_and_zero_thresholds() {
         let targets = [target("src/a.rs", 3, 2), target("web/b.svelte", 1, 0)];
         assert!(is_small_pr(&targets, &[], 50));
         // Exactly at the limit still counts as small.
         assert!(is_small_pr(&targets, &[], 6));
-    }
+        assert!(!is_small_pr(&[target("src/a.rs", 3, 2)], &[], 4));
+        assert!(!is_small_pr(&[target("src/a.rs", 1, 0)], &[], 0));
 
-    #[test]
-    fn not_small_above_line_or_file_limit() {
-        let targets = [target("src/a.rs", 3, 2)];
-        assert!(!is_small_pr(&targets, &[], 4));
         let many: Vec<FileDiff> = (0..=SMALL_PR_MAX_FILES)
             .map(|i| target(&format!("src/f{i}.rs"), 1, 0))
             .collect();
         assert!(!is_small_pr(&many, &[], 1000));
         assert!(!is_small_pr(&[], &[], 1000));
-    }
-
-    #[test]
-    fn zero_threshold_disables_small_pr() {
-        assert!(!is_small_pr(&[target("src/a.rs", 1, 0)], &[], 0));
     }
 
     #[test]
@@ -191,12 +157,12 @@ mod tests {
     #[test]
     fn critical_rule_forces_full_review() {
         let targets = [target("src/a.rs", 1, 0)];
-        let critical = rule(Severity::Critical, Some("src/**"), true);
+        let critical = rule("t", Severity::Critical, Some("src/**"), true);
         assert!(!is_small_pr(&targets, &[critical], 50));
         // Not covered, not critical or disabled: still small.
-        let elsewhere = rule(Severity::Critical, Some("docs/**"), true);
-        let warning = rule(Severity::Warning, None, true);
-        let disabled = rule(Severity::Critical, None, false);
+        let elsewhere = rule("t", Severity::Critical, Some("docs/**"), true);
+        let warning = rule("t", Severity::Warning, None, true);
+        let disabled = rule("t", Severity::Critical, None, false);
         assert!(is_small_pr(&targets, &[elsewhere, warning, disabled], 50));
     }
 }

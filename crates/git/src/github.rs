@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::{
     CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest,
-    RemoteRepo, RepoRef, basic_auth_header, git_url, normalize_path,
+    RemoteRepo, RepoRef, basic_auth_header, decode, git_url, normalize_path,
 };
 
 /// Batas halaman saat mengikuti header `Link` (30 x 100 = 3000 item).
@@ -111,12 +111,6 @@ impl GithubProvider {
         let pages: Vec<Vec<GhFile>> = self.get_pages(first_url).await?;
         Ok(pages.into_iter().flatten().map(GhFile::into_diff).collect())
     }
-}
-
-async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, GitError> {
-    resp.json::<T>()
-        .await
-        .map_err(|e| GitError::Decode(e.without_url().to_string()))
 }
 
 /// URL `rel="next"` dari nilai header `Link`, kalau ada. URL bisa memuat koma literal

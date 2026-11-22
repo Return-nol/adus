@@ -89,6 +89,15 @@ pub(crate) fn basic_auth_header(user: &str, password: &str) -> String {
     format!("Basic {encoded}")
 }
 
+/// Decode a JSON response body into `T`, mapping parse/transport failures to `GitError::Decode`.
+pub(crate) async fn decode<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, GitError> {
+    resp.json::<T>()
+        .await
+        .map_err(|e| GitError::Decode(e.without_url().to_string()))
+}
+
 pub trait GitProviderFactory: Send + Sync {
     fn create(&self, kind: ConnectionKind, org_or_owner: &str, token: &str)
     -> Arc<dyn GitProvider>;

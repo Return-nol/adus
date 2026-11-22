@@ -194,7 +194,7 @@ fn queue_error(err: QueueError) -> ApiError {
 
 /// Cek header `X-Hub-Signature-256` (`sha256=<hex>`): HMAC-SHA256 body dengan `secret`,
 /// dibandingkan constant-time. Secret kosong selalu ditolak.
-pub fn verify_github_signature(secret: &str, body: &[u8], header: Option<&str>) -> bool {
+fn verify_github_signature(secret: &str, body: &[u8], header: Option<&str>) -> bool {
     if secret.is_empty() {
         return false;
     }
@@ -216,7 +216,7 @@ fn tokens_match(expected: &str, given: &str) -> bool {
 }
 
 /// Ubah event GitHub (header `X-GitHub-Event`) menjadi job. `None` = abaikan.
-pub fn parse_github(event: &str, body: &Value, repo_id: Uuid) -> Option<Job> {
+fn parse_github(event: &str, body: &Value, repo_id: Uuid) -> Option<Job> {
     let action = body["action"].as_str()?;
     match event {
         "pull_request" => {
@@ -269,7 +269,7 @@ fn github_comment(body: &Value, number: &Value, repo_id: Uuid) -> Option<Job> {
 }
 
 /// Ubah notifikasi service hook Azure DevOps menjadi job. `None` = abaikan.
-pub fn parse_azure(body: &Value, repo_id: Uuid) -> Option<Job> {
+fn parse_azure(body: &Value, repo_id: Uuid) -> Option<Job> {
     let resource = &body["resource"];
     let trigger = match body["eventType"].as_str()? {
         "git.pullrequest.created" => Trigger::Opened,

@@ -40,21 +40,6 @@ fn new_usage(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn usage_rows_record_cache_tokens(pool: PgPool) {
-    let (provider_id, key_id) = provider_and_key(&pool).await;
-    usage::insert(&pool, new_usage(provider_id, key_id, 100, 60, 30))
-        .await
-        .unwrap();
-
-    let row: (i32, i32, i32) =
-        sqlx::query_as("SELECT input_tokens, cache_read_tokens, cache_write_tokens FROM llm_usage")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(row, (100, 60, 30));
-}
-
-#[sqlx::test(migrations = "../../migrations")]
 async fn daily_and_breakdown_sum_cache_tokens(pool: PgPool) {
     let (provider_id, key_id) = provider_and_key(&pool).await;
     usage::insert(&pool, new_usage(provider_id, key_id, 100, 60, 30))

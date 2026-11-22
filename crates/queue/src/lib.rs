@@ -142,19 +142,6 @@ impl Queue {
         Ok(queue)
     }
 
-    /// `true` hanya untuk pemanggilan pertama dengan `dedup_key` ini dalam 24 jam.
-    pub async fn first_seen(&self, dedup_key: &str) -> Result<bool, QueueError> {
-        let reply: Option<String> = redis::cmd("SET")
-            .arg(self.dedup_key(dedup_key))
-            .arg(1)
-            .arg("NX")
-            .arg("EX")
-            .arg(DEDUP_TTL_SECS)
-            .query_async(&mut self.conn.clone())
-            .await?;
-        Ok(reply.is_some())
-    }
-
     pub async fn enqueue(&self, job: &Job) -> Result<(), QueueError> {
         let job_json = serde_json::to_string(job)?;
         let _id: String = redis::cmd("XADD")

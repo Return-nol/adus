@@ -34,14 +34,14 @@ use crate::dedup::deduplicate_findings;
 use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
-    DiffBatch, MARKER, MAX_BATCH_CHARS, batch_targets, build_manifest, format_inline,
+    DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, batch_targets, build_manifest, format_inline,
     format_summary,
 };
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
 use crate::small_pr::is_small_pr;
-use crate::tools::{ToolCache, Toolbox};
-use crate::verifier::{CandidateFinding, VerifyContext, verify_candidates};
+use crate::tools::Toolbox;
+use crate::verifier::{CandidateFinding, VerifyContext, VerifyInput, verify_candidates};
 use crate::workspace::{RepoCloner, WorkspaceError};
 
 /// Budget of one Generalist review (`Engine::review_timeout`), small PRs included.
@@ -112,7 +112,7 @@ struct ReviewOutput {
     redacted_comments: usize,
 }
 
-pub fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
+fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
     match mode {
         ReviewMode::Generalist => ReasoningEffort::Medium,
         ReviewMode::Specialists => ReasoningEffort::High,
@@ -329,7 +329,8 @@ impl Engine {
                 Err(err) => return Err(self.fetch_error(&conn, err).await),
             };
             // The PR file manifest lists every file of the PR, not only those reviewed now.
-            let pr_files = full.clone();
+            let manifest_files: Vec<ManifestFile> =
+                full.iter().map(ManifestFile::from_diff).collect();
             let candidates = match last {
                 None => full_targets(full),
                 Some(last_head) => {
@@ -348,7 +349,8 @@ impl Engine {
             let matcher = ignore_matcher(&effective_ignore_paths(&settings));
             let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
             let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
-            let mut targets = Vec::new();
+            let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
+            let mut files: Vec<FileDiff> = Vec::new();
             let mut skipped: Vec<(String, &'static str)> = Vec::new();
             let mut ignored_paths: Vec<String> = Vec::new();
             for target in candidates {
@@ -372,47 +374,34 @@ impl Engine {
                 }
                 if added_line_count(patch) > max_lines {
                     skipped.push((target.file.path, "too_large"));
-                } else if targets.len() >= max_files {
+                } else if files.len() >= max_files {
                     skipped.push((target.file.path, "file_limit"));
                 } else {
-                    targets.push(target);
+                    allowed.insert(normalize_path(&target.file.path), target.allowed);
+                    files.push(target.file);
                 }
             }
             let ignored = ignored_paths.len();
 
-            if targets.is_empty() && skipped.is_empty() {
+            if files.is_empty() && skipped.is_empty() {
                 return Ok(Outcome::Skipped("nothing_to_review"));
             }
 
-            let mut warnings: Vec<String> = Vec::new();
-            // Only skipped files left: no clone and no LLM, just the summary.
-            let output = if targets.is_empty() {
-                ReviewOutput::default()
+            let (small, rules, memories, manifest) = if files.is_empty() {
+                (false, Vec::new(), Vec::new(), String::new())
             } else {
-                let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
-                let files: Vec<FileDiff> = targets
-                    .into_iter()
-                    .map(|target| {
-                        allowed.insert(normalize_path(&target.file.path), target.allowed);
-                        target.file
-                    })
-                    .collect();
                 let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
                 let skipped_map: HashMap<&str, &'static str> = skipped
                     .iter()
                     .map(|(path, reason)| (path.as_str(), *reason))
                     .collect();
-                let manifest = build_manifest(&pr_files, &ignored_set, &skipped_map);
+                let manifest = build_manifest(&manifest_files, &ignored_set, &skipped_map);
                 let rules = rules::applicable(&self.db, repo.id)
                     .await
                     .map_err(db_error)?;
                 let memories = memories::applicable(&self.db, repo.id)
                     .await
                     .map_err(db_error)?;
-                let usage = UsageContext {
-                    review_id: Some(review_id),
-                    repository_id: Some(repo.id),
-                };
                 // A small, low-risk PR is reviewed from the diff alone, in one Generalist pass: no
                 // clone and no tools (the same diff-only path as a failed clone, but not a failure).
                 // A `Command` (`@adudu review`) always gets the full review.
@@ -424,50 +413,65 @@ impl Engine {
                 if small {
                     mode = ReviewMode::Generalist;
                 }
-                let budget = self.budget(mode);
-                let stages = Stages {
-                    conn: &conn,
-                    git: git.as_ref(),
-                    repo_ref: &repo_ref,
-                    pr: &pr,
-                    mode,
-                    provider_id,
-                    primary_model: &primary_model,
-                    fast_model: &fast_model,
-                    rules: &rules,
-                    memories: &memories,
-                    usage: &usage,
-                    deadlines: Deadlines::new(start, budget),
-                    small,
-                    token_budget: Arc::new(TokenBudget::new(
-                        u64::try_from(settings.max_review_input_tokens).unwrap_or(0),
-                    )),
-                };
-                let review = self.review_targets(
-                    &stages,
-                    files,
-                    allowed,
-                    &manifest,
-                    &mut skipped,
-                    &mut warnings,
-                );
-                match tokio::time::timeout_at(start + budget, review).await {
-                    Ok(output) => output?,
-                    Err(_elapsed) => return Err(timed_out()),
-                }
+                (small, rules, memories, manifest)
             };
 
-            let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
-            let (summary, summary_redacted) = redact_owned(summary);
-            tracing::debug!(
-                redacted_tool_outputs = output.redacted_tool_outputs,
-                redacted_comments = output.redacted_comments + usize::from(summary_redacted),
-                "secret redaction"
-            );
-            let post = git.post_review(&repo_ref, &pr, &output.comments, &summary);
-            match tokio::time::timeout_at(start + self.budget(mode), post).await {
-                Ok(Ok(posted)) => Ok(Outcome::Done { posted }),
-                Ok(Err(err)) => Err(self.post_error(&conn, err).await),
+            let budget = self.budget(mode);
+            let usage = UsageContext {
+                review_id: Some(review_id),
+                repository_id: Some(repo.id),
+            };
+            let stages = Stages {
+                conn: &conn,
+                git: git.as_ref(),
+                repo_ref: &repo_ref,
+                pr: &pr,
+                mode,
+                provider_id,
+                primary_model: &primary_model,
+                fast_model: &fast_model,
+                rules: &rules,
+                memories: &memories,
+                usage: &usage,
+                deadlines: Deadlines::new(start, budget),
+                small,
+                token_budget: Arc::new(TokenBudget::new(
+                    u64::try_from(settings.max_review_input_tokens).unwrap_or(0),
+                )),
+            };
+            let mut warnings: Vec<String> = Vec::new();
+            let finish = async {
+                // Only skipped files left: no clone and no LLM, just the summary.
+                let output = if files.is_empty() {
+                    ReviewOutput::default()
+                } else {
+                    self.review_targets(
+                        &stages,
+                        files,
+                        allowed,
+                        &manifest,
+                        &mut skipped,
+                        &mut warnings,
+                    )
+                    .await?
+                };
+                let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
+                let (summary, summary_redacted) = redact_owned(summary);
+                tracing::debug!(
+                    redacted_tool_outputs = output.redacted_tool_outputs,
+                    redacted_comments = output.redacted_comments + usize::from(summary_redacted),
+                    "secret redaction"
+                );
+                match git
+                    .post_review(&repo_ref, &pr, &output.comments, &summary)
+                    .await
+                {
+                    Ok(posted) => Ok(Outcome::Done { posted }),
+                    Err(err) => Err(self.post_error(&conn, err).await),
+                }
+            };
+            match tokio::time::timeout_at(start + budget, finish).await {
+                Ok(outcome) => outcome,
                 Err(_elapsed) => Err(timed_out()),
             }
         };
@@ -542,7 +546,7 @@ impl Engine {
             None => None,
         };
         // One cache for every agent of this review, Finder and Verifier alike.
-        let toolbox = workspace.map(|ws| Toolbox::new(ws, Arc::new(ToolCache::new())));
+        let toolbox = workspace.map(Toolbox::new);
 
         let input = FinderInput {
             pr: s.pr,
@@ -597,13 +601,15 @@ impl Engine {
             };
             let report = verify_candidates(
                 ctx,
-                candidates,
-                &files,
-                s.rules,
-                s.memories,
-                repo_instructions.as_deref(),
-                verifier_toolbox,
-                s.deadlines.verifier,
+                VerifyInput {
+                    candidates,
+                    targets: &files,
+                    rules: s.rules,
+                    memories: s.memories,
+                    repo_instructions: repo_instructions.as_deref(),
+                    toolbox: verifier_toolbox,
+                    deadline: s.deadlines.verifier,
+                },
             )
             .await;
             if let Some(err) = report.all_retryable_error {
@@ -639,7 +645,7 @@ impl Engine {
                 verified,
             );
             match tokio::time::timeout_at(s.deadlines.dedup, dedup).await {
-                Ok(result) => result.kept,
+                Ok(kept) => kept,
                 Err(_elapsed) => {
                     tracing::warn!("semantic dedup cut by the deadline; keeping all findings");
                     fallback
@@ -680,7 +686,7 @@ impl Engine {
             .iter()
             .map(|s| {
                 let end_offset = s.start_line.and_then(|_| {
-                    let patch = patches.get(&normalize_path(&s.file)).copied().flatten()?;
+                    let patch = patches.get(s.file.as_str()).copied().flatten()?;
                     right_line_end_offset(patch, s.line)
                 });
                 let (body, redacted) = inline_body(s);
@@ -848,7 +854,7 @@ fn collect_candidates(
         .filter(|task| task.result.is_ok())
         .map(|task| task.batch)
         .collect();
-    let batch_allowed: Vec<HashMap<String, CommentableRange>> = batches
+    let batch_allowed: Vec<HashMap<String, &CommentableRange>> = batches
         .iter()
         .map(|batch| {
             batch
@@ -856,7 +862,7 @@ fn collect_candidates(
                 .iter()
                 .filter_map(|file| {
                     let path = normalize_path(&file.path);
-                    let range = allowed.get(&path)?.clone();
+                    let range = allowed.get(&path)?;
                     Some((path, range))
                 })
                 .collect()
@@ -938,7 +944,7 @@ fn generalist_retry(tasks: &[FinderTask]) -> Option<EngineError> {
 }
 
 /// `AllKeysFailed`, `NoKeys` and `Internal` may pass when the job is retried later.
-fn is_retryable(err: &ChatError) -> bool {
+pub(crate) fn is_retryable(err: &ChatError) -> bool {
     matches!(
         err,
         ChatError::AllKeysFailed { .. } | ChatError::NoKeys | ChatError::Internal(_)

@@ -179,11 +179,7 @@ async fn check_settings(state: &AppState, out: &mut Vec<Check>) {
         return;
     };
     let primary = provider.primary_model().filter(|_| provider.enabled);
-    let fast = provider
-        .fast_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty());
+    let fast = provider.fast_model();
     match (primary, fast) {
         (None, _) => out.push(Check::problem(
             Status::Fail,

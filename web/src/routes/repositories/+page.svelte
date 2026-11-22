@@ -30,12 +30,10 @@
 		id: string;
 		connection_id: string;
 		display_name: string;
-		name: string;
 		enabled: boolean;
 		auto_review: boolean;
 		review_provider_id: string | null;
 		review_mode: ReviewMode | null;
-		webhook_count: number;
 	};
 
 	let connections = $state<Connection[]>([]);

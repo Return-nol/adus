@@ -101,23 +101,6 @@ async fn connect_twice_ignores_existing_group() {
 }
 
 #[tokio::test]
-async fn first_seen_true_once() {
-    let (queue, prefix) = new_queue().await;
-    assert!(queue.first_seen("github:delivery-1").await.unwrap());
-    assert!(!queue.first_seen("github:delivery-1").await.unwrap());
-    assert!(queue.first_seen("github:delivery-2").await.unwrap());
-
-    let mut conn = raw_connection().await;
-    let ttl: i64 = conn
-        .ttl(format!("{prefix}:dedup:github:delivery-1"))
-        .await
-        .unwrap();
-    assert!(ttl > 86_000 && ttl <= 86_400, "ttl was {ttl}");
-
-    cleanup(&prefix).await;
-}
-
-#[tokio::test]
 async fn enqueue_once_adds_one_entry_per_key() {
     let (queue, prefix) = new_queue().await;
     assert!(queue.enqueue_once(&review_job(1), "gh:d-1").await.unwrap());

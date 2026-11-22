@@ -29,15 +29,15 @@ use crate::specialists::{SpecialistKind, active_specialists};
 use crate::tools::Toolbox;
 
 /// Diff batches reviewed at the same time (spec 4.7).
-pub const BATCH_CONCURRENCY: usize = 2;
+const BATCH_CONCURRENCY: usize = 2;
 /// LLM calls one Finder agent may make.
 pub const FINDER_MAX_STEPS: usize = 20;
 /// The last Finder steps that offer only `submit_findings`.
-pub const FINDER_WRAP_UP_STEPS: usize = 2;
+const FINDER_WRAP_UP_STEPS: usize = 2;
 
 /// Where the Finder talks to the model: the provider's `primary_model` at `finder_effort(mode)`.
 #[derive(Clone, Copy)]
-pub struct FinderLlm<'a> {
+pub(crate) struct FinderLlm<'a> {
     pub chat: &'a dyn ChatService,
     pub provider_id: Uuid,
     pub model: &'a str,
@@ -48,7 +48,7 @@ pub struct FinderLlm<'a> {
 }
 
 /// What every Finder agent of one review is shown.
-pub struct FinderInput<'a> {
+pub(crate) struct FinderInput<'a> {
     pub pr: &'a PullRequest,
     pub manifest: &'a str,
     pub batches: &'a [DiffBatch<'a>],
@@ -59,7 +59,7 @@ pub struct FinderInput<'a> {
 
 /// Why a Finder task has no result.
 #[derive(Debug)]
-pub enum FinderFailure {
+pub(crate) enum FinderFailure {
     /// The Finder deadline passed first.
     TimedOut,
     /// The batch was not started: the review's token budget was already exhausted.
@@ -69,7 +69,7 @@ pub enum FinderFailure {
 
 /// One Finder agent: a specialist on one batch.
 #[derive(Debug)]
-pub struct FinderTask {
+pub(crate) struct FinderTask {
     /// Index into `FinderInput::batches`.
     pub batch: usize,
     pub kind: SpecialistKind,
@@ -77,7 +77,7 @@ pub struct FinderTask {
 }
 
 #[derive(Debug)]
-pub struct FinderRun {
+pub(crate) struct FinderRun {
     /// Ordered by (batch index, specialist order).
     pub tasks: Vec<FinderTask>,
     /// The model rejected tool calling, so `tasks` come from the re-run without tools.
@@ -88,7 +88,7 @@ pub struct FinderRun {
 /// one they review the diff only but may still submit through `submit_findings`. If any
 /// agent reports `ToolsUnsupported`, the whole tool-mode result is discarded and every agent
 /// runs again with no tools at all, under the same `deadline`.
-pub async fn run_finder(
+pub(crate) async fn run_finder(
     llm: FinderLlm<'_>,
     input: &FinderInput<'_>,
     toolbox: Option<&Toolbox>,
@@ -122,7 +122,7 @@ async fn run_all(
     deadline: Instant,
 ) -> Vec<FinderTask> {
     let with_tools = matches!(tools, AgentTools::Full(_));
-    let submit = SubmitFindings::new();
+    let submit = SubmitFindings(submit_findings_tool_def());
     // Futures are built up front: a closure inside the stream would make the future lose
     // `Send` (higher-ranked lifetime inference), as in `agent.rs`.
     let batches: Vec<_> = input
@@ -155,17 +155,9 @@ async fn run_all(
                 }
                 let agents: Vec<_> = kinds
                     .into_iter()
-                    .map(|kind| run_one(llm, kind, prompt.clone(), tools, submit, deadline))
+                    .map(|kind| run_one(llm, index, kind, prompt.clone(), tools, submit, deadline))
                     .collect();
-                let results = future::join_all(agents).await;
-                results
-                    .into_iter()
-                    .map(|(kind, result)| FinderTask {
-                        batch: index,
-                        kind,
-                        result,
-                    })
-                    .collect::<Vec<_>>()
+                future::join_all(agents).await
             }
         })
         .collect();
@@ -180,15 +172,13 @@ async fn run_all(
 /// One specialist on one batch, cut at `deadline`.
 async fn run_one(
     llm: FinderLlm<'_>,
+    batch: usize,
     kind: SpecialistKind,
     prompt: String,
     tools: AgentTools<'_>,
     submit: &SubmitFindings,
     deadline: Instant,
-) -> (
-    SpecialistKind,
-    Result<AgentOutcome<Vec<Suggestion>>, FinderFailure>,
-) {
+) -> FinderTask {
     let system = build_finder_system_prompt(kind, matches!(tools, AgentTools::Full(_)));
     let agent = AgentLlm {
         chat: llm.chat,
@@ -229,28 +219,22 @@ async fn run_one(
             Err(FinderFailure::TimedOut)
         }
     };
-    (kind, result)
+    FinderTask {
+        batch,
+        kind,
+        result,
+    }
 }
 
 /// The Finder's terminal tool, `submit_findings`. A reply without a tool call is read as the
 /// JSON array of the diff-only output format.
-struct SubmitFindings {
-    def: ToolDef,
-}
-
-impl SubmitFindings {
-    fn new() -> Self {
-        Self {
-            def: submit_findings_tool_def(),
-        }
-    }
-}
+struct SubmitFindings(ToolDef);
 
 impl SubmitSpec for SubmitFindings {
     type Output = Vec<Suggestion>;
 
     fn tool_def(&self) -> &ToolDef {
-        &self.def
+        &self.0
     }
 
     fn parse_arguments(&self, arguments: &Value) -> Result<Vec<Suggestion>, String> {

@@ -20,7 +20,7 @@ const TRUNCATED: &str = "\n[truncated]";
 /// Each instruction file as `--- <path> ---` followed by its text, blocks separated by a blank
 /// line and capped at 8,000 characters. Missing, unreadable, binary and blank files are
 /// skipped; `None` when nothing is left.
-pub async fn load_repo_instructions(workspace: Arc<RepoWorkspace>) -> Option<String> {
+pub(crate) async fn load_repo_instructions(workspace: Arc<RepoWorkspace>) -> Option<String> {
     match tokio::task::spawn_blocking(move || load_sync(&workspace)).await {
         Ok(text) => text,
         Err(err) => {
@@ -85,20 +85,10 @@ fn candidate_paths(ws: &RepoWorkspace) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use tempfile::TempDir;
-
     use super::*;
 
     fn workspace(files: &[(&str, &[u8])]) -> Arc<RepoWorkspace> {
-        let dir = TempDir::new().unwrap();
-        for (rel, body) in files {
-            let path = dir.path().join(rel);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, body).unwrap();
-        }
-        Arc::new(RepoWorkspace::from_temp_dir(dir).unwrap())
+        Arc::new(RepoWorkspace::from_files(files))
     }
 
     #[tokio::test]

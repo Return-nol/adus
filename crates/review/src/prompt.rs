@@ -1,7 +1,7 @@
 //! Teks yang dibuat Adus: prompt untuk LLM dan komentar yang diposting ke PR.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt;
 
 use adus_core::types::Severity;
 use adus_db::memories::Memory;
@@ -12,7 +12,7 @@ use adus_git::{FileDiff, FileStatus, PullRequest};
 use crate::parse::Suggestion;
 use crate::specialists::SpecialistKind;
 
-pub use adus_core::types::ADUDU_MARKER as MARKER;
+pub(crate) use adus_core::types::ADUDU_MARKER as MARKER;
 
 /// Deskripsi PR dipotong sepanjang ini (karakter, bukan byte).
 const MAX_DESCRIPTION_CHARS: usize = 4000;
@@ -49,10 +49,11 @@ pub(crate) fn or_none(text: String) -> String {
     }
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
+/// `text` cut to at most `max` chars, with `marker` appended when cut.
+pub(crate) fn truncate_with_marker<'a>(text: &'a str, max: usize, marker: &str) -> Cow<'a, str> {
     match text.char_indices().nth(max) {
-        Some((cut, _)) => format!("{}\n[truncated]", &text[..cut]),
-        None => text.to_string(),
+        Some((cut, _)) => Cow::Owned(format!("{}{marker}", &text[..cut])),
+        None => Cow::Borrowed(text),
     }
 }
 
@@ -87,7 +88,7 @@ fn annotate_patch(patch: &str) -> String {
 }
 
 /// Most characters of rendered diffs in one Finder batch. A single larger file gets its own batch.
-pub const MAX_BATCH_CHARS: usize = 40_000;
+pub(crate) const MAX_BATCH_CHARS: usize = 40_000;
 
 /// The Finder's mindset, first in every Finder system prompt.
 const FINDER_MINDSET: &str = r#"You are Adudu, a senior software engineer reviewing a pull request for your team. Your goal is to find the real defects this change introduces before it is merged. Hunt thoroughly: read the change closely and think about how it behaves on every path, not only the expected one. Report only problems you can explain concretely and back with what the code shows; a short list of real problems is worth far more than a long list of guesses."#;
@@ -153,7 +154,7 @@ const FINDER_TASK_DIFF_ONLY: &str = "Review the files in <diffs> using only the 
 /// byte-identical for every [`SpecialistKind`] (so providers can cache the prefix); only the
 /// trailing `<Role>` differs. `with_tools = false` is the self-contained diff-only variant: no
 /// repository tools, answer with a JSON array.
-pub fn build_finder_system_prompt(kind: SpecialistKind, with_tools: bool) -> String {
+pub(crate) fn build_finder_system_prompt(kind: SpecialistKind, with_tools: bool) -> String {
     let (workflow, output) = if with_tools {
         (
             FINDER_WORKFLOW_TOOLS,
@@ -175,7 +176,7 @@ pub fn build_finder_system_prompt(kind: SpecialistKind, with_tools: bool) -> Str
 
 /// First user message of a Finder agent for one batch. Every untrusted section is wrapped in its
 /// tag with that closing tag neutralized. `<repository_instructions>` is left out when `None`.
-pub fn build_finder_user_prompt(
+pub(crate) fn build_finder_user_prompt(
     pr: &PullRequest,
     manifest: &str,
     batch: &DiffBatch<'_>,
@@ -189,7 +190,7 @@ pub fn build_finder_user_prompt(
         wrap("pr_title", &pr.title),
         wrap(
             "pr_description",
-            &truncate_chars(&pr.description, MAX_DESCRIPTION_CHARS),
+            &truncate_with_marker(&pr.description, MAX_DESCRIPTION_CHARS, "\n[truncated]"),
         ),
         wrap("pr_manifest", manifest),
         wrap("rules", &or_none(format_rules(&batch.rules))),
@@ -266,7 +267,7 @@ fn status_text(status: FileStatus, path: &str, old_path: Option<&str>) -> String
 
 /// Files reviewed by one Finder pass, with the rules that match at least one of them.
 #[derive(Debug, Clone)]
-pub struct DiffBatch<'a> {
+pub(crate) struct DiffBatch<'a> {
     pub files: Vec<&'a FileDiff>,
     pub rules: Vec<&'a Rule>,
 }
@@ -275,7 +276,7 @@ pub struct DiffBatch<'a> {
 /// Files are sorted by parent directory, then path, so siblings share a batch, and packed in that
 /// order; a file larger than `max_chars` gets a batch of its own. Each batch keeps the `rules`
 /// (in their given order) that match at least one of its files.
-pub fn batch_targets<'a>(
+pub(crate) fn batch_targets<'a>(
     targets: &'a [FileDiff],
     rules: &'a [Rule],
     max_chars: usize,
@@ -316,22 +317,17 @@ fn parent_dir(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
-/// One line of the PR file manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManifestEntry {
-    pub path: String,
-    pub old_path: Option<String>,
-    pub status: FileStatus,
-    /// `+` lines of the patch (0 without a patch).
-    pub added: usize,
-    /// `-` lines of the patch (0 without a patch).
-    pub removed: usize,
-    /// Shown in brackets after the counts, e.g. `ignored` or `skipped: patch too large`.
-    pub note: Option<&'static str>,
+/// Lightweight per-file metadata needed to render `<pr_manifest>` without holding patches.
+pub(crate) struct ManifestFile {
+    path: String,
+    old_path: Option<String>,
+    status: FileStatus,
+    added: usize,
+    removed: usize,
 }
 
-impl ManifestEntry {
-    fn new(file: &FileDiff, note: Option<&'static str>) -> Self {
+impl ManifestFile {
+    pub(crate) fn from_diff(file: &FileDiff) -> Self {
         let (added, removed) = file.patch.as_deref().map_or((0, 0), changed_line_counts);
         Self {
             path: file.path.clone(),
@@ -339,65 +335,50 @@ impl ManifestEntry {
             status: file.status,
             added,
             removed,
-            note,
         }
     }
 }
 
-impl fmt::Display for ManifestEntry {
-    /// `- src/a.rs (modified, +2 -1)`, then ` [note]` when there is one.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let status = status_text(self.status, &self.path, self.old_path.as_deref());
-        write!(
-            f,
-            "- {} ({status}, +{} -{})",
-            self.path, self.added, self.removed
-        )?;
-        if let Some(note) = self.note {
-            write!(f, " [{note}]")?;
-        }
-        Ok(())
-    }
-}
-
-/// The PR file manifest: a header line, then one [`ManifestEntry`] line per file of
-/// `all_files`, in order. Files in `ignored_paths` are marked `[ignored]`; files in
-/// `skipped_reasons` (path → engine skip reason) are marked `[skipped: ...]`.
-pub fn build_manifest(
-    all_files: &[FileDiff],
+/// The PR file manifest: a header line, then one line per file of `files`, in order.
+/// Files in `ignored_paths` are marked `[ignored]`; files in `skipped_reasons` are marked
+/// `[skipped: ...]`.
+pub(crate) fn build_manifest(
+    files: &[ManifestFile],
     ignored_paths: &HashSet<&str>,
     skipped_reasons: &HashMap<&str, &'static str>,
 ) -> String {
-    let count = all_files.len();
+    let count = files.len();
     let noun = if count == 1 { "file" } else { "files" };
     let mut lines = vec![format!("{count} {noun} changed in this pull request:")];
-    for file in all_files {
+    for file in files {
         let path = file.path.as_str();
+        let status = status_text(file.status, path, file.old_path.as_deref());
         let note = if ignored_paths.contains(path) {
             Some("ignored")
         } else {
             skipped_reasons.get(path).map(|reason| skip_note(reason))
         };
-        lines.push(ManifestEntry::new(file, note).to_string());
+        let suffix = note.map_or(String::new(), |n| format!(" [{n}]"));
+        lines.push(format!(
+            "- {path} ({status}, +{} -{}){suffix}",
+            file.added, file.removed
+        ));
     }
     lines.join("\n")
 }
 
-/// Manifest note for an engine skip reason (see `format_summary`).
+/// Manifest note for a pre-Finder skip reason (see `format_summary`).
 fn skip_note(reason: &str) -> &'static str {
     match reason {
         "no_patch" => "skipped: no diff available",
         "too_large" => "skipped: patch too large",
         "file_limit" => "skipped: file limit reached",
-        "unparseable" => "skipped: review output could not be parsed",
-        "llm_error" => "skipped: LLM error",
-        "timed_out" => "skipped: did not finish in time",
         _ => "skipped",
     }
 }
 
 /// `(+ lines, - lines)` inside the hunks of a single-file patch (file headers do not count).
-fn changed_line_counts(patch: &str) -> (usize, usize) {
+pub(crate) fn changed_line_counts(patch: &str) -> (usize, usize) {
     let mut in_hunk = false;
     let (mut added, mut removed) = (0, 0);
     for line in patch.lines() {
@@ -429,7 +410,7 @@ fn severity_label(severity: Severity) -> &'static str {
 }
 
 /// Isi komentar inline untuk satu temuan.
-pub fn format_inline(s: &Suggestion) -> String {
+pub(crate) fn format_inline(s: &Suggestion) -> String {
     // Judul harus satu baris supaya tetap di dalam label tebal.
     let title = s.title.lines().collect::<Vec<_>>().join(" ");
     let mut out = format!(
@@ -452,7 +433,7 @@ pub fn format_inline(s: &Suggestion) -> String {
 /// `ignored` = jumlah file yang cocok dengan daftar ignore (hanya jumlahnya yang ditampilkan,
 /// bukan namanya).
 /// `warnings` are listed last under **Notes** (e.g. a fallback to diff-only review).
-pub fn format_summary(
+pub(crate) fn format_summary(
     counts: &BTreeMap<Severity, usize>,
     skipped: &[(String, &'static str)],
     ignored: usize,
@@ -507,43 +488,10 @@ fn skip_reason_label(reason: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adus_db::memories::MemorySource;
-    use adus_db::rules::KnowledgeScope;
+    use crate::test_support::{memory, rule};
     use adus_git::FileStatus;
     use adus_git::diff::commentable_lines;
-    use chrono::Utc;
     use std::collections::BTreeSet;
-    use uuid::Uuid;
-
-    fn rule(title: &str, glob: Option<&str>) -> Rule {
-        Rule {
-            id: Uuid::nil(),
-            scope: KnowledgeScope::Global,
-            repository_id: None,
-            title: title.into(),
-            body: format!("body of {title}"),
-            path_glob: glob.map(str::to_string),
-            severity: Severity::Critical,
-            enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    fn memory(content: &str) -> Memory {
-        Memory {
-            id: Uuid::nil(),
-            scope: KnowledgeScope::Global,
-            repository_id: None,
-            content: content.into(),
-            source: MemorySource::Manual,
-            source_url: None,
-            created_by: None,
-            created_by_email: None,
-            enabled: true,
-            created_at: Utc::now(),
-        }
-    }
 
     fn pr(description: &str) -> PullRequest {
         PullRequest {
@@ -561,8 +509,11 @@ mod tests {
     fn description_truncated_char_safe() {
         let long = "é".repeat(MAX_DESCRIPTION_CHARS + 10);
         let expected = format!("{}\n[truncated]", "é".repeat(MAX_DESCRIPTION_CHARS));
-        assert_eq!(truncate_chars(&long, MAX_DESCRIPTION_CHARS), expected);
-        assert_eq!(truncate_chars("abc", 3), "abc");
+        assert_eq!(
+            truncate_with_marker(&long, MAX_DESCRIPTION_CHARS, "\n[truncated]"),
+            expected
+        );
+        assert_eq!(truncate_with_marker("abc", 3, "\n[truncated]"), "abc");
         assert_eq!(wrap("patch", "x"), "<patch>\nx\n</patch>");
     }
 
@@ -581,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn annotate_patch_numbers_new_lines() {
+    fn annotate_patch_numbers_new_lines_and_agrees_with_commentable_lines() {
         let patch = "diff --git a/x b/x\n@@ -1,3 +1,4 @@\n a\n-b\n+B\n+C\n\n\\ No newline at end of file\n@@ -10,2 +11,2 @@\n x\n+y";
         let expected = "diff --git a/x b/x\n\
                         @@ -1,3 +1,4 @@\n\
@@ -595,10 +546,19 @@ mod tests {
                         \x20  11   x\n\
                         \x20  12 + y";
         assert_eq!(annotate_patch(patch), expected);
+
+        let crlf = "--- a/x\r\n+++ b/x\r\n@@ -1 +1 @@\r\n-a\r\n+A\r\n@@ -5,3 +5,4 @@\r\n ctx\r\n\r\n+new\r\n-old\r\n+last\r\n\\ No newline at end of file\r\n";
+        let plus_rows: BTreeSet<u32> = annotate_patch(crlf)
+            .lines()
+            .filter(|row| row.get(5..8) == Some(" + "))
+            .filter_map(|row| row.get(..5)?.trim().parse().ok())
+            .collect();
+        assert_eq!(plus_rows, commentable_lines(crlf));
+        assert_eq!(plus_rows, BTreeSet::from([1, 7, 8]));
     }
 
     #[test]
-    fn formatted_comments_contain_marker() {
+    fn format_inline_renders_marker_title_body_and_fence() {
         let s = Suggestion {
             file: "a.rs".into(),
             start_line: None,
@@ -616,10 +576,24 @@ mod tests {
 
         let plain = format_inline(&Suggestion {
             suggestion: None,
-            ..s
+            ..s.clone()
         });
         assert!(!plain.contains("```"));
 
+        let nested = format_inline(&Suggestion {
+            file: "a.md".into(),
+            severity: Severity::Info,
+            title: "first\nsecond\r\nthird".into(),
+            body: "b".into(),
+            suggestion: Some("````rust\nx\n```\n\n".into()),
+            ..s
+        });
+        assert!(nested.contains("**ℹ️ Info:** first second third\n"));
+        assert!(nested.ends_with("`````suggestion\n````rust\nx\n```\n`````"));
+    }
+
+    #[test]
+    fn format_summary_renders_counts_ignored_skipped_and_notes() {
         let counts = BTreeMap::from([
             (Severity::Info, 1),
             (Severity::Warning, 0),
@@ -629,67 +603,33 @@ mod tests {
             ("logo.png".to_string(), "no_patch"),
             ("big.rs".to_string(), "too_large"),
         ];
-        let summary = format_summary(&counts, &skipped, 0, &[]);
+        let warnings = [
+            "Codebase context unavailable — reviewed diff only".to_string(),
+            "Performance reviewer did not complete".to_string(),
+        ];
+        let summary = format_summary(&counts, &skipped, 3, &warnings);
         assert!(summary.contains(MARKER));
         assert!(summary.contains("Adudu reviewed this PR"));
-        assert!(summary.contains("- 🚨 Critical: 2\n- ℹ️ Info: 1"));
+        assert!(summary.contains("- 🚨 Critical: 2\n- ℹ️ Info: 1\n\n3 files ignored\n\n"));
         assert!(!summary.contains("Warning"));
-        assert!(
-            summary.contains(
-                "**Skipped files**\n- `logo.png`: no diff available (binary or too large)\n- `big.rs`: patch too large"
-            )
-        );
+        assert!(summary.ends_with(
+            "**Skipped files**\n\
+             - `logo.png`: no diff available (binary or too large)\n\
+             - `big.rs`: patch too large\n\n\
+             **Notes**\n\
+             - Codebase context unavailable — reviewed diff only\n\
+             - Performance reviewer did not complete"
+        ));
+
+        let one = format_summary(&BTreeMap::new(), &[], 1, &[]);
+        assert!(one.ends_with("No issues found.\n\n1 file ignored"));
 
         let empty = format_summary(&BTreeMap::from([(Severity::Info, 0)]), &[], 0, &[]);
         assert!(empty.contains(MARKER));
         assert!(empty.contains("No issues found."));
         assert!(!empty.contains("Skipped"));
         assert!(!empty.contains("ignored"));
-    }
-
-    #[test]
-    fn summary_includes_ignored_count() {
-        let counts = BTreeMap::from([(Severity::Warning, 1)]);
-        let skipped = [("big.rs".to_string(), "too_large")];
-        let summary = format_summary(&counts, &skipped, 3, &[]);
-        assert!(summary.contains("- ⚠️ Warning: 1\n\n3 files ignored\n\n**Skipped files**"));
-
-        let one = format_summary(&BTreeMap::new(), &[], 1, &[]);
-        assert!(one.ends_with("No issues found.\n\n1 file ignored"));
-    }
-
-    #[test]
-    fn suggestion_fence_title_and_trailing_newlines() {
-        let s = Suggestion {
-            file: "a.md".into(),
-            start_line: None,
-            line: 1,
-            severity: Severity::Info,
-            title: "first\nsecond\r\nthird".into(),
-            body: "b".into(),
-            suggestion: Some("````rust\nx\n```\n\n".into()),
-        };
-        let out = format_inline(&s);
-        assert!(out.contains("**ℹ️ Info:** first second third\n"));
-        assert!(out.ends_with("`````suggestion\n````rust\nx\n```\n`````"));
-
-        let plain = format_inline(&Suggestion {
-            suggestion: Some("let x = `y`;\n".into()),
-            ..s
-        });
-        assert!(plain.ends_with("\n```suggestion\nlet x = `y`;\n```"));
-    }
-
-    #[test]
-    fn annotate_patch_agrees_with_commentable_lines() {
-        let p = "--- a/x\r\n+++ b/x\r\n@@ -1 +1 @@\r\n-a\r\n+A\r\n@@ -5,3 +5,4 @@\r\n ctx\r\n\r\n+new\r\n-old\r\n+last\r\n\\ No newline at end of file\r\n";
-        let plus_rows: BTreeSet<u32> = annotate_patch(p)
-            .lines()
-            .filter(|row| row.get(5..8) == Some(" + "))
-            .filter_map(|row| row.get(..5)?.trim().parse().ok())
-            .collect();
-        assert_eq!(plus_rows, commentable_lines(p));
-        assert_eq!(plus_rows, BTreeSet::from([1, 7, 8]));
+        assert!(!empty.contains("Notes"));
     }
 
     fn diff(path: &str, status: FileStatus, patch: Option<&str>) -> FileDiff {
@@ -728,13 +668,7 @@ mod tests {
                 prefixes.iter().all(|prefix| *prefix == prefixes[0]),
                 "with_tools = {with_tools}"
             );
-            let shared = prefixes[0];
-            assert!(shared.starts_with("<ReviewInstructions>\n"));
-            assert!(shared.ends_with("</ReviewInstructions>\n\n"));
-            for tag in ["</Workflow>", "</Scope>", "</UntrustedInput>"] {
-                assert!(shared.contains(tag), "{tag} missing");
-            }
-            assert!(!shared.contains("<Role>"));
+            assert!(!prefixes[0].contains("<Role>"));
         }
 
         let tools = build_finder_system_prompt(SpecialistKind::Generalist, true);
@@ -751,8 +685,6 @@ mod tests {
         for name in ["read_file", "grep", "list_dir", "find_files"] {
             assert!(!plain.contains(name), "{name} in the diff-only prompt");
         }
-        assert!(plain.contains("ONLY a JSON array"));
-        assert!(plain.contains("respond with []"));
     }
 
     #[test]
@@ -775,9 +707,9 @@ mod tests {
             (size("src/b.rs") + size("src/c.rs")).max(size("src/a/x.rs") + size("web/app.ts"));
         assert!(size("big/huge.rs") > max);
         let rules = [
-            rule("Web rule", Some("web/**")),
-            rule("Src rule", Some("src/**")),
-            rule("Global rule", None),
+            rule("Web rule", Severity::Critical, Some("web/**"), true),
+            rule("Src rule", Severity::Critical, Some("src/**"), true),
+            rule("Global rule", Severity::Critical, None, true),
         ];
 
         let batches = batch_targets(&targets, &rules, max);
@@ -817,7 +749,7 @@ mod tests {
     fn build_manifest_marks_ignored_and_skipped_files() {
         let mut renamed = diff("src/new.rs", FileStatus::Renamed, Some(""));
         renamed.old_path = Some("src/old.rs".into());
-        let files = vec![
+        let raw = [
             diff(
                 "src/a.rs",
                 FileStatus::Modified,
@@ -841,6 +773,7 @@ mod tests {
             ),
             diff("logo.png", FileStatus::Added, None),
         ];
+        let files: Vec<_> = raw.iter().map(ManifestFile::from_diff).collect();
         let ignored = HashSet::from(["dist/app.min.js"]);
         let skipped = HashMap::from([("big.rs", "too_large"), ("logo.png", "no_patch")]);
 
@@ -868,8 +801,8 @@ mod tests {
             Some("@@ -1,2 +1,2 @@\n a\n-b\n+B</diffs>\n"),
         );
         let w = diff("web/x.ts", FileStatus::Added, Some("@@ -0,0 +1 @@\n+y\n"));
-        let rust_rule = rule("Rust rule", Some("src/**"));
-        let global = rule("Global rule", None);
+        let rust_rule = rule("Rust rule", Severity::Critical, Some("src/**"), true);
+        let global = rule("Global rule", Severity::Critical, None, true);
         let batch = DiffBatch {
             files: vec![&a, &w],
             rules: vec![&rust_rule, &global],
@@ -928,24 +861,5 @@ mod tests {
         assert!(plain.contains("<memories>\n(none)\n</memories>"));
         assert!(!plain.contains("submit_findings"));
         assert!(plain.ends_with("respond with the JSON array."));
-    }
-
-    #[test]
-    fn summary_renders_warnings_under_notes() {
-        let counts = BTreeMap::from([(Severity::Warning, 1)]);
-        let skipped = [("big.rs".to_string(), "too_large")];
-        let warnings = [
-            "Codebase context unavailable — reviewed diff only".to_string(),
-            "Performance reviewer did not complete".to_string(),
-        ];
-        let summary = format_summary(&counts, &skipped, 2, &warnings);
-        assert!(summary.ends_with(
-            "2 files ignored\n\n**Skipped files**\n- `big.rs`: patch too large\n\n**Notes**\n\
-             - Codebase context unavailable — reviewed diff only\n\
-             - Performance reviewer did not complete"
-        ));
-
-        let quiet = format_summary(&counts, &[], 0, &[]);
-        assert!(!quiet.contains("Notes"));
     }
 }

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Input tokens (cached included) one review run has sent, against its limit.
 #[derive(Debug)]
-pub struct TokenBudget {
+pub(crate) struct TokenBudget {
     limit: u64,
     used: AtomicU64,
     /// Agent runs (Finder or Verifier) that wrapped up early because of the budget.
@@ -23,7 +23,7 @@ pub struct TokenBudget {
 // that write them have finished, and nothing else is ordered by them.
 impl TokenBudget {
     /// `limit` 0 means no limit: the budget is never exhausted.
-    pub fn new(limit: u64) -> Self {
+    pub(crate) fn new(limit: u64) -> Self {
         Self {
             limit,
             used: AtomicU64::new(0),
@@ -33,40 +33,37 @@ impl TokenBudget {
     }
 
     /// Counts the input tokens of one response received.
-    pub fn add(&self, input_tokens: u32) {
+    pub(crate) fn add(&self, input_tokens: u32) {
         self.used
             .fetch_add(u64::from(input_tokens), Ordering::Relaxed);
     }
 
-    pub fn used(&self) -> u64 {
+    pub(crate) fn used(&self) -> u64 {
         self.used.load(Ordering::Relaxed)
     }
 
-    pub fn limit(&self) -> u64 {
-        self.limit
-    }
-
     /// True once a non-zero limit is reached.
-    pub fn exhausted(&self) -> bool {
+    pub(crate) fn exhausted(&self) -> bool {
         self.limit > 0 && self.used() >= self.limit
     }
 
     /// An agent run wrapped up early because the budget was exhausted.
-    pub fn note_wrap_up(&self) {
+    pub(crate) fn note_wrap_up(&self) {
         self.wrap_ups.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A Verifier candidate was checked diff-only instead of with the repository tools.
-    pub fn note_diff_only(&self) {
+    pub(crate) fn note_diff_only(&self) {
         self.diff_only_verifications.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Agent runs that wrapped up early because of the budget, so far.
-    pub fn wrap_ups(&self) -> usize {
+    pub(crate) fn wrap_ups(&self) -> usize {
         self.wrap_ups.load(Ordering::Relaxed)
     }
 
-    pub fn diff_only_verifications(&self) -> usize {
+    #[cfg(test)]
+    fn diff_only_verifications(&self) -> usize {
         self.diff_only_verifications.load(Ordering::Relaxed)
     }
 
@@ -74,7 +71,7 @@ impl TokenBudget {
     /// the Finder batches never started (taken from the Finder's final tasks, so a re-run
     /// without tools is not counted twice); `finder_wrap_ups` is [`Self::wrap_ups`] read when
     /// the Finder finished, so Verifier wrap-ups are not named.
-    pub fn warning(&self, batches_skipped: usize, finder_wrap_ups: usize) -> Option<String> {
+    pub(crate) fn warning(&self, batches_skipped: usize, finder_wrap_ups: usize) -> Option<String> {
         let mut details = Vec::new();
         match batches_skipped {
             0 => {}
@@ -84,7 +81,7 @@ impl TokenBudget {
         if finder_wrap_ups > 0 {
             details.push("some reviewers stopped early".to_string());
         }
-        match self.diff_only_verifications() {
+        match self.diff_only_verifications.load(Ordering::Relaxed) {
             0 => {}
             1 => details.push("1 finding verified from the diff only".to_string()),
             n => details.push(format!("{n} findings verified from the diff only")),
@@ -106,22 +103,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_budget_zero_never_exhausts() {
-        let budget = TokenBudget::new(0);
-        assert!(!budget.exhausted());
-        budget.add(u32::MAX);
-        budget.add(u32::MAX);
-        assert_eq!(budget.used(), 2 * u64::from(u32::MAX));
-        assert_eq!(budget.limit(), 0);
-        assert!(!budget.exhausted());
-    }
+    fn token_budget_exhausts_only_at_non_zero_limit() {
+        let zero = TokenBudget::new(0);
+        assert!(!zero.exhausted());
+        zero.add(u32::MAX);
+        zero.add(u32::MAX);
+        assert_eq!(zero.used(), 2 * u64::from(u32::MAX));
+        assert!(!zero.exhausted());
 
-    #[test]
-    fn token_budget_exhausts_at_limit() {
         let budget = TokenBudget::new(1_000);
-        assert_eq!(budget.limit(), 1_000);
         budget.add(600);
-        assert!(!budget.exhausted());
         budget.add(399);
         assert_eq!(budget.used(), 999);
         assert!(!budget.exhausted());

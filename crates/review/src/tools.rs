@@ -9,9 +9,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use adus_llm::ToolDef;
@@ -22,6 +23,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use crate::prompt::truncate_with_marker;
 use crate::redact::redact_secrets;
 use crate::workspace::{PathError, RepoPath, RepoWorkspace, is_secret_path};
 
@@ -69,40 +71,36 @@ impl Default for SearchLimits {
     }
 }
 
-/// Arguments of `read_file`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReadFileArgs {
-    pub path: String,
-    pub start_line: Option<u32>,
-    pub end_line: Option<u32>,
+#[derive(Deserialize)]
+struct ReadFileArgs {
+    path: String,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
 }
 
-/// Arguments of `grep`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct GrepArgs {
-    pub pattern: String,
-    pub path: Option<String>,
-    pub glob: Option<String>,
-    pub case_sensitive: Option<bool>,
+#[derive(Deserialize)]
+struct GrepArgs {
+    pattern: String,
+    path: Option<String>,
+    glob: Option<String>,
+    case_sensitive: Option<bool>,
 }
 
-/// Arguments of `list_dir`.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ListDirArgs {
-    pub path: Option<String>,
+#[derive(Default, Deserialize)]
+struct ListDirArgs {
+    path: Option<String>,
 }
 
-/// Arguments of `find_files`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct FindFilesArgs {
-    pub pattern: String,
-    pub path: Option<String>,
+#[derive(Deserialize)]
+struct FindFilesArgs {
+    pattern: String,
+    path: Option<String>,
 }
 
 /// What a tool call returns to the model. Error content always starts with `"Error: "`,
 /// because some providers drop the error flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolOutput {
+pub(crate) struct ToolOutput {
     pub content: String,
     pub is_error: bool,
 }
@@ -201,7 +199,7 @@ enum CacheKey {
 /// Results of successful read-only calls, shared by every agent of one review. The lock is
 /// only taken inside blocking tool work, never across an `.await`.
 #[derive(Debug, Default)]
-pub struct ToolCache {
+struct ToolCache {
     entries: RwLock<HashMap<CacheKey, String>>,
     hits: AtomicU64,
     /// Fresh results that had a secret masked (cache hits are not counted again).
@@ -209,17 +207,14 @@ pub struct ToolCache {
 }
 
 impl ToolCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// How many calls were answered from the cache.
-    pub fn hits(&self) -> u64 {
+    #[cfg(test)]
+    fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
     }
 
     /// How many fresh tool results had a secret masked.
-    pub fn redacted(&self) -> u64 {
+    fn redacted(&self) -> u64 {
         self.redacted.load(Ordering::Relaxed)
     }
 
@@ -266,8 +261,11 @@ impl ReadOnlyCall {
         }
     }
 
-    /// Resolves paths and defaults into a [`CacheKey`]. Touches the filesystem.
-    fn normalize(&self, ws: &RepoWorkspace) -> Result<CacheKey, ToolError> {
+    /// Resolves paths and defaults into `(CacheKey, RepoPath)`. Touches the filesystem once.
+    fn normalize(&self, ws: &RepoWorkspace) -> Result<(CacheKey, RepoPath), ToolError> {
+        let resolve_opt = |path: Option<&str>| -> Result<RepoPath, ToolError> {
+            Ok(ws.resolve_or_root(path.map_or("", str::trim))?)
+        };
         match self {
             Self::ReadFile(args) => {
                 let path = ws.resolve(args.path.trim())?;
@@ -278,19 +276,21 @@ impl ReadOnlyCall {
                     Some(end) => end.min(last_allowed),
                     None => last_allowed,
                 };
-                Ok(CacheKey::ReadFile {
+                let key = CacheKey::ReadFile {
                     path: path.rel().to_owned(),
                     start,
                     end,
-                })
+                };
+                Ok((key, path))
             }
             Self::Grep(args) => {
                 if args.pattern.is_empty() {
                     return Err(ToolError::EmptyPattern);
                 }
-                Ok(CacheKey::Grep {
+                let path = resolve_opt(args.path.as_deref())?;
+                let key = CacheKey::Grep {
                     pattern: args.pattern.clone(),
-                    path: resolve_target(ws, args.path.as_deref())?.rel().to_owned(),
+                    path: path.rel().to_owned(),
                     glob: args
                         .glob
                         .as_deref()
@@ -298,15 +298,24 @@ impl ReadOnlyCall {
                         .filter(|g| !g.is_empty())
                         .map(str::to_owned),
                     case_sensitive: args.case_sensitive.unwrap_or(true),
-                })
+                };
+                Ok((key, path))
             }
-            Self::ListDir(args) => Ok(CacheKey::ListDir {
-                path: resolve_target(ws, args.path.as_deref())?.rel().to_owned(),
-            }),
-            Self::FindFiles(args) => Ok(CacheKey::FindFiles {
-                pattern: args.pattern.trim().to_owned(),
-                path: resolve_target(ws, args.path.as_deref())?.rel().to_owned(),
-            }),
+            Self::ListDir(args) => {
+                let path = resolve_opt(args.path.as_deref())?;
+                let key = CacheKey::ListDir {
+                    path: path.rel().to_owned(),
+                };
+                Ok((key, path))
+            }
+            Self::FindFiles(args) => {
+                let path = resolve_opt(args.path.as_deref())?;
+                let key = CacheKey::FindFiles {
+                    pattern: args.pattern.trim().to_owned(),
+                    path: path.rel().to_owned(),
+                };
+                Ok((key, path))
+            }
         }
     }
 }
@@ -318,56 +327,38 @@ fn parse_args<T: DeserializeOwned>(tool: &'static str, args: &Value) -> Result<T
     })
 }
 
-/// Validates an optional directory-or-file argument; missing or `.` is the repository root.
-fn resolve_target(ws: &RepoWorkspace, path: Option<&str>) -> Result<RepoPath, ToolError> {
-    let path = path.map(str::trim).unwrap_or("");
-    if path.split('/').all(|part| part.is_empty() || part == ".") {
-        return Ok(ws.resolve_dir("")?);
-    }
-    Ok(ws.resolve(path)?)
-}
-
-/// Re-validates a normalized relative path (`""` is the root).
-fn resolve_rel(ws: &RepoWorkspace, rel: &str) -> Result<RepoPath, ToolError> {
-    if rel.is_empty() {
-        Ok(ws.resolve_dir("")?)
-    } else {
-        Ok(ws.resolve(rel)?)
-    }
-}
+static READ_ONLY_DEFS: LazyLock<Vec<ToolDef>> = LazyLock::new(read_only_defs);
 
 /// The read-only tools bound to one workspace and cache.
 #[derive(Debug)]
-pub struct Toolbox {
+pub(crate) struct Toolbox {
     workspace: Arc<RepoWorkspace>,
     cache: Arc<ToolCache>,
-    read_only_defs: Vec<ToolDef>,
     limits: SearchLimits,
 }
 
 impl Toolbox {
-    pub fn new(workspace: Arc<RepoWorkspace>, cache: Arc<ToolCache>) -> Self {
+    pub(crate) fn new(workspace: Arc<RepoWorkspace>) -> Self {
         Self {
             workspace,
-            cache,
-            read_only_defs: read_only_defs(),
+            cache: Arc::new(ToolCache::default()),
             limits: SearchLimits::default(),
         }
     }
 
     /// How many fresh tool results of this review had a secret masked.
-    pub fn redacted_outputs(&self) -> u64 {
+    pub(crate) fn redacted_outputs(&self) -> u64 {
         self.cache.redacted()
     }
 
     /// Definitions of `read_file`, `grep`, `list_dir` and `find_files`, in that order.
-    pub fn read_only_tool_defs(&self) -> &[ToolDef] {
-        &self.read_only_defs
+    pub(crate) fn read_only_tool_defs(&self) -> &[ToolDef] {
+        &READ_ONLY_DEFS
     }
 
     /// Runs one read-only tool call off the async runtime. Never panics; failures come back as
     /// `is_error` outputs.
-    pub async fn execute_read_only(&self, name: &str, args: &Value) -> ToolOutput {
+    pub(crate) async fn execute_read_only(&self, name: &str, args: &Value) -> ToolOutput {
         let call = match ReadOnlyCall::parse(name, args) {
             Ok(call) => call,
             Err(err) => return ToolOutput::error(&err),
@@ -390,50 +381,39 @@ impl Toolbox {
         }
     }
 
-    /// Lines `center_line ± radius` of `path` in the `read_file` format, or `None` on any
-    /// failure (bad path, secret, binary, too large, line out of range). Blocking.
-    ///
-    /// The text is raw: never redacted and never cached, so the Verifier sees a hardcoded
-    /// secret the finding is about.
-    pub fn read_file_snippet_sync(
+    /// [`read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
+    pub(crate) async fn read_file_snippet(
         &self,
         path: &str,
         center_line: u32,
         radius: u32,
     ) -> Option<String> {
-        let args = ReadFileArgs {
-            path: path.to_owned(),
-            start_line: Some(center_line.saturating_sub(radius).max(1)),
-            end_line: Some(center_line.saturating_add(radius)),
-        };
-        let key = ReadOnlyCall::ReadFile(args)
-            .normalize(&self.workspace)
-            .ok()?;
-        run_uncached(&self.workspace, &key, self.limits)
-            .ok()
-            .map(|found| found.text)
-    }
-
-    /// [`Self::read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
-    pub async fn read_file_snippet(
-        &self,
-        path: &str,
-        center_line: u32,
-        radius: u32,
-    ) -> Option<String> {
-        let this = Self {
-            workspace: Arc::clone(&self.workspace),
-            cache: Arc::clone(&self.cache),
-            // Only `read_file` runs here; the tool definitions are not needed.
-            read_only_defs: Vec::new(),
-            limits: self.limits,
-        };
+        let ws = Arc::clone(&self.workspace);
         let path = path.to_owned();
-        tokio::task::spawn_blocking(move || this.read_file_snippet_sync(&path, center_line, radius))
+        tokio::task::spawn_blocking(move || read_file_snippet_sync(&ws, &path, center_line, radius))
             .await
             .ok()
             .flatten()
     }
+}
+
+/// Lines `center_line ± radius` of `path` in the `read_file` format, or `None` on any
+/// failure (bad path, secret, binary, too large, line out of range). Blocking.
+///
+/// The text is raw: never redacted and never cached, so the Verifier sees a hardcoded
+/// secret the finding is about.
+fn read_file_snippet_sync(
+    ws: &RepoWorkspace,
+    path: &str,
+    center_line: u32,
+    radius: u32,
+) -> Option<String> {
+    let target = ws.resolve(path.trim()).ok()?;
+    let start = center_line.saturating_sub(radius).max(1);
+    let end = center_line
+        .saturating_add(radius)
+        .min(start.saturating_add(READ_MAX_LINES - 1));
+    read_file(&target, start, end).ok()
 }
 
 /// Runs `call` through the cache. Fresh content is redacted before it is cached, so cached
@@ -444,11 +424,11 @@ fn run_cached(
     call: &ReadOnlyCall,
     limits: SearchLimits,
 ) -> Result<String, ToolError> {
-    let key = call.normalize(ws)?;
+    let (key, target) = call.normalize(ws)?;
     if let Some(hit) = cache.get(&key) {
         return Ok(hit);
     }
-    let mut found = run_uncached(ws, &key, limits)?;
+    let mut found = run_uncached(ws, &key, &target, limits)?;
     if let Cow::Owned(redacted) = redact_secrets(&found.text) {
         found.text = redacted;
         cache.redacted.fetch_add(1, Ordering::Relaxed);
@@ -464,20 +444,28 @@ fn run_cached(
 fn run_uncached(
     ws: &RepoWorkspace,
     key: &CacheKey,
+    target: &RepoPath,
     limits: SearchLimits,
 ) -> Result<ToolText, ToolError> {
     let found = match key {
-        CacheKey::ReadFile { path, start, end } => {
-            ToolText::complete(read_file(ws, path, *start, *end)?)
+        CacheKey::ReadFile { start, end, .. } => {
+            ToolText::complete(read_file(target, *start, *end)?)
         }
         CacheKey::Grep {
             pattern,
-            path,
             glob,
             case_sensitive,
-        } => grep(ws, pattern, path, glob.as_deref(), *case_sensitive, limits)?,
-        CacheKey::ListDir { path } => ToolText::complete(list_dir(ws, path)?),
-        CacheKey::FindFiles { pattern, path } => find_files(ws, pattern, path, limits)?,
+            ..
+        } => grep(
+            ws,
+            target,
+            pattern,
+            glob.as_deref(),
+            *case_sensitive,
+            limits,
+        )?,
+        CacheKey::ListDir { .. } => ToolText::complete(list_dir(target)?),
+        CacheKey::FindFiles { pattern, .. } => find_files(ws, target, pattern, limits)?,
     };
     Ok(found)
 }
@@ -516,8 +504,8 @@ pub(crate) fn read_text(abs: &Path) -> Result<String, ToolError> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn read_file(ws: &RepoWorkspace, rel: &str, start: u32, end: u32) -> Result<String, ToolError> {
-    let path = ws.resolve(rel)?;
+fn read_file(path: &RepoPath, start: u32, end: u32) -> Result<String, ToolError> {
+    let rel = path.rel();
     if path.abs().is_dir() {
         return Err(ToolError::IsDirectory(rel.to_owned()));
     }
@@ -602,45 +590,40 @@ fn relative(root: &Path, path: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// One step of [`walk_files`].
-enum Walked {
-    File {
-        rel: String,
-        abs: PathBuf,
-    },
-    /// The time budget ran out; the walk stops here.
-    TimeUp,
-}
-
-/// Files under `target` (or `target` itself when it is a file), with their relative paths.
-/// Checks `deadline` before every walk entry, directories included, and yields one
-/// [`Walked::TimeUp`] when it has passed.
+/// Walks files under `target` until `deadline` passes or `visit` breaks. Returns `true` when
+/// `deadline` cut the walk short.
 fn walk_files(
     ws: &RepoWorkspace,
     target: &RepoPath,
     deadline: Instant,
-) -> impl Iterator<Item = Walked> {
-    let root = ws.root().to_path_buf();
-    let mut timed_out = false;
-    walk(ws, target.abs())
-        .filter_map(Result::ok)
-        .map_while(move |entry| {
-            if timed_out {
-                return None;
-            }
-            if Instant::now() >= deadline {
-                timed_out = true;
-                return Some(Some(Walked::TimeUp));
-            }
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                return Some(None);
-            }
-            Some(relative(&root, entry.path()).map(|rel| Walked::File {
-                rel,
-                abs: entry.into_path(),
-            }))
-        })
-        .flatten()
+    mut visit: impl FnMut(String, PathBuf) -> ControlFlow<()>,
+) -> bool {
+    let root = ws.root();
+    for entry in walk(ws, target.abs()).filter_map(Result::ok) {
+        if Instant::now() >= deadline {
+            return true;
+        }
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let Some(rel) = relative(root, entry.path()) else {
+            continue;
+        };
+        if visit(rel, entry.into_path()).is_break() {
+            return false;
+        }
+    }
+    false
+}
+
+fn expect_dir(path: &RepoPath) -> Result<(), ToolError> {
+    if path.abs().is_file() {
+        Err(ToolError::NotADirectory(path.rel().to_owned()))
+    } else if !path.abs().is_dir() {
+        Err(ToolError::NotFound(path.rel().to_owned()))
+    } else {
+        Ok(())
+    }
 }
 
 fn compile_glob(pattern: &str) -> Result<GlobMatcher, ToolError> {
@@ -680,8 +663,8 @@ impl Capped {
 
 fn grep(
     ws: &RepoWorkspace,
+    target: &RepoPath,
     pattern: &str,
-    rel: &str,
     glob: Option<&str>,
     case_sensitive: bool,
     limits: SearchLimits,
@@ -694,9 +677,8 @@ fn grep(
         .build()
         .map_err(|e| ToolError::Regex(excerpt(&e.to_string(), MAX_ECHO_CHARS)))?;
     let glob = glob.map(compile_glob).transpose()?;
-    let target = resolve_rel(ws, rel)?;
     if !target.abs().exists() {
-        return Err(ToolError::NotFound(rel.to_owned()));
+        return Err(ToolError::NotFound(target.rel().to_owned()));
     }
 
     let mut search = GrepSearch {
@@ -706,69 +688,67 @@ fn grep(
         out: Capped::new(GREP_MAX_CHARS - NOTE_RESERVE_CHARS),
         groups: 0,
         long_lines: 0,
+        scanned: 0,
+        skipped: 0,
+        truncated: None,
         timed_out: false,
     };
-    let mut scanned = 0;
-    let mut skipped = 0;
-    let mut truncated = None;
-    for walked in walk_files(ws, &target, deadline) {
-        let (file_rel, abs) = match walked {
-            Walked::File { rel, abs } => (rel, abs),
-            Walked::TimeUp => {
-                search.timed_out = true;
-                truncated = Some(time_limit_note());
-                break;
-            }
-        };
+    let walk_timed_out = walk_files(ws, target, deadline, |file_rel, abs| {
         if glob.as_ref().is_some_and(|g| !g.is_match(&file_rel)) {
-            continue;
+            return ControlFlow::Continue(());
         }
-        if scanned == GREP_MAX_FILES {
-            truncated = Some(format!(
+        if search.scanned == GREP_MAX_FILES {
+            search.truncated = Some(format!(
                 "stopped after scanning {GREP_MAX_FILES} files; narrow path or glob"
             ));
-            break;
+            return ControlFlow::Break(());
         }
-        scanned += 1;
+        search.scanned += 1;
         let Ok(text) = read_text(&abs) else {
-            skipped += 1;
-            continue;
+            search.skipped += 1;
+            return ControlFlow::Continue(());
         };
         if let Err(reason) = search.file(&file_rel, &text) {
-            truncated = Some(reason);
-            break;
+            search.truncated = Some(reason);
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(())
+    });
+    if walk_timed_out {
+        search.timed_out = true;
+        search.truncated = Some(time_limit_note());
     }
 
-    let (groups, long_lines, time_cut) = (search.groups, search.long_lines, search.timed_out);
     let mut result = search.out.text;
-    if groups == 0 && truncated.is_none() {
-        let place = if rel.is_empty() {
+    if search.groups == 0 && search.truncated.is_none() {
+        let place = if target.rel().is_empty() {
             "the repository"
         } else {
-            rel
+            target.rel()
         };
         let pattern = excerpt(pattern, MAX_ECHO_CHARS);
         result = format!("No matches for `{pattern}` in {place}.\n");
     }
-    if skipped > 0 {
+    if search.skipped > 0 {
         result.push_str(&format!(
-            "[{skipped} file(s) skipped: binary, unreadable or larger than 2 MB]\n"
+            "[{} file(s) skipped: binary, unreadable or larger than 2 MB]\n",
+            search.skipped
         ));
     }
-    if long_lines > 0 {
+    if search.long_lines > 0 {
         let kib = limits.line_window / 1024;
         result.push_str(&format!(
-            "[search truncated: {long_lines} line(s) longer than {kib} KiB were only searched in their first {kib} KiB]\n"
+            "[search truncated: {} line(s) longer than {kib} KiB were only searched in their first {kib} KiB]\n",
+            search.long_lines
         ));
     }
-    if let Some(reason) = truncated {
+    if let Some(reason) = search.truncated {
         result.push_str(&format!("[search truncated: {reason}]\n"));
     }
     result.pop();
     Ok(ToolText {
         text: result,
-        time_cut,
+        time_cut: search.timed_out,
     })
 }
 
@@ -785,6 +765,9 @@ struct GrepSearch<'r> {
     groups: usize,
     /// Lines matched only within their first `line_window` bytes.
     long_lines: usize,
+    scanned: usize,
+    skipped: usize,
+    truncated: Option<String>,
     /// The deadline passed before the search finished.
     timed_out: bool,
 }
@@ -803,7 +786,7 @@ impl GrepSearch<'_> {
             }
             let window = if line.len() > self.line_window {
                 self.long_lines += 1;
-                prefix_at_char_boundary(line, self.line_window)
+                &line[..line.floor_char_boundary(self.line_window)]
             } else {
                 line
             };
@@ -860,32 +843,15 @@ impl GrepSearch<'_> {
     }
 }
 
-/// The longest prefix of `text` of at most `max` bytes that ends on a char boundary.
-fn prefix_at_char_boundary(text: &str, max: usize) -> &str {
-    let mut end = max.min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
 /// `text` cut to `max` characters, marked when cut. Keeps model-supplied text (patterns,
 /// tool names, parser messages) and minified lines from flooding the output.
 fn excerpt(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        None => text.to_owned(),
-        Some((at, _)) => format!("{}{LINE_TRUNCATED}", &text[..at]),
-    }
+    truncate_with_marker(text, max, LINE_TRUNCATED).into_owned()
 }
 
-fn list_dir(ws: &RepoWorkspace, rel: &str) -> Result<String, ToolError> {
-    let dir = resolve_rel(ws, rel)?;
-    if dir.abs().is_file() {
-        return Err(ToolError::NotADirectory(rel.to_owned()));
-    }
-    if !dir.abs().is_dir() {
-        return Err(ToolError::NotFound(rel.to_owned()));
-    }
+fn list_dir(dir: &RepoPath) -> Result<String, ToolError> {
+    expect_dir(dir)?;
+    let rel = dir.rel();
     let mut entries: Vec<(String, bool)> = std::fs::read_dir(dir.abs())?
         .filter_map(Result::ok)
         .filter_map(|entry| {
@@ -924,37 +890,24 @@ fn list_dir(ws: &RepoWorkspace, rel: &str) -> Result<String, ToolError> {
 
 fn find_files(
     ws: &RepoWorkspace,
+    dir: &RepoPath,
     pattern: &str,
-    rel: &str,
     limits: SearchLimits,
 ) -> Result<ToolText, ToolError> {
     let deadline = Instant::now() + limits.time_budget;
     let glob = compile_glob(pattern)?;
-    let dir = resolve_rel(ws, rel)?;
-    if dir.abs().is_file() {
-        return Err(ToolError::NotADirectory(rel.to_owned()));
-    }
-    if !dir.abs().is_dir() {
-        return Err(ToolError::NotFound(rel.to_owned()));
-    }
+    expect_dir(dir)?;
     let mut found: Vec<String> = Vec::new();
-    let mut timed_out = false;
-    for walked in walk_files(ws, &dir, deadline) {
-        match walked {
-            Walked::File { rel, .. } if glob.is_match(&rel) => {
-                found.push(rel);
-                // One extra match tells whether the list was cut.
-                if found.len() > LIST_MAX_ENTRIES {
-                    break;
-                }
-            }
-            Walked::File { .. } => {}
-            Walked::TimeUp => {
-                timed_out = true;
-                break;
+    let timed_out = walk_files(ws, dir, deadline, |rel, _| {
+        if glob.is_match(&rel) {
+            found.push(rel);
+            // One extra match tells whether the list was cut.
+            if found.len() > LIST_MAX_ENTRIES {
+                return ControlFlow::Break(());
             }
         }
-    }
+        ControlFlow::Continue(())
+    });
     let more = found.len() > LIST_MAX_ENTRIES;
     found.truncate(LIST_MAX_ENTRIES);
     found.sort();
@@ -986,109 +939,85 @@ fn find_files(
     })
 }
 
+fn prop(ty: &str, description: &str) -> Value {
+    json!({"type": ty, "description": description})
+}
+
+fn tool_def(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolDef {
+    let mut parameters = json!({
+        "type": "object",
+        "properties": properties,
+    });
+    if !required.is_empty()
+        && let Some(obj) = parameters.as_object_mut()
+    {
+        obj.insert("required".into(), json!(required));
+    }
+    ToolDef {
+        name: name.into(),
+        description: description.into(),
+        parameters,
+    }
+}
+
 fn read_only_defs() -> Vec<ToolDef> {
     vec![
-        ToolDef {
-            name: "read_file".into(),
-            description: "Read a text file from the pull request's head checkout. Returns at most \
-                200 lines and 8,000 characters, starting with a header \
-                `[<path>: lines <start>-<end> of <total>]`, then one `<line number>: <text>` row \
-                per line. When <end> is below <total>, call again with start_line = <end> + 1. \
-                Refuses binary files, files over 2 MB (use grep instead), secret files and .git."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to the repository root, with / separators, e.g. src/main.rs"
-                    },
-                    "start_line": {
-                        "type": "integer",
-                        "description": "First line to return, 1-based. Defaults to 1."
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "Last line to return, inclusive. Defaults to start_line + 199."
-                    }
-                },
-                "required": ["path"]
+        tool_def(
+            "read_file",
+            "Read a text file from the pull request's head checkout. Returns at most \
+             200 lines and 8,000 characters, starting with a header \
+             `[<path>: lines <start>-<end> of <total>]`, then one `<line number>: <text>` row \
+             per line. When <end> is below <total>, call again with start_line = <end> + 1. \
+             Refuses binary files, files over 2 MB (use grep instead), secret files and .git.",
+            json!({
+                "path": prop("string", "File path relative to the repository root, with / separators, e.g. src/main.rs"),
+                "start_line": prop("integer", "First line to return, 1-based. Defaults to 1."),
+                "end_line": prop("integer", "Last line to return, inclusive. Defaults to start_line + 199.")
             }),
-        },
-        ToolDef {
-            name: "grep".into(),
-            description: "Search file contents with a regular expression (Rust regex syntax, \
-                matched per line). Skips .gitignore'd, binary, secret and .git files and files \
-                over 2 MB. Output: groups separated by a blank line; each group starts with the \
-                file path, then lines `<n>> <text>` for matches and `<n>- <text>` for up to 2 \
-                context lines around them. Stops at 40 groups, 8,000 characters, 20,000 files \
-                scanned or 10 seconds and then ends with `[search truncated: ...]`. Only the \
-                first 64 KiB of each line is searched; printed lines longer than 500 characters \
-                are cut."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regular expression to search for."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory or file to search, relative to the repository root. Defaults to the whole repository."
-                    },
-                    "glob": {
-                        "type": "string",
-                        "description": "Only search files whose path relative to the repository root matches this glob; * also matches /, so *.rs finds Rust files at any depth."
-                    },
-                    "case_sensitive": {
-                        "type": "boolean",
-                        "description": "Match case exactly. Defaults to true."
-                    }
-                },
-                "required": ["pattern"]
+            &["path"],
+        ),
+        tool_def(
+            "grep",
+            "Search file contents with a regular expression (Rust regex syntax, \
+             matched per line). Skips .gitignore'd, binary, secret and .git files and files \
+             over 2 MB. Output: groups separated by a blank line; each group starts with the \
+             file path, then lines `<n>> <text>` for matches and `<n>- <text>` for up to 2 \
+             context lines around them. Stops at 40 groups, 8,000 characters, 20,000 files \
+             scanned or 10 seconds and then ends with `[search truncated: ...]`. Only the \
+             first 64 KiB of each line is searched; printed lines longer than 500 characters \
+             are cut.",
+            json!({
+                "pattern": prop("string", "Regular expression to search for."),
+                "path": prop("string", "Directory or file to search, relative to the repository root. Defaults to the whole repository."),
+                "glob": prop("string", "Only search files whose path relative to the repository root matches this glob; * also matches /, so *.rs finds Rust files at any depth."),
+                "case_sensitive": prop("boolean", "Match case exactly. Defaults to true.")
             }),
-        },
-        ToolDef {
-            name: "list_dir".into(),
-            description: "List the immediate entries of a directory. Output: a header \
-                `[<dir>: <count> entries]`, then one name per line sorted alphabetically, with \
-                a trailing / for directories. Secret files and .git are hidden. Shows at most \
-                150 entries and 4,000 characters, then `[listing truncated: ...]`."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory relative to the repository root. Defaults to the root."
-                    }
-                }
+            &["pattern"],
+        ),
+        tool_def(
+            "list_dir",
+            "List the immediate entries of a directory. Output: a header \
+             `[<dir>: <count> entries]`, then one name per line sorted alphabetically, with \
+             a trailing / for directories. Secret files and .git are hidden. Shows at most \
+             150 entries and 4,000 characters, then `[listing truncated: ...]`.",
+            json!({
+                "path": prop("string", "Directory relative to the repository root. Defaults to the root.")
             }),
-        },
-        ToolDef {
-            name: "find_files".into(),
-            description: "Find files whose path relative to the repository root matches a glob. \
-                * also matches /, so *.rs finds Rust files at any depth; use **/name.ext for a \
-                file name in any directory. Skips .gitignore'd, secret and .git files. Output: \
-                one path per line, sorted, at most 150 paths and 4,000 characters; stops after \
-                10 seconds. A cut list ends with `[results truncated: ...]`."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob matched against paths relative to the repository root, e.g. **/Cargo.toml or src/**/*.ts"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Only search below this directory, relative to the repository root. Defaults to the root."
-                    }
-                },
-                "required": ["pattern"]
+            &[],
+        ),
+        tool_def(
+            "find_files",
+            "Find files whose path relative to the repository root matches a glob. \
+             * also matches /, so *.rs finds Rust files at any depth; use **/name.ext for a \
+             file name in any directory. Skips .gitignore'd, secret and .git files. Output: \
+             one path per line, sorted, at most 150 paths and 4,000 characters; stops after \
+             10 seconds. A cut list ends with `[results truncated: ...]`.",
+            json!({
+                "pattern": prop("string", "Glob matched against paths relative to the repository root, e.g. **/Cargo.toml or src/**/*.ts"),
+                "path": prop("string", "Only search below this directory, relative to the repository root. Defaults to the root.")
             }),
-        },
+            &["pattern"],
+        ),
     ]
 }
 
@@ -1098,22 +1027,15 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::{Value, json};
-    use tempfile::TempDir;
 
     use super::*;
 
     fn workspace(files: &[(&str, &[u8])]) -> Arc<RepoWorkspace> {
-        let dir = TempDir::new().unwrap();
-        for (rel, body) in files {
-            let path = dir.path().join(rel);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, body).unwrap();
-        }
-        Arc::new(RepoWorkspace::from_temp_dir(dir).unwrap())
+        Arc::new(RepoWorkspace::from_files(files))
     }
 
     fn toolbox(files: &[(&str, &[u8])]) -> Toolbox {
-        Toolbox::new(workspace(files), Arc::new(ToolCache::new()))
+        Toolbox::new(workspace(files))
     }
 
     async fn ok(tb: &Toolbox, name: &str, args: Value) -> String {
@@ -1482,31 +1404,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_and_find_files_stop_when_the_time_budget_runs_out() {
-        let tb = limited(
-            &[("src/a.rs", b"needle\n")],
-            Duration::ZERO,
-            GREP_LINE_WINDOW,
-        );
+    async fn search_time_budget_cuts_calls_without_caching_them() {
+        let files: &[(&str, &[u8])] = &[("src/a.rs", b"needle\n")];
+        let cut = limited(files, Duration::ZERO, GREP_LINE_WINDOW);
         assert_eq!(
-            ok(&tb, "grep", json!({"pattern": "needle"})).await,
+            ok(&cut, "grep", json!({"pattern": "needle"})).await,
             "[search truncated: time limit reached; narrow the pattern, path or glob]"
         );
         assert_eq!(
-            ok(&tb, "find_files", json!({"pattern": "*.rs"})).await,
+            ok(&cut, "find_files", json!({"pattern": "*.rs"})).await,
             "No files match `*.rs`.\n\
              [results truncated: time limit reached; narrow the pattern or path]"
         );
-    }
-
-    #[tokio::test]
-    async fn searches_cut_by_the_time_budget_are_not_cached() {
-        let files: &[(&str, &[u8])] = &[("src/a.rs", b"needle\n")];
-        let cut = limited(files, Duration::ZERO, GREP_LINE_WINDOW);
-        for _ in 0..2 {
-            ok(&cut, "grep", json!({"pattern": "needle"})).await;
-            ok(&cut, "find_files", json!({"pattern": "*.rs"})).await;
-        }
+        ok(&cut, "grep", json!({"pattern": "needle"})).await;
+        ok(&cut, "find_files", json!({"pattern": "*.rs"})).await;
         assert_eq!(cut.cache.hits(), 0, "a time-cut result is recomputed");
 
         let full = toolbox(files);
@@ -1515,24 +1426,6 @@ mod tests {
             ok(&full, "find_files", json!({"pattern": "*.rs"})).await;
         }
         assert_eq!(full.cache.hits(), 2, "a finished search is cached");
-    }
-
-    #[test]
-    fn grep_line_loop_checks_the_deadline() {
-        let regex = Regex::new("needle").unwrap();
-        let mut search = GrepSearch {
-            regex: &regex,
-            deadline: Instant::now(),
-            line_window: GREP_LINE_WINDOW,
-            out: Capped::new(1_000),
-            groups: 0,
-            long_lines: 0,
-            timed_out: false,
-        };
-        assert_eq!(search.file("a.rs", "needle\n"), Err(time_limit_note()));
-        assert!(search.timed_out);
-        assert_eq!(search.groups, 0);
-        assert!(search.out.text.is_empty());
     }
 
     #[tokio::test]
@@ -1586,34 +1479,12 @@ mod tests {
             ),
             "{out}"
         );
-        assert_eq!(prefix_at_char_boundary("a\u{e9}", 2), "a");
-        assert_eq!(prefix_at_char_boundary("ab", 10), "ab");
-    }
-
-    #[tokio::test]
-    async fn search_errors_say_how_to_adjust() {
-        let tb = toolbox(&[("bin.dat", b"\0")]);
-        assert!(
-            err(&tb, "grep", json!({"pattern": ""}))
-                .await
-                .contains("pass a regular expression")
-        );
-        assert!(
-            err(&tb, "find_files", json!({"pattern": "{a"}))
-                .await
-                .contains("use *, ** and {a,b} with / separators")
-        );
-        assert!(
-            err(&tb, "read_file", json!({"path": "bin.dat"}))
-                .await
-                .contains("read a source or text file instead")
-        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn walks_and_reads_do_not_follow_symlinks_out_of_the_workspace() {
-        let outside = TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
         fs::write(outside.path().join("secret.txt"), "needle\n").unwrap();
         let tb = toolbox(&[("src/a.rs", b"x\n")]);
         let root = tb.workspace.root();
@@ -1653,6 +1524,8 @@ mod tests {
         );
         err(&tb, "list_dir", json!({"path": ".git"})).await;
         err(&tb, "list_dir", json!({"path": "../"})).await;
+        err(&tb, "list_dir", json!({"path": "/"})).await;
+        assert!(tb.workspace.resolve_or_root("///").is_err());
         assert!(
             err(&tb, "list_dir", json!({"path": "a.rs"}))
                 .await
@@ -1760,18 +1633,18 @@ mod tests {
     #[test]
     fn snippet_returns_numbered_window_or_none() {
         let body = numbered(20);
-        let tb = toolbox(&[
+        let ws = workspace(&[
             ("src/a.rs", body.as_bytes()),
             (".env", b"x"),
             ("bin", b"\0"),
         ]);
         assert_eq!(
-            tb.read_file_snippet_sync("src/a.rs", 10, 2).as_deref(),
+            read_file_snippet_sync(&ws, "src/a.rs", 10, 2).as_deref(),
             Some(
                 "[src/a.rs: lines 8-12 of 20]\n8: line 8\n9: line 9\n10: line 10\n11: line 11\n12: line 12"
             )
         );
-        let top = tb.read_file_snippet_sync("src/a.rs", 1, 3).unwrap();
+        let top = read_file_snippet_sync(&ws, "src/a.rs", 1, 3).unwrap();
         assert!(
             top.starts_with("[src/a.rs: lines 1-4 of 20]\n1: line 1"),
             "{top}"
@@ -1783,7 +1656,7 @@ mod tests {
             ("src/a.rs", 50),
             ("../x", 1),
         ] {
-            assert_eq!(tb.read_file_snippet_sync(path, line, 2), None, "{path}");
+            assert_eq!(read_file_snippet_sync(&ws, path, line, 2), None, "{path}");
         }
     }
 
@@ -1792,58 +1665,47 @@ mod tests {
     const FAKE_GITHUB_TOKEN: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[tokio::test]
-    async fn read_file_masks_a_committed_aws_key() {
-        let body = format!("const REGION = 1;\nconst KEY = \"{FAKE_AWS_KEY}\";\nfn f() {{}}\n");
+    async fn tools_redact_and_cache_secrets_while_verifier_snippet_stays_raw() {
+        let body = format!(
+            "const REGION = 1;\nconst KEY = \"{FAKE_AWS_KEY}\";\nlet token = \"{FAKE_GITHUB_TOKEN}\";\n"
+        );
         let tb = toolbox(&[("src/config.ts", body.as_bytes())]);
+
         let out = ok(&tb, "read_file", json!({"path": "src/config.ts"})).await;
         assert_eq!(
             out,
-            "[src/config.ts: lines 1-3 of 3]\n1: const REGION = 1;\n2: const KEY = \"[REDACTED]\";\n3: fn f() {}"
+            "[src/config.ts: lines 1-3 of 3]\n1: const REGION = 1;\n2: const KEY = \"[REDACTED]\";\n3: let token = \"[REDACTED]\";"
         );
         assert_eq!(tb.redacted_outputs(), 1);
-    }
 
-    #[tokio::test]
-    async fn grep_masks_a_github_token_in_matches() {
-        let body = format!("a\nlet token = \"{FAKE_GITHUB_TOKEN}\";\nb\n");
-        let tb = toolbox(&[("src/client.rs", body.as_bytes())]);
-        let out = ok(&tb, "grep", json!({"pattern": "token"})).await;
-        assert!(!out.contains(FAKE_GITHUB_TOKEN), "{out}");
-        assert!(out.contains("2> let token = \"[REDACTED]\";"), "{out}");
-        assert!(out.contains("1- a") && out.contains("3- b"), "{out}");
-    }
-
-    #[tokio::test]
-    async fn cached_result_is_the_redacted_one() {
-        let body = format!("key = {FAKE_AWS_KEY}\n");
-        let tb = toolbox(&[("settings.py", body.as_bytes())]);
-        let first = ok(&tb, "read_file", json!({"path": "settings.py"})).await;
+        // Cached entry is already redacted and a normalized repeat hits cache without recounting.
         let entries: Vec<String> = tb.cache.entries.read().unwrap().values().cloned().collect();
-        assert_eq!(entries, vec![first.clone()]);
-        assert!(!entries[0].contains(FAKE_AWS_KEY), "{}", entries[0]);
-        let again = ok(&tb, "read_file", json!({"path": "./settings.py"})).await;
-        assert_eq!(again, first);
+        assert_eq!(entries, vec![out.clone()]);
+        assert_eq!(
+            ok(&tb, "read_file", json!({"path": "./src/config.ts"})).await,
+            out
+        );
         assert_eq!(tb.cache.hits(), 1);
-        // A cache hit is not counted again.
         assert_eq!(tb.redacted_outputs(), 1);
-    }
 
-    #[tokio::test]
-    async fn verifier_snippet_stays_raw_and_bypasses_the_cache() {
-        let body = format!("key = {FAKE_AWS_KEY}\n");
-        let tb = toolbox(&[("settings.py", body.as_bytes())]);
-        ok(
-            &tb,
-            "read_file",
-            json!({"path": "settings.py", "end_line": 3}),
-        )
-        .await;
-        let snippet = tb.read_file_snippet("settings.py", 1, 2).await.unwrap();
+        // grep masks secrets too.
+        let grep_out = ok(&tb, "grep", json!({"pattern": "token"})).await;
+        assert!(!grep_out.contains(FAKE_GITHUB_TOKEN), "{grep_out}");
+        assert!(
+            grep_out.contains("3> let token = \"[REDACTED]\";"),
+            "{grep_out}"
+        );
+        assert_eq!(tb.redacted_outputs(), 2);
+
+        // Verifier snippet bypasses cache and stays unredacted.
+        let snippet = tb.read_file_snippet("src/config.ts", 2, 1).await.unwrap();
         assert_eq!(
             snippet,
-            format!("[settings.py: lines 1-1 of 1]\n1: key = {FAKE_AWS_KEY}")
+            format!(
+                "[src/config.ts: lines 1-3 of 3]\n1: const REGION = 1;\n2: const KEY = \"{FAKE_AWS_KEY}\";\n3: let token = \"{FAKE_GITHUB_TOKEN}\";"
+            )
         );
-        assert_eq!(tb.cache.hits(), 0);
+        assert_eq!(tb.cache.hits(), 1);
     }
 
     fn assert_portable_schema(schema: &Value) {

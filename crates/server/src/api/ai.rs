@@ -3,9 +3,12 @@ use std::time::{Duration, Instant};
 use adus_core::types::ProviderKind;
 use adus_db::{
     ai::{self, AiKey, AiKeyStatus, AiProvider, KeyPatch},
-    usage::{self, NewUsage},
+    usage,
 };
-use adus_llm::{ChatRequest, LlmError, client_for};
+use adus_llm::{
+    ChatRequest, LlmError, client_for,
+    router::{UsageContext, new_usage},
+};
 use axum::{
     Json, Router,
     extract::State,
@@ -279,7 +282,9 @@ fn model_list_cache_key(
 }
 
 fn same_base_url(a: Option<&str>, b: Option<&str>) -> bool {
-    let norm = |u: Option<&str>| u.map(|u| u.trim().trim_end_matches('/').to_string());
+    fn norm(u: Option<&str>) -> Option<&str> {
+        u.map(|u| u.trim().trim_end_matches('/'))
+    }
     norm(a) == norm(b)
 }
 
@@ -521,18 +526,6 @@ async fn remove_key(
     }
 }
 
-/// Nama `error_kind` yang sama dengan yang dipakai router.
-fn error_kind(err: &LlmError) -> &'static str {
-    match err {
-        LlmError::RateLimited { .. } => "rate_limited",
-        LlmError::Unauthorized => "unauthorized",
-        LlmError::Transient(_) => "transient",
-        LlmError::Invalid(_) => "invalid",
-        LlmError::ToolsUnsupported(_) => "tools_unsupported",
-        LlmError::ContextOverflow(_) => "context_overflow",
-    }
-}
-
 const TEST_KEY_MAX_TOKENS: u32 = 512;
 
 /// Satu panggilan "ping" ke provider dengan key ini. Tidak lewat router dan tidak pernah
@@ -573,26 +566,20 @@ async fn test_key(
             )
             .chat(&secret, &req)
             .await
-            .map_err(|e| (error_kind(&e), e.to_string()))
+            .map_err(|e| (e.error_kind(), e.to_string()))
         }
     };
     let latency_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
 
-    let tokens = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
-    let row = NewUsage {
-        review_id: None,
-        repository_id: None,
-        provider_id: provider.id,
-        key_id: key.id,
-        model: &model,
-        input_tokens: outcome.as_ref().map_or(0, |r| tokens(r.input_tokens)),
-        output_tokens: outcome.as_ref().map_or(0, |r| tokens(r.output_tokens)),
-        cache_read_tokens: outcome.as_ref().map_or(0, |r| tokens(r.cache_read_tokens)),
-        cache_write_tokens: outcome.as_ref().map_or(0, |r| tokens(r.cache_write_tokens)),
+    let row = new_usage(
+        &UsageContext::default(),
+        provider.id,
+        key.id,
+        &model,
         latency_ms,
-        success: outcome.is_ok(),
-        error_kind: outcome.as_ref().err().map(|(kind, _)| *kind),
-    };
+        outcome.as_ref().ok(),
+        outcome.as_ref().err().map(|(kind, _)| *kind),
+    );
     // Gagal mencatat tidak boleh menggagalkan hasil tes.
     if let Err(err) = usage::insert(&state.db, row).await {
         tracing::warn!("failed to write usage row for key test: {err}");

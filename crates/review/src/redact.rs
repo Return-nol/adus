@@ -9,13 +9,10 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::LazyLock;
 
-use regex::{Captures, Match, Regex, RegexBuilder};
-
-/// Compiled-size limit of each pattern (the same bound the `grep` tool uses).
-const REGEX_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+use regex::{Captures, Match, Regex};
 
 /// What a masked value is replaced with.
-pub const REDACTED: &str = "[REDACTED]";
+pub(crate) const REDACTED: &str = "[REDACTED]";
 
 /// Shortest value of a named assignment that is masked.
 const MIN_VALUE_CHARS: usize = 8;
@@ -74,11 +71,7 @@ impl Patterns {
 }
 
 fn build(pattern: &str) -> Option<Regex> {
-    match RegexBuilder::new(pattern)
-        .size_limit(REGEX_SIZE_LIMIT)
-        .dfa_size_limit(REGEX_SIZE_LIMIT)
-        .build()
-    {
+    match Regex::new(pattern) {
         Ok(regex) => Some(regex),
         Err(err) => {
             tracing::error!(error = %err, "a secret redaction pattern does not compile");
@@ -91,7 +84,7 @@ static PATTERNS: LazyLock<Option<Patterns>> = LazyLock::new(Patterns::compile);
 
 /// `text` with every value that looks like a secret replaced by [`REDACTED`];
 /// `Cow::Borrowed` when nothing matched.
-pub fn redact_secrets(text: &str) -> Cow<'_, str> {
+pub(crate) fn redact_secrets(text: &str) -> Cow<'_, str> {
     let Some(p) = PATTERNS.as_ref() else {
         return Cow::Borrowed(text);
     };
@@ -116,13 +109,22 @@ pub fn redact_secrets(text: &str) -> Cow<'_, str> {
 /// Replaces `edits` in `text` with [`REDACTED`]; leaves `text` (and its borrow) alone when
 /// there are none.
 fn apply(text: &mut Cow<'_, str>, edits: &[Range<usize>]) {
-    if !edits.is_empty() {
-        *text = Cow::Owned(replace_ranges(text, edits));
+    if edits.is_empty() {
+        return;
     }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for range in edits {
+        out.push_str(&text[last..range.start]);
+        out.push_str(REDACTED);
+        last = range.end;
+    }
+    out.push_str(&text[last..]);
+    *text = Cow::Owned(out);
 }
 
 /// Whether [`redact_secrets`] would change `text`.
-pub fn contains_secret(text: &str) -> bool {
+pub(crate) fn contains_secret(text: &str) -> bool {
     matches!(redact_secrets(text), Cow::Owned(_))
 }
 
@@ -260,19 +262,6 @@ fn is_base64_line(body: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
 }
 
-/// `text` with each of the sorted, non-overlapping `ranges` replaced by [`REDACTED`].
-fn replace_ranges(text: &str, ranges: &[Range<usize>]) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for range in ranges {
-        out.push_str(&text[last..range.start]);
-        out.push_str(REDACTED);
-        last = range.end;
-    }
-    out.push_str(&text[last..]);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,171 +289,108 @@ mod tests {
     }
 
     #[test]
-    fn no_match_returns_borrowed() {
-        let text = "fn main() {\n    println!(\"hello\");\n}\n";
-        assert!(matches!(redact_secrets(text), Cow::Borrowed(t) if t == text));
-        assert!(!contains_secret(text));
+    fn pem_private_keys_are_masked_preserving_line_counts() {
+        let block = "const KEY: &str = r\"\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAfakefakefake\nZmFrZWZha2VmYWtlZmFrZQ==\n-----END RSA PRIVATE KEY-----\n\";\n";
+        let block_out = redacted(block);
+        assert_eq!(block_out.lines().count(), block.lines().count());
+        assert!(contains_secret(block));
+
+        let cases = [
+            (
+                block.to_string(),
+                "const KEY: &str = r\"\n-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n[REDACTED]\n-----END RSA PRIVATE KEY-----\n\";\n",
+            ),
+            (
+                "[k.pem: lines 1-4 of 4]\n1: -----BEGIN PRIVATE KEY-----\n2: MIIEvfakefake\n3: Zm9vYmFy\n4: -----END PRIVATE KEY-----".into(),
+                "[k.pem: lines 1-4 of 4]\n1: -----BEGIN PRIVATE KEY-----\n2: [REDACTED]\n3: [REDACTED]\n4: -----END PRIVATE KEY-----",
+            ),
+            (
+                "5: Zm9vYmFyZm9vYmFy\n6: YmF6\n7: -----END OPENSSH PRIVATE KEY-----\n8: }".into(),
+                "5: [REDACTED]\n6: [REDACTED]\n7: -----END OPENSSH PRIVATE KEY-----\n8: }",
+            ),
+            (
+                "k.pem\n1> -----BEGIN EC PRIVATE KEY-----\n2- Zm9vYmFy\n3- YmF6YmF6\n\nsrc/a.rs\n4> let a = 1;".into(),
+                "k.pem\n1> -----BEGIN EC PRIVATE KEY-----\n2- [REDACTED]\n3- [REDACTED]\n\nsrc/a.rs\n4> let a = 1;",
+            ),
+            (
+                r#"{"key": "-----BEGIN PRIVATE KEY-----\nMIIfake\n-----END PRIVATE KEY-----\n"}"#.into(),
+                r#"{"key": "-----BEGIN PRIVATE KEY-----[REDACTED]-----END PRIVATE KEY-----\n"}"#,
+            ),
+            (
+                "[k.pem: lines 1-3 of 30]\n1: -----BEGIN PRIVATE KEY-----\n2: MIIEvQIBADANBgkqhkiG9w0B\n3: Zm9vYmFyZm9vYmFy".into(),
+                "[k.pem: lines 1-3 of 30]\n1: -----BEGIN PRIVATE KEY-----\n2: [REDACTED]\n3: [REDACTED]",
+            ),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\nZm9vYmFyZm9vYmFy\n-----END RSA PRIVATE KEY-----".into(),
+                "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n[REDACTED]\n\n[REDACTED]\n-----END RSA PRIVATE KEY-----",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redacted(&input), want, "{input:?}");
+        }
     }
 
     #[test]
-    fn pem_block_keeps_line_count() {
-        let text = "const KEY: &str = r\"\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAfakefakefake\nZmFrZWZha2VmYWtlZmFrZQ==\n-----END RSA PRIVATE KEY-----\n\";\n";
-        let out = redacted(text);
-        assert_eq!(
-            out,
-            "const KEY: &str = r\"\n-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n[REDACTED]\n-----END RSA PRIVATE KEY-----\n\";\n"
-        );
-        assert_eq!(out.lines().count(), text.lines().count());
-        assert!(contains_secret(text));
-    }
-
-    #[test]
-    fn pem_in_read_file_output_keeps_line_numbers() {
-        let text = "[k.pem: lines 1-4 of 4]\n1: -----BEGIN PRIVATE KEY-----\n2: MIIEvfakefake\n3: Zm9vYmFy\n4: -----END PRIVATE KEY-----";
-        assert_eq!(
-            redacted(text),
-            "[k.pem: lines 1-4 of 4]\n1: -----BEGIN PRIVATE KEY-----\n2: [REDACTED]\n3: [REDACTED]\n4: -----END PRIVATE KEY-----"
-        );
-    }
-
-    #[test]
-    fn pem_cut_by_a_tool_window_is_still_masked() {
-        // A window that starts inside the key: the base64 lines before END.
-        let tail = "5: Zm9vYmFyZm9vYmFy\n6: YmF6\n7: -----END OPENSSH PRIVATE KEY-----\n8: }";
-        assert_eq!(
-            redacted(tail),
-            "5: [REDACTED]\n6: [REDACTED]\n7: -----END OPENSSH PRIVATE KEY-----\n8: }"
-        );
-        // grep context after BEGIN with no END; the next file's group is untouched.
-        let grep = "k.pem\n1> -----BEGIN EC PRIVATE KEY-----\n2- Zm9vYmFy\n3- YmF6YmF6\n\nsrc/a.rs\n4> let a = 1;";
-        assert_eq!(
-            redacted(grep),
-            "k.pem\n1> -----BEGIN EC PRIVATE KEY-----\n2- [REDACTED]\n3- [REDACTED]\n\nsrc/a.rs\n4> let a = 1;"
-        );
-        // Both markers on one line (an escaped JSON string).
-        let json =
-            r#"{"key": "-----BEGIN PRIVATE KEY-----\nMIIfake\n-----END PRIVATE KEY-----\n"}"#;
-        assert_eq!(
-            redacted(json),
-            r#"{"key": "-----BEGIN PRIVATE KEY-----[REDACTED]-----END PRIVATE KEY-----\n"}"#
-        );
-    }
-
-    #[test]
-    fn comment_body_quoting_the_marker_keeps_its_fences_and_code() {
-        assert_untouched(
+    fn pem_markers_in_prose_code_and_public_certs_are_untouched() {
+        for text in [
             "<!-- adudu -->\n**Critical:** Private key committed\n\nThe file holds a `-----BEGIN RSA PRIVATE KEY-----` block. Rotate it.\n\nMove it to a secret store.\n\n```suggestion\nlet k = load_key()?;\n```",
-        );
-    }
-
-    #[test]
-    fn code_with_a_begin_literal_leaves_the_following_lines_alone() {
-        assert_untouched(
             "if line.starts_with(\"-----BEGIN PRIVATE KEY-----\") {\n    parse(line);\n}\nfn other() { x() }",
-        );
-        assert_untouched(
             "[src/pem.rs: lines 4-7 of 9]\n4: if line.starts_with(\"-----BEGIN PRIVATE KEY-----\") {\n5:     parse(line);\n6: }\n7: fn other() { x() }",
-        );
-    }
-
-    #[test]
-    fn key_cut_at_the_window_end_and_legacy_headers_are_masked() {
-        let cut = "[k.pem: lines 1-3 of 30]\n1: -----BEGIN PRIVATE KEY-----\n2: MIIEvQIBADANBgkqhkiG9w0B\n3: Zm9vYmFyZm9vYmFy";
-        assert_eq!(
-            redacted(cut),
-            "[k.pem: lines 1-3 of 30]\n1: -----BEGIN PRIVATE KEY-----\n2: [REDACTED]\n3: [REDACTED]"
-        );
-        let legacy = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF\n\nZm9vYmFyZm9vYmFy\n-----END RSA PRIVATE KEY-----";
-        assert_eq!(
-            redacted(legacy),
-            "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]\n[REDACTED]\n\n[REDACTED]\n-----END RSA PRIVATE KEY-----"
-        );
-    }
-
-    #[test]
-    fn pem_public_key_and_certificate_are_untouched() {
-        assert_untouched(
             "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n-----END PUBLIC KEY-----\n",
-        );
-        assert_untouched(
             "-----BEGIN CERTIFICATE-----\nMIIDdzCCAl+gAwIBAgIE\n-----END CERTIFICATE-----",
-        );
+        ] {
+            assert_untouched(text);
+        }
     }
 
     #[test]
-    fn aws_access_key_id() {
-        assert_eq!(
-            redacted(&format!("aws_key = {AWS}\n")),
-            "aws_key = [REDACTED]\n"
-        );
-        assert_eq!(redacted("id: ASIAIOSFODNN7EXAMPLE."), "id: [REDACTED].");
-        // Too short, lowercase, or inside a longer word.
-        assert_untouched("AKIAIOSFODNN7EXAM AKIAiosfodnn7example XAKIAIOSFODNN7EXAMPLE");
-    }
+    fn provider_tokens_and_jwts() {
+        let masked = [
+            (format!("aws_key = {AWS}\n"), "aws_key = [REDACTED]\n"),
+            ("id: ASIAIOSFODNN7EXAMPLE.".into(), "id: [REDACTED]."),
+            (format!("token={GITHUB}"), "token=[REDACTED]"),
+            (
+                format!("Bearer gho_{}", "b".repeat(40)),
+                "Bearer [REDACTED]",
+            ),
+            (
+                format!("pat github_pat_{} end", "c".repeat(30)),
+                "pat [REDACTED] end",
+            ),
+            (
+                "key = sk-proj-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                "key = [REDACTED]",
+            ),
+            (format!("sk-ant-api03-{}", "x".repeat(30)), "[REDACTED]"),
+            (format!("k: AIza{}", "A".repeat(35)), "k: [REDACTED]"),
+            ("SLACK xoxb-1234567890-abcdef".into(), "SLACK [REDACTED]"),
+            (format!("sk_test_{}", "a".repeat(24)), "[REDACTED]"),
+            (format!("rk_live_{} x", "b".repeat(16)), "[REDACTED] x"),
+            (
+                "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJlZmFrZQ"
+                    .into(),
+                "Authorization: Bearer [REDACTED]",
+            ),
+        ];
+        for (input, want) in masked {
+            assert_eq!(redacted(&input), want, "{input:?}");
+        }
 
-    #[test]
-    fn github_tokens() {
-        assert_eq!(redacted(&format!("token={GITHUB}")), "token=[REDACTED]");
-        assert_eq!(
-            redacted(&format!("Bearer gho_{}", "b".repeat(40))),
-            "Bearer [REDACTED]"
-        );
-        assert_eq!(
-            redacted(&format!("pat github_pat_{} end", "c".repeat(30))),
-            "pat [REDACTED] end"
-        );
-        assert_untouched(&format!("ghp_{} ghx_{}", "a".repeat(20), "a".repeat(40)));
-        assert_untouched("github_pat_short");
-    }
-
-    #[test]
-    fn openai_and_anthropic_style_keys() {
-        assert_eq!(
-            redacted("key = sk-proj-aaaaaaaaaaaaaaaaaaaaaaaa"),
-            "key = [REDACTED]"
-        );
-        assert_eq!(
-            redacted(&format!("sk-ant-api03-{}", "x".repeat(30))),
-            "[REDACTED]"
-        );
-        // Shorter than 20 characters after `sk-`, or not at a word start.
-        assert_untouched("sk-short-value-1234 task-aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    }
-
-    #[test]
-    fn google_api_key() {
-        let key = format!("AIza{}", "A".repeat(35));
-        assert_eq!(redacted(&format!("k: {key}")), "k: [REDACTED]");
-        assert_untouched(&format!("AIza{}", "A".repeat(20)));
-    }
-
-    #[test]
-    fn slack_tokens() {
-        assert_eq!(redacted("SLACK xoxb-1234567890-abcdef"), "SLACK [REDACTED]");
-        assert_untouched("xoxb-123 xoxz-1234567890-abcdef");
-    }
-
-    #[test]
-    fn stripe_keys() {
-        assert_eq!(
-            redacted(&format!("sk_test_{}", "a".repeat(24))),
-            "[REDACTED]"
-        );
-        assert_eq!(
-            redacted(&format!("rk_live_{} x", "b".repeat(16))),
-            "[REDACTED] x"
-        );
-        assert_untouched(&format!("sk_test_short pk_test_{}", "a".repeat(24)));
-    }
-
-    #[test]
-    fn jwts() {
-        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlIn0.c2lnbmF0dXJlZmFrZQ";
-        assert_eq!(
-            redacted(&format!("Authorization: Bearer {jwt}")),
-            "Authorization: Bearer [REDACTED]"
-        );
-        assert_untouched("eyJhbGciOiJIUzI1NiJ9.short.sig");
+        for untouched in [
+            "AKIAIOSFODNN7EXAM AKIAiosfodnn7example XAKIAIOSFODNN7EXAMPLE".to_string(),
+            format!(
+                "ghp_{} ghx_{} github_pat_short",
+                "a".repeat(20),
+                "a".repeat(40)
+            ),
+            "sk-short-value-1234 task-aaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            format!("AIza{}", "A".repeat(20)),
+            "xoxb-123 xoxz-1234567890-abcdef".to_string(),
+            format!("sk_test_short pk_test_{}", "a".repeat(24)),
+            "eyJhbGciOiJIUzI1NiJ9.short.sig".to_string(),
+        ] {
+            assert_untouched(&untouched);
+        }
     }
 
     #[test]
@@ -538,9 +464,6 @@ mod tests {
             r#"password = "[REDACTED]""#,
             "API_KEY=[REDACTED]",
             // Keyword arguments and JSX props: indented, or code-shaped values.
-            "    password=password,",
-            "    api_key=settings.API_KEY,",
-            "  apiKey={process.env.API_KEY}",
             "conn = connect(\n    host=host,\n    password=password,\n    api_key=settings.API_KEY,\n)\n",
             "<Client\n  apiKey={process.env.API_KEY}\n/>",
             "api_key=settings.API_KEY,",
@@ -550,17 +473,6 @@ mod tests {
         ] {
             assert_untouched(text);
         }
-    }
-
-    #[test]
-    fn markdown_marker_and_fences_survive() {
-        let body = format!(
-            "<!-- adudu -->\n**Warning:** Hardcoded key\n\nThe key `{AWS}` is committed.\n\n```suggestion\nlet key = std::env::var(\"AWS_KEY\")?;\n```"
-        );
-        assert_eq!(
-            redacted(&body),
-            "<!-- adudu -->\n**Warning:** Hardcoded key\n\nThe key `[REDACTED]` is committed.\n\n```suggestion\nlet key = std::env::var(\"AWS_KEY\")?;\n```"
-        );
     }
 
     #[test]

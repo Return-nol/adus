@@ -12,8 +12,8 @@ use adus_git::GitError;
 use adus_queue::Queue;
 use sqlx::PgPool;
 
-use crate::MARKER;
 use crate::engine::{Engine, EngineError, db_error};
+use crate::prompt::MARKER;
 
 const MENTION: &str = "@adudu";
 /// Batas panjang isi `remember`, dalam karakter.
@@ -35,7 +35,7 @@ pub enum Command {
 
 /// `None` jika tidak ada mention `@adudu` atau komentar itu buatan Adus sendiri (memuat MARKER).
 /// Hanya teks setelah mention pertama yang dibaca; kata pertamanya adalah perintah.
-pub fn parse_command(body: &str) -> Option<Command> {
+pub(crate) fn parse_command(body: &str) -> Option<Command> {
     if body.contains(MARKER) {
         return None;
     }
@@ -221,6 +221,99 @@ impl Engine {
                 EngineError::Retryable(message, None)
             }
             GitError::NotFound | GitError::Decode(_) => EngineError::Fatal(message),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_review_case_insensitive() {
+        assert_eq!(
+            parse_command("@Adudu REVIEW"),
+            Some(Command::Review { mode: None })
+        );
+        assert_eq!(
+            parse_command("thanks! @adudu review please"),
+            Some(Command::Review { mode: None })
+        );
+        // Hanya mention sungguhan yang dihitung, walau ada teks mirip sebelumnya.
+        assert_eq!(
+            parse_command("foo@adudu.com — @adudu review"),
+            Some(Command::Review { mode: None })
+        );
+    }
+
+    #[test]
+    fn parse_review_deep_and_specialists() {
+        let specialists = Some(Command::Review {
+            mode: Some(ReviewMode::Specialists),
+        });
+        assert_eq!(parse_command("@adudu review deep"), specialists);
+        assert_eq!(parse_command("@adudu review specialists"), specialists);
+        assert_eq!(parse_command("@adudu REVIEW DEEP!"), specialists);
+        assert_eq!(
+            parse_command("@adudu review generalist"),
+            Some(Command::Review {
+                mode: Some(ReviewMode::Generalist)
+            })
+        );
+        let configured = Some(Command::Review { mode: None });
+        assert_eq!(parse_command("@adudu review"), configured);
+        assert_eq!(parse_command("@adudu review please"), configured);
+        assert_eq!(parse_command("@adudu review deeper"), configured);
+    }
+
+    #[test]
+    fn parse_remember_with_colon() {
+        assert_eq!(
+            parse_command("@adudu remember:  use anyhow in bins \n"),
+            Some(Command::Remember("use anyhow in bins".into()))
+        );
+        assert_eq!(
+            parse_command("@adudu Remember prefer tracing"),
+            Some(Command::Remember("prefer tracing".into()))
+        );
+    }
+
+    #[test]
+    fn parse_please_remember() {
+        assert_eq!(
+            parse_command("@adudu please remember: no unwrap"),
+            Some(Command::Remember("no unwrap".into()))
+        );
+        assert_eq!(
+            parse_command("@adudu PLEASE Remember tabs"),
+            Some(Command::Remember("tabs".into()))
+        );
+    }
+
+    #[test]
+    fn remember_empty_is_unknown() {
+        for body in [
+            "@adudu remember:   ",
+            "@adudu remember",
+            "@adudu dance",
+            "@adudu",
+            "@adudu reviewer",
+        ] {
+            assert_eq!(parse_command(body), Some(Command::Unknown), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn non_mentions_and_marker_return_none() {
+        let marker_body = format!("{MARKER}\n@adudu review");
+        for body in [
+            "please review this",
+            "adudu review",
+            "@aduduku review",
+            "mail foo@adudu.com review",
+            marker_body.as_str(),
+        ] {
+            assert_eq!(parse_command(body), None, "{body:?}");
         }
     }
 }

@@ -13,7 +13,7 @@ use thiserror::Error;
 
 /// Satu temuan dari LLM untuk satu baris (atau rentang baris) di file baru.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Suggestion {
+pub(crate) struct Suggestion {
     pub file: String,
     /// First line of the span `start_line..=line` of existing new-file lines that `suggestion`
     /// replaces. `None`, or a value equal to `line` (which parsing turns into `None`), means a
@@ -29,36 +29,36 @@ pub struct Suggestion {
 
 /// Baris dan rentang hunk sisi kanan pada satu file yang valid untuk dikomentari.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CommentableRange {
+pub(crate) struct CommentableRange {
     pub lines: BTreeSet<u32>,
     pub hunks: Vec<RangeInclusive<u32>>,
 }
 
 impl CommentableRange {
-    pub fn from_patch(patch: &str) -> Self {
+    pub(crate) fn from_patch(patch: &str) -> Self {
         Self {
             lines: commentable_lines(patch),
             hunks: commentable_hunks(patch),
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.lines.is_empty()
     }
 
     /// Whether `start_line < line` and both lie in one diff hunk.
-    pub fn spans_one_hunk(&self, start_line: u32, line: u32) -> bool {
+    fn spans_one_hunk(&self, start_line: u32, line: u32) -> bool {
         same_hunk(&self.hunks, start_line, line)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("no JSON array found in the model output")]
-pub struct ParseError;
+pub(crate) struct ParseError;
 
 /// Ambil array JSON pertama dari jawaban model (boleh dibungkus ```json atau diapit prosa).
 /// Objek yang kurang field wajib (`file`, `line`, `title`, `body`) dilewati, bukan menggagalkan parse.
-pub fn parse_suggestions(raw: &str) -> Result<Vec<Suggestion>, ParseError> {
+pub(crate) fn parse_suggestions(raw: &str) -> Result<Vec<Suggestion>, ParseError> {
     let items = first_json_array(raw).ok_or(ParseError)?;
     Ok(items.iter().filter_map(to_suggestion).collect())
 }
@@ -142,7 +142,7 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
 
 /// The Finder's terminal tool. Uses only `type`, `properties`, `required`, `description`,
 /// `items` and `enum`, the JSON-schema subset every provider (Gemini included) accepts.
-pub fn submit_findings_tool_def() -> ToolDef {
+pub(crate) fn submit_findings_tool_def() -> ToolDef {
     ToolDef {
         name: "submit_findings".into(),
         description: "Submit your final review findings and end the review. Call it exactly \
@@ -206,7 +206,7 @@ struct SubmitFindingsArgs {
 
 /// Reads the `submit_findings` arguments. Elements that are not objects or lack a required
 /// field are skipped, as in [`parse_suggestions`]. The error text is shown to the model.
-pub fn parse_submit_findings(args: &Value) -> Result<Vec<Suggestion>, String> {
+pub(crate) fn parse_submit_findings(args: &Value) -> Result<Vec<Suggestion>, String> {
     let parsed = SubmitFindingsArgs::deserialize(args).map_err(|err| {
         format!("{err}; expected an object with a `findings` array of finding objects")
     })?;
@@ -224,9 +224,9 @@ pub fn parse_submit_findings(args: &Value) -> Result<Vec<Suggestion>, String> {
 /// range is dropped, the `suggestion` goes too, because a multi-line replacement anchored to
 /// `line` alone duplicates code on "Apply suggestion". Exact duplicates are then merged (see
 /// `dedup_exact`). `file` in the result is the normalized path.
-pub fn keep_valid_batch(
+pub(crate) fn keep_valid_batch(
     suggestions: Vec<Suggestion>,
-    allowed_by_file: &HashMap<String, CommentableRange>,
+    allowed_by_file: &HashMap<String, &CommentableRange>,
 ) -> Vec<Suggestion> {
     let valid = suggestions.into_iter().filter_map(|s| {
         let file = normalize_path(&s.file);
@@ -301,12 +301,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_fenced_json() {
-        let raw = "```json\n[{\"file\":\"src/a.rs\",\"line\":3,\"severity\":\"critical\",\
-                   \"title\":\"T\",\"body\":\"B\",\"suggestion\":\"let x = 1;\"}]\n```";
-        let got = parse_suggestions(raw).unwrap();
+    fn parses_suggestions_formats_and_errors() {
+        let fenced = "```json\n[{\"file\":\"src/a.rs\",\"line\":3,\"severity\":\"critical\",\
+                      \"title\":\"T\",\"body\":\"B\",\"suggestion\":\"let x = 1;\"}]\n```";
         assert_eq!(
-            got,
+            parse_suggestions(fenced).unwrap(),
             vec![Suggestion {
                 file: "src/a.rs".into(),
                 start_line: None,
@@ -317,83 +316,90 @@ mod tests {
                 suggestion: Some("let x = 1;".into()),
             }]
         );
-    }
 
-    #[test]
-    fn parses_with_leading_prose() {
-        let raw = "Sure! Here is the review [see below]:\n\
-                   [{\"file\":\"a.rs\",\"line\":\"7\",\"severity\":\"warning\",\"title\":\"T\",\"body\":\"B\"}]\n\
-                   Let me know if you need more.";
-        let got = parse_suggestions(raw).unwrap();
+        let prose = "Sure! Here is the review [see below]:\n\
+                     [{\"file\":\"a.rs\",\"line\":\"7\",\"severity\":\"warning\",\"title\":\"T\",\"body\":\"B\"}]\n\
+                     Let me know if you need more.";
+        let got = parse_suggestions(prose).unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].line, 7, "numeric string line is accepted");
+        assert_eq!(got[0].line, 7);
         assert_eq!(got[0].severity, Severity::Warning);
         assert_eq!(got[0].suggestion, None);
+
+        // Empty brackets in prose do not mask a real finding array; empty arrays still parse.
+        let with_brackets = "Found 1 issue in `main(String[] args)`:\n\
+                             [{\"file\":\"a.rs\",\"line\":2,\"title\":\"T\",\"body\":\"B\"}]";
+        assert_eq!(parse_suggestions(with_brackets).unwrap().len(), 1);
+        for empty in ["- [ ] todo\n[]", "[]", "```json\n[ ]\n```"] {
+            assert_eq!(parse_suggestions(empty).unwrap(), vec![], "{empty}");
+        }
+        for bad in ["I found no issues.", "[not json", ""] {
+            assert_eq!(parse_suggestions(bad), Err(ParseError), "{bad}");
+        }
     }
 
     #[test]
-    fn empty_bracket_in_prose_does_not_hide_findings() {
-        let raw = "Found 1 issue in `main(String[] args)`:
-                   [{\"file\":\"a.rs\",\"line\":2,\"title\":\"T\",\"body\":\"B\"}]";
-        assert_eq!(parse_suggestions(raw).unwrap().len(), 1);
-        assert_eq!(
-            parse_suggestions(
-                "- [ ] todo
-[]"
-            )
-            .unwrap(),
-            vec![]
-        );
-    }
-
-    #[test]
-    fn empty_array_ok() {
-        assert_eq!(parse_suggestions("[]").unwrap(), vec![]);
-        assert_eq!(parse_suggestions("```json\n[ ]\n```").unwrap(), vec![]);
-    }
-
-    #[test]
-    fn garbage_is_error() {
-        assert_eq!(parse_suggestions("I found no issues."), Err(ParseError));
-        assert_eq!(parse_suggestions("[not json"), Err(ParseError));
-        assert_eq!(parse_suggestions(""), Err(ParseError));
-    }
-
-    #[test]
-    fn unknown_severity_defaults_info() {
+    fn skips_incomplete_items_defaults_severity_and_sanitizes_start_line() {
         let raw = r#"[{"file":"a.rs","line":1,"severity":"blocker","title":"T","body":"B"},
                       {"file":"a.rs","line":2,"title":"T","body":"B"},
                       {"file":"a.rs","line":3,"severity":"CRITICAL","title":"T","body":"B"}]"#;
-        let got = parse_suggestions(raw).unwrap();
-        let severities: Vec<_> = got.iter().map(|s| s.severity).collect();
+        let severities: Vec<_> = parse_suggestions(raw)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.severity)
+            .collect();
         assert_eq!(
             severities,
             vec![Severity::Info, Severity::Info, Severity::Critical]
         );
-    }
 
-    #[test]
-    fn skips_objects_missing_required_fields() {
-        let raw = r#"[{"line":1,"title":"no file","body":"B"},
-                      {"file":"a.rs","title":"no line","body":"B"},
-                      {"file":"a.rs","line":-1,"title":"bad line","body":"B"},
-                      {"file":"a.rs","line":"x","title":"bad line","body":"B"},
-                      {"file":"a.rs","line":1,"body":"no title"},
-                      {"file":"a.rs","line":1,"title":"no body"},
-                      {"file":"a.rs","line":9,"title":"ok","body":"B"}]"#;
-        let got = parse_suggestions(raw).unwrap();
+        let incomplete = r#"[{"line":1,"title":"no file","body":"B"},
+                             {"file":"a.rs","title":"no line","body":"B"},
+                             {"file":"a.rs","line":-1,"title":"bad line","body":"B"},
+                             {"file":"a.rs","line":"x","title":"bad line","body":"B"},
+                             {"file":"a.rs","line":1,"body":"no title"},
+                             {"file":"a.rs","line":1,"title":"no body"},
+                             {"file":"a.rs","line":9,"title":"ok","body":"B"}]"#;
+        let got = parse_suggestions(incomplete).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].title, "ok");
+
+        let ranges = r#"[
+            {"file":"a.rs","start_line":2,"line":5,"title":"num","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":"3","line":5,"title":"str","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":5,"line":5,"title":"equal","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":null,"line":5,"title":"null","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":7,"line":5,"title":"inverted","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":0,"line":5,"title":"zero","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":"bad","line":5,"title":"bad_str","body":"B","suggestion":"x"}
+        ]"#;
+        let parsed: Vec<(String, Option<u32>, bool)> = parse_suggestions(ranges)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.title, s.start_line, s.suggestion.is_some()))
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                ("num".into(), Some(2), true),
+                ("str".into(), Some(3), true),
+                ("equal".into(), None, true),
+                ("null".into(), None, true),
+                ("inverted".into(), None, false),
+                ("zero".into(), None, false),
+                ("bad_str".into(), None, false),
+            ]
+        );
     }
 
     #[test]
-    fn parse_submit_findings_extracts_valid_items_and_skips_incomplete() {
-        let args = serde_json::json!({"findings": [
-            {"file": "src/a.rs", "line": 3, "severity": "critical", "title": "T",
+    fn parse_submit_findings_validates_and_sanitizes() {
+        let args = json!({"findings": [
+            {"file": "src/a.rs", "start_line": 2, "line": 3, "severity": "critical", "title": "T",
              "body": "B", "suggestion": "let x = 1;"},
             {"file": "src/a.rs", "title": "no line", "body": "B"},
             "not an object",
-            {"file": "src/b.rs", "line": "4", "title": "T2", "body": "B2"}
+            {"file": "src/b.rs", "start_line": "bad", "line": "4", "title": "T2", "body": "B2", "suggestion": "y"}
         ]});
         let got = parse_submit_findings(&args).unwrap();
         assert_eq!(
@@ -401,7 +407,7 @@ mod tests {
             vec![
                 Suggestion {
                     file: "src/a.rs".into(),
-                    start_line: None,
+                    start_line: Some(2),
                     line: 3,
                     severity: Severity::Critical,
                     title: "T".into(),
@@ -420,56 +426,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            parse_submit_findings(&serde_json::json!({"findings": []})).unwrap(),
+            parse_submit_findings(&json!({"findings": []})).unwrap(),
             vec![]
         );
-        let missing = parse_submit_findings(&serde_json::json!({})).unwrap_err();
-        assert!(missing.contains("findings"), "{missing}");
-        let wrong_type =
-            parse_submit_findings(&serde_json::json!({"findings": "none"})).unwrap_err();
-        assert!(wrong_type.contains("findings"), "{wrong_type}");
-    }
-
-    #[test]
-    fn parses_and_sanitizes_start_line() {
-        let raw = r#"[
-            {"file":"a.rs","start_line":2,"line":5,"title":"num","body":"B","suggestion":"x"},
-            {"file":"a.rs","start_line":"3","line":5,"title":"str","body":"B","suggestion":"x"},
-            {"file":"a.rs","start_line":5,"line":5,"title":"equal","body":"B","suggestion":"x"},
-            {"file":"a.rs","start_line":null,"line":5,"title":"null","body":"B","suggestion":"x"},
-            {"file":"a.rs","start_line":7,"line":5,"title":"inverted","body":"B","suggestion":"x"},
-            {"file":"a.rs","start_line":0,"line":5,"title":"zero","body":"B","suggestion":"x"},
-            {"file":"a.rs","start_line":"bad","line":5,"title":"bad_str","body":"B","suggestion":"x"}
-        ]"#;
-        let got = parse_suggestions(raw).unwrap();
-        let parsed: Vec<(&str, Option<u32>, bool)> = got
-            .iter()
-            .map(|s| (s.title.as_str(), s.start_line, s.suggestion.is_some()))
-            .collect();
-        // An equal or missing start line is a single-line finding and keeps its suggestion. A
-        // requested range that is not valid loses the range and the suggestion written for it.
-        assert_eq!(
-            parsed,
-            [
-                ("num", Some(2), true),
-                ("str", Some(3), true),
-                ("equal", None, true),
-                ("null", None, true),
-                ("inverted", None, false),
-                ("zero", None, false),
-                ("bad_str", None, false),
-            ]
-        );
-
-        let args = serde_json::json!({"findings": [
-            {"file": "a.rs", "start_line": 2, "line": 4, "severity": "warning", "title": "T", "body": "B"},
-            {"file": "a.rs", "start_line": "bad", "line": 4, "severity": "warning", "title": "T2",
-             "body": "B", "suggestion": "y"}
-        ]});
-        let submitted = parse_submit_findings(&args).unwrap();
-        assert_eq!(submitted[0].start_line, Some(2));
-        assert_eq!(submitted[1].start_line, None);
-        assert_eq!(submitted[1].suggestion, None);
+        for bad in [json!({}), json!({"findings": "none"})] {
+            let err = parse_submit_findings(&bad).unwrap_err();
+            assert!(err.contains("findings"), "{err}");
+        }
     }
 
     #[test]
@@ -477,19 +440,16 @@ mod tests {
         let def = submit_findings_tool_def();
         assert_eq!(def.name, "submit_findings");
         let params = &def.parameters;
-        assert_eq!(params["required"], serde_json::json!(["findings"]));
+        assert_eq!(params["required"], json!(["findings"]));
         let item = &params["properties"]["findings"]["items"];
         assert_eq!(
             item["required"],
-            serde_json::json!(["file", "line", "severity", "title", "body"])
+            json!(["file", "line", "severity", "title", "body"])
         );
-        assert_eq!(
-            item["properties"]["start_line"]["type"],
-            serde_json::json!("integer")
-        );
+        assert_eq!(item["properties"]["start_line"]["type"], json!("integer"));
         assert_eq!(
             item["properties"]["severity"]["enum"],
-            serde_json::json!(["info", "warning", "critical"])
+            json!(["info", "warning", "critical"])
         );
         let text = params.to_string();
         for banned in ["additionalProperties", "$schema", "oneOf"] {
@@ -502,23 +462,16 @@ mod tests {
         clippy::single_range_in_vec_init,
         reason = "hunk list contains a single inclusive line range"
     )]
-    fn keep_valid_batch_filters_across_multiple_files_and_dedups() {
-        let allowed = HashMap::from([
-            (
-                "src/a.rs".to_string(),
-                CommentableRange {
-                    lines: BTreeSet::from([2, 3]),
-                    hunks: vec![1..=4],
-                },
-            ),
-            (
-                "src/b.rs".to_string(),
-                CommentableRange {
-                    lines: BTreeSet::from([5]),
-                    hunks: vec![4..=6],
-                },
-            ),
-        ]);
+    fn keep_valid_batch_filters_files_lines_hunks_and_dedups() {
+        let ra = CommentableRange {
+            lines: BTreeSet::from([2, 3]),
+            hunks: vec![1..=4],
+        };
+        let rb = CommentableRange {
+            lines: BTreeSet::from([5]),
+            hunks: vec![4..=6],
+        };
+        let allowed = HashMap::from([("src/a.rs".to_string(), &ra), ("src/b.rs".to_string(), &rb)]);
         let got = keep_valid_batch(
             vec![
                 sugg("/src/a.rs", 2, "T"),
@@ -539,27 +492,24 @@ mod tests {
                 sugg("src/a.rs", 2, "other title"),
             ]
         );
-    }
 
-    #[test]
-    fn keep_valid_batch_enforces_same_hunk_start_line_and_drops_its_suggestion() {
         let patch = "@@ -1,2 +1,3 @@\n ctx\n+a\n+b\n@@ -10,2 +11,3 @@\n x\n+y\n z\n";
+        let range = CommentableRange::from_patch(patch);
+        let allowed = HashMap::from([("src/a.rs".to_string(), &range)]);
         let with_fence = |start_line, line, title| Suggestion {
             suggestion: Some("one\ntwo".into()),
             ..sugg_span("src/a.rs", start_line, line, title)
         };
-        let inputs = vec![
-            with_fence(Some(1), 3, "context start in same hunk"),
-            with_fence(Some(2), 12, "cross hunk"),
-            with_fence(Some(9), 12, "before hunk"),
-            with_fence(None, 12, "single line"),
-        ];
-        let allowed =
-            HashMap::from([("src/a.rs".to_string(), CommentableRange::from_patch(patch))]);
-
-        let batch = keep_valid_batch(inputs, &allowed);
-
-        let kept: Vec<(Option<u32>, bool)> = batch
+        let batch = keep_valid_batch(
+            vec![
+                with_fence(Some(1), 3, "context start in same hunk"),
+                with_fence(Some(2), 12, "cross hunk"),
+                with_fence(Some(9), 12, "before hunk"),
+                with_fence(None, 12, "single line"),
+            ],
+            &allowed,
+        );
+        let kept: Vec<_> = batch
             .iter()
             .map(|s| (s.start_line, s.suggestion.is_some()))
             .collect();
@@ -572,8 +522,8 @@ mod tests {
     #[test]
     fn exact_duplicates_prefer_a_valid_range_and_keep_the_first_position() {
         let patch = "@@ -1,1 +1,4 @@\n a\n+b\n+c\n+d\n";
-        let allowed =
-            HashMap::from([("src/a.rs".to_string(), CommentableRange::from_patch(patch))]);
+        let range = CommentableRange::from_patch(patch);
+        let allowed = HashMap::from([("src/a.rs".to_string(), &range)]);
         let got = keep_valid_batch(
             vec![
                 sugg("src/a.rs", 3, "T"),

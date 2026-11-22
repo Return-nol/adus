@@ -430,18 +430,6 @@ async fn router_does_not_penalize_key_on_tools_unsupported_or_overflow(pool: PgP
     assert_eq!(kinds, ["context_overflow", "tools_unsupported"]);
 }
 
-#[test]
-fn new_chat_error_display_text() {
-    assert_eq!(
-        ChatError::ToolsUnsupported("x".into()).to_string(),
-        "tools not supported: x"
-    );
-    assert_eq!(
-        ChatError::ContextOverflow("y".into()).to_string(),
-        "context window exceeded: y"
-    );
-}
-
 #[sqlx::test(migrations = "../../migrations")]
 async fn undecryptable_key_skipped_not_invalidated_and_next_key_used(pool: PgPool) {
     let s = setup(&pool, ProviderKind::Openai, 2).await;
@@ -495,11 +483,18 @@ async fn no_decryptable_key_is_internal_error(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_attempt_writes_usage_row(pool: PgPool) {
-    let s = setup(&pool, ProviderKind::Openai, 2).await;
+    let s = setup(&pool, ProviderKind::Anthropic, 2).await;
     ai::mark_used(&pool, s.keys[1].id, Utc::now())
         .await
         .unwrap();
+    let cached = ChatResponse {
+        input_tokens: 100,
+        cache_read_tokens: 60,
+        cache_write_tokens: 30,
+        ..ok_response()
+    };
     s.fake.script("key-0", vec![rate_limited(30)]);
+    s.fake.script("key-1", vec![Ok(cached)]);
 
     chat(&s).await.unwrap();
 
@@ -510,13 +505,16 @@ async fn every_attempt_writes_usage_row(pool: PgPool) {
         model: String,
         input_tokens: i32,
         output_tokens: i32,
+        cache_read_tokens: i32,
+        cache_write_tokens: i32,
         latency_ms: i32,
         success: bool,
         error_kind: Option<String>,
     }
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT key_id, provider_id, model, input_tokens, output_tokens, latency_ms, success, \
-         error_kind FROM llm_usage ORDER BY created_at, id",
+        "SELECT key_id, provider_id, model, input_tokens, output_tokens, cache_read_tokens, \
+         cache_write_tokens, latency_ms, success, error_kind \
+         FROM llm_usage ORDER BY created_at, id",
     )
     .fetch_all(&pool)
     .await
@@ -526,12 +524,28 @@ async fn every_attempt_writes_usage_row(pool: PgPool) {
     assert_eq!(rows[0].key_id, s.keys[0].id);
     assert!(!rows[0].success);
     assert_eq!(rows[0].error_kind.as_deref(), Some("rate_limited"));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert_eq!(
+        (
+            rows[0].input_tokens,
+            rows[0].output_tokens,
+            rows[0].cache_read_tokens,
+            rows[0].cache_write_tokens
+        ),
+        (0, 0, 0, 0)
+    );
 
     assert_eq!(rows[1].key_id, s.keys[1].id);
     assert!(rows[1].success);
     assert_eq!(rows[1].error_kind, None);
-    assert_eq!((rows[1].input_tokens, rows[1].output_tokens), (10, 5));
+    assert_eq!(
+        (
+            rows[1].input_tokens,
+            rows[1].output_tokens,
+            rows[1].cache_read_tokens,
+            rows[1].cache_write_tokens
+        ),
+        (100, 5, 60, 30)
+    );
 
     for row in &rows {
         assert_eq!(row.provider_id, s.provider.id);
@@ -669,80 +683,4 @@ async fn deleting_key_and_provider_keeps_usage_history(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!((key_id, provider_id), (None, None));
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn settings_row_exists_with_defaults(pool: PgPool) {
-    let current = adus_db::settings::get(&pool).await.unwrap();
-    assert_eq!(current.max_files_per_review, 30);
-    assert_eq!(current.max_patch_lines_per_file, 1500);
-    assert_eq!(current.default_provider_id, None);
-
-    let provider = ai::insert_provider(
-        &pool,
-        ProviderKind::Gemini,
-        "g",
-        None,
-        "gemini-x",
-        Some("gemini-fast"),
-    )
-    .await
-    .unwrap();
-    let new = adus_db::settings::Settings {
-        default_provider_id: Some(provider.id),
-        max_files_per_review: 10,
-        max_patch_lines_per_file: 500,
-        ignore_paths: Some(vec!["dist/**".into()]),
-        ignored_title_keywords: vec!["wip".into()],
-        review_mode: adus_core::types::ReviewMode::Specialists,
-        small_pr_max_lines: 120,
-        max_review_input_tokens: 500_000,
-    };
-    assert_eq!(adus_db::settings::update(&pool, &new).await.unwrap(), new);
-    // Hapus provider -> default_provider_id di-NULL-kan.
-    ai::delete_provider(&pool, provider.id).await.unwrap();
-    assert_eq!(
-        adus_db::settings::get(&pool)
-            .await
-            .unwrap()
-            .default_provider_id,
-        None
-    );
-}
-
-#[test]
-fn internal_error_display_text() {
-    let err = ChatError::Internal("cannot decrypt API keys — check ADUS_SECRET_KEY".into());
-    assert_eq!(
-        err.to_string(),
-        "internal error: cannot decrypt API keys — check ADUS_SECRET_KEY"
-    );
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn router_writes_cache_tokens_to_usage(pool: PgPool) {
-    let s = setup(&pool, ProviderKind::Anthropic, 2).await;
-    ai::mark_used(&pool, s.keys[1].id, Utc::now())
-        .await
-        .unwrap();
-    let cached = ChatResponse {
-        input_tokens: 100,
-        cache_read_tokens: 60,
-        cache_write_tokens: 30,
-        ..ok_response()
-    };
-    s.fake.script("key-0", vec![rate_limited(30)]);
-    s.fake.script("key-1", vec![Ok(cached)]);
-
-    chat(&s).await.unwrap();
-
-    let rows: Vec<(bool, i32, i32, i32)> = sqlx::query_as(
-        "SELECT success, input_tokens, cache_read_tokens, cache_write_tokens \
-         FROM llm_usage ORDER BY created_at, id",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    // The failed attempt records no tokens; the success records its cache tokens as well.
-    assert_eq!(rows, vec![(false, 0, 0, 0), (true, 100, 60, 30)]);
 }

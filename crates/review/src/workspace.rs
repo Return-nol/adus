@@ -12,7 +12,7 @@
 //!   rejecting traversal, `.git`, secret files and symlinks that leave the root.
 
 use std::ffi::OsString;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -24,9 +24,9 @@ use tempfile::TempDir;
 use tokio::process::Command;
 
 /// Budget for a whole clone (init, fetch, checkout, size check).
-pub const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
+const CLONE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Largest checkout (excluding `.git`) a review may work on.
-pub const MAX_WORKSPACE_BYTES: u64 = 500 * 1024 * 1024;
+const MAX_WORKSPACE_BYTES: u64 = 500 * 1024 * 1024;
 /// Orphaned workspaces older than this are swept at startup. A clone lives ~35 min at most.
 const ORPHAN_MAX_AGE: Duration = Duration::from_secs(3600);
 /// Oldest git with `GIT_CONFIG_COUNT` support.
@@ -91,8 +91,8 @@ pub enum WorkspaceError {
     Unavailable(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PathError {
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PathError {
     #[error("invalid path: {0}")]
     Invalid(String),
     #[error("path escapes the repository root")]
@@ -104,20 +104,20 @@ pub enum PathError {
 }
 
 /// A path validated to stay inside a [`RepoWorkspace`]. Only the workspace creates one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoPath {
+#[derive(Debug)]
+pub(crate) struct RepoPath {
     abs: PathBuf,
     rel: String,
 }
 
 impl RepoPath {
     /// Absolute path under [`RepoWorkspace::root`].
-    pub fn abs(&self) -> &Path {
+    pub(crate) fn abs(&self) -> &Path {
         &self.abs
     }
 
     /// Normalized relative path with `/` separators (`""` for the root).
-    pub fn rel(&self) -> &str {
+    pub(crate) fn rel(&self) -> &str {
         &self.rel
     }
 }
@@ -150,7 +150,7 @@ impl RepoWorkspace {
     }
 
     /// Validates `rel` (relative, `/`-separated). The target does not need to exist.
-    pub fn resolve(&self, rel: &str) -> Result<RepoPath, PathError> {
+    pub(crate) fn resolve(&self, rel: &str) -> Result<RepoPath, PathError> {
         let parts = split_rel(rel)?;
         if parts.is_empty() {
             return Err(PathError::Invalid("empty path".into()));
@@ -158,8 +158,21 @@ impl RepoWorkspace {
         self.resolve_parts(&parts)
     }
 
+    /// Returns the root for `""` or `"."`, otherwise delegates to [`Self::resolve`] (which rejects
+    /// `"/"` and `"///"` as absolute paths).
+    pub(crate) fn resolve_or_root(&self, rel: &str) -> Result<RepoPath, PathError> {
+        if matches!(rel, "" | ".") {
+            Ok(RepoPath {
+                abs: self.canonical_root.clone(),
+                rel: String::new(),
+            })
+        } else {
+            self.resolve(rel)
+        }
+    }
+
     /// Like [`Self::resolve`], and the target must be an existing file.
-    pub fn resolve_existing_file(&self, rel: &str) -> Result<RepoPath, PathError> {
+    pub(crate) fn resolve_existing_file(&self, rel: &str) -> Result<RepoPath, PathError> {
         let path = self.resolve(rel)?;
         if path.abs.is_file() {
             Ok(path)
@@ -170,7 +183,7 @@ impl RepoWorkspace {
 
     /// Like [`Self::resolve`], and the target must be an existing directory. `""` and `"."` are
     /// the root.
-    pub fn resolve_dir(&self, rel: &str) -> Result<RepoPath, PathError> {
+    pub(crate) fn resolve_dir(&self, rel: &str) -> Result<RepoPath, PathError> {
         let parts = split_rel(rel)?;
         let path = if parts.is_empty() {
             RepoPath {
@@ -194,11 +207,9 @@ impl RepoWorkspace {
         let inside = existing
             .strip_prefix(&self.canonical_root)
             .map_err(|_| PathError::EscapesRoot)?;
-        let names: Vec<String> = inside
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        check_names(names.iter().map(String::as_str))?;
+        for component in inside.components() {
+            check_names([component.as_os_str().to_string_lossy().as_ref()])?;
+        }
         let abs = missing.iter().fold(existing, |path, part| path.join(part));
         Ok(RepoPath {
             abs,
@@ -252,28 +263,20 @@ fn split_rel(rel: &str) -> Result<Vec<&str>, PathError> {
             _ if cfg!(windows) && part.contains(':') => {
                 return Err(PathError::Invalid(format!("invalid path segment: {part}")));
             }
-            _ => {
-                let mut components = Path::new(part).components();
-                let single_normal = matches!(
-                    (components.next(), components.next()),
-                    (Some(Component::Normal(_)), None)
-                );
-                if !single_normal {
-                    return Err(PathError::Invalid(format!("invalid path segment: {part}")));
-                }
-                parts.push(part);
-            }
+            _ => parts.push(part),
         }
     }
     Ok(parts)
 }
 
-fn check_names<'a>(names: impl Iterator<Item = &'a str> + Clone) -> Result<(), PathError> {
-    if names.clone().any(is_git_dir_name) {
-        return Err(PathError::ForbiddenGitPath);
-    }
-    if names.into_iter().any(is_secret_name) {
-        return Err(PathError::SecretFile);
+fn check_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<(), PathError> {
+    for name in names {
+        if is_git_dir_name(name) {
+            return Err(PathError::ForbiddenGitPath);
+        }
+        if is_secret_name(name) {
+            return Err(PathError::SecretFile);
+        }
     }
     Ok(())
 }
@@ -303,7 +306,7 @@ fn is_secret_name(name: &str) -> bool {
 
 /// True when any component of `rel` (split on `/` or `\`) is `.git` or a secret file name,
 /// case-insensitively. Tools use it to filter listings and search results.
-pub fn is_secret_path(rel: &str) -> bool {
+pub(crate) fn is_secret_path(rel: &str) -> bool {
     rel.split(['/', '\\'])
         .any(|name| is_git_dir_name(name) || is_secret_name(name))
 }
@@ -315,7 +318,7 @@ pub trait RepoCloner: Send + Sync {
 }
 
 /// `<temp dir>/adus-clones`, the parent of every workspace on this host.
-pub fn clones_root() -> PathBuf {
+fn clones_root() -> PathBuf {
     std::env::temp_dir().join("adus-clones")
 }
 
@@ -327,7 +330,7 @@ pub async fn cleanup_orphaned_workspaces() -> usize {
 
 /// Removes `adus-*` entries of `root` whose mtime is at least `max_age` old. IO errors are
 /// logged and skipped; a missing `root` removes nothing.
-pub async fn cleanup_orphaned_in(root: &Path, max_age: Duration) -> usize {
+async fn cleanup_orphaned_in(root: &Path, max_age: Duration) -> usize {
     let root = root.to_path_buf();
     match tokio::task::spawn_blocking(move || sweep_orphans(&root, max_age)).await {
         Ok(removed) => removed,
@@ -340,12 +343,9 @@ pub async fn cleanup_orphaned_in(root: &Path, max_age: Duration) -> usize {
 
 fn sweep_orphans(root: &Path, max_age: Duration) -> usize {
     // Never follow a symlinked root: it would delete `adus-*` entries somewhere else.
-    match std::fs::symlink_metadata(root) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            tracing::warn!(path = %root.display(), "clones root is a symlink; not sweeping it");
-            return 0;
-        }
-        _ => {}
+    if std::fs::symlink_metadata(root).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        tracing::warn!(path = %root.display(), "clones root is a symlink; not sweeping it");
+        return 0;
     }
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -369,7 +369,24 @@ fn sweep_orphans(root: &Path, max_age: Duration) -> usize {
             continue;
         }
         let path = entry.path();
-        match remove_if_old(&path, now, max_age) {
+        let remove = || -> std::io::Result<bool> {
+            let meta = std::fs::symlink_metadata(&path)?;
+            let age = meta
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .unwrap_or(Duration::ZERO);
+            if age < max_age {
+                return Ok(false);
+            }
+            if meta.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+            Ok(true)
+        };
+        match remove() {
             Ok(true) => removed += 1,
             Ok(false) => {}
             Err(e) => {
@@ -380,33 +397,16 @@ fn sweep_orphans(root: &Path, max_age: Duration) -> usize {
     removed
 }
 
-fn remove_if_old(path: &Path, now: SystemTime, max_age: Duration) -> std::io::Result<bool> {
-    let meta = std::fs::symlink_metadata(path)?;
-    let age = meta
-        .modified()
-        .ok()
-        .and_then(|modified| now.duration_since(modified).ok())
-        .unwrap_or(Duration::ZERO);
-    if age < max_age {
-        return Ok(false);
-    }
-    if meta.is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else {
-        std::fs::remove_file(path)?;
-    }
-    Ok(true)
-}
-
 /// Shallow-clones with the `git` CLI under the hardening described in the module docs.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GitCliCloner {
-    pub clone_timeout: Duration,
-    pub max_bytes: u64,
+    clone_timeout: Duration,
+    max_bytes: u64,
     /// Parent directory of the workspaces ([`clones_root`] in production).
-    pub clones_root: PathBuf,
+    clones_root: PathBuf,
     /// Allows `file://` URLs. Tests only.
-    pub allow_file_protocol_for_test: bool,
+    #[cfg(test)]
+    allow_file_protocol_for_test: bool,
 }
 
 impl Default for GitCliCloner {
@@ -415,6 +415,7 @@ impl Default for GitCliCloner {
             clone_timeout: CLONE_TIMEOUT,
             max_bytes: MAX_WORKSPACE_BYTES,
             clones_root: clones_root(),
+            #[cfg(test)]
             allow_file_protocol_for_test: false,
         }
     }
@@ -464,11 +465,22 @@ impl RepoCloner for GitCliCloner {
 }
 
 impl GitCliCloner {
+    fn allow_file_protocol(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.allow_file_protocol_for_test
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
     fn check_url(&self, url: &str) -> Result<(), WorkspaceError> {
         let lower = url.to_ascii_lowercase();
         let allowed = lower.starts_with("https://")
             || lower.starts_with("http://")
-            || (self.allow_file_protocol_for_test && lower.starts_with("file://"));
+            || (self.allow_file_protocol() && lower.starts_with("file://"));
         if allowed {
             Ok(())
         } else {
@@ -523,12 +535,25 @@ impl GitCliCloner {
         CHECKED.get_or_init(|| result).clone()
     }
 
-    async fn init(&self, layout: &Layout) -> Result<(), WorkspaceError> {
+    async fn run_git(
+        &self,
+        layout: &Layout,
+        step: &str,
+        configure: impl FnOnce(&mut Command),
+    ) -> Result<String, WorkspaceError> {
         let mut cmd = self.git(layout);
-        // Empty template: no sample hooks or other template files.
-        cmd.args(["init", "--quiet", "--template=", "--"])
-            .arg(&layout.repo);
-        run(cmd, "init", &Redactor::default()).await.map(drop)
+        configure(&mut cmd);
+        run(cmd, step, &Redactor::default()).await
+    }
+
+    async fn init(&self, layout: &Layout) -> Result<(), WorkspaceError> {
+        self.run_git(layout, "init", |cmd| {
+            // Empty template: no sample hooks or other template files.
+            cmd.args(["init", "--quiet", "--template=", "--"])
+                .arg(&layout.repo);
+        })
+        .await
+        .map(drop)
     }
 
     /// Fetches `spec.refspec`; on a non-auth failure retries once with the fallback refspec.
@@ -576,19 +601,23 @@ impl GitCliCloner {
     }
 
     async fn checkout(&self, layout: &Layout) -> Result<(), WorkspaceError> {
-        let mut cmd = self.git(layout);
-        cmd.arg(flag_with_path("--git-dir=", &layout.git_dir))
-            .arg(flag_with_path("--work-tree=", &layout.repo))
-            .args(["checkout", "--detach", "--force", "FETCH_HEAD"]);
-        run(cmd, "checkout", &Redactor::default()).await.map(drop)
+        self.run_git(layout, "checkout", |cmd| {
+            cmd.arg(flag_with_path("--git-dir=", &layout.git_dir))
+                .arg(flag_with_path("--work-tree=", &layout.repo))
+                .args(["checkout", "--detach", "--force", "FETCH_HEAD"]);
+        })
+        .await
+        .map(drop)
     }
 
     /// A different HEAD (PR pushed during the clone) is only logged; no HEAD is an error.
     async fn check_head(&self, layout: &Layout, expected_sha: &str) -> Result<(), WorkspaceError> {
-        let mut cmd = self.git(layout);
-        cmd.arg(flag_with_path("--git-dir=", &layout.git_dir))
-            .args(["rev-parse", "--verify", "HEAD"]);
-        let head = run(cmd, "rev-parse", &Redactor::default()).await?;
+        let head = self
+            .run_git(layout, "rev-parse", |cmd| {
+                cmd.arg(flag_with_path("--git-dir=", &layout.git_dir))
+                    .args(["rev-parse", "--verify", "HEAD"]);
+            })
+            .await?;
         let head = head.trim();
         if head.is_empty() {
             return Err(WorkspaceError::Unavailable("checkout has no HEAD".into()));
@@ -606,7 +635,7 @@ impl GitCliCloner {
     /// `git` with the hardening `-c` flags. Every value is a constant of ours, never repo or
     /// user input.
     fn git(&self, layout: &Layout) -> Command {
-        let protocol_file = if self.allow_file_protocol_for_test {
+        let protocol_file = if self.allow_file_protocol() {
             "protocol.file.allow=always"
         } else {
             "protocol.file.allow=never"
@@ -754,18 +783,14 @@ impl Redactor {
 /// `(major, minor)` from `git --version` output (e.g. `git version 2.43.0`).
 pub fn parse_git_version(output: &str) -> Option<(u32, u32)> {
     let version = output.trim().strip_prefix("git version ")?;
-    let mut parts = version.split('.');
-    let mut number = || -> Option<u32> {
-        let digits: String = parts
-            .next()?
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        digits.parse().ok()
-    };
-    let major = number()?;
-    let minor = number()?;
-    Some((major, minor))
+    let mut nums = version.split('.').map(|part| {
+        let end = part
+            .bytes()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(part.len());
+        part[..end].parse::<u32>().ok()
+    });
+    Some((nums.next()??, nums.next()??))
 }
 
 /// Whether this git can take the auth header from the environment (2.31+).
@@ -831,11 +856,17 @@ fn ensure_private_root(root: &Path) -> std::io::Result<()> {
 /// at 0700, no other non-root user can enter it, rename within it, or replace anything under it,
 /// which closes the race between [`ensure_private_root`] and the workspace creation.
 #[cfg(unix)]
+fn is_private_dir(meta: &std::fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.file_type().is_dir() && meta.mode() & 0o077 == 0 && meta.uid() == uid
+}
+
+#[cfg(unix)]
 fn verify_workspace_parent(root: &Path, workspace: &Path) -> std::io::Result<()> {
     let uid = process_uid()?;
-    let root_facts = DirFacts::of(&std::fs::symlink_metadata(root)?);
-    let ws_facts = DirFacts::of(&std::fs::symlink_metadata(workspace)?);
-    if workspace_parent_trusted(&root_facts, &ws_facts, uid) {
+    if is_private_dir(&std::fs::symlink_metadata(root)?, uid)
+        && is_private_dir(&std::fs::symlink_metadata(workspace)?, uid)
+    {
         Ok(())
     } else {
         Err(std::io::Error::new(
@@ -862,48 +893,6 @@ fn process_uid() -> std::io::Result<u32> {
     }
     let uid = tempfile::tempfile()?.metadata()?.uid();
     Ok(*UID.get_or_init(|| uid))
-}
-
-/// What the ownership check needs from `symlink_metadata` of a directory.
-#[cfg_attr(
-    all(not(unix), not(test)),
-    expect(dead_code, reason = "ownership is only checked on Unix")
-)]
-struct DirFacts {
-    /// From `symlink_metadata`, so a symlink is never a directory.
-    is_dir: bool,
-    mode: u32,
-    uid: u32,
-}
-
-impl DirFacts {
-    #[cfg(unix)]
-    fn of(meta: &std::fs::Metadata) -> Self {
-        use std::os::unix::fs::MetadataExt;
-        Self {
-            is_dir: meta.file_type().is_dir(),
-            mode: meta.mode(),
-            uid: meta.uid(),
-        }
-    }
-
-    /// A real directory without group or other permission bits, owned by `uid`.
-    #[cfg_attr(
-        all(not(unix), not(test)),
-        expect(dead_code, reason = "ownership is only checked on Unix")
-    )]
-    fn is_private_of(&self, uid: u32) -> bool {
-        self.is_dir && self.mode & 0o077 == 0 && self.uid == uid
-    }
-}
-
-/// Both the clones root and the new workspace are private directories of `process_uid`.
-#[cfg_attr(
-    all(not(unix), not(test)),
-    expect(dead_code, reason = "ownership is only checked on Unix")
-)]
-fn workspace_parent_trusted(root: &DirFacts, workspace: &DirFacts, process_uid: u32) -> bool {
-    root.is_private_of(process_uid) && workspace.is_private_of(process_uid)
 }
 
 /// Deletes a failed workspace now. Retries briefly because Windows releases the files of a
@@ -1126,16 +1115,41 @@ mod tests {
             .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
     }
 
+    fn cmd_envs(cmd: &Command) -> Vec<(String, Option<String>)> {
+        cmd.as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
     #[tokio::test]
     async fn clones_local_repo_with_hardened_flags_and_deletes_on_drop() {
         let source = source_repo();
-        let root = private_root();
+        let parent = private_root();
+        let clones = parent.path().join("adus-clones");
         let url = source.url();
 
-        let ws = cloner(root.path())
+        let ws = cloner(&clones)
             .clone_pr(&spec(&url, &source.head, None, &source.head))
             .await
             .unwrap();
+
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&clones), 0o700);
+            assert_eq!(mode(ws.root().parent().unwrap()), 0o700);
+        }
 
         let main = ws.resolve_existing_file("src/main.rs").unwrap();
         assert_eq!(fs::read_to_string(main.abs()).unwrap(), "fn main() {}\n");
@@ -1171,7 +1185,7 @@ mod tests {
         let path = ws.root().to_path_buf();
         drop(ws);
         assert!(!path.exists());
-        assert!(entries(root.path()).is_empty());
+        assert!(entries(&clones).is_empty());
     }
 
     #[tokio::test]
@@ -1247,27 +1261,25 @@ mod tests {
         assert!(args.contains(&"--depth=1".to_string()));
         assert!(args.contains(&"--no-recurse-submodules".to_string()));
 
-        let envs: Vec<(String, String)> = std_cmd
-            .get_envs()
-            .filter_map(|(k, v)| {
-                Some((
-                    k.to_string_lossy().into_owned(),
-                    v?.to_string_lossy().into_owned(),
-                ))
-            })
-            .collect();
-        let get = |key: &str| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("1"));
-        assert_eq!(get("GIT_CONFIG_KEY_0").as_deref(), Some("http.extraHeader"));
+        let envs = cmd_envs(&cmd);
+        let get = |key: &str| {
+            envs.iter()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, v)| v.as_deref())
+        };
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(get("GIT_CONFIG_KEY_0"), Some("http.extraHeader"));
         assert_eq!(
             get("GIT_CONFIG_VALUE_0"),
-            Some(format!("Authorization: {header}"))
+            Some(format!("Authorization: {header}").as_str())
         );
-        assert_eq!(get("GIT_TERMINAL_PROMPT").as_deref(), Some("0"));
-        assert_eq!(get("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
-        assert_eq!(get("GIT_CONFIG_GLOBAL").as_deref(), Some("/dev/null"));
+        assert_eq!(get("GIT_TERMINAL_PROMPT"), Some("0"));
+        assert_eq!(get("GIT_CONFIG_NOSYSTEM"), Some("1"));
+        assert_eq!(get("GIT_CONFIG_GLOBAL"), Some("/dev/null"));
         for (key, value) in &envs {
-            if key != "GIT_CONFIG_VALUE_0" {
+            if key != "GIT_CONFIG_VALUE_0"
+                && let Some(value) = value
+            {
                 assert!(!value.contains(PAT), "PAT leaked into {key}");
             }
         }
@@ -1290,15 +1302,9 @@ mod tests {
         let cmd = cloner.base_command_with(&layout, host_env);
 
         // Windows matches variable names case-insensitively, so compare upper-cased names.
-        let envs: Vec<(String, Option<String>)> = cmd
-            .as_std()
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().to_ascii_uppercase(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
+        let envs: Vec<(String, Option<String>)> = cmd_envs(&cmd)
+            .into_iter()
+            .map(|(k, v)| (k.to_ascii_uppercase(), v))
             .collect();
         let get = |key: &str| envs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         assert_eq!(get("HTTPS_PROXY"), Some(Some("HTTPS_PROXY-value".into())));
@@ -1311,17 +1317,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_to_fallback_refspec_when_primary_fetch_fails() {
+    async fn falls_back_to_fallback_refspec_and_allows_head_mismatch() {
         let source = source_repo();
         let root = private_root();
         let url = source.url();
+        let mismatched_sha = "0123456789abcdef0123456789abcdef01234567";
 
         let ws = cloner(root.path())
             .clone_pr(&spec(
                 &url,
                 "refs/pull/999/head",
                 Some("refs/heads/main"),
-                &source.head,
+                mismatched_sha,
             ))
             .await
             .unwrap();
@@ -1335,17 +1342,6 @@ mod tests {
         assert!(matches!(err, WorkspaceError::Unavailable(_)), "{err:?}");
         drop(ws);
         assert!(entries(root.path()).is_empty());
-    }
-
-    #[tokio::test]
-    async fn head_mismatch_with_expected_sha_still_succeeds() {
-        let source = source_repo();
-        let root = private_root();
-        let other = "0123456789abcdef0123456789abcdef01234567";
-        let ws = cloner(root.path())
-            .clone_pr(&spec(&source.url(), "refs/heads/main", None, other))
-            .await;
-        assert!(ws.is_ok(), "{ws:?}");
     }
 
     #[tokio::test]
@@ -1366,19 +1362,14 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_urls_outside_http_and_https() {
-        let source = source_repo();
         let root = private_root();
         let strict = GitCliCloner {
             clones_root: root.path().to_path_buf(),
             ..GitCliCloner::default()
         };
-        for url in [
-            source.url(),
-            "ext::sh -c touch% /tmp/x".into(),
-            "ssh://h/r".into(),
-        ] {
+        for url in ["file:///tmp/repo", "ext::sh -c touch% /tmp/x", "ssh://h/r"] {
             let err = strict
-                .clone_pr(&spec(&url, "refs/heads/main", None, &source.head))
+                .clone_pr(&spec(url, "refs/heads/main", None, "abc"))
                 .await
                 .unwrap_err();
             assert!(
@@ -1389,26 +1380,16 @@ mod tests {
         assert!(entries(root.path()).is_empty());
     }
 
-    fn workspace_with_files(files: &[&str]) -> RepoWorkspace {
-        let dir = TempDir::new().unwrap();
-        for f in files {
-            let path = dir.path().join(f);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, "x").unwrap();
-        }
-        RepoWorkspace::from_temp_dir(dir).unwrap()
-    }
-
     #[test]
     fn resolve_rejects_traversal_git_and_secret_files() {
-        let ws = workspace_with_files(&[
-            "src/main.rs",
-            ".env",
-            ".env.example",
-            ".env.production",
-            "certs/server.pem",
-            "keys/id_rsa",
-            ".git/HEAD",
+        let ws = RepoWorkspace::from_files(&[
+            ("src/main.rs", b"x"),
+            (".env", b"x"),
+            (".env.example", b"x"),
+            (".env.production", b"x"),
+            ("certs/server.pem", b"x"),
+            ("keys/id_rsa", b"x"),
+            (".git/HEAD", b"x"),
         ]);
         let cases: &[(&str, PathError)] = &[
             ("../etc/passwd", PathError::EscapesRoot),
@@ -1528,90 +1509,28 @@ mod tests {
         }
     }
 
-    fn facts(is_dir: bool, mode: u32, uid: u32) -> DirFacts {
-        DirFacts { is_dir, mode, uid }
-    }
-
-    #[test]
-    fn workspace_parent_check_requires_private_dirs_of_the_process_uid() {
-        const ME: u32 = 1000;
-        const OTHER: u32 = 1001;
-        let ok = |root: DirFacts, ws: DirFacts| workspace_parent_trusted(&root, &ws, ME);
-        assert!(ok(facts(true, 0o40700, ME), facts(true, 0o40700, ME)));
-        assert!(ok(facts(true, 0o500, ME), facts(true, 0o700, ME)));
-        // Root and workspace both swapped in by another user: consistent, but not ours.
-        assert!(!ok(facts(true, 0o700, OTHER), facts(true, 0o700, OTHER)));
-        // Root ours, workspace replaced by another user.
-        assert!(!ok(facts(true, 0o700, ME), facts(true, 0o700, OTHER)));
-        // Root foreign at 0700 (an owner that flips the mode), workspace ours.
-        assert!(!ok(facts(true, 0o700, OTHER), facts(true, 0o700, ME)));
-        // Group or other bits on either.
-        for mode in [0o750, 0o701, 0o777] {
-            assert!(
-                !ok(facts(true, mode, ME), facts(true, 0o700, ME)),
-                "{mode:o}"
-            );
-            assert!(
-                !ok(facts(true, 0o700, ME), facts(true, mode, ME)),
-                "{mode:o}"
-            );
-        }
-        // A symlink or file (`symlink_metadata` reports not-a-directory).
-        assert!(!ok(facts(false, 0o700, ME), facts(true, 0o700, ME)));
-        assert!(!ok(facts(true, 0o700, ME), facts(false, 0o700, ME)));
-    }
-
     #[cfg(unix)]
-    #[test]
-    fn verify_workspace_parent_accepts_private_and_rejects_shared_root() {
+    #[tokio::test]
+    async fn unix_parent_dir_and_clones_root_must_be_private() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let root = private_root();
+        let parent = private_root();
         assert_eq!(
             process_uid().unwrap(),
-            fs::symlink_metadata(root.path()).unwrap().uid()
+            fs::symlink_metadata(parent.path()).unwrap().uid()
         );
-        let ws = root.path().join("adus-ws");
+        let ws = parent.path().join("adus-ws");
         fs::create_dir(&ws).unwrap();
         fs::set_permissions(&ws, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(verify_workspace_parent(root.path(), &ws).is_ok());
+        assert!(verify_workspace_parent(parent.path(), &ws).is_ok());
 
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(verify_workspace_parent(root.path(), &ws).is_err());
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(verify_workspace_parent(parent.path(), &ws).is_err());
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o700)).unwrap();
 
         fs::set_permissions(&ws, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(verify_workspace_parent(root.path(), &ws).is_err());
-        let missing = root.path().join("gone");
-        assert!(verify_workspace_parent(root.path(), &missing).is_err());
-    }
+        assert!(verify_workspace_parent(parent.path(), &ws).is_err());
+        assert!(verify_workspace_parent(parent.path(), &parent.path().join("gone")).is_err());
 
-    #[cfg(unix)]
-    fn mode(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn clones_root_and_workspace_are_private() {
-        let source = source_repo();
-        let parent = private_root();
-        let clones = parent.path().join("adus-clones");
-        let ws = cloner(&clones)
-            .clone_pr(&spec(&source.url(), &source.head, None, &source.head))
-            .await
-            .unwrap();
-        assert_eq!(mode(&clones), 0o700);
-        let workspace_dir = ws.root().parent().unwrap();
-        assert_eq!(mode(workspace_dir), 0o700);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn refuses_symlinked_or_shared_clones_root() {
-        use std::os::unix::fs::PermissionsExt;
-        let source = source_repo();
-        let parent = private_root();
         let target = parent.path().join("target");
         fs::create_dir(&target).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1620,6 +1539,7 @@ mod tests {
         let shared = parent.path().join("shared");
         fs::create_dir(&shared).unwrap();
 
+        let dummy_spec = spec("https://github.com/o/r.git", "refs/heads/main", None, "abc");
         for (root, perms) in [
             (&link, None),
             (&shared, Some(0o777)),
@@ -1628,10 +1548,7 @@ mod tests {
             if let Some(perms) = perms {
                 fs::set_permissions(root, fs::Permissions::from_mode(perms)).unwrap();
             }
-            let err = cloner(root)
-                .clone_pr(&spec(&source.url(), &source.head, None, &source.head))
-                .await
-                .unwrap_err();
+            let err = cloner(root).clone_pr(&dummy_spec).await.unwrap_err();
             assert!(
                 matches!(err, WorkspaceError::Unavailable(_)),
                 "{root:?}: {err:?}"

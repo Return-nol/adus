@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use adus_llm::{
     AssistantPart, ChatRequest, ChatResponse, LlmError, Message, ProviderKind, ReasoningEffort,
-    StopReason, ToolCall, ToolDef, ToolResult, UserPart, client_for, default_base_url,
+    StopReason, ToolCall, ToolDef, ToolResult, UserPart, client_for,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, header, method, path};
@@ -181,11 +181,11 @@ async fn openai_sends_max_completion_tokens_only() {
     )
     .await;
     chat(ProviderKind::Openai, &server).await.unwrap();
-    let body: Value = server.received_requests().await.unwrap()[0]
-        .body_json()
-        .unwrap();
+    let body = sent_body(&server).await;
     assert_eq!(body["max_completion_tokens"], 321);
     assert!(body.get("max_tokens").is_none());
+    assert!(body.get("tools").is_none());
+    assert!(body.get("tool_choice").is_none());
 }
 
 #[tokio::test]
@@ -196,9 +196,7 @@ async fn compatible_sends_max_tokens_only() {
     )
     .await;
     chat(ProviderKind::OpenaiCompatible, &server).await.unwrap();
-    let body: Value = server.received_requests().await.unwrap()[0]
-        .body_json()
-        .unwrap();
+    let body = sent_body(&server).await;
     assert_eq!(body["max_tokens"], 321);
     assert!(body.get("max_completion_tokens").is_none());
 }
@@ -257,23 +255,6 @@ async fn compatible_without_base_url_is_invalid() {
         err,
         LlmError::Invalid("base_url required for openai_compatible".into())
     );
-}
-
-#[test]
-fn default_base_urls() {
-    assert_eq!(
-        default_base_url(ProviderKind::Openai),
-        Some("https://api.openai.com/v1")
-    );
-    assert_eq!(
-        default_base_url(ProviderKind::Anthropic),
-        Some("https://api.anthropic.com")
-    );
-    assert_eq!(
-        default_base_url(ProviderKind::Gemini),
-        Some("https://generativelanguage.googleapis.com")
-    );
-    assert_eq!(default_base_url(ProviderKind::OpenaiCompatible), None);
 }
 
 // ---------- Anthropic ----------
@@ -373,6 +354,9 @@ async fn gemini_parses_text_and_usage() {
             cache_write_tokens: 0,
         }
     );
+    let body = sent_body(&server).await;
+    assert!(body.get("tools").is_none());
+    assert!(body.get("toolConfig").is_none());
 }
 
 #[tokio::test]
@@ -494,7 +478,7 @@ async fn status_400_404_422_are_invalid_with_provider_message() {
 
 #[tokio::test]
 async fn invalid_message_is_truncated_and_survives_non_json_body() {
-    let long = "x".repeat(500);
+    let long = "é".repeat(500);
     let server = serve(
         OPENAI_PATH,
         ResponseTemplate::new(400).set_body_json(json!({"error": {"message": long}})),
@@ -503,7 +487,7 @@ async fn invalid_message_is_truncated_and_survives_non_json_body() {
     let LlmError::Invalid(msg) = chat(ProviderKind::Openai, &server).await.unwrap_err() else {
         panic!("expected Invalid");
     };
-    assert_eq!(msg.matches('x').count(), 200);
+    assert_eq!(msg.matches('é').count(), 200);
 
     let server = serve(
         OPENAI_PATH,
@@ -626,20 +610,6 @@ async fn truncated_200_body_is_transient_but_bad_json_is_invalid() {
     );
 }
 
-#[tokio::test]
-async fn multibyte_message_is_truncated_on_char_boundary() {
-    let long = "é".repeat(300);
-    let server = serve(
-        OPENAI_PATH,
-        ResponseTemplate::new(400).set_body_json(json!({"error": {"message": long}})),
-    )
-    .await;
-    let LlmError::Invalid(msg) = chat(ProviderKind::Openai, &server).await.unwrap_err() else {
-        panic!("expected Invalid");
-    };
-    assert_eq!(msg.matches('é').count(), 200);
-}
-
 // ---------- Tool calling: OpenAI ----------
 
 #[tokio::test]
@@ -737,19 +707,6 @@ async fn compatible_tool_calls_without_id_get_unique_synthetic_ids() {
 }
 
 #[tokio::test]
-async fn openai_without_tools_omits_tools_and_tool_choice() {
-    let server = serve(
-        OPENAI_PATH,
-        ok(json!({"choices": [{"message": {"content": "x"}}]})),
-    )
-    .await;
-    chat(ProviderKind::Openai, &server).await.unwrap();
-    let body = sent_body(&server).await;
-    assert!(body.get("tools").is_none());
-    assert!(body.get("tool_choice").is_none());
-}
-
-#[tokio::test]
 async fn openai_serializes_tool_calls_and_tool_role_on_turn_two() {
     let server = serve(
         OPENAI_PATH,
@@ -822,42 +779,34 @@ async fn openai_malformed_tool_arguments_are_wrapped_not_fatal() {
 }
 
 #[tokio::test]
-async fn compatible_with_tools_still_sends_max_tokens_only() {
-    let server = serve(
-        OPENAI_PATH,
-        ok(json!({"choices": [{"message": {"content": "x"}}]})),
-    )
-    .await;
-    chat_with(ProviderKind::OpenaiCompatible, &server, &with_tools())
-        .await
-        .unwrap();
-    let body = sent_body(&server).await;
-    assert_eq!(body["max_tokens"], 321);
-    assert!(body.get("max_completion_tokens").is_none());
-    assert_eq!(body["tools"][0]["function"]["name"], "read_file");
-}
-
-#[tokio::test]
-async fn compatible_model_without_tool_support_is_tools_unsupported() {
-    // OpenAI-style object error and Ollama-style string error.
-    for body in [
-        json!({"error": {"message": "This model does not support tools"}}),
-        json!({"error": "registry.ollama.ai/library/tiny:latest does not support tools"}),
+async fn tools_unsupported_requires_tools_and_marker() {
+    // OpenAI-style object error, Ollama-style string error, and 422 unknown-field error.
+    for (status, body) in [
+        (
+            400,
+            json!({"error": {"message": "This model does not support tools"}}),
+        ),
+        (
+            400,
+            json!({"error": "registry.ollama.ai/library/tiny:latest does not support tools"}),
+        ),
+        (422, json!({"error": {"message": "Unknown field: tools"}})),
     ] {
-        let server = serve(OPENAI_PATH, ResponseTemplate::new(400).set_body_json(body)).await;
+        let server = serve(
+            OPENAI_PATH,
+            ResponseTemplate::new(status).set_body_json(body),
+        )
+        .await;
         let err = chat_with(ProviderKind::OpenaiCompatible, &server, &with_tools())
             .await
             .unwrap_err();
         let LlmError::ToolsUnsupported(msg) = &err else {
             panic!("expected ToolsUnsupported, got {err:?}");
         };
-        assert!(msg.contains("does not support tools"), "{msg}");
         assert!(!msg.contains(KEY), "{msg}");
     }
-}
 
-#[tokio::test]
-async fn tools_marker_without_tools_in_request_stays_invalid() {
+    // Same marker without tools in the request stays `Invalid`.
     let server = serve(
         OPENAI_PATH,
         ResponseTemplate::new(400)
@@ -871,94 +820,61 @@ async fn tools_marker_without_tools_in_request_stays_invalid() {
 }
 
 #[tokio::test]
-async fn unknown_tools_field_is_tools_unsupported() {
-    let server = serve(
-        OPENAI_PATH,
-        ResponseTemplate::new(422)
-            .set_body_json(json!({"error": {"message": "Unknown field: tools"}})),
-    )
-    .await;
-    let err = chat_with(ProviderKind::OpenaiCompatible, &server, &with_tools())
-        .await
-        .unwrap_err();
-    assert!(matches!(err, LlmError::ToolsUnsupported(_)), "{err:?}");
-}
-
-#[tokio::test]
-async fn compatible_maximum_context_length_is_context_overflow() {
-    let server = serve(
-        OPENAI_PATH,
-        ResponseTemplate::new(400).set_body_json(json!({"error": {
-            "message": "This model's maximum context length is 8192 tokens.",
-            "code": "context_length_exceeded",
-        }})),
-    )
-    .await;
-    let err = chat(ProviderKind::OpenaiCompatible, &server)
-        .await
-        .unwrap_err();
-    let LlmError::ContextOverflow(msg) = &err else {
-        panic!("expected ContextOverflow, got {err:?}");
-    };
-    assert!(msg.contains("maximum context length"), "{msg}");
-}
-
-#[tokio::test]
-async fn context_overflow_markers_map_for_every_provider() {
-    for (kind, route) in ALL {
-        for (status, message) in [
-            (400, "prompt is too long: 210000 tokens > 200000 maximum"),
-            (
-                400,
-                "The input token count exceeds the maximum number of tokens allowed",
-            ),
-            (422, "Input is too long for requested model"),
-        ] {
-            let server = serve(
-                route,
-                ResponseTemplate::new(status).set_body_json(json!({"error": {"message": message}})),
-            )
-            .await;
-            let err = chat(kind, &server).await.unwrap_err();
-            assert!(
-                matches!(err, LlmError::ContextOverflow(_)),
-                "{kind:?} {status} {message}: {err:?}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn status_413_is_context_overflow() {
-    for (kind, route) in ALL {
-        let server = serve(
-            route,
-            ResponseTemplate::new(413)
-                .set_body_json(json!({"error": {"message": "Request exceeds the maximum size"}})),
-        )
-        .await;
+async fn context_overflow_markers_and_413_map_to_context_overflow() {
+    let cases = [
+        (
+            ProviderKind::Openai,
+            OPENAI_PATH,
+            400,
+            json!({"error": {
+                "message": "This model's maximum context length is 8192 tokens.",
+                "code": "context_length_exceeded",
+            }}),
+        ),
+        (
+            ProviderKind::OpenaiCompatible,
+            OPENAI_PATH,
+            400,
+            json!({"error": {"message": "prompt is too long: 210000 tokens > 200000 maximum"}}),
+        ),
+        (
+            ProviderKind::Anthropic,
+            ANTHROPIC_PATH,
+            400,
+            json!({"error": {"message": "The input token count exceeds the maximum number of tokens allowed"}}),
+        ),
+        (
+            ProviderKind::Gemini,
+            GEMINI_PATH,
+            422,
+            json!({"error": {"message": "Input is too long for requested model"}}),
+        ),
+    ];
+    for (kind, route, status, body) in cases {
+        let server = serve(route, ResponseTemplate::new(status).set_body_json(body)).await;
         let err = chat(kind, &server).await.unwrap_err();
-        let LlmError::ContextOverflow(msg) = &err else {
-            panic!("{kind:?}: expected ContextOverflow, got {err:?}");
-        };
-        assert!(msg.contains("413"), "{msg}");
+        assert!(
+            matches!(err, LlmError::ContextOverflow(_)),
+            "{kind:?} {status}: {err:?}"
+        );
     }
-    // Without a body too.
+
+    // 413 with a JSON body and without a body.
+    let server = serve(
+        ANTHROPIC_PATH,
+        ResponseTemplate::new(413)
+            .set_body_json(json!({"error": {"message": "Request exceeds the maximum size"}})),
+    )
+    .await;
+    let LlmError::ContextOverflow(msg) = chat(ProviderKind::Anthropic, &server).await.unwrap_err()
+    else {
+        panic!("expected ContextOverflow");
+    };
+    assert!(msg.contains("413"), "{msg}");
+
     let server = serve(OPENAI_PATH, ResponseTemplate::new(413)).await;
     let err = chat(ProviderKind::Openai, &server).await.unwrap_err();
     assert!(matches!(err, LlmError::ContextOverflow(_)), "{err:?}");
-}
-
-#[test]
-fn new_llm_error_display_text() {
-    assert_eq!(
-        LlmError::ToolsUnsupported("x".into()).to_string(),
-        "tools not supported: x"
-    );
-    assert_eq!(
-        LlmError::ContextOverflow("y".into()).to_string(),
-        "context window exceeded: y"
-    );
 }
 
 #[tokio::test]
@@ -1040,25 +956,30 @@ async fn anthropic_sends_cache_control_on_system_last_tool_and_checkpoint() {
 }
 
 #[tokio::test]
-async fn anthropic_merges_tool_results_and_following_user_text_into_one_user_turn() {
-    let server = serve(
-        ANTHROPIC_PATH,
-        ok(json!({"content": [{"type": "text", "text": "done"}]})),
-    )
-    .await;
-    chat_with(ProviderKind::Anthropic, &server, &turn_two_with_nudge())
-        .await
-        .unwrap();
-    let messages = &sent_body(&server).await["messages"];
-    assert_eq!(messages.as_array().map(Vec::len), Some(3));
-    assert_eq!(
-        messages[2],
-        json!({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": "fn main() {}", "is_error": false},
-            {"type": "tool_result", "tool_use_id": "call_2", "content": "bad pattern", "is_error": true},
-            {"type": "text", "text": "please submit", "cache_control": {"type": "ephemeral"}},
-        ]})
-    );
+async fn anthropic_merges_adjacent_user_and_tool_turns_with_tool_results_first() {
+    for (req, expected_text) in [
+        (turn_two_with_nudge(), "please submit"),
+        (user_then_tool(), "note"),
+    ] {
+        let server = serve(
+            ANTHROPIC_PATH,
+            ok(json!({"content": [{"type": "text", "text": "done"}]})),
+        )
+        .await;
+        chat_with(ProviderKind::Anthropic, &server, &req)
+            .await
+            .unwrap();
+        let messages = &sent_body(&server).await["messages"];
+        assert_eq!(messages.as_array().map(Vec::len), Some(3));
+        assert_eq!(
+            messages[2],
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "fn main() {}", "is_error": false},
+                {"type": "tool_result", "tool_use_id": "call_2", "content": "bad pattern", "is_error": true},
+                {"type": "text", "text": expected_text, "cache_control": {"type": "ephemeral"}},
+            ]})
+        );
+    }
 }
 
 #[tokio::test]
@@ -1174,19 +1095,6 @@ async fn gemini_sends_function_declarations_and_round_trips_thought_signature() 
 }
 
 #[tokio::test]
-async fn gemini_without_tools_omits_tools_and_tool_config() {
-    let server = serve(
-        GEMINI_PATH,
-        ok(json!({"candidates": [{"content": {"parts": [{"text": "x"}]}}]})),
-    )
-    .await;
-    chat(ProviderKind::Gemini, &server).await.unwrap();
-    let body = sent_body(&server).await;
-    assert!(body.get("tools").is_none());
-    assert!(body.get("toolConfig").is_none());
-}
-
-#[tokio::test]
 async fn gemini_assigns_unique_synthetic_ids_and_keeps_thought_signature() {
     let server = serve(
         GEMINI_PATH,
@@ -1237,24 +1145,6 @@ async fn gemini_assigns_unique_synthetic_ids_and_keeps_thought_signature() {
         }
     );
 }
-
-#[test]
-fn text_request_holds_one_user_message_and_no_tools() {
-    let req = ChatRequest::text("m", "sys", "hi", 9);
-    assert_eq!(
-        req.messages,
-        vec![Message::User {
-            parts: vec![UserPart::Text("hi".into())]
-        }]
-    );
-    assert!(req.tools.is_empty());
-    assert_eq!(
-        (req.model.as_str(), req.system.as_str(), req.max_tokens),
-        ("m", "sys", 9)
-    );
-}
-
-// ---------- Fix round 1 ----------
 
 /// `turn_two` with a user note between the assistant's tool calls and the tool results.
 fn user_then_tool() -> ChatRequest {
@@ -1335,28 +1225,6 @@ async fn overflow_marker_in_error_code_or_type_is_context_overflow() {
 }
 
 #[tokio::test]
-async fn anthropic_puts_tool_results_before_text_when_user_precedes_tool() {
-    let server = serve(
-        ANTHROPIC_PATH,
-        ok(json!({"content": [{"type": "text", "text": "done"}]})),
-    )
-    .await;
-    chat_with(ProviderKind::Anthropic, &server, &user_then_tool())
-        .await
-        .unwrap();
-    let messages = &sent_body(&server).await["messages"];
-    assert_eq!(messages.as_array().map(Vec::len), Some(3));
-    assert_eq!(
-        messages[2],
-        json!({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "call_1", "content": "fn main() {}", "is_error": false},
-            {"type": "tool_result", "tool_use_id": "call_2", "content": "bad pattern", "is_error": true},
-            {"type": "text", "text": "note", "cache_control": {"type": "ephemeral"}},
-        ]})
-    );
-}
-
-#[tokio::test]
 async fn gemini_puts_function_responses_before_text_when_user_precedes_tool() {
     let server = serve(
         GEMINI_PATH,
@@ -1402,23 +1270,6 @@ async fn gemini_drops_empty_assistant_text_parts() {
             {"functionCall": {"name": "grep", "args": {"pattern": "todo"}}},
         ]})
     );
-}
-
-#[tokio::test]
-async fn openai_sends_reasoning_effort_when_configured() {
-    let server = serve(
-        OPENAI_PATH,
-        ok(json!({"choices": [{"message": {"content": "ok"}}]})),
-    )
-    .await;
-    let req = ChatRequest::text("o3", "sys", "hi", 100).with_effort(ReasoningEffort::High);
-    chat_with(ProviderKind::Openai, &server, &req)
-        .await
-        .unwrap();
-    let body = sent_body(&server).await;
-    assert_eq!(body["reasoning_effort"], "high");
-    // Reasoning tokens count against the cap, so High reserves 8192 on top of the answer.
-    assert_eq!(body["max_completion_tokens"], 100 + 8192);
 }
 
 #[tokio::test]

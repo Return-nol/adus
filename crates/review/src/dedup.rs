@@ -4,27 +4,20 @@
 
 use std::collections::BTreeSet;
 
+use adus_llm::ReasoningEffort;
 use adus_llm::router::{ChatService, UsageContext};
-use adus_llm::{ChatRequest, ReasoningEffort};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::agent::{AgentLlm, chat_low_effort};
 use crate::budget::TokenBudget;
 use crate::parse::{Suggestion, first_json_object};
 use crate::prompt::wrap;
-use crate::verifier::CandidateFinding;
+use crate::verifier::{CandidateFinding, SerializedCandidate};
 
 /// Output cap of the answer (a short list of indices).
 const DEDUP_MAX_TOKENS: u32 = 1_024;
-
-/// Findings left after semantic deduplication.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DedupResult {
-    /// In their original order.
-    pub kept: Vec<Suggestion>,
-    pub dropped_duplicates: usize,
-}
 
 const DEDUP_SYSTEM: &str = r#"You merge duplicate findings of a pull request review. Several reviewers checked the same pull request, and some of their findings in <findings> may describe the same underlying problem.
 Two findings are duplicates when they share one root cause at the same or a related location, even when they are worded differently or come from different reviewers (for example a bug reviewer and a security reviewer flagging the same flaw). Findings about different problems are never duplicates, even on the same line.
@@ -38,59 +31,56 @@ Respond with ONLY a JSON object, no prose and no markdown fences: {"keep_indices
 /// Fewer than two findings need no call. An LLM error, an unparseable answer, an index out of
 /// range or an empty list keeps every finding (logged as a warning). The call's input tokens
 /// are added to `token_budget`; it runs even when the budget is exhausted (one small call).
-pub async fn deduplicate_findings(
+pub(crate) async fn deduplicate_findings(
     chat: &dyn ChatService,
     provider_id: Uuid,
     model: &str,
     usage_ctx: &UsageContext,
     token_budget: Option<&TokenBudget>,
     findings: Vec<CandidateFinding>,
-) -> DedupResult {
-    let unchanged = |findings: Vec<CandidateFinding>| DedupResult {
-        kept: findings.into_iter().map(|f| f.suggestion).collect(),
-        dropped_duplicates: 0,
+) -> Vec<Suggestion> {
+    let unchanged = |findings: Vec<CandidateFinding>| -> Vec<Suggestion> {
+        findings.into_iter().map(|f| f.suggestion).collect()
     };
     if findings.len() < 2 {
         return unchanged(findings);
     }
 
-    let request = ChatRequest::text(
+    let llm = AgentLlm {
+        chat,
+        provider_id,
         model,
-        DEDUP_SYSTEM,
+        system: DEDUP_SYSTEM,
+        effort: Some(ReasoningEffort::Low),
+        usage: usage_ctx,
+    };
+    let text = match chat_low_effort(
+        &llm,
+        token_budget,
         build_user_prompt(&findings),
         DEDUP_MAX_TOKENS,
     )
-    .with_effort(ReasoningEffort::Low);
-    let response = match chat.chat(provider_id, request, usage_ctx.clone()).await {
-        Ok(response) => {
-            if let Some(budget) = token_budget {
-                budget.add(response.input_tokens);
-            }
-            response
-        }
+    .await
+    {
+        Ok(text) => text,
         Err(err) => {
             tracing::warn!(error = %err, "semantic dedup failed; keeping all findings");
             return unchanged(findings);
         }
     };
-    let Some(keep) = first_json_object::<KeepIndices>(&response.text)
+    let Some(keep) = first_json_object::<KeepIndices>(&text)
         .and_then(|answer| valid_selection(answer.keep_indices, findings.len()))
     else {
         tracing::warn!("semantic dedup answer has no valid keep_indices; keeping all findings");
         return unchanged(findings);
     };
 
-    let total = findings.len();
-    let kept: Vec<Suggestion> = findings
+    findings
         .into_iter()
         .enumerate()
         .filter(|(index, _)| keep.contains(index))
         .map(|(_, finding)| finding.suggestion)
-        .collect();
-    DedupResult {
-        dropped_duplicates: total - kept.len(),
-        kept,
-    }
+        .collect()
 }
 
 /// The model's answer.
@@ -114,27 +104,9 @@ fn build_user_prompt(findings: &[CandidateFinding]) -> String {
     let items: Vec<_> = findings
         .iter()
         .enumerate()
-        .map(|(index, finding)| {
-            let s = &finding.suggestion;
-            let mut item = json!({
-                "index": index,
-                "file": s.file,
-                "line": s.line,
-                "severity": s.severity,
-                "title": s.title,
-                "body": s.body,
-                "reported_by": format!("{} reviewer", finding.specialist.label()),
-            });
-            if let Some(start) = s.start_line
-                && let Some(obj) = item.as_object_mut()
-            {
-                obj.insert("start_line".into(), json!(start));
-            }
-            item
-        })
+        .map(|(index, finding)| SerializedCandidate::new(finding, Some(index), false))
         .collect();
-    let list = json!(items);
-    let list = serde_json::to_string_pretty(&list).unwrap_or_else(|_| list.to_string());
+    let list = serde_json::to_string_pretty(&items).unwrap_or_else(|_| json!(items).to_string());
     format!(
         "{}\n\nReturn the indices of the findings to keep as {{\"keep_indices\": [...]}}.",
         wrap("findings", &list)
@@ -143,67 +115,14 @@ fn build_user_prompt(findings: &[CandidateFinding]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-
     use adus_core::types::Severity;
     use adus_llm::router::ChatError;
-    use adus_llm::{ChatResponse, Message, StopReason, UserPart};
-    use async_trait::async_trait;
 
     use super::*;
     use crate::specialists::SpecialistKind;
+    use crate::test_support::{ScriptedChat, text_turn, user_text};
 
     const FAST_MODEL: &str = "fast-model";
-
-    /// Scripted `ChatService` that records every request.
-    #[derive(Default)]
-    struct ScriptedChat {
-        script: Mutex<VecDeque<Result<ChatResponse, ChatError>>>,
-        requests: Mutex<Vec<ChatRequest>>,
-    }
-
-    impl ScriptedChat {
-        fn new(script: Vec<Result<ChatResponse, ChatError>>) -> Self {
-            Self {
-                script: Mutex::new(script.into()),
-                ..Self::default()
-            }
-        }
-
-        fn requests(&self) -> Vec<ChatRequest> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl ChatService for ScriptedChat {
-        async fn chat(
-            &self,
-            _provider_id: Uuid,
-            req: ChatRequest,
-            _ctx: UsageContext,
-        ) -> Result<ChatResponse, ChatError> {
-            self.requests.lock().unwrap().push(req);
-            self.script
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Err(ChatError::Invalid("script exhausted".into())))
-        }
-    }
-
-    fn text_turn(text: &str) -> Result<ChatResponse, ChatError> {
-        Ok(ChatResponse {
-            text: text.into(),
-            tool_calls: Vec::new(),
-            stop_reason: StopReason::EndTurn,
-            input_tokens: 100,
-            output_tokens: 10,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-        })
-    }
 
     fn finding(title: &str, specialist: SpecialistKind) -> CandidateFinding {
         CandidateFinding {
@@ -231,39 +150,17 @@ mod tests {
         findings.iter().map(|f| f.suggestion.clone()).collect()
     }
 
-    async fn dedup(chat: &ScriptedChat, findings: Vec<CandidateFinding>) -> DedupResult {
+    async fn dedup(chat: &ScriptedChat, findings: Vec<CandidateFinding>) -> Vec<Suggestion> {
         let usage = UsageContext::default();
         deduplicate_findings(chat, Uuid::from_u128(1), FAST_MODEL, &usage, None, findings).await
-    }
-
-    fn user_text(req: &ChatRequest) -> &str {
-        match req.messages.first() {
-            Some(Message::User { parts }) => parts
-                .first()
-                .map(|UserPart::Text(text)| text.as_str())
-                .unwrap_or(""),
-            _ => "",
-        }
     }
 
     #[tokio::test]
     async fn skips_llm_call_for_zero_or_one_finding() {
         let chat = ScriptedChat::new(Vec::new());
-        assert_eq!(
-            dedup(&chat, Vec::new()).await,
-            DedupResult {
-                kept: Vec::new(),
-                dropped_duplicates: 0
-            }
-        );
+        assert_eq!(dedup(&chat, Vec::new()).await, Vec::<Suggestion>::new());
         let one = findings(&["only"]);
-        assert_eq!(
-            dedup(&chat, one.clone()).await,
-            DedupResult {
-                kept: suggestions(&one),
-                dropped_duplicates: 0
-            }
-        );
+        assert_eq!(dedup(&chat, one.clone()).await, suggestions(&one));
         assert!(chat.requests().is_empty());
     }
 
@@ -277,13 +174,10 @@ mod tests {
         let chat = ScriptedChat::new(vec![text_turn(
             "Duplicates found:\n```json\n{\"keep_indices\": [3, 0, 3]}\n```",
         )]);
-        let result = dedup(&chat, input.clone()).await;
+        let kept = dedup(&chat, input.clone()).await;
         assert_eq!(
-            result,
-            DedupResult {
-                kept: vec![input[0].suggestion.clone(), input[3].suggestion.clone()],
-                dropped_duplicates: 2,
-            }
+            kept,
+            vec![input[0].suggestion.clone(), input[3].suggestion.clone()]
         );
 
         let reqs = chat.requests();
@@ -316,15 +210,8 @@ mod tests {
             let label = format!("{answer:?}");
             let input = findings(&["zero", "one", "two"]);
             let chat = ScriptedChat::new(vec![answer]);
-            let result = dedup(&chat, input.clone()).await;
-            assert_eq!(
-                result,
-                DedupResult {
-                    kept: suggestions(&input),
-                    dropped_duplicates: 0
-                },
-                "{label}"
-            );
+            let kept = dedup(&chat, input.clone()).await;
+            assert_eq!(kept, suggestions(&input), "{label}");
             assert_eq!(chat.requests().len(), 1, "{label}");
         }
     }

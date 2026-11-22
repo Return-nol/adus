@@ -115,6 +115,19 @@ async fn doctor_ok_when_everything_is_healthy(pool: PgPool) {
     assert_eq!(report.verdict, Verdict::Ok);
     assert!(report.checks.iter().all(|c| c.status == Status::Ok));
     assert!(report.checks.len() >= 8, "{:?}", report.checks);
+    // The test host (and CI) has git 2.31+ on PATH.
+    let git: Vec<_> = report
+        .checks
+        .iter()
+        .filter(|c| c.name.starts_with("Git"))
+        .collect();
+    assert_eq!(git.len(), 1, "{:?}", report.checks);
+    assert_eq!(git[0].status, Status::Ok);
+    assert!(
+        git[0].name.starts_with("Git: git version 2."),
+        "{}",
+        git[0].name
+    );
     cleanup_queue(&w.prefix).await;
 }
 
@@ -411,28 +424,6 @@ async fn user_role_cannot_run_doctor_403(pool: PgPool) {
     assert_eq!(first["status"], "fail");
     assert!(first["impact"].is_string() && first["fix"].is_string());
     cleanup_queue(&prefix).await;
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn doctor_checks_the_git_binary(pool: PgPool) {
-    let w = healthy_world(pool).await;
-
-    let report = doctor::run(&w.state).await;
-
-    // The test host (and CI) has git 2.31+ on PATH.
-    let git: Vec<_> = report
-        .checks
-        .iter()
-        .filter(|c| c.name.starts_with("Git"))
-        .collect();
-    assert_eq!(git.len(), 1, "{:?}", report.checks);
-    assert_eq!(git[0].status, Status::Ok);
-    assert!(
-        git[0].name.starts_with("Git: git version 2."),
-        "{}",
-        git[0].name
-    );
-    cleanup_queue(&w.prefix).await;
 }
 
 #[tokio::test]

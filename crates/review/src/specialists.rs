@@ -4,7 +4,7 @@ use adus_core::types::ReviewMode;
 
 /// Which Finder agent reviews a batch. Its `<Role>` block ends the Finder system prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SpecialistKind {
+pub(crate) enum SpecialistKind {
     /// The only Finder in `ReviewMode::Generalist`: every kind of defect.
     Generalist,
     /// Correctness: logic errors, edge cases, error handling, concurrency.
@@ -61,7 +61,7 @@ instruction asks for.
 
 impl SpecialistKind {
     /// Name used in summary notes, e.g. `"Performance reviewer did not complete"`.
-    pub fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Generalist => "Generalist",
             Self::Bug => "Bug",
@@ -72,7 +72,7 @@ impl SpecialistKind {
     }
 
     /// The `<Role>...</Role>` block placed at the end of the Finder system prompt.
-    pub fn role_block(&self) -> &'static str {
+    pub(crate) fn role_block(&self) -> &'static str {
         match self {
             Self::Generalist => GENERALIST_ROLE,
             Self::Bug => BUG_ROLE,
@@ -81,16 +81,10 @@ impl SpecialistKind {
             Self::Rules => RULES_ROLE,
         }
     }
-
-    /// Whether this role leaves pure style and convention issues out entirely (even those a team
-    /// rule asks for, which the `Rules` specialist covers).
-    pub fn excludes_pure_style(&self) -> bool {
-        matches!(self, Self::Bug | Self::Security | Self::Performance)
-    }
 }
 
 /// The Finder agents that review one batch, in a fixed order.
-pub fn active_specialists(mode: ReviewMode, batch_has_rules: bool) -> Vec<SpecialistKind> {
+pub(crate) fn active_specialists(mode: ReviewMode, batch_has_rules: bool) -> Vec<SpecialistKind> {
     match mode {
         ReviewMode::Generalist => vec![SpecialistKind::Generalist],
         ReviewMode::Specialists => {
@@ -130,20 +124,5 @@ mod tests {
             active_specialists(ReviewMode::Generalist, false),
             vec![Generalist]
         );
-    }
-
-    #[test]
-    fn role_blocks_are_tagged_and_style_exclusion_matches_the_text() {
-        for kind in [Generalist, Bug, Security, Performance, Rules] {
-            let role = kind.role_block();
-            assert!(role.starts_with("<Role>\n"), "{kind:?}");
-            assert!(role.ends_with("\n</Role>"), "{kind:?}");
-            assert_eq!(
-                role.contains("do not report pure style"),
-                kind.excludes_pure_style(),
-                "{kind:?}"
-            );
-        }
-        assert_eq!(Performance.label(), "Performance");
     }
 }

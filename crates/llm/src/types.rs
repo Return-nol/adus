@@ -27,7 +27,7 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
@@ -199,6 +199,20 @@ pub enum LlmError {
     ContextOverflow(String),
 }
 
+impl LlmError {
+    /// Canonical snake_case error kind stored in `llm_usage.error_kind`.
+    pub fn error_kind(&self) -> &'static str {
+        match self {
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Unauthorized => "unauthorized",
+            Self::Transient(_) => "transient",
+            Self::Invalid(_) => "invalid",
+            Self::ToolsUnsupported(_) => "tools_unsupported",
+            Self::ContextOverflow(_) => "context_overflow",
+        }
+    }
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError>;
@@ -206,19 +220,15 @@ pub trait LlmClient: Send + Sync {
 }
 
 /// Substrings (lowercase) in a provider error that mean the model rejected reasoning/thinking params.
-const REASONING_UNSUPPORTED_MARKERS: [&str; 9] = [
+const REASONING_UNSUPPORTED_MARKERS: [&str; 5] = [
     "reasoning_effort",
     "reasoning effort",
     "thinking",
-    "thinking_config",
-    "thinkingconfig",
-    "thinking_budget",
-    "thinkingbudget",
     "budget_tokens",
     "does not support reasoning",
 ];
 
-pub(crate) fn is_reasoning_unsupported(err: &LlmError) -> bool {
+fn is_reasoning_unsupported(err: &LlmError) -> bool {
     let LlmError::Invalid(msg) = err else {
         return false;
     };
@@ -227,6 +237,21 @@ pub(crate) fn is_reasoning_unsupported(err: &LlmError) -> bool {
         && REASONING_UNSUPPORTED_MARKERS
             .iter()
             .any(|m| lower.contains(m))
+}
+
+/// Retries `call` once with `effort = None` when the provider rejects the reasoning parameter.
+pub(crate) async fn chat_with_effort_fallback<F, Fut>(
+    effort: Option<ReasoningEffort>,
+    call: F,
+) -> Result<ChatResponse, LlmError>
+where
+    F: Fn(Option<ReasoningEffort>) -> Fut,
+    Fut: std::future::Future<Output = Result<ChatResponse, LlmError>>,
+{
+    match call(effort).await {
+        Err(ref err) if effort.is_some() && is_reasoning_unsupported(err) => call(None).await,
+        other => other,
+    }
 }
 
 pub(crate) fn normalize_model_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {

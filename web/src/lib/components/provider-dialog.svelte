@@ -7,7 +7,6 @@
 		enabled: boolean;
 		status: 'ok' | 'invalid' | 'rate_limited';
 		cooldown_until: string | null;
-		last_used_at: string | null;
 	};
 	export type Provider = {
 		id: string;
@@ -52,16 +51,18 @@
 	let name = $state('');
 	let baseUrl = $state('');
 	let apiKey = $state('');
-	let primaryModel = $state('');
-	let fastModel = $state('');
+	type ModelPickerState = {
+		value: string;
+		open: boolean;
+		search: string;
+	};
+
+	let primary = $state<ModelPickerState>({ value: '', open: false, search: '' });
+	let fast = $state<ModelPickerState>({ value: '', open: false, search: '' });
 	let models = $state<string[]>([]);
 	let tested = $state(false);
 	let testing = $state(false);
 	let busy = $state(false);
-	let primaryOpen = $state(false);
-	let fastOpen = $state(false);
-	let primarySearch = $state('');
-	let fastSearch = $state('');
 
 	// Reset the form each time the dialog opens, and drop any entered API key on close.
 	$effect(() => {
@@ -73,15 +74,11 @@
 		name = provider?.name ?? '';
 		baseUrl = provider?.base_url ?? '';
 		apiKey = '';
-		primaryModel = provider?.primary_model ?? '';
-		fastModel = provider?.fast_model ?? '';
+		primary = { value: provider?.primary_model ?? '', open: false, search: '' };
+		fast = { value: provider?.fast_model ?? '', open: false, search: '' };
 		models = [];
 		tested = false;
 		testing = false;
-		primaryOpen = false;
-		fastOpen = false;
-		primarySearch = '';
-		fastSearch = '';
 	});
 
 	const shownKind = $derived(provider?.kind ?? kind);
@@ -98,13 +95,7 @@
 			(shownKind !== 'openai_compatible' || Boolean(baseUrl.trim()))
 	);
 	const canSave = $derived(
-		!busy && !testing && tested && Boolean(name.trim()) && Boolean(primaryModel.trim())
-	);
-	const customPrimary = $derived(
-		primarySearch.trim() && !models.includes(primarySearch.trim()) ? primarySearch.trim() : ''
-	);
-	const customFast = $derived(
-		fastSearch.trim() && !models.includes(fastSearch.trim()) ? fastSearch.trim() : ''
+		!busy && !testing && tested && Boolean(name.trim()) && Boolean(primary.value.trim())
 	);
 
 	function resetConnection() {
@@ -142,16 +133,16 @@
 		busy = true;
 		try {
 			const url = baseUrl.trim();
-			const primary = primaryModel.trim();
-			const fast = fastModel.trim() || null;
+			const primaryModel = primary.value.trim();
+			const fastModel = fast.value.trim() || null;
 			const secret = apiKey.trim();
 			if (provider) {
 				// Empty base_url clears it (the server then rejects that for openai_compatible).
 				await api('PATCH', `/ai-providers/${provider.id}`, {
 					name: name.trim(),
 					base_url: url,
-					primary_model: primary,
-					fast_model: fast
+					primary_model: primaryModel,
+					fast_model: fastModel
 				});
 				// A key typed here (first key, or re-entered for a new base URL) is saved too.
 				if (secret) {
@@ -165,8 +156,8 @@
 					kind,
 					name: name.trim(),
 					base_url: url || null,
-					primary_model: primary,
-					fast_model: fast,
+					primary_model: primaryModel,
+					fast_model: fastModel,
 					key: secret,
 					key_label: 'Default'
 				});
@@ -181,6 +172,93 @@
 		}
 	}
 </script>
+
+{#snippet modelPicker(
+	label: string,
+	picker: ModelPickerState,
+	placeholder: string,
+	allowNone = false
+)}
+	{@const trimmed = picker.search.trim()}
+	{@const custom = trimmed && !models.includes(trimmed) ? trimmed : ''}
+	<div class="grid gap-2">
+		<Label>
+			{label}
+			{#if allowNone}
+				<span class="text-xs font-normal text-muted-foreground">(optional)</span>
+			{/if}
+		</Label>
+		<Popover.Root bind:open={picker.open}>
+			<Popover.Trigger disabled={!tested}>
+				{#snippet child({ props })}
+					<Button
+						{...props}
+						variant="outline"
+						role="combobox"
+						aria-expanded={picker.open}
+						disabled={!tested}
+						class="w-full justify-between rounded-sm font-normal"
+					>
+						{#if picker.value}
+							<span class="truncate font-mono">{picker.value}</span>
+						{:else}
+							<span class="text-muted-foreground">
+								{tested ? placeholder : 'Test connection to load models'}
+							</span>
+						{/if}
+						<RiArrowDownSLine data-icon="inline-end" class="text-muted-foreground" />
+					</Button>
+				{/snippet}
+			</Popover.Trigger>
+			<Popover.Content class="w-(--bits-popover-anchor-width) p-0" align="start">
+				<Command.Root>
+					<Command.Input placeholder="Search or type a model..." bind:value={picker.search} />
+					<Command.List>
+						<Command.Empty>No matching models.</Command.Empty>
+						{#if allowNone}
+							<Command.Item
+								value="None (use Primary model)"
+								data-checked={!picker.value}
+								onSelect={() => {
+									picker.value = '';
+									picker.open = false;
+								}}
+							>
+								<span>None (use Primary model)</span>
+							</Command.Item>
+						{/if}
+						{#if custom}
+							<Command.Item
+								value={custom}
+								data-checked={picker.value === custom}
+								onSelect={() => {
+									picker.value = custom;
+									picker.open = false;
+								}}
+							>
+								<span class="truncate">
+									Use "<code class="font-mono">{custom}</code>"
+								</span>
+							</Command.Item>
+						{/if}
+						{#each models as m (m)}
+							<Command.Item
+								value={m}
+								data-checked={picker.value === m}
+								onSelect={() => {
+									picker.value = m;
+									picker.open = false;
+								}}
+							>
+								<span class="truncate font-mono">{m}</span>
+							</Command.Item>
+						{/each}
+					</Command.List>
+				</Command.Root>
+			</Popover.Content>
+		</Popover.Root>
+	</div>
+{/snippet}
 
 <Dialog.Root bind:open>
 	<Dialog.Content>
@@ -250,139 +328,8 @@
 					</Button>
 				</div>
 			</div>
-			<div class="grid gap-2">
-				<Label>Primary model</Label>
-				<Popover.Root bind:open={primaryOpen}>
-					<Popover.Trigger disabled={!tested}>
-						{#snippet child({ props })}
-							<Button
-								{...props}
-								variant="outline"
-								role="combobox"
-								aria-expanded={primaryOpen}
-								disabled={!tested}
-								class="w-full justify-between rounded-sm font-normal"
-							>
-								{#if primaryModel}
-									<span class="truncate font-mono">{primaryModel}</span>
-								{:else}
-									<span class="text-muted-foreground">
-										{tested ? 'Select primary model...' : 'Test connection to load models'}
-									</span>
-								{/if}
-								<RiArrowDownSLine data-icon="inline-end" class="text-muted-foreground" />
-							</Button>
-						{/snippet}
-					</Popover.Trigger>
-					<Popover.Content class="w-(--bits-popover-anchor-width) p-0" align="start">
-						<Command.Root>
-							<Command.Input placeholder="Search or type a model..." bind:value={primarySearch} />
-							<Command.List>
-								<Command.Empty>No matching models.</Command.Empty>
-								{#if customPrimary}
-									<Command.Item
-										value={customPrimary}
-										data-checked={primaryModel === customPrimary}
-										onSelect={() => {
-											primaryModel = customPrimary;
-											primaryOpen = false;
-										}}
-									>
-										<span class="truncate">
-											Use "<code class="font-mono">{customPrimary}</code>"
-										</span>
-									</Command.Item>
-								{/if}
-								{#each models as m (m)}
-									<Command.Item
-										value={m}
-										data-checked={primaryModel === m}
-										onSelect={() => {
-											primaryModel = m;
-											primaryOpen = false;
-										}}
-									>
-										<span class="truncate font-mono">{m}</span>
-									</Command.Item>
-								{/each}
-							</Command.List>
-						</Command.Root>
-					</Popover.Content>
-				</Popover.Root>
-			</div>
-			<div class="grid gap-2">
-				<Label>
-					Fast model
-					<span class="text-xs font-normal text-muted-foreground">(optional)</span>
-				</Label>
-				<Popover.Root bind:open={fastOpen}>
-					<Popover.Trigger disabled={!tested}>
-						{#snippet child({ props })}
-							<Button
-								{...props}
-								variant="outline"
-								role="combobox"
-								aria-expanded={fastOpen}
-								disabled={!tested}
-								class="w-full justify-between rounded-sm font-normal"
-							>
-								{#if fastModel}
-									<span class="truncate font-mono">{fastModel}</span>
-								{:else}
-									<span class="text-muted-foreground">
-										{tested ? 'None (use Primary model)' : 'Test connection to load models'}
-									</span>
-								{/if}
-								<RiArrowDownSLine data-icon="inline-end" class="text-muted-foreground" />
-							</Button>
-						{/snippet}
-					</Popover.Trigger>
-					<Popover.Content class="w-(--bits-popover-anchor-width) p-0" align="start">
-						<Command.Root>
-							<Command.Input placeholder="Search or type a model..." bind:value={fastSearch} />
-							<Command.List>
-								<Command.Empty>No matching models.</Command.Empty>
-								<Command.Item
-									value="None (use Primary model)"
-									data-checked={!fastModel}
-									onSelect={() => {
-										fastModel = '';
-										fastOpen = false;
-									}}
-								>
-									<span>None (use Primary model)</span>
-								</Command.Item>
-								{#if customFast}
-									<Command.Item
-										value={customFast}
-										data-checked={fastModel === customFast}
-										onSelect={() => {
-											fastModel = customFast;
-											fastOpen = false;
-										}}
-									>
-										<span class="truncate">
-											Use "<code class="font-mono">{customFast}</code>"
-										</span>
-									</Command.Item>
-								{/if}
-								{#each models as m (m)}
-									<Command.Item
-										value={m}
-										data-checked={fastModel === m}
-										onSelect={() => {
-											fastModel = m;
-											fastOpen = false;
-										}}
-									>
-										<span class="truncate font-mono">{m}</span>
-									</Command.Item>
-								{/each}
-							</Command.List>
-						</Command.Root>
-					</Popover.Content>
-				</Popover.Root>
-			</div>
+			{@render modelPicker('Primary model', primary, 'Select primary model...')}
+			{@render modelPicker('Fast model', fast, 'None (use Primary model)', true)}
 			<Dialog.Footer>
 				<Button type="submit" disabled={!canSave}>{provider ? 'Save' : 'Add'}</Button>
 			</Dialog.Footer>

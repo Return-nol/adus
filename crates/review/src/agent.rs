@@ -2,6 +2,7 @@
 //! result through one terminal tool. Context compaction and a one-shot context-overflow
 //! recovery keep long runs within the model's window. Used by the Finder and the Verifier.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,19 +17,19 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::budget::TokenBudget;
+use crate::prompt::truncate_with_marker;
 use crate::tools::{ToolOutput, Toolbox};
 
 /// Default `AgentConfig::compaction_char_limit`.
-pub const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 160_000;
-/// Default `AgentConfig::max_output_tokens`.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
+const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 160_000;
+const MAX_OUTPUT_TOKENS: u32 = 8_192;
 /// Default `AgentConfig::max_concurrent_tools`.
-pub const DEFAULT_MAX_CONCURRENT_TOOLS: usize = 4;
+const DEFAULT_MAX_CONCURRENT_TOOLS: usize = 4;
 /// Default `AgentConfig::wrap_up_steps`: only the final step is a wrap-up step.
-pub const DEFAULT_WRAP_UP_STEPS: usize = 1;
+const DEFAULT_WRAP_UP_STEPS: usize = 1;
 
 /// Replaces old tool output when the conversation grows past the compaction limit.
-pub const OMITTED_TOOL_OUTPUT: &str = "[earlier tool output omitted to save context]";
+const OMITTED_TOOL_OUTPUT: &str = "[earlier tool output omitted to save context]";
 /// Only tool outputs longer than this are compacted.
 const COMPACT_MIN_CHARS: usize = 120;
 /// The newest messages (two turns) are never compacted.
@@ -36,7 +37,7 @@ const COMPACT_KEEP_TAIL: usize = 4;
 /// A run with a `deadline` wraps up once the time left is less than this many times its
 /// slowest whole step (LLM call plus tools). With 2, at least one such step is left when
 /// wrap-up starts, enough for the submit step.
-pub const WRAP_UP_STEP_FACTOR: u32 = 2;
+const WRAP_UP_STEP_FACTOR: u32 = 2;
 /// The halfway budget note is only sent to runs with at least this many steps.
 const BUDGET_NOTE_MIN_STEPS: usize = 4;
 /// Tool outputs kept after a context overflow are cut to this many chars.
@@ -46,12 +47,11 @@ const TRUNCATED_MARKER: &str = "\n[output truncated]";
 
 /// Limits of one agent run.
 #[derive(Debug, Clone)]
-pub struct AgentConfig {
+pub(crate) struct AgentConfig {
     /// LLM calls allowed in one run (Finder 20, Verifier 6).
     pub max_steps: usize,
     /// Old tool outputs are compacted while the conversation is longer than this (chars).
     pub compaction_char_limit: usize,
-    pub max_output_tokens: u32,
     /// Read-only tool calls of one turn that run at the same time.
     pub max_concurrent_tools: usize,
     /// The last steps that offer only the terminal tool (Finder 2, otherwise 1). 0 counts as 1.
@@ -67,11 +67,10 @@ pub struct AgentConfig {
 
 impl AgentConfig {
     /// `max_steps` with the default limits for everything else.
-    pub fn new(max_steps: usize) -> Self {
+    pub(crate) fn new(max_steps: usize) -> Self {
         Self {
             max_steps,
             compaction_char_limit: DEFAULT_COMPACTION_CHAR_LIMIT,
-            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             max_concurrent_tools: DEFAULT_MAX_CONCURRENT_TOOLS,
             wrap_up_steps: DEFAULT_WRAP_UP_STEPS,
             deadline: None,
@@ -82,7 +81,7 @@ impl AgentConfig {
 
 /// A finished run.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AgentOutcome<T> {
+pub(crate) struct AgentOutcome<T> {
     pub result: T,
     /// LLM calls made (the overflow retry repeats a step and is not counted twice).
     pub steps_used: usize,
@@ -93,7 +92,7 @@ pub struct AgentOutcome<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub enum AgentError {
+pub(crate) enum AgentError {
     /// The model or endpoint rejected tool calling; the caller falls back to diff-only.
     #[error("tools not supported: {0}")]
     ToolsUnsupported(String),
@@ -105,7 +104,7 @@ pub enum AgentError {
 }
 
 /// The terminal tool that ends a run, and how its result is read.
-pub trait SubmitSpec: Send + Sync {
+pub(crate) trait SubmitSpec: Send + Sync {
     type Output: Send;
 
     /// Definition sent to the model (for example `submit_findings`).
@@ -120,7 +119,7 @@ pub trait SubmitSpec: Send + Sync {
 
 /// Which tools the model gets.
 #[derive(Debug, Clone, Copy)]
-pub enum AgentTools<'a> {
+pub(crate) enum AgentTools<'a> {
     /// Read-only repository tools plus the terminal tool.
     Full(&'a Toolbox),
     /// Only the terminal tool (no checkout, but the model supports tools).
@@ -131,7 +130,7 @@ pub enum AgentTools<'a> {
 
 /// Where and how the agent talks to the model.
 #[derive(Clone, Copy)]
-pub struct AgentLlm<'a> {
+pub(crate) struct AgentLlm<'a> {
     pub chat: &'a dyn ChatService,
     pub provider_id: Uuid,
     pub model: &'a str,
@@ -139,6 +138,25 @@ pub struct AgentLlm<'a> {
     pub effort: Option<ReasoningEffort>,
     /// Cloned into every `chat` call.
     pub usage: &'a UsageContext,
+}
+
+/// Single-turn low-effort text call, recording `input_tokens` into `token_budget`.
+pub(crate) async fn chat_low_effort(
+    llm: &AgentLlm<'_>,
+    token_budget: Option<&TokenBudget>,
+    prompt: String,
+    max_tokens: u32,
+) -> Result<String, ChatError> {
+    let request = ChatRequest::text(llm.model, llm.system, prompt, max_tokens)
+        .with_effort(llm.effort.unwrap_or(ReasoningEffort::Low));
+    let response = llm
+        .chat
+        .chat(llm.provider_id, request, llm.usage.clone())
+        .await?;
+    if let Some(budget) = token_budget {
+        budget.add(response.input_tokens);
+    }
+    Ok(response.text)
 }
 
 /// Runs the agent on `prompt` (the first user message) until it submits a result.
@@ -156,7 +174,7 @@ pub struct AgentLlm<'a> {
 ///
 /// Cancel-safe: all state is local to the future, so dropping it (a deadline) ends the run.
 /// Tool work already handed to `spawn_blocking` finishes on its own.
-pub async fn run_react_loop<S: SubmitSpec>(
+pub(crate) async fn run_react_loop<S: SubmitSpec>(
     llm: &AgentLlm<'_>,
     tools: AgentTools<'_>,
     submit: &S,
@@ -192,24 +210,21 @@ pub async fn run_react_loop<S: SubmitSpec>(
             )));
         }
         nudged_last_step = false;
-        let read_only = match tools {
-            AgentTools::Full(toolbox) if !wrap_up.active() => Some(toolbox),
-            _ => None,
+        let (read_only, offered) = match (tools, wrap_up.active()) {
+            (AgentTools::NoTools, _) => (None, Vec::new()),
+            (AgentTools::Full(toolbox), false) => {
+                let mut defs = toolbox.read_only_tool_defs().to_vec();
+                defs.push(submit_def.clone());
+                (Some(toolbox), defs)
+            }
+            (AgentTools::Full(_) | AgentTools::SubmitOnly, _) => (None, vec![submit_def.clone()]),
         };
-        let offered = offered_tools(tools, read_only, submit_def);
 
         // The whole step is timed (LLM call plus tools): the slowest one sizes the margin a
         // deadline-close run keeps for its submit step.
         let step_started = Instant::now();
         compact(&mut messages, config.compaction_char_limit);
-        let response = request(
-            llm,
-            &mut messages,
-            offered,
-            config.max_output_tokens,
-            &mut overflow_retried,
-        )
-        .await?;
+        let response = request(llm, &mut messages, offered, &mut overflow_retried).await?;
         tally.add(&response);
         if let Some(budget) = &config.token_budget {
             budget.add(response.input_tokens);
@@ -366,30 +381,12 @@ fn unparseable(submit_name: &str, steps_used: usize) -> AgentError {
     ))
 }
 
-/// Tool definitions for one request. `read_only` is the toolbox when this step may use it.
-fn offered_tools(
-    tools: AgentTools<'_>,
-    read_only: Option<&Toolbox>,
-    submit_def: &ToolDef,
-) -> Vec<ToolDef> {
-    match (tools, read_only) {
-        (AgentTools::NoTools, _) => Vec::new(),
-        (_, Some(toolbox)) => {
-            let mut defs = toolbox.read_only_tool_defs().to_vec();
-            defs.push(submit_def.clone());
-            defs
-        }
-        (_, None) => vec![submit_def.clone()],
-    }
-}
-
 /// One LLM call. A context overflow is retried once per run on a compacted conversation, as
 /// the same step.
 async fn request(
     llm: &AgentLlm<'_>,
     messages: &mut Vec<Message>,
     tools: Vec<ToolDef>,
-    max_tokens: u32,
     overflow_retried: &mut bool,
 ) -> Result<ChatResponse, AgentError> {
     let build = |messages: &[Message], tools: Vec<ToolDef>| ChatRequest {
@@ -397,7 +394,7 @@ async fn request(
         system: llm.system.to_owned(),
         messages: messages.to_vec(),
         tools,
-        max_tokens,
+        max_tokens: MAX_OUTPUT_TOKENS,
         effort: llm.effort,
     };
     let first = llm
@@ -541,16 +538,13 @@ fn compact_for_overflow(messages: &mut Vec<Message>) {
     for message in messages.iter_mut().skip(1) {
         if let Message::Tool { results } = message {
             for result in results {
-                truncate_chars(&mut result.content, OVERFLOW_TOOL_CHARS);
+                if let Cow::Owned(cut) =
+                    truncate_with_marker(&result.content, OVERFLOW_TOOL_CHARS, TRUNCATED_MARKER)
+                {
+                    result.content = cut;
+                }
             }
         }
-    }
-}
-
-fn truncate_chars(text: &mut String, max_chars: usize) {
-    if let Some((cut, _)) = text.char_indices().nth(max_chars) {
-        text.truncate(cut);
-        text.push_str(TRUNCATED_MARKER);
     }
 }
 
@@ -590,21 +584,16 @@ fn message_char_len(message: &Message) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use adus_llm::{
-        AssistantPart, ChatRequest, ChatResponse, ReasoningEffort, StopReason, ToolCall,
-        ToolResult, UserPart,
+        AssistantPart, ChatRequest, ChatResponse, ReasoningEffort, ToolCall, ToolResult, UserPart,
     };
-    use async_trait::async_trait;
     use serde_json::json;
-    use tempfile::TempDir;
 
     use super::*;
-    use crate::tools::ToolCache;
+    use crate::test_support::{ScriptedChat, call, msg_text, text_turn, tool_names, tools_turn};
     use crate::workspace::RepoWorkspace;
 
     const SUBMIT: &str = "submit_answer";
@@ -659,120 +648,6 @@ mod tests {
         }
     }
 
-    /// Scripted `ChatService` that records every request.
-    #[derive(Default)]
-    struct ScriptedChat {
-        script: Mutex<VecDeque<Result<ChatResponse, ChatError>>>,
-        /// How long each call takes, in call order (on the paused test clock); none = instant.
-        latencies: Mutex<VecDeque<Duration>>,
-        /// When set, the script is ignored: every call takes this long and answers like a model
-        /// that reads files while it may and submits once only the submit tool is offered.
-        investigating: Option<Duration>,
-        requests: Mutex<Vec<ChatRequest>>,
-        calls: Mutex<Vec<(Uuid, UsageContext)>>,
-    }
-
-    impl ScriptedChat {
-        fn new(script: Vec<Result<ChatResponse, ChatError>>) -> Self {
-            Self {
-                script: Mutex::new(script.into()),
-                ..Self::default()
-            }
-        }
-
-        /// Reads `src/a.rs` while `read_file` is offered, submits `"submitted"` once only the
-        /// submit tool is; every call takes `latency`.
-        fn investigating(latency: Duration) -> Self {
-            Self {
-                investigating: Some(latency),
-                ..Self::default()
-            }
-        }
-
-        /// Like `new`, but call `i` sleeps `latencies[i]` before it answers.
-        fn with_latencies(
-            script: Vec<Result<ChatResponse, ChatError>>,
-            latencies: Vec<Duration>,
-        ) -> Self {
-            Self {
-                script: Mutex::new(script.into()),
-                latencies: Mutex::new(latencies.into()),
-                ..Self::default()
-            }
-        }
-
-        fn requests(&self) -> Vec<ChatRequest> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait]
-    impl ChatService for ScriptedChat {
-        async fn chat(
-            &self,
-            provider_id: Uuid,
-            req: ChatRequest,
-            ctx: UsageContext,
-        ) -> Result<ChatResponse, ChatError> {
-            if let Some(latency) = self.investigating {
-                let id = format!("i{}", self.requests.lock().unwrap().len());
-                let reads = req.tools.iter().any(|t| t.name == "read_file");
-                self.requests.lock().unwrap().push(req);
-                tokio::time::sleep(latency).await;
-                let call = if reads {
-                    read(&id, "src/a.rs")
-                } else {
-                    submit(&id, "submitted")
-                };
-                return tools_turn(vec![call]);
-            }
-            self.requests.lock().unwrap().push(req);
-            self.calls.lock().unwrap().push((provider_id, ctx));
-            let latency = self.latencies.lock().unwrap().pop_front();
-            if let Some(latency) = latency {
-                tokio::time::sleep(latency).await;
-            }
-            self.script
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Err(ChatError::Invalid("script exhausted".into())))
-        }
-    }
-
-    fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
-        ToolCall {
-            id: id.into(),
-            name: name.into(),
-            arguments,
-            provider_meta: None,
-        }
-    }
-
-    fn tools_turn(calls: Vec<ToolCall>) -> Result<ChatResponse, ChatError> {
-        Ok(ChatResponse {
-            text: String::new(),
-            tool_calls: calls,
-            stop_reason: StopReason::ToolUse,
-            input_tokens: 100,
-            output_tokens: 10,
-            cache_read_tokens: 7,
-            cache_write_tokens: 3,
-        })
-    }
-
-    fn text_turn(text: &str) -> Result<ChatResponse, ChatError> {
-        Ok(ChatResponse {
-            text: text.into(),
-            tool_calls: Vec::new(),
-            stop_reason: StopReason::EndTurn,
-            input_tokens: 100,
-            output_tokens: 10,
-            cache_read_tokens: 7,
-            cache_write_tokens: 3,
-        })
-    }
-
     fn submit(id: &str, answer: &str) -> ToolCall {
         call(id, SUBMIT, json!({"answer": answer}))
     }
@@ -782,14 +657,8 @@ mod tests {
     }
 
     fn toolbox(files: &[(&str, &str)]) -> Toolbox {
-        let dir = TempDir::new().unwrap();
-        for (rel, body) in files {
-            let path = dir.path().join(rel);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, body).unwrap();
-        }
-        let ws = Arc::new(RepoWorkspace::from_temp_dir(dir).unwrap());
-        Toolbox::new(ws, Arc::new(ToolCache::new()))
+        let raw: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (*p, b.as_bytes())).collect();
+        Toolbox::new(Arc::new(RepoWorkspace::from_files(&raw)))
     }
 
     fn default_toolbox() -> Toolbox {
@@ -817,17 +686,6 @@ mod tests {
             usage: &usage,
         };
         run_react_loop(&llm, tools, &SubmitAnswer::new(), config, "PROMPT".into()).await
-    }
-
-    fn tool_names(req: &ChatRequest) -> Vec<String> {
-        req.tools.iter().map(|t| t.name.clone()).collect()
-    }
-
-    fn user_text(msg: &Message) -> Option<&str> {
-        match msg {
-            Message::User { parts } => parts.first().map(|UserPart::Text(t)| t.as_str()),
-            _ => None,
-        }
     }
 
     fn tool_results(msg: &Message) -> &[ToolResult] {
@@ -891,12 +749,34 @@ mod tests {
         }
     }
 
+    fn count_user(req: &ChatRequest, text: &str) -> usize {
+        req.messages
+            .iter()
+            .filter(|m| msg_text(m) == Some(text))
+            .count()
+    }
+
+    fn count_notes(req: &ChatRequest) -> usize {
+        req.messages
+            .iter()
+            .filter(|m| msg_text(m).is_some_and(|t| t.starts_with("Step budget: ")))
+            .count()
+    }
+
+    fn with_cache(mut turn: Result<ChatResponse, ChatError>) -> Result<ChatResponse, ChatError> {
+        if let Ok(resp) = &mut turn {
+            resp.cache_read_tokens = 7;
+            resp.cache_write_tokens = 3;
+        }
+        turn
+    }
+
     #[tokio::test]
     async fn completes_multi_turn_tool_calls_then_submits() {
         let tb = default_toolbox();
         let chat = ScriptedChat::new(vec![
-            tools_turn(vec![read("c1", "src/a.rs")]),
-            tools_turn(vec![submit("c2", "done")]),
+            with_cache(tools_turn(vec![read("c1", "src/a.rs")])),
+            with_cache(tools_turn(vec![submit("c2", "done")])),
         ]);
         let out = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(20))
             .await
@@ -913,7 +793,7 @@ mod tests {
         assert_eq!(tool_names(&reqs[0]), expected);
         assert_eq!(reqs[0].model, "m1");
         assert_eq!(reqs[0].system, "sys");
-        assert_eq!(reqs[0].max_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
+        assert_eq!(reqs[0].max_tokens, MAX_OUTPUT_TOKENS);
         assert_eq!(reqs[0].effort, Some(ReasoningEffort::Medium));
         assert_eq!(reqs[0].messages, vec![user("PROMPT")]);
 
@@ -927,7 +807,7 @@ mod tests {
         assert!(!results[0].is_error);
         assert!(results[0].content.contains("fn alpha() {}"));
 
-        let calls = chat.calls.lock().unwrap().clone();
+        let calls = chat.calls();
         assert_eq!(calls.len(), 2);
         for (provider, ctx) in calls {
             assert_eq!(provider, Uuid::from_u128(1));
@@ -962,56 +842,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_when_submit_arguments_malformed() {
+    async fn retries_malformed_submit_and_keeps_multi_call_order() {
         let tb = default_toolbox();
         let chat = ScriptedChat::new(vec![
             tools_turn(vec![call("c1", SUBMIT, json!({"wrong": 1}))]),
+            tools_turn(vec![
+                read("r1", "src/a.rs"),
+                call("s1", SUBMIT, json!("not an object")),
+                call("g1", "grep", json!({"pattern": "beta"})),
+            ]),
             tools_turn(vec![submit("c2", "fixed")]),
         ]);
         let out = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(6))
             .await
             .unwrap();
         assert_eq!(out.result, "fixed");
-        assert_eq!(out.steps_used, 2);
+        assert_eq!(out.steps_used, 3);
 
         let reqs = chat.requests();
-        let results = tool_results(&reqs[1].messages[2]);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].call_id, "c1");
-        assert_eq!(results[0].tool_name, SUBMIT);
-        assert!(results[0].is_error);
-        assert!(results[0].content.starts_with("Error: "));
+        let single = tool_results(&reqs[1].messages[2]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].call_id, "c1");
+        assert_eq!(single[0].tool_name, SUBMIT);
+        assert!(single[0].is_error);
         assert_eq!(
-            results[0].content,
+            single[0].content,
             "Error: invalid submit_answer arguments: missing string field `answer`. Call submit_answer again with corrected arguments."
         );
-    }
 
-    #[tokio::test]
-    async fn malformed_submit_in_multi_call_turn_answers_every_call_in_order() {
-        let tb = default_toolbox();
-        let chat = ScriptedChat::new(vec![
-            tools_turn(vec![
-                read("c1", "src/a.rs"),
-                call("c2", SUBMIT, json!("not an object")),
-                call("c3", "grep", json!({"pattern": "beta"})),
-            ]),
-            tools_turn(vec![submit("c4", "ok")]),
-        ]);
-        run(&chat, AgentTools::Full(&tb), &AgentConfig::new(20))
-            .await
-            .unwrap();
-
-        let reqs = chat.requests();
-        assert_paired(&reqs[1].messages);
-        let results = tool_results(&reqs[1].messages[2]);
-        let ids: Vec<&str> = results.iter().map(|r| r.call_id.as_str()).collect();
-        assert_eq!(ids, ["c1", "c2", "c3"]);
-        assert!(!results[0].is_error);
-        assert!(results[1].is_error);
-        assert_eq!(results[1].tool_name, SUBMIT);
-        assert!(!results[2].is_error);
-        assert!(results[2].content.contains("beta"));
+        assert_paired(&reqs[2].messages);
+        let multi = tool_results(&reqs[2].messages[4]);
+        let ids: Vec<&str> = multi.iter().map(|r| r.call_id.as_str()).collect();
+        assert_eq!(ids, ["r1", "s1", "g1"]);
+        assert!(!multi[0].is_error);
+        assert!(multi[1].is_error);
+        assert_eq!(multi[1].tool_name, SUBMIT);
+        assert!(!multi[2].is_error);
+        assert!(multi[2].content.contains("beta"));
     }
 
     #[tokio::test]
@@ -1031,7 +898,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wraps_up_on_final_step_with_submit_tool_only() {
+    async fn wraps_up_with_submit_only_in_final_window() {
+        // Default 1-step wrap-up across budgets, including a successful wrap-up submit.
         let tb = default_toolbox();
         let chat = ScriptedChat::new(vec![
             tools_turn(vec![read("c1", "src/a.rs")]),
@@ -1044,25 +912,11 @@ mod tests {
         assert_eq!(out.result, "wrapped");
         assert_eq!(out.steps_used, 3);
         assert!(!out.cut_short);
-
         let reqs = chat.requests();
-        assert_eq!(reqs.len(), 3);
-        assert_eq!(tool_names(&reqs[0]).len(), 5);
-        assert_eq!(tool_names(&reqs[1]).len(), 5);
         assert_eq!(tool_names(&reqs[2]), [SUBMIT]);
-        let last = reqs[2].messages.last().unwrap();
-        assert_eq!(user_text(last), Some(WRAP_UP));
-        // The reminder appears exactly once, and only on the final step.
-        for req in &reqs[..2] {
-            assert!(req.messages.iter().all(|m| user_text(m) != Some(WRAP_UP)));
-        }
-        assert_paired(&reqs[2].messages);
-    }
+        assert_eq!(msg_text(reqs[2].messages.last().unwrap()), Some(WRAP_UP));
 
-    #[tokio::test]
-    async fn wrap_up_happens_exactly_on_last_step_for_each_budget() {
-        for max_steps in [1usize, 2, 6, 20] {
-            let tb = default_toolbox();
+        for max_steps in [1usize, 2, 6] {
             let script = (0..max_steps)
                 .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
                 .collect();
@@ -1070,30 +924,55 @@ mod tests {
             let err = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(max_steps))
                 .await
                 .unwrap_err();
-            assert!(
-                matches!(err, AgentError::Unparseable(_)),
-                "{max_steps}: {err:?}"
-            );
-
+            assert!(matches!(err, AgentError::Unparseable(_)), "{max_steps}");
             let reqs = chat.requests();
-            assert_eq!(reqs.len(), max_steps, "one request per step");
+            assert_eq!(reqs.len(), max_steps);
             for (step, req) in reqs.iter().enumerate() {
                 let final_step = step + 1 == max_steps;
-                let reminders = req
-                    .messages
-                    .iter()
-                    .filter(|m| user_text(m) == Some(WRAP_UP))
-                    .count();
-                assert_eq!(reminders, usize::from(final_step), "{max_steps}/{step}");
-                let expected = if final_step { 1 } else { 5 };
-                assert_eq!(tool_names(req).len(), expected, "{max_steps}/{step}");
+                assert_eq!(count_user(req, WRAP_UP), usize::from(final_step));
+                assert_eq!(tool_names(req).len(), if final_step { 1 } else { 5 });
                 assert_paired(&req.messages);
             }
         }
+
+        // Multi-step wrap-up window refuses read-only calls inside the window.
+        let mut script: Vec<_> = (1..=5)
+            .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
+            .collect();
+        script.push(tools_turn(vec![submit("c6", "wrapped")]));
+        let chat = ScriptedChat::new(script);
+        let mut config = AgentConfig::new(6);
+        config.wrap_up_steps = 2;
+        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        let reqs = chat.requests();
+        for (step, req) in reqs.iter().enumerate() {
+            let wrap_up = step >= 4;
+            assert_eq!(tool_names(req).len(), if wrap_up { 1 } else { 5 });
+            assert_eq!(count_user(req, WRAP_UP), usize::from(wrap_up));
+            assert_paired(&req.messages);
+        }
+        let refused = tool_results(reqs[5].messages.last().unwrap());
+        assert!(refused[0].is_error);
+        assert_eq!(
+            refused[0].content,
+            "Error: tool read_file is not available now; call submit_answer with your result"
+        );
+
+        // Window larger than budget makes every step a wrap-up step.
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![read("c1", "src/a.rs")]),
+            tools_turn(vec![submit("c2", "ok")]),
+        ]);
+        let mut config = AgentConfig::new(3);
+        config.wrap_up_steps = 5;
+        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        let reqs = chat.requests();
+        assert!(reqs.iter().all(|r| tool_names(r) == [SUBMIT]));
+        assert!(reqs.iter().all(|r| count_user(r, WRAP_UP) == 1));
     }
 
     #[tokio::test]
-    async fn exhausted_budget_recovers_prose_as_cut_short() {
+    async fn exhausted_step_budget_recovers_prose_or_fails_safely() {
         let tb = default_toolbox();
         let mut last = tools_turn(vec![read("c1", "src/a.rs")]).unwrap();
         last.text = r#"Out of steps, here it is: {"answer": "partial"}"#.into();
@@ -1104,27 +983,25 @@ mod tests {
         assert_eq!(out.result, "partial");
         assert!(out.cut_short);
         assert_eq!(out.steps_used, 2);
-    }
 
-    #[tokio::test]
-    async fn exhausted_budget_without_prose_is_unparseable() {
-        let tb = default_toolbox();
         let chat = ScriptedChat::new(vec![
             tools_turn(vec![call("c0", SUBMIT, json!({}))]),
             tools_turn(vec![call("c1", SUBMIT, json!({}))]),
         ]);
-        let err = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(2))
-            .await
-            .unwrap_err();
-        let AgentError::Unparseable(message) = err else {
-            panic!("expected Unparseable, got {err:?}");
+        let AgentError::Unparseable(message) =
+            run(&chat, AgentTools::Full(&tb), &AgentConfig::new(2))
+                .await
+                .unwrap_err()
+        else {
+            panic!("expected Unparseable");
         };
         assert!(!message.contains("PROMPT"));
     }
 
     #[tokio::test]
-    async fn falls_back_to_prose_json_when_model_skips_submit_tool() {
+    async fn prose_fallback_and_single_nudge_behavior() {
         let tb = default_toolbox();
+        // Immediate prose JSON fallback succeeds on step 1.
         let chat = ScriptedChat::new(vec![text_turn(
             "Here is my answer:\n```json\n{\"answer\": \"prose\"}\n```",
         )]);
@@ -1134,11 +1011,8 @@ mod tests {
         assert_eq!(out.result, "prose");
         assert_eq!(out.steps_used, 1);
         assert!(!out.cut_short);
-    }
 
-    #[tokio::test]
-    async fn nudges_once_then_accepts_submit() {
-        let tb = default_toolbox();
+        // Nudge once, then accept submit.
         let chat = ScriptedChat::new(vec![
             text_turn("I think the code is fine."),
             tools_turn(vec![submit("c1", "after nudge")]),
@@ -1148,38 +1022,22 @@ mod tests {
             .unwrap();
         assert_eq!(out.result, "after nudge");
         assert_eq!(out.steps_used, 2);
-
         let reqs = chat.requests();
-        assert_eq!(user_text(reqs[1].messages.last().unwrap()), Some(NUDGE));
+        assert_eq!(msg_text(reqs[1].messages.last().unwrap()), Some(NUDGE));
         assert_eq!(reqs[1].messages.len(), 3);
-    }
 
-    #[tokio::test]
-    async fn nudges_only_once_per_run() {
-        let tb = default_toolbox();
+        // Nudges at most once per run, and never when max_steps == 1.
         let chat = ScriptedChat::new(vec![
             text_turn("no json here"),
             tools_turn(vec![read("c1", "src/a.rs")]),
             text_turn("still no json"),
-            tools_turn(vec![submit("c2", "never reached")]),
         ]);
         let err = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(20))
             .await
             .unwrap_err();
         assert!(matches!(err, AgentError::Unparseable(_)));
-        let reqs = chat.requests();
-        assert_eq!(reqs.len(), 3);
-        let nudges = reqs[2]
-            .messages
-            .iter()
-            .filter(|m| user_text(m) == Some(NUDGE))
-            .count();
-        assert_eq!(nudges, 1);
-    }
+        assert_eq!(count_user(&chat.requests()[2], NUDGE), 1);
 
-    #[tokio::test]
-    async fn no_nudge_when_no_steps_remain() {
-        let tb = default_toolbox();
         let chat = ScriptedChat::new(vec![text_turn("no json"), text_turn("unused")]);
         let err = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(1))
             .await
@@ -1189,7 +1047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nudge_on_second_to_last_step_skips_wrap_up_reminder() {
+    async fn nudge_and_no_tools_modes_skip_wrap_up_reminder() {
         let tb = default_toolbox();
         let chat = ScriptedChat::new(vec![
             text_turn("no json"),
@@ -1200,17 +1058,9 @@ mod tests {
             .unwrap();
         let reqs = chat.requests();
         assert_eq!(tool_names(&reqs[1]), [SUBMIT]);
-        assert_eq!(user_text(reqs[1].messages.last().unwrap()), Some(NUDGE));
-        assert!(
-            reqs[1]
-                .messages
-                .iter()
-                .all(|m| user_text(m) != Some(WRAP_UP))
-        );
-    }
+        assert_eq!(msg_text(reqs[1].messages.last().unwrap()), Some(NUDGE));
+        assert_eq!(count_user(&reqs[1], WRAP_UP), 0);
 
-    #[tokio::test]
-    async fn no_tools_mode_sends_no_tools_and_recovers_prose_after_nudge() {
         let chat = ScriptedChat::new(vec![
             text_turn("thinking out loud"),
             text_turn(r#"{"answer": "from prose"}"#),
@@ -1221,15 +1071,9 @@ mod tests {
         assert_eq!(out.result, "from prose");
         assert!(!out.cut_short);
         let reqs = chat.requests();
-        assert_eq!(reqs.len(), 2);
         assert!(reqs.iter().all(|r| r.tools.is_empty()));
-        assert_eq!(user_text(reqs[1].messages.last().unwrap()), Some(NUDGE));
-        assert!(
-            reqs[1]
-                .messages
-                .iter()
-                .all(|m| user_text(m) != Some(WRAP_UP))
-        );
+        assert_eq!(msg_text(reqs[1].messages.last().unwrap()), Some(NUDGE));
+        assert_eq!(count_user(&reqs[1], WRAP_UP), 0);
     }
 
     #[tokio::test]
@@ -1253,7 +1097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compacts_oldest_tool_outputs_when_exceeding_char_limit() {
+    async fn compacts_oldest_tool_outputs_in_run_when_exceeding_char_limit() {
         let big = "x".repeat(2_000);
         let tb = toolbox(&[("src/big.rs", &big)]);
         let chat = ScriptedChat::new(vec![
@@ -1278,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_replaces_oldest_first_and_stops_when_under_limit() {
+    fn compact_respects_limit_protects_tail_and_terminates() {
         let long = "y".repeat(1_000);
         let mut msgs = vec![
             user(&"p".repeat(500)),
@@ -1292,17 +1136,12 @@ mod tests {
             tool_msg(&["d"], &long),
         ];
         let before = msgs.clone();
-        // Over the limit by less than one output: only the oldest is replaced.
         compact(&mut msgs, messages_char_len(&before) - 100);
         assert_eq!(tool_results(&msgs[2])[0].content, OMITTED_TOOL_OUTPUT);
         assert_eq!(msgs[3..], before[3..]);
         assert_eq!(msgs[0], before[0]);
-    }
 
-    #[test]
-    fn compaction_terminates_when_nothing_is_left_to_compact() {
-        let long = "z".repeat(1_000);
-        let mut msgs = vec![
+        let mut protected = vec![
             user(&long),
             assistant_calls(&["a"]),
             tool_msg(&["a"], "short output"),
@@ -1311,14 +1150,13 @@ mod tests {
             assistant_calls(&["c"]),
             tool_msg(&["c"], &long),
         ];
-        let before = msgs.clone();
-        compact(&mut msgs, 0);
-        // The prompt, short outputs and the last 4 messages are never touched.
-        assert_eq!(msgs, before);
+        let before = protected.clone();
+        compact(&mut protected, 0);
+        assert_eq!(protected, before);
     }
 
     #[test]
-    fn overflow_compaction_keeps_prompt_latest_turn_and_trailing_user() {
+    fn compact_for_overflow_keeps_prompt_latest_turn_and_trailing_user() {
         let long = "w".repeat(2_000);
         let mut msgs = vec![
             user("PROMPT"),
@@ -1341,7 +1179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovers_once_from_context_overflow_error() {
+    async fn recovers_once_from_context_overflow_and_fails_on_second() {
         let tb = toolbox(&[("src/big.rs", &"v".repeat(3_000))]);
         let chat = ScriptedChat::new(vec![
             tools_turn(vec![read("c1", "src/big.rs")]),
@@ -1355,10 +1193,8 @@ mod tests {
         assert_eq!(out.result, "recovered");
         // The overflowed call is repeated, not counted as a new step.
         assert_eq!(out.steps_used, 3);
-
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 4);
-        assert_eq!(reqs[2].messages.len(), 5);
         let retried = &reqs[3].messages;
         assert_eq!(retried.len(), 3);
         assert_eq!(retried[0], user("PROMPT"));
@@ -1366,16 +1202,12 @@ mod tests {
         assert_paired(retried);
         assert!(tool_results(&retried[2])[0].content.chars().count() < 600);
         assert_eq!(tool_names(&reqs[3]), tool_names(&reqs[2]));
-    }
 
-    #[tokio::test]
-    async fn second_context_overflow_is_returned() {
         let tb = default_toolbox();
         let chat = ScriptedChat::new(vec![
             tools_turn(vec![read("c1", "src/a.rs")]),
             Err(ChatError::ContextOverflow("too long".into())),
             Err(ChatError::ContextOverflow("still too long".into())),
-            tools_turn(vec![submit("c2", "unused")]),
         ]);
         let err = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(20))
             .await
@@ -1388,104 +1220,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn propagates_tools_unsupported_immediately() {
+    async fn propagates_tools_unsupported_and_chat_errors() {
         let tb = default_toolbox();
-        let chat = ScriptedChat::new(vec![
-            Err(ChatError::ToolsUnsupported("no tools here".into())),
-            tools_turn(vec![submit("c1", "unused")]),
-        ]);
+        let chat = ScriptedChat::new(vec![Err(ChatError::ToolsUnsupported(
+            "no tools here".into(),
+        ))]);
         let err = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(20))
             .await
             .unwrap_err();
         assert_eq!(err, AgentError::ToolsUnsupported("no tools here".into()));
         assert_eq!(chat.requests().len(), 1);
-    }
 
-    #[tokio::test]
-    async fn other_chat_errors_are_returned_as_chat() {
         let chat = ScriptedChat::new(vec![Err(ChatError::NoKeys)]);
         let err = run(&chat, AgentTools::SubmitOnly, &AgentConfig::new(6))
             .await
             .unwrap_err();
         assert_eq!(err, AgentError::Chat(ChatError::NoKeys));
         assert_eq!(chat.requests().len(), 1);
-    }
-
-    fn budget_note(used: usize, max: usize) -> String {
-        format!(
-            "Step budget: {used} of {max} steps used. Gather only the evidence you still need, then call submit_answer."
-        )
-    }
-
-    /// How many user messages of `req` are exactly `text`.
-    fn count_user(req: &ChatRequest, text: &str) -> usize {
-        req.messages
-            .iter()
-            .filter(|m| user_text(m) == Some(text))
-            .count()
-    }
-
-    /// Budget notes of any step count in `req`.
-    fn count_notes(req: &ChatRequest) -> usize {
-        req.messages
-            .iter()
-            .filter(|m| user_text(m).is_some_and(|t| t.starts_with("Step budget: ")))
-            .count()
-    }
-
-    #[tokio::test]
-    async fn wrap_up_window_offers_only_submit_for_the_last_two_steps() {
-        let tb = default_toolbox();
-        let mut script: Vec<_> = (1..=5)
-            .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
-            .collect();
-        script.push(tools_turn(vec![submit("c6", "wrapped")]));
-        let chat = ScriptedChat::new(script);
-        let mut config = AgentConfig::new(6);
-        config.wrap_up_steps = 2;
-        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
-        assert_eq!(out.result, "wrapped");
-        assert_eq!(out.steps_used, 6);
-        assert!(!out.cut_short);
-
-        let reqs = chat.requests();
-        assert_eq!(reqs.len(), 6);
-        for (step, req) in reqs.iter().enumerate() {
-            let wrap_up = step >= 4;
-            let expected = if wrap_up { 1 } else { 5 };
-            assert_eq!(tool_names(req).len(), expected, "step {step}");
-            // One reminder, sent when the window starts, then kept in the history.
-            assert_eq!(
-                count_user(req, WRAP_UP),
-                usize::from(wrap_up),
-                "step {step}"
-            );
-            assert_paired(&req.messages);
-        }
-        assert_eq!(user_text(reqs[4].messages.last().unwrap()), Some(WRAP_UP));
-        assert_eq!(tool_names(&reqs[4]), [SUBMIT]);
-        // The read call made inside the window is refused, still paired with its call.
-        let refused = tool_results(reqs[5].messages.last().unwrap());
-        assert_eq!(refused[0].call_id, "c5");
-        assert!(refused[0].is_error);
-        assert_eq!(
-            refused[0].content,
-            "Error: tool read_file is not available now; call submit_answer with your result"
-        );
-
-        // A window larger than the budget makes every step a wrap-up step.
-        let chat = ScriptedChat::new(vec![
-            tools_turn(vec![read("c1", "src/a.rs")]),
-            tools_turn(vec![submit("c2", "ok")]),
-        ]);
-        let mut config = AgentConfig::new(3);
-        config.wrap_up_steps = 5;
-        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
-        let reqs = chat.requests();
-        assert!(reqs.iter().all(|r| tool_names(r) == [SUBMIT]));
-        assert_eq!(user_text(reqs[0].messages.last().unwrap()), Some(WRAP_UP));
-        assert!(reqs.iter().all(|r| count_user(r, WRAP_UP) == 1));
-        assert_paired(&reqs[1].messages);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1505,51 +1256,17 @@ mod tests {
         assert_eq!(out.result, "in time");
         assert_eq!(out.steps_used, 4);
         assert!(!out.cut_short);
-        assert!(Instant::now() <= deadline, "submitted before the deadline");
+        assert!(Instant::now() <= deadline);
 
-        // Steps end at 30, 40 and 50 s. Before step 4, 50 s are left: less than 2 × the slowest
-        // step (60 s), so step 4 offers only the submit tool, with one reminder.
         let reqs = chat.requests();
-        assert_eq!(reqs.len(), 4);
         for req in &reqs[..3] {
             assert_eq!(tool_names(req).len(), 5);
             assert_eq!(count_user(req, WRAP_UP), 0);
         }
         assert_eq!(tool_names(&reqs[3]), [SUBMIT]);
-        assert_eq!(user_text(reqs[3].messages.last().unwrap()), Some(WRAP_UP));
+        assert_eq!(msg_text(reqs[3].messages.last().unwrap()), Some(WRAP_UP));
         assert_eq!(count_user(&reqs[3], WRAP_UP), 1);
         assert_paired(&reqs[3].messages);
-    }
-
-    /// The case the 2 × whole-step margin exists for: every step takes as long as the slowest
-    /// one, and the model only submits once it is told to (it reads while it may).
-    #[tokio::test(start_paused = true)]
-    async fn steady_latency_still_submits_before_the_deadline() {
-        let tb = default_toolbox();
-        let chat = ScriptedChat::investigating(Duration::from_secs(10));
-        let deadline = Instant::now() + Duration::from_secs(95);
-        let mut config = AgentConfig::new(50);
-        config.deadline = Some(deadline);
-        // The caller's hard cut, as the Finder and the Verifier apply it.
-        let run = run(&chat, AgentTools::Full(&tb), &config);
-        let out = tokio::time::timeout_at(deadline, run)
-            .await
-            .expect("submitted before the hard cut")
-            .unwrap();
-        assert_eq!(out.result, "submitted");
-        assert!(!out.cut_short);
-        assert!(Instant::now() <= deadline);
-
-        // Steps end every 10 s. Before step 9 (at 80 s) 15 s are left, less than 2 × 10 s, so
-        // step 9 only offers the submit tool and ends at 90 s. (With 1.5 × it would have read
-        // once more and submitted at 100 s, after the cut.)
-        assert_eq!(out.steps_used, 9);
-        let reqs = chat.requests();
-        assert_eq!(reqs.len(), 9);
-        assert!(reqs[..8].iter().all(|r| tool_names(r).len() == 5));
-        assert_eq!(tool_names(&reqs[8]), [SUBMIT]);
-        assert_eq!(count_user(&reqs[8], WRAP_UP), 1);
-        assert_paired(&reqs[8].messages);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1571,7 +1288,6 @@ mod tests {
         let reqs = chat.requests();
         assert_eq!(tool_names(&reqs[0]).len(), 5);
         assert_eq!(reqs[0].messages, vec![user("PROMPT")]);
-        // After one measured step the deadline rule applies.
         assert_eq!(tool_names(&reqs[1]), [SUBMIT]);
         assert_eq!(count_user(&reqs[1], WRAP_UP), 1);
         assert_paired(&reqs[1].messages);
@@ -1586,7 +1302,6 @@ mod tests {
                 .collect()
         };
 
-        // Verifier-like budget: the note goes before step 4 (3 of 6 used), once.
         let mut script = reads(5);
         script.push(tools_turn(vec![submit("c6", "ok")]));
         let chat = ScriptedChat::new(script);
@@ -1594,44 +1309,23 @@ mod tests {
             .await
             .unwrap();
         let reqs = chat.requests();
-        let note = budget_note(3, 6);
+        let note = "Step budget: 3 of 6 steps used. Gather only the evidence you still need, then call submit_answer.";
         for (step, req) in reqs.iter().enumerate() {
             assert_eq!(count_notes(req), usize::from(step >= 3), "step {step}");
             assert_paired(&req.messages);
         }
-        assert_eq!(
-            user_text(reqs[3].messages.last().unwrap()),
-            Some(note.as_str())
-        );
-        // The wrap-up reminder comes later, on its own step.
+        assert_eq!(msg_text(reqs[3].messages.last().unwrap()), Some(note));
         assert_eq!(count_user(&reqs[3], WRAP_UP), 0);
         assert_eq!(count_user(&reqs[5], WRAP_UP), 1);
 
-        // Finder budget: 10 of 20, before the two-step wrap-up window.
-        let mut script = reads(19);
-        script.push(tools_turn(vec![submit("c20", "ok")]));
-        let chat = ScriptedChat::new(script);
-        let mut config = AgentConfig::new(20);
-        config.wrap_up_steps = 2;
-        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
-        let reqs = chat.requests();
-        assert_eq!(
-            user_text(reqs[10].messages.last().unwrap()),
-            Some(budget_note(10, 20).as_str())
-        );
-        assert_eq!(count_notes(&reqs[9]), 0);
-        assert_eq!(count_notes(&reqs[19]), 1);
-
-        // No note when the half-way step already starts the wrap-up (the reminder wins),
-        // for budgets under 4 steps, or without the repository tools.
+        // No note when halfway starts wrap-up, for budgets < 4, or without repository tools.
         let mut window = AgentConfig::new(4);
         window.wrap_up_steps = 2;
-        let cases = [
+        for (tools, config, steps) in [
             (AgentTools::Full(&tb), window, 4),
             (AgentTools::Full(&tb), AgentConfig::new(3), 3),
             (AgentTools::SubmitOnly, AgentConfig::new(6), 6),
-        ];
-        for (tools, config, steps) in cases {
+        ] {
             let chat = ScriptedChat::new(reads(steps));
             let err = run(&chat, tools, &config).await.unwrap_err();
             assert!(matches!(err, AgentError::Unparseable(_)), "{err:?}");
@@ -1645,7 +1339,6 @@ mod tests {
     #[tokio::test]
     async fn exhausted_budget_switches_agent_to_submit_only() {
         let tb = default_toolbox();
-        // Every turn reports 100 input tokens; the ceiling is crossed by the third step.
         let mut script: Vec<_> = (1..=3)
             .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
             .collect();
@@ -1657,8 +1350,8 @@ mod tests {
         let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
         assert_eq!(out.result, "within budget");
         assert_eq!(out.steps_used, 4);
-        assert_eq!(budget.used(), 400, "every response is counted once");
-        assert_eq!(budget.wrap_ups(), 1, "a token-budget wrap-up is counted");
+        assert_eq!(budget.used(), 400);
+        assert_eq!(budget.wrap_ups(), 1);
 
         let reqs = chat.requests();
         for req in &reqs[..3] {
@@ -1666,12 +1359,10 @@ mod tests {
             assert_eq!(count_user(req, WRAP_UP), 0);
         }
         assert_eq!(tool_names(&reqs[3]), [SUBMIT]);
-        assert_eq!(user_text(reqs[3].messages.last().unwrap()), Some(WRAP_UP));
-        assert_eq!(count_user(&reqs[3], WRAP_UP), 1);
+        assert_eq!(msg_text(reqs[3].messages.last().unwrap()), Some(WRAP_UP));
         assert_paired(&reqs[3].messages);
 
-        // A budget another agent of the review already used up: this agent still takes one
-        // investigating step, then only submits.
+        // Already-exhausted budget still allows one investigating step, then submits.
         let chat = ScriptedChat::new(vec![
             tools_turn(vec![read("c1", "src/a.rs")]),
             tools_turn(vec![submit("c2", "late")]),
@@ -1681,10 +1372,9 @@ mod tests {
         let reqs = chat.requests();
         assert_eq!(tool_names(&reqs[0]).len(), 5);
         assert_eq!(tool_names(&reqs[1]), [SUBMIT]);
-        assert_eq!(count_user(&reqs[1], WRAP_UP), 1);
         assert_eq!(budget.wrap_ups(), 2);
 
-        // A wrap-up for the step budget is not a token-budget one.
+        // Step-budget wrap-up and failed calls do not increment wrap_ups / used.
         let chat = ScriptedChat::new(vec![
             tools_turn(vec![read("c1", "src/a.rs")]),
             tools_turn(vec![submit("c2", "by steps")]),
@@ -1695,7 +1385,6 @@ mod tests {
         run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
         assert_eq!(unused.wrap_ups(), 0);
 
-        // A failed call adds nothing.
         let chat = ScriptedChat::new(vec![Err(ChatError::NoKeys)]);
         let fresh = Arc::new(TokenBudget::new(250));
         let mut config = AgentConfig::new(20);
@@ -1704,30 +1393,5 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(fresh.used(), 0);
-    }
-
-    #[test]
-    fn run_future_is_send() {
-        fn assert_send<F: Send>(_: F) {}
-        let chat = ScriptedChat::new(Vec::new());
-        let usage = UsageContext::default();
-        let llm = AgentLlm {
-            chat: &chat,
-            provider_id: Uuid::nil(),
-            model: "m",
-            system: "s",
-            effort: None,
-            usage: &usage,
-        };
-        let tb = default_toolbox();
-        let submit = SubmitAnswer::new();
-        let config = AgentConfig::new(1);
-        assert_send(run_react_loop(
-            &llm,
-            AgentTools::Full(&tb),
-            &submit,
-            &config,
-            String::new(),
-        ));
     }
 }

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::types::{
     AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
-    StopReason, ToolCall, UserPart, decode, is_reasoning_unsupported, key_header, non_empty,
+    StopReason, ToolCall, UserPart, chat_with_effort_fallback, decode, key_header, non_empty,
     normalize_model_ids, request_timeout, send,
 };
 
@@ -186,12 +186,7 @@ impl AnthropicClient {
 #[async_trait]
 impl LlmClient for AnthropicClient {
     async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        match self.chat_once(api_key, req, req.effort).await {
-            Err(ref err) if req.effort.is_some() && is_reasoning_unsupported(err) => {
-                self.chat_once(api_key, req, None).await
-            }
-            other => other,
-        }
+        chat_with_effort_fallback(req.effort, |effort| self.chat_once(api_key, req, effort)).await
     }
 
     async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError> {
