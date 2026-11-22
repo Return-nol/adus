@@ -31,6 +31,10 @@ pub const OMITTED_TOOL_OUTPUT: &str = "[earlier tool output omitted to save cont
 const COMPACT_MIN_CHARS: usize = 120;
 /// The newest messages (two turns) are never compacted.
 const COMPACT_KEEP_TAIL: usize = 4;
+/// A run with a `deadline` wraps up once the time left is less than this many times its
+/// slowest whole step (LLM call plus tools). With 2, at least one such step is left when
+/// wrap-up starts, enough for the submit step.
+pub const WRAP_UP_STEP_FACTOR: u32 = 2;
 /// The halfway budget note is only sent to runs with at least this many steps.
 const BUDGET_NOTE_MIN_STEPS: usize = 4;
 /// Tool outputs kept after a context overflow are cut to this many chars.
@@ -50,8 +54,9 @@ pub struct AgentConfig {
     pub max_concurrent_tools: usize,
     /// The last steps that offer only the terminal tool (Finder 2, otherwise 1). 0 counts as 1.
     pub wrap_up_steps: usize,
-    /// When set, the run wraps up early once the time left is less than 1.5 × its slowest
-    /// LLM call so far, so it submits before a caller's hard cut at this instant.
+    /// When set, the run wraps up early once the time left is less than
+    /// [`WRAP_UP_STEP_FACTOR`] × its slowest step so far (LLM call plus tools), so it submits
+    /// before a caller's hard cut at this instant.
     pub deadline: Option<Instant>,
 }
 
@@ -137,7 +142,7 @@ pub struct AgentLlm<'a> {
 /// once more (`cut_short`).
 ///
 /// **Wrap-up:** from the last `wrap_up_steps` steps on, or earlier once `deadline` is closer
-/// than 1.5 × the slowest LLM call of this run (never before one call was measured), only
+/// than 2 × the slowest whole step of this run (never before one step was measured), only
 /// the terminal tool is offered, and one reminder to submit is sent when that starts. Halfway
 /// through a budget of at least 4 steps with the repository tools, one note tells the model
 /// how many steps it has used.
@@ -186,9 +191,10 @@ pub async fn run_react_loop<S: SubmitSpec>(
         };
         let offered = offered_tools(tools, read_only, submit_def);
 
+        // The whole step is timed (LLM call plus tools): the slowest one sizes the margin a
+        // deadline-close run keeps for its submit step.
+        let step_started = Instant::now();
         compact(&mut messages, config.compaction_char_limit);
-        // Only the LLM call is timed (not the tools): the slowest one sizes the deadline margin.
-        let started = Instant::now();
         let response = request(
             llm,
             &mut messages,
@@ -197,7 +203,6 @@ pub async fn run_react_loop<S: SubmitSpec>(
             &mut overflow_retried,
         )
         .await?;
-        wrap_up.record(started.elapsed());
         tally.add(&response);
         tracing::debug!(
             step = tally.steps_used,
@@ -223,6 +228,7 @@ pub async fn run_react_loop<S: SubmitSpec>(
             messages.push(user_message(format!(
                 "Please submit your result by calling {submit_name} (or return the JSON directly)."
             )));
+            wrap_up.record(step_started.elapsed());
             continue;
         }
 
@@ -248,6 +254,7 @@ pub async fn run_react_loop<S: SubmitSpec>(
         .await;
         messages.push(Message::Tool { results });
         last_text = text;
+        wrap_up.record(step_started.elapsed());
     }
 
     match submit.parse_prose(&last_text) {
@@ -261,7 +268,7 @@ pub async fn run_react_loop<S: SubmitSpec>(
 struct WrapUp {
     /// Why wrap-up started (`"steps"` or `"deadline"`); once set it stays set.
     reason: Option<&'static str>,
-    /// The slowest LLM call of this run so far.
+    /// The slowest whole step (LLM call plus tools) of this run so far.
     slowest: Option<Duration>,
 }
 
@@ -287,18 +294,19 @@ impl WrapUp {
         self.active()
     }
 
-    /// The time left is less than 1.5 × the slowest call, so one more investigating step would
-    /// leave too little time to submit. False until one call was measured.
+    /// The time left is less than [`WRAP_UP_STEP_FACTOR`] × the slowest step, so one more
+    /// investigating step could leave too little time to submit. False until one step was
+    /// measured.
     fn deadline_close(&self, deadline: Option<Instant>) -> bool {
         let (Some(deadline), Some(slowest)) = (deadline, self.slowest) else {
             return false;
         };
-        let needed = slowest.saturating_add(slowest / 2);
+        let needed = slowest.saturating_mul(WRAP_UP_STEP_FACTOR);
         deadline.saturating_duration_since(Instant::now()) < needed
     }
 
-    fn record(&mut self, latency: Duration) {
-        self.slowest = Some(self.slowest.map_or(latency, |slowest| slowest.max(latency)));
+    fn record(&mut self, step: Duration) {
+        self.slowest = Some(self.slowest.map_or(step, |slowest| slowest.max(step)));
     }
 }
 
@@ -637,6 +645,9 @@ mod tests {
         script: Mutex<VecDeque<Result<ChatResponse, ChatError>>>,
         /// How long each call takes, in call order (on the paused test clock); none = instant.
         latencies: Mutex<VecDeque<Duration>>,
+        /// When set, the script is ignored: every call takes this long and answers like a model
+        /// that reads files while it may and submits once only the submit tool is offered.
+        investigating: Option<Duration>,
         requests: Mutex<Vec<ChatRequest>>,
         calls: Mutex<Vec<(Uuid, UsageContext)>>,
     }
@@ -645,6 +656,15 @@ mod tests {
         fn new(script: Vec<Result<ChatResponse, ChatError>>) -> Self {
             Self {
                 script: Mutex::new(script.into()),
+                ..Self::default()
+            }
+        }
+
+        /// Reads `src/a.rs` while `read_file` is offered, submits `"submitted"` once only the
+        /// submit tool is; every call takes `latency`.
+        fn investigating(latency: Duration) -> Self {
+            Self {
+                investigating: Some(latency),
                 ..Self::default()
             }
         }
@@ -674,6 +694,18 @@ mod tests {
             req: ChatRequest,
             ctx: UsageContext,
         ) -> Result<ChatResponse, ChatError> {
+            if let Some(latency) = self.investigating {
+                let id = format!("i{}", self.requests.lock().unwrap().len());
+                let reads = req.tools.iter().any(|t| t.name == "read_file");
+                self.requests.lock().unwrap().push(req);
+                tokio::time::sleep(latency).await;
+                let call = if reads {
+                    read(&id, "src/a.rs")
+                } else {
+                    submit(&id, "submitted")
+                };
+                return tools_turn(vec![call]);
+            }
             self.requests.lock().unwrap().push(req);
             self.calls.lock().unwrap().push((provider_id, ctx));
             let latency = self.latencies.lock().unwrap().pop_front();
@@ -1439,36 +1471,65 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deadline_close_switches_to_submit_only_early() {
         let tb = default_toolbox();
-        let mut script: Vec<_> = (1..=4)
+        let mut script: Vec<_> = (1..=3)
             .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
             .collect();
-        script.push(tools_turn(vec![submit("c5", "in time")]));
+        script.push(tools_turn(vec![submit("c4", "in time")]));
         let secs = Duration::from_secs;
-        let chat = ScriptedChat::with_latencies(
-            script,
-            vec![secs(30), secs(10), secs(10), secs(10), secs(10)],
-        );
+        let chat =
+            ScriptedChat::with_latencies(script, vec![secs(30), secs(10), secs(10), secs(10)]);
         let deadline = Instant::now() + secs(100);
         let mut config = AgentConfig::new(20);
         config.deadline = Some(deadline);
         let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
         assert_eq!(out.result, "in time");
-        assert_eq!(out.steps_used, 5);
+        assert_eq!(out.steps_used, 4);
         assert!(!out.cut_short);
         assert!(Instant::now() <= deadline, "submitted before the deadline");
 
-        // Steps end at 30, 40, 50 and 60 s. Before step 5, 40 s are left: less than 1.5 × the
-        // slowest step (45 s), so step 5 offers only the submit tool, with one reminder.
+        // Steps end at 30, 40 and 50 s. Before step 4, 50 s are left: less than 2 × the slowest
+        // step (60 s), so step 4 offers only the submit tool, with one reminder.
         let reqs = chat.requests();
-        assert_eq!(reqs.len(), 5);
-        for req in &reqs[..4] {
+        assert_eq!(reqs.len(), 4);
+        for req in &reqs[..3] {
             assert_eq!(tool_names(req).len(), 5);
             assert_eq!(count_user(req, WRAP_UP), 0);
         }
-        assert_eq!(tool_names(&reqs[4]), [SUBMIT]);
-        assert_eq!(user_text(reqs[4].messages.last().unwrap()), Some(WRAP_UP));
-        assert_eq!(count_user(&reqs[4], WRAP_UP), 1);
-        assert_paired(&reqs[4].messages);
+        assert_eq!(tool_names(&reqs[3]), [SUBMIT]);
+        assert_eq!(user_text(reqs[3].messages.last().unwrap()), Some(WRAP_UP));
+        assert_eq!(count_user(&reqs[3], WRAP_UP), 1);
+        assert_paired(&reqs[3].messages);
+    }
+
+    /// The case the 2 × whole-step margin exists for: every step takes as long as the slowest
+    /// one, and the model only submits once it is told to (it reads while it may).
+    #[tokio::test(start_paused = true)]
+    async fn steady_latency_still_submits_before_the_deadline() {
+        let tb = default_toolbox();
+        let chat = ScriptedChat::investigating(Duration::from_secs(10));
+        let deadline = Instant::now() + Duration::from_secs(95);
+        let mut config = AgentConfig::new(50);
+        config.deadline = Some(deadline);
+        // The caller's hard cut, as the Finder and the Verifier apply it.
+        let run = run(&chat, AgentTools::Full(&tb), &config);
+        let out = tokio::time::timeout_at(deadline, run)
+            .await
+            .expect("submitted before the hard cut")
+            .unwrap();
+        assert_eq!(out.result, "submitted");
+        assert!(!out.cut_short);
+        assert!(Instant::now() <= deadline);
+
+        // Steps end every 10 s. Before step 9 (at 80 s) 15 s are left, less than 2 × 10 s, so
+        // step 9 only offers the submit tool and ends at 90 s. (With 1.5 × it would have read
+        // once more and submitted at 100 s, after the cut.)
+        assert_eq!(out.steps_used, 9);
+        let reqs = chat.requests();
+        assert_eq!(reqs.len(), 9);
+        assert!(reqs[..8].iter().all(|r| tool_names(r).len() == 5));
+        assert_eq!(tool_names(&reqs[8]), [SUBMIT]);
+        assert_eq!(count_user(&reqs[8], WRAP_UP), 1);
+        assert_paired(&reqs[8].messages);
     }
 
     #[tokio::test(start_paused = true)]

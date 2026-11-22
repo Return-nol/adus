@@ -291,150 +291,166 @@ impl Engine {
             .or(repo.review_mode)
             .unwrap_or(settings.review_mode);
 
-        // Updated + review sebelumnya di commit lain → hanya baris dari commit baru.
-        let last = match trigger {
-            Trigger::Updated => reviews::last_done(&self.db, repo.id, pr_number)
-                .await
-                .map_err(db_error)?
-                .and_then(|review| review.head_sha),
-            _ => None,
-        };
-        if last.as_deref() == Some(pr.head_sha.as_str()) {
-            return Ok(Outcome::Skipped("already_reviewed"));
-        }
-        let full = match git.pr_diff(&repo_ref, &pr).await {
-            Ok(files) => files,
-            Err(err) => return Err(self.fetch_error(&conn, err).await),
-        };
-        // The PR file manifest lists every file of the PR, not only those reviewed now.
-        let pr_files = full.clone();
-        let candidates = match last {
-            None => full_targets(full),
-            Some(last_head) => match git.diff_between(&repo_ref, &last_head, &pr.head_sha).await {
-                Ok(changed) => incremental_targets(changed, full),
-                // Setelah force-push commit lama bisa hilang; review penuh saja daripada gagal terus.
-                Err(GitError::NotFound) => {
-                    tracing::warn!(%review_id, "previous head not found, falling back to a full review");
-                    full_targets(full)
-                }
+        // From here on the run is bounded by the budget it can still end with: a Generalist run
+        // stays Generalist, a Specialists run may still be forced to Generalist (small PR). The
+        // cut inside, at the effective mode's budget, stays the real one.
+        let cut = start
+            + match mode {
+                ReviewMode::Generalist => self.review_timeout,
+                ReviewMode::Specialists => self.specialists_review_timeout.max(self.review_timeout),
+            };
+        let rest = async {
+            // Updated + review sebelumnya di commit lain → hanya baris dari commit baru.
+            let last = match trigger {
+                Trigger::Updated => reviews::last_done(&self.db, repo.id, pr_number)
+                    .await
+                    .map_err(db_error)?
+                    .and_then(|review| review.head_sha),
+                _ => None,
+            };
+            if last.as_deref() == Some(pr.head_sha.as_str()) {
+                return Ok(Outcome::Skipped("already_reviewed"));
+            }
+            let full = match git.pr_diff(&repo_ref, &pr).await {
+                Ok(files) => files,
                 Err(err) => return Err(self.fetch_error(&conn, err).await),
-            },
-        };
-
-        let matcher = ignore_matcher(&effective_ignore_paths(&settings));
-        let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
-        let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
-        let mut targets = Vec::new();
-        let mut skipped: Vec<(String, &'static str)> = Vec::new();
-        let mut ignored_paths: Vec<String> = Vec::new();
-        for target in candidates {
-            // File terhapus tidak pernah direview, jadi juga tidak dihitung sebagai di-ignore.
-            if target.file.status == FileStatus::Deleted {
-                continue;
-            }
-            // Hanya `path` baru yang dicocokkan, juga untuk file yang di-rename.
-            if let Some(matcher) = &matcher
-                && matcher.is_ignored(&target.file.path)
-            {
-                ignored_paths.push(target.file.path);
-                continue;
-            }
-            let Some(patch) = &target.file.patch else {
-                skipped.push((target.file.path, "no_patch"));
-                continue;
             };
-            if target.allowed.is_empty() {
-                continue; // tidak ada baris baru yang bisa dikomentari
+            // The PR file manifest lists every file of the PR, not only those reviewed now.
+            let pr_files = full.clone();
+            let candidates = match last {
+                None => full_targets(full),
+                Some(last_head) => {
+                    match git.diff_between(&repo_ref, &last_head, &pr.head_sha).await {
+                        Ok(changed) => incremental_targets(changed, full),
+                        // Setelah force-push commit lama bisa hilang; review penuh saja daripada gagal terus.
+                        Err(GitError::NotFound) => {
+                            tracing::warn!(%review_id, "previous head not found, falling back to a full review");
+                            full_targets(full)
+                        }
+                        Err(err) => return Err(self.fetch_error(&conn, err).await),
+                    }
+                }
+            };
+
+            let matcher = ignore_matcher(&effective_ignore_paths(&settings));
+            let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
+            let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
+            let mut targets = Vec::new();
+            let mut skipped: Vec<(String, &'static str)> = Vec::new();
+            let mut ignored_paths: Vec<String> = Vec::new();
+            for target in candidates {
+                // File terhapus tidak pernah direview, jadi juga tidak dihitung sebagai di-ignore.
+                if target.file.status == FileStatus::Deleted {
+                    continue;
+                }
+                // Hanya `path` baru yang dicocokkan, juga untuk file yang di-rename.
+                if let Some(matcher) = &matcher
+                    && matcher.is_ignored(&target.file.path)
+                {
+                    ignored_paths.push(target.file.path);
+                    continue;
+                }
+                let Some(patch) = &target.file.patch else {
+                    skipped.push((target.file.path, "no_patch"));
+                    continue;
+                };
+                if target.allowed.is_empty() {
+                    continue; // tidak ada baris baru yang bisa dikomentari
+                }
+                if added_line_count(patch) > max_lines {
+                    skipped.push((target.file.path, "too_large"));
+                } else if targets.len() >= max_files {
+                    skipped.push((target.file.path, "file_limit"));
+                } else {
+                    targets.push(target);
+                }
             }
-            if added_line_count(patch) > max_lines {
-                skipped.push((target.file.path, "too_large"));
-            } else if targets.len() >= max_files {
-                skipped.push((target.file.path, "file_limit"));
+            let ignored = ignored_paths.len();
+
+            if targets.is_empty() && skipped.is_empty() {
+                return Ok(Outcome::Skipped("nothing_to_review"));
+            }
+
+            let mut warnings: Vec<String> = Vec::new();
+            // Only skipped files left: no clone and no LLM, just the summary.
+            let output = if targets.is_empty() {
+                ReviewOutput::default()
             } else {
-                targets.push(target);
-            }
-        }
-        let ignored = ignored_paths.len();
+                let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
+                let files: Vec<FileDiff> = targets
+                    .into_iter()
+                    .map(|target| {
+                        allowed.insert(normalize_path(&target.file.path), target.allowed);
+                        target.file
+                    })
+                    .collect();
+                let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
+                let skipped_map: HashMap<&str, &'static str> = skipped
+                    .iter()
+                    .map(|(path, reason)| (path.as_str(), *reason))
+                    .collect();
+                let manifest = build_manifest(&pr_files, &ignored_set, &skipped_map);
+                let rules = rules::applicable(&self.db, repo.id)
+                    .await
+                    .map_err(db_error)?;
+                let memories = memories::applicable(&self.db, repo.id)
+                    .await
+                    .map_err(db_error)?;
+                let usage = UsageContext {
+                    review_id: Some(review_id),
+                    repository_id: Some(repo.id),
+                };
+                // A small, low-risk PR is reviewed from the diff alone, in one Generalist pass: no
+                // clone and no tools (the same diff-only path as a failed clone, but not a failure).
+                // A `Command` (`@adudu review`) always gets the full review.
+                let small_pr_max_lines = match trigger {
+                    Trigger::Command => 0,
+                    _ => u32::try_from(settings.small_pr_max_lines).unwrap_or(0),
+                };
+                let small = is_small_pr(&files, &rules, small_pr_max_lines);
+                if small {
+                    mode = ReviewMode::Generalist;
+                }
+                let budget = self.budget(mode);
+                let stages = Stages {
+                    conn: &conn,
+                    git: git.as_ref(),
+                    repo_ref: &repo_ref,
+                    pr: &pr,
+                    mode,
+                    provider_id,
+                    primary_model: &primary_model,
+                    fast_model: &fast_model,
+                    rules: &rules,
+                    memories: &memories,
+                    usage: &usage,
+                    deadlines: Deadlines::new(start, budget),
+                    small,
+                };
+                let review = self.review_targets(
+                    &stages,
+                    files,
+                    allowed,
+                    &manifest,
+                    &mut skipped,
+                    &mut warnings,
+                );
+                match tokio::time::timeout_at(start + budget, review).await {
+                    Ok(output) => output?,
+                    Err(_elapsed) => return Err(timed_out()),
+                }
+            };
 
-        if targets.is_empty() && skipped.is_empty() {
-            return Ok(Outcome::Skipped("nothing_to_review"));
-        }
-
-        let mut warnings: Vec<String> = Vec::new();
-        // Only skipped files left: no clone and no LLM, just the summary.
-        let output = if targets.is_empty() {
-            ReviewOutput::default()
-        } else {
-            let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
-            let files: Vec<FileDiff> = targets
-                .into_iter()
-                .map(|target| {
-                    allowed.insert(normalize_path(&target.file.path), target.allowed);
-                    target.file
-                })
-                .collect();
-            let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
-            let skipped_map: HashMap<&str, &'static str> = skipped
-                .iter()
-                .map(|(path, reason)| (path.as_str(), *reason))
-                .collect();
-            let manifest = build_manifest(&pr_files, &ignored_set, &skipped_map);
-            let rules = rules::applicable(&self.db, repo.id)
-                .await
-                .map_err(db_error)?;
-            let memories = memories::applicable(&self.db, repo.id)
-                .await
-                .map_err(db_error)?;
-            let usage = UsageContext {
-                review_id: Some(review_id),
-                repository_id: Some(repo.id),
-            };
-            // A small, low-risk PR is reviewed from the diff alone, in one Generalist pass: no
-            // clone and no tools (the same diff-only path as a failed clone, but not a failure).
-            // A `Command` (`@adudu review`) always gets the full review.
-            let small_pr_max_lines = match trigger {
-                Trigger::Command => 0,
-                _ => u32::try_from(settings.small_pr_max_lines).unwrap_or(0),
-            };
-            let small = is_small_pr(&files, &rules, small_pr_max_lines);
-            if small {
-                mode = ReviewMode::Generalist;
-            }
-            let budget = self.budget(mode);
-            let stages = Stages {
-                conn: &conn,
-                git: git.as_ref(),
-                repo_ref: &repo_ref,
-                pr: &pr,
-                mode,
-                provider_id,
-                primary_model: &primary_model,
-                fast_model: &fast_model,
-                rules: &rules,
-                memories: &memories,
-                usage: &usage,
-                deadlines: Deadlines::new(start, budget),
-                small,
-            };
-            let review = self.review_targets(
-                &stages,
-                files,
-                allowed,
-                &manifest,
-                &mut skipped,
-                &mut warnings,
-            );
-            match tokio::time::timeout_at(start + budget, review).await {
-                Ok(output) => output?,
-                Err(_elapsed) => return Err(timed_out()),
+            let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
+            let post = git.post_review(&repo_ref, &pr, &output.comments, &summary);
+            match tokio::time::timeout_at(start + self.budget(mode), post).await {
+                Ok(Ok(posted)) => Ok(Outcome::Done { posted }),
+                Ok(Err(err)) => Err(self.post_error(&conn, err).await),
+                Err(_elapsed) => Err(timed_out()),
             }
         };
-
-        let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
-        let post = git.post_review(&repo_ref, &pr, &output.comments, &summary);
-        match tokio::time::timeout_at(start + self.budget(mode), post).await {
-            Ok(Ok(posted)) => Ok(Outcome::Done { posted }),
-            Ok(Err(err)) => Err(self.post_error(&conn, err).await),
+        match tokio::time::timeout_at(cut, rest).await {
+            Ok(outcome) => outcome,
             Err(_elapsed) => Err(timed_out()),
         }
     }

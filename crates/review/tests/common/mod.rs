@@ -47,6 +47,8 @@ pub struct GitState {
     pub get_pr_delay: Duration,
     /// Jika diisi, `pr_diff` gagal dengan error ini.
     pub pr_diff_error: Option<GitError>,
+    /// `pr_diff` waits this long before it answers (a slow provider).
+    pub pr_diff_delay: Duration,
     /// Jika diisi, `diff_between` gagal dengan error ini.
     pub diff_between_error: Option<GitError>,
     /// Jika diisi, `post_review` gagal dengan error ini.
@@ -79,6 +81,7 @@ impl FakeGit {
                 get_pr_error: None,
                 get_pr_delay: Duration::ZERO,
                 pr_diff_error: None,
+                pr_diff_delay: Duration::ZERO,
                 diff_between_error: None,
                 post_error: None,
                 comment_error: None,
@@ -154,6 +157,8 @@ impl GitProvider for FakeGit {
     }
 
     async fn pr_diff(&self, _repo: &RepoRef, _pr: &PullRequest) -> Result<Vec<FileDiff>, GitError> {
+        let delay = self.state().pr_diff_delay;
+        tokio::time::sleep(delay).await;
         let state = self.state();
         match &state.pr_diff_error {
             Some(err) => Err(err.clone()),

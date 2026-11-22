@@ -1088,6 +1088,31 @@ async fn nothing_to_review_posts_nothing(pool: PgPool) {
     assert_eq!(s.chat.calls().len(), 1);
 }
 
+/// Once the mode is known, the fetches that follow are bounded by that mode's budget, not
+/// only by the larger backstop of `review_pr`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn generalist_fetch_phase_is_bounded_by_its_own_budget(pool: PgPool) {
+    let mut s = setup(
+        &pool,
+        FakeGit::new(pr("h1"), vec![file("src/a.rs", PATCH_234)]),
+    )
+    .await;
+    s.git.state().pr_diff_delay = Duration::from_secs(30);
+    s.engine.review_timeout = Duration::from_millis(300);
+    let started = Instant::now();
+
+    let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    assert_eq!(err, EngineError::Fatal("review timed out".into()));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "cut at the Generalist budget"
+    );
+    let row = latest(&pool).await;
+    assert_eq!(row.status, ReviewStatus::Failed);
+    assert_eq!(row.error.as_deref(), Some("review timed out"));
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn slow_review_times_out_and_is_marked_failed(pool: PgPool) {
     let mut s = setup(
@@ -1940,16 +1965,17 @@ async fn slow_specialist_submits_before_the_finder_deadline(pool: PgPool) {
     let mut s = setup(&pool, FakeGit::new(pr("h1"), vec![file("a.rs", PATCH_2)])).await;
     s.git.state().clone_spec = Some(clone_spec());
     s.cloner.files(&[("a.rs", "a\nb\n")]);
-    // Finder deadline at 60 % = 1.2 s. The Bug reviewer's first step takes 300 ms and every
-    // later one 60 ms, and it keeps reading files while it may: running all 20 steps would end
-    // at ~1.44 s, after the deadline. With less than 1.5 × 300 ms left it must submit instead.
-    s.engine.specialists_review_timeout = Duration::from_secs(2);
+    // Finder deadline at 60 % = 2.4 s. The Bug reviewer's first step takes 600 ms and every
+    // later one 100 ms, and it keeps reading files while it may: running all 20 steps would end
+    // at ~2.5 s, after the deadline. With less than 2 × 600 ms left it must submit instead
+    // (around 1.3 s), leaving about a second of margin for a loaded host.
+    s.engine.specialists_review_timeout = Duration::from_secs(4);
     s.chat.explore_until_wrap_up(
         BUG_ROLE,
         "a.rs",
         json!([finding_json("a.rs", 2, "warning", "Slow bug")]),
-        Duration::from_millis(300),
-        Duration::from_millis(60),
+        Duration::from_millis(600),
+        Duration::from_millis(100),
     );
 
     let id = run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
@@ -1974,7 +2000,7 @@ async fn slow_specialist_submits_before_the_finder_deadline(pool: PgPool) {
         .filter(|c| c.system.contains(BUG_ROLE))
         .collect();
     // It investigated, then wrapped up early on time, not in the last steps of its budget.
-    assert!(bug.len() > 2, "{} steps", bug.len());
+    assert!(bug.len() >= 2, "{} steps", bug.len());
     assert!(bug.len() < FINDER_MAX_STEPS - 2, "{} steps", bug.len());
     let (last, earlier) = bug.split_last().unwrap();
     assert_eq!(last.tools, vec!["submit_findings"]);

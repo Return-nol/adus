@@ -19,14 +19,15 @@ Collected from the per-task and final reviews of the v1 plan and the follow-up p
 - Task 15: minor (deferred): key value kept in state after failed save until close; busy.delete outside finally; fail() duplicated in 4 pages (move to api.ts); chart colors near-gray; Select value='' None unverified at runtime; sidebar /token-usage→/usage fixed
 - Task 16: minor (deferred): no test asserts updated_at advances; ACTIVE_REPO const duplicated in rules.rs/memories.rs; update/delete by id don't check active repo; rule_matches_path compiles glob per call (ponytail)
 - Task 17: minor (deferred): no unit test for safeHttpUrl; login page not prettier-formatted (fmt keeps reformatting it — format & commit once); scope dropdown includes disabled repos
-- Task 18: minor (deferred): XAUTOCLAIM from 0-0 COUNT 1 scans ~10 PEL entries (fine at 2 workers); jobs >15 min get reclaimed while running
+- Task 18: minor (deferred): XAUTOCLAIM from 0-0 COUNT 1 scans ~10 PEL entries (fine at 2 workers); ~~jobs >15 min get reclaimed while running~~ (resolved in Task 13: `RECLAIM_IDLE` 35 min > `JOB_TIMEOUT` 31 min, compile-time assert)
 - Task 18: minor (deferred): empty XPENDING after claim delivers anyway (at-least-once dup, very unlikely)
 - Task 19: minor (deferred): GitHub delivery id unsigned → replay with new id bypasses dedup (accepted; optional sha256(body) key); test cleanup leaks streams on failed assertion; CI must start Redis (Task 27)
 - Task 20: minor (deferred): first non-empty array could be an example array; title blank lines → double spaces
 - Task 21: minor (deferred): 'no model configured' comment repeats on every push (plan-mandated)
 - Task 21: minor (deferred): @adudu review on delete-only PR gives no visible feedback (Skipped row only)
 - Task 22: minor (deferred): GitHub email fallback in authorize is dead code/latent risk (plan-mandated; doc it); blockquote escapable with bare \r and re-pings @mentions; 'please review' → Unknown; mentions inside code/quotes trigger; missing-repo path untested
-- Task 23: minor (deferred): shutdown race strands a delivery 15 min (+1 attempt) — alternative is_cancelled check at loop top; reclaim duration not exposed for const assert
+- Task 23: minor (deferred): shutdown race strands a delivery until reclaim (now 35 min, +1 attempt) — alternative is_cancelled check at loop top; ~~reclaim duration not exposed for const assert~~ (resolved in Task 13: `adus_queue::RECLAIM_IDLE`)
+- Task 13: minor (deferred): reclaim after 35 min slows dead-worker takeover. Idea: the running worker refreshes its entry's idle time on each heartbeat (XCLAIM … JUSTID to itself), so RECLAIM_IDLE can go back to short.
 - Task 23: minor (deferred): Azure timeout mid-post → Retryable dup threads (pre-existing; split prepare/post phases, Fatal after posting starts on Azure); panic inside review_pr leaves row running; server failure exits code 0; abort() not awaited before unlock; rows left running after 30 s shutdown grace
 - Task 24: minor (deferred): repo filter omits soft-deleted repos; filter change flashes empty table
 - Task 25: minor (deferred): localhost warning misses [::1]; check_git list-error branch untested
