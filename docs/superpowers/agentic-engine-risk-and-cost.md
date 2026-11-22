@@ -1,6 +1,6 @@
 # Agentic review engine — risk & cost breakdown
 
-Living note for `feat/advanced-agentic-review-flow` (updated 2026-11-22). Spec: `docs/superpowers/specs/2026-11-21-agentic-review-engine-design.md`. Plan: `docs/superpowers/plans/2026-11-21-agentic-review-engine.md` (Tasks 1–13 written; 14–15 decided, not yet written into the plan).
+Living note for `feat/advanced-agentic-review-flow` (updated 2026-11-22). Spec: `docs/superpowers/specs/2026-11-21-agentic-review-engine-design.md`. Plan: `docs/superpowers/plans/2026-11-21-agentic-review-engine.md` (Tasks 1–15 written and done; final review #2 fixed).
 
 Token figures marked *estimate* come from the code limits (~4 chars per token). Figures marked *measured* come from live runs on `manot40/better-booru#11` (8 files, +102/−13, model `google/gemini-4-hydrogen`).
 
@@ -28,7 +28,7 @@ Token figures marked *estimate* come from the code limits (~4 chars per token). 
 | Dedup | fast model, Low | 1 (only when ≥ 2 findings) | a few K | — |
 | Small PR | primary, forced Generalist, no tools | 1 Finder call per batch + diff-only Verifier | ~3–5K + Verifier | 1–3 files, ≤ `small_pr_max_lines`, no risky path |
 
-Cost drivers: re-sent agent history (prompt caching helps — Gemini read 108K from cache on the Generalist run), reasoning tokens (billed as output), Specialists multiplying the Finder, and retries (a retried review repeats clone + Finder + Verifier).
+Cost drivers: re-sent agent history (prompt caching helps — Gemini read 108K from cache on the Generalist run), reasoning tokens (billed as output), Specialists multiplying the Finder, and retries (a retried review repeats clone + Finder + Verifier; the token ceiling is per run, so each Generalist retry may spend up to it again).
 
 ### Time budget
 
@@ -61,7 +61,7 @@ Up to 500 MB temp disk per running review × workers; CPU for in-process grep (1
 
 - Verifier is fail-closed: fewer false positives, some true findings dropped (counted in a note).
 - Semantic Dedup by the fast model may merge distinct issues; on error it keeps everything.
-- Partial reviews: Specialists posts survivors with a note; Generalist retries when every Finder failure is retryable; deadline cuts never retry. Task 13 makes slow agents submit before the deadline instead of losing their work.
+- Partial reviews: Specialists posts survivors with a note; Generalist retries when some Finder task failed and every failure was retryable; deadline cuts and token-budget skips never retry. Task 13 makes slow agents submit before the deadline instead of losing their work.
 - Small-PR heuristic: substring risky words fail safe (`author.rs` → full review). Open: a tiny follow-up push to a large PR counts as small.
 - Multi-line anchors not yet verified live (GitHub range acceptance + Apply, Azure end offset, Azure suggestion fences). A GitHub 422 fails the whole review.
 - Parked regression: Verifier snippet can miss the end line on spans > ~160 lines.
@@ -103,10 +103,10 @@ Defaults change in the new migration 0009 (0003 is already on `origin/feat/adus-
 
 | # | Mitigation | Task | Status |
 |---|---|---|---|
-| — | Deadline-aware wrap-up (time or last 2 steps) + one step-budget note; 30-min Specialists budget; worker chain 31/35/35 | 13 | implementing |
-| 1 | Per-review input-token ceiling: setting `max_review_input_tokens` (default 2,000,000, 0 = off); when crossed, Finder agents wrap up and remaining Verifier candidates are dropped with a note | 14 | done |
-| 2 | Secret redaction: mask API keys, tokens, private keys, `password=`-style values in tool outputs and repo instructions before the LLM, and in posted comment bodies; PR diffs are not masked so a hardcoded secret can still be flagged | 15 | done |
-| 3 | Record `cache_read_tokens` / `cache_write_tokens` in `llm_usage` and show them in usage totals | 14 | done |
+| — | Deadline-aware wrap-up (time or last 2 steps) + one step-budget note; 30-min Specialists budget; worker chain 31/35/35 | 13 | done (`1859570`, fix `c3c5902`) |
+| 1 | Per-review input-token ceiling: setting `max_review_input_tokens` (default 2,000,000, 0 = off); when crossed, running agents wrap up, unstarted batches are skipped, and remaining Verifier candidates are verified diff-only (one fast-model call each, still fail-closed) instead of dropped; the summary names only what the ceiling cut | 14 | done (`7d12f25`; diff-only Verifier and precise note in final fix wave 2) |
+| 2 | Secret redaction: mask API keys, tokens, private keys, `password=`-style values in tool outputs and repo instructions before the LLM, and in posted comment bodies; PR diffs are not masked so a hardcoded secret can still be flagged | 15 | done (`79e9573`, fix `5059fce`) |
+| 3 | Record `cache_read_tokens` / `cache_write_tokens` in `llm_usage` and show them in usage totals | 14 | done (`7d12f25`) |
 | 4 | Skip a review whose PR head changed while queued (check whether already done) | — | not chosen yet |
 | 5 | Log every webhook Adus rejects or ignores (event, reason, never the body) | — | not chosen yet |
 | 6 | Cheaper Specialists (Performance at Medium, step cap ~14) | — | not chosen yet |
@@ -119,14 +119,15 @@ Kill git's helper child on clone timeout; runtime orphan-workspace sweep; Verifi
 ## 4. Decisions on record (2026-11-21 → 22)
 
 - Tools keep honouring `.gitignore`.
-- Generalist retries when any Finder failure is retryable; Specialists keeps partial posting.
+- Generalist retries when some Finder task failed and every failure was retryable; Specialists keeps partial posting.
 - Small PRs: Finder diff-only (legacy per-file prompt deleted), always Generalist; commands bypass.
 - Docker only for final gates (Linux compile/test check passed at `0c784d9`).
 - Specialists budget 30 min; deadline-aware wrap-up (Kodus community code consulted for behaviour only: `force-finalize.policy.ts`, `budget.policy.ts`, `llm-call.ts`; Kodus has no time-based wrap-up and drops an agent's findings on timeout).
-- Token ceiling is a setting (default 2M), not a constant.
+- Token ceiling is a setting (default 2M), not a constant. Once it is reached, remaining Verifier candidates are verified diff-only rather than dropped (user decision 2026-11-22).
 
 ## 5. Resume pointer
 
-- Branch `feat/advanced-agentic-review-flow`; latest commits `37ede53` (plan Task 13) on top of `5a6bc5f` (Task 11). Nothing pushed; `.cargo/config.toml` stays uncommitted.
-- SDD ledger: `.superpowers/sdd/2026-11-21-agentic-review-engine/progress.md` (tail lists Task 13 dispatch and the Task 14/15 decisions).
-- Next: Task 13 report → review → (fix loop) → write Tasks 14 and 15 into the plan → implement + review each → dev DB repair (new 0008 checksum, settings row 30/1500/100) → Linux gate only if Unix code changed.
+- Branch `feat/advanced-agentic-review-flow`; Tasks 1–15 are committed (latest feature commits `7d12f25` Task 14, `79e9573`/`5059fce` Task 15), and final review #2 is fixed on top (`04e02dc` code, followed by a docs commit). `origin` has the branch up to `144a0a5`; later commits stay local until the user pushes. `.cargo/config.toml` stays uncommitted.
+- Dev DB: no 0008 checksum repair is needed. Migration 0009 moves the defaults (30/1500/100) and applies on the next server start.
+- Deferred minors of this plan live in `docs/superpowers/backlog.md` under "Agentic review engine (plan 2026-11-21)".
+- Next: merge review, then the Linux gate only if Unix code changed.
