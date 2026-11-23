@@ -2,6 +2,7 @@ mod agent;
 mod budget;
 pub mod command;
 mod dedup;
+mod discussion;
 pub mod engine;
 pub mod finder;
 mod parse;

@@ -19,8 +19,8 @@ use adus_db::rules::Rule;
 use adus_db::{ai, memories, rules, settings};
 use adus_git::diff::{added_line_count, intersect_hunks, right_line_end_offset};
 use adus_git::{
-    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PullRequest,
-    RepoRef,
+    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PrThread,
+    PullRequest, RepoRef,
 };
 use adus_llm::ReasoningEffort;
 use adus_llm::router::{ChatError, ChatService, UsageContext};
@@ -30,7 +30,8 @@ use uuid::Uuid;
 
 use crate::agent::AgentError;
 use crate::budget::TokenBudget;
-use crate::dedup::deduplicate_findings;
+use crate::dedup::{DedupOutcome, deduplicate_findings};
+use crate::discussion::threads_for_dedup;
 use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
@@ -154,6 +155,8 @@ struct Stages<'a> {
     fast_model: &'a str,
     rules: &'a [Rule],
     memories: &'a [Memory],
+    /// The PR's existing discussion (empty when it could not be fetched).
+    threads: &'a [PrThread],
     usage: &'a UsageContext,
     deadlines: Deadlines,
     /// A small, low-risk PR: reviewed diff-only in one Generalist pass (`mode` is already
@@ -415,6 +418,17 @@ impl Engine {
                 }
                 (small, rules, memories, manifest)
             };
+            // Read once, for Semantic Dedup. Without it the review still runs, as before.
+            let threads = if files.is_empty() {
+                Vec::new()
+            } else {
+                git.list_pr_threads(&repo_ref, pr_number)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(%review_id, error = %err, "could not list PR threads; deduplicating without them");
+                        Vec::new()
+                    })
+            };
 
             let budget = self.budget(mode);
             let usage = UsageContext {
@@ -432,6 +446,7 @@ impl Engine {
                 fast_model: &fast_model,
                 rules: &rules,
                 memories: &memories,
+                threads: &threads,
                 usage: &usage,
                 deadlines: Deadlines::new(start, budget),
                 small,
@@ -632,26 +647,39 @@ impl Engine {
         };
         let verified_kept = verified.len();
 
-        let found: Vec<Suggestion> = if verified.len() < 2 {
-            verified.into_iter().map(|c| c.suggestion).collect()
-        } else {
-            let fallback: Vec<Suggestion> = verified.iter().map(|c| c.suggestion.clone()).collect();
-            let dedup = deduplicate_findings(
-                self.chat.as_ref(),
-                s.provider_id,
-                s.fast_model,
-                s.usage,
-                Some(s.token_budget.as_ref()),
-                verified,
-            );
-            match tokio::time::timeout_at(s.deadlines.dedup, dedup).await {
-                Ok(kept) => kept,
-                Err(_elapsed) => {
-                    tracing::warn!("semantic dedup cut by the deadline; keeping all findings");
-                    fallback
+        let finding_paths = verified
+            .iter()
+            .map(|c| normalize_path(&c.suggestion.file))
+            .collect();
+        let existing = threads_for_dedup(s.threads, &finding_paths);
+        let fallback: Vec<Suggestion> = verified.iter().map(|c| c.suggestion.clone()).collect();
+        let dedup = deduplicate_findings(
+            self.chat.as_ref(),
+            s.provider_id,
+            s.fast_model,
+            s.usage,
+            Some(s.token_budget.as_ref()),
+            verified,
+            &existing,
+        );
+        let DedupOutcome {
+            kept: found,
+            already_raised,
+        } = match tokio::time::timeout_at(s.deadlines.dedup, dedup).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => {
+                tracing::warn!("semantic dedup cut by the deadline; keeping all findings");
+                DedupOutcome {
+                    kept: fallback,
+                    already_raised: 0,
                 }
             }
         };
+        if already_raised > 0 {
+            warnings.push(format!(
+                "{already_raised} finding(s) skipped: already raised in this PR's discussion."
+            ));
+        }
 
         let budget = s.token_budget.as_ref();
         // Only when the ceiling changed something (spec decision 15).
@@ -666,7 +694,8 @@ impl Engine {
             candidates = candidate_count,
             verified_kept,
             verifier_dropped,
-            dedup_dropped = verified_kept.saturating_sub(found.len()),
+            dedup_dropped = verified_kept.saturating_sub(found.len() + already_raised),
+            already_raised,
             cache_read_tokens,
             cache_write_tokens,
             input_tokens = budget.used(),

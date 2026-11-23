@@ -8,7 +8,7 @@ use adus_db::connections::ConnectionStatus;
 use adus_db::repositories::RepoPatch;
 use adus_db::reviews::{self, Review, ReviewStatus};
 use adus_db::rules::{self, KnowledgeScope, NewRule};
-use adus_git::{ConnectionKind, FileStatus, GitError};
+use adus_git::{ConnectionKind, FileStatus, GitError, PrThread, PrThreadComment};
 use adus_llm::ReasoningEffort;
 use adus_llm::router::ChatError;
 use adus_review::engine::{EngineError, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
@@ -1742,6 +1742,61 @@ async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(poo
     assert_eq!(posted.comments.len(), 1);
     assert!(posted.comments[0].body.contains("Missing null check"));
     assert!(posted.summary.contains("Critical: 1"));
+}
+
+const ALREADY_RAISED_NOTE: &str = "1 finding(s) skipped: already raised in this PR's discussion.";
+
+/// `src/a.rs` with one Finder finding on line 3 and one existing thread on that file.
+async fn setup_with_discussion(pool: &PgPool) -> Setup {
+    let s = setup_files(pool, vec![file("src/a.rs", PATCH_234)]).await;
+    s.git.state().threads = vec![PrThread {
+        path: Some("src/a.rs".into()),
+        line: Some(3),
+        status: None,
+        url: None,
+        comments: vec![PrThreadComment {
+            author: "bob".into(),
+            by_adus: false,
+            body: "This can overflow.".into(),
+        }],
+    }];
+    s.chat.finder(Reply::text(
+        &json!([finding_json("src/a.rs", 3, "critical", "Overflow")]).to_string(),
+    ));
+    s
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_skips_findings_already_raised_in_discussion(pool: PgPool) {
+    let s = setup_with_discussion(&pool).await;
+    s.chat.push_stage(
+        Stage::Dedup,
+        Reply::text(r#"{"keep_indices": [0], "already_raised": [{"finding": 0, "comment": 0}]}"#),
+    );
+
+    let id = run(&s, Trigger::Updated).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    let dedup = s.chat.dedup_calls();
+    assert_eq!(dedup.len(), 1);
+    assert!(dedup[0].user.contains("This can overflow."));
+    let git = s.git.state();
+    assert!(git.reviews[0].comments.is_empty());
+    assert!(git.reviews[0].summary.contains(ALREADY_RAISED_NOTE));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_posts_normally_when_thread_fetch_fails(pool: PgPool) {
+    let s = setup_with_discussion(&pool).await;
+    s.git.state().threads_error = Some(GitError::Status(500));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
+    assert!(s.chat.dedup_calls().is_empty(), "one finding, no comments");
+    let git = s.git.state();
+    assert_eq!(git.reviews[0].comments.len(), 1);
+    assert!(!git.reviews[0].summary.contains("already raised"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
