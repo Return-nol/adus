@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::agent::{AgentLlm, chat_low_effort};
 use crate::command::{MAX_MEMORY_CHARS, authorize};
-use crate::discussion::format_threads;
+use crate::discussion::{format_threads, within_budget};
 use crate::engine::{Engine, EngineError, chat_error, db_error, is_retryable};
 use crate::parse::first_json_object;
 use crate::prompt::wrap;
@@ -28,8 +28,11 @@ use crate::prompt::wrap;
 const MAX_LEARN_THREADS: usize = 60;
 /// Most exceptions stored per PR head.
 const MAX_EXCEPTIONS: usize = 5;
-/// Output cap of the answer (up to 5 statements of at most 2,000 chars).
-const LEARN_MAX_TOKENS: u32 = 4_096;
+/// Output cap of the answer (up to 5 statements of at most 2,000 chars); OpenAI counts reasoning
+/// tokens in it too.
+const LEARN_MAX_TOKENS: u32 = 8_192;
+/// Longest `<known_memories>` and `<rejected_memories>` list each, in chars.
+const MAX_MEMORIES_CHARS: usize = 20_000;
 
 const LEARN_SYSTEM: &str = r#"You read the discussion of a closed pull request and pick out design exceptions: places where a reviewer (Adus or a person) flagged code as wrong and the discussion established that the code is intentional, with a reason such as the product requirements (PRD), the team's coding standard or an external constraint.
 <threads> holds the qualifying discussion threads, each with an index, its file path and line when it has one, and a status (an Azure DevOps status of "byDesign" or "wontFix" is a strong hint). Each comment has an index within its thread and an author ("adus" is Adus itself).
@@ -110,11 +113,12 @@ impl Engine {
             Ok(threads) => threads,
             Err(err) => return Err(self.fetch_error(&conn, err).await),
         };
-        let qualifying: Vec<&PrThread> = threads
-            .iter()
-            .filter(|thread| qualifies(thread))
-            .take(MAX_LEARN_THREADS)
-            .collect();
+        let qualifying = within_budget(
+            threads
+                .iter()
+                .filter(|thread| qualifies(thread))
+                .take(MAX_LEARN_THREADS),
+        );
         if qualifying.is_empty() {
             return record(LearningOutcome::NothingToLearn, 0)
                 .await
@@ -187,25 +191,54 @@ impl Engine {
 
     /// The first `defended_by` comment author who is a registered, active Adus user (the same
     /// match as `@adudu` commands), decided from the comment authors, never the model's word.
+    /// `None` as well when any other non-Adus author of the thread is not such a user, so an
+    /// outsider's reason never becomes active through a maintainer's unrelated reply.
     async fn defender(
         &self,
         kind: ConnectionKind,
         thread: &PrThread,
         defended_by: &[usize],
     ) -> Result<Option<Uuid>, EngineError> {
+        let mut defender = None;
         for &index in defended_by {
-            let login = thread.comments[index].author.clone();
-            // Azure's author is the `uniqueName`, which is the email.
-            let email = (kind == ConnectionKind::AzureDevops).then(|| login.clone());
-            let author = CommentAuthor {
-                login: Some(login),
-                email,
-            };
-            if let Some(user) = authorize(&self.db, kind, &author).await.map_err(db_error)? {
-                return Ok(Some(user.id));
+            defender = self
+                .registered(kind, &thread.comments[index].author)
+                .await?;
+            if defender.is_some() {
+                break;
             }
         }
-        Ok(None)
+        if defender.is_none() {
+            return Ok(None);
+        }
+        let authors: BTreeSet<&str> = thread
+            .comments
+            .iter()
+            .filter(|c| !c.by_adus)
+            .map(|c| c.author.as_str())
+            .collect();
+        for author in authors {
+            if self.registered(kind, author).await?.is_none() {
+                return Ok(None);
+            }
+        }
+        Ok(defender)
+    }
+
+    /// The registered, active Adus user who wrote as `author` (login, or email on Azure, where
+    /// the author is the `uniqueName`).
+    async fn registered(
+        &self,
+        kind: ConnectionKind,
+        author: &str,
+    ) -> Result<Option<Uuid>, EngineError> {
+        let email = (kind == ConnectionKind::AzureDevops).then(|| author.to_string());
+        let author = CommentAuthor {
+            login: Some(author.to_string()),
+            email,
+        };
+        let user = authorize(&self.db, kind, &author).await.map_err(db_error)?;
+        Ok(user.map(|user| user.id))
     }
 }
 
@@ -243,13 +276,23 @@ fn valid_exceptions(exceptions: Vec<Exception>, threads: &[&PrThread]) -> Vec<Ex
 }
 
 /// The threads in `<threads>`, then known memories (every status but rejected) in
-/// `<known_memories>` and rejected ones in `<rejected_memories>`, each wrapped as data.
+/// `<known_memories>` and rejected ones in `<rejected_memories>`, each wrapped as data. Each
+/// memory list is newest first and stops before the memory that would take it past
+/// `MAX_MEMORIES_CHARS`.
 fn build_user_prompt(threads: &[&PrThread], known: &[Memory]) -> String {
     let list = |rejected: bool| {
+        // Pretty JSON of strings: `[`, newline, then per item two spaces, the escaped string,
+        // a comma (not after the last) and a newline, then `]`: 2 + sum(escaped + 4) chars.
+        let mut length = 2;
         let contents: Vec<&str> = known
             .iter()
+            .rev()
             .filter(|m| (m.status == MemoryStatus::Rejected) == rejected)
             .map(|m| m.content.as_str())
+            .take_while(|content| {
+                length += json!(content).to_string().chars().count() + 4;
+                length <= MAX_MEMORIES_CHARS
+            })
             .collect();
         serde_json::to_string_pretty(&contents).unwrap_or_else(|_| json!(contents).to_string())
     };

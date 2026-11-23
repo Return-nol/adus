@@ -126,6 +126,7 @@ pub struct PrThreadComment {
 - Each exception becomes a memory: `scope = repo`, `source = pr_learning`, `source_url` = the thread's url, `created_by` = the registered Adus user who defended it (else `NULL`), and a status:
   - mode `approval` → `pending`, whoever defended it;
   - mode `auto` → `active` **only** when at least one `defended_by` comment's author is a registered, active Adus user, matched with the same rule as `@adudu` commands (GitHub `users.github_login`, Azure email = `uniqueName`, both case-insensitive); otherwise `pending`. The check is done in code from the comment authors, never from the model's word.
+  - *Implementation refinement (final review):* `auto` additionally requires every non-Adus comment author in that thread to resolve to a registered, active Adus user; otherwise `pending`. This stops an unregistered commenter's "by design" reason from going live because the model cited an unrelated maintainer reply. The threads section is cut to 40,000 chars and the known/rejected memory lists to 20,000 chars each (newest first); the answer cap is 8,192 tokens (see `docs/SPEC.md` §8.5).
 
 ## 6. Data Model (migration `0009`)
 

@@ -44,9 +44,10 @@ pub(crate) struct DedupOutcome {
 ///
 /// No call is made without findings, or for one finding with no existing thread. An LLM error,
 /// an unparseable answer, an index out of range or an empty `keep_indices` keeps every finding
-/// (logged as a warning). A finding is dropped as already raised only when the answer cites a
-/// thread that exists. The call's input tokens are added to `token_budget`; it runs even when
-/// the budget is exhausted (one small call).
+/// (logged as a warning), except that an empty `keep_indices` with at least one valid
+/// `already_raised` citation means "keep all, then drop the cited ones". A finding is dropped as
+/// already raised only when the answer cites a thread that exists. The call's input tokens are
+/// added to `token_budget`; it runs even when the budget is exhausted (one small call).
 pub(crate) async fn deduplicate_findings(
     chat: &dyn ChatService,
     provider_id: Uuid,
@@ -87,7 +88,13 @@ pub(crate) async fn deduplicate_findings(
         }
     };
     let Some((keep, answer)) = first_json_object::<DedupAnswer>(&text).and_then(|answer| {
-        let keep = valid_selection(&answer.keep_indices, findings.len())?;
+        let cites = |c: &Citation| c.finding < findings.len() && c.comment < existing.len();
+        // Everything already raised: the natural answer keeps nothing as a duplicate pick.
+        let keep = if answer.keep_indices.is_empty() && answer.already_raised.iter().any(cites) {
+            (0..findings.len()).collect()
+        } else {
+            valid_selection(&answer.keep_indices, findings.len())?
+        };
         Some((keep, answer))
     }) else {
         tracing::warn!("semantic dedup answer has no valid keep_indices; keeping all findings");
@@ -285,13 +292,24 @@ mod tests {
     #[tokio::test]
     async fn dedup_runs_for_one_finding_when_existing_comments() {
         let thread = existing("This can panic on empty input.");
+        // An empty keep_indices with a valid citation means "keep all, drop the cited".
+        for keep in ["[0]", "[]"] {
+            let chat = ScriptedChat::new(vec![text_turn(&format!(
+                r#"{{"keep_indices": {keep}, "already_raised": [{{"finding": 0, "comment": 0}}]}}"#
+            ))]);
+            let outcome = dedup_with(&chat, findings(&["only"]), &[&thread]).await;
+            assert!(outcome.kept.is_empty(), "{keep}");
+            assert_eq!(outcome.already_raised, 1, "{keep}");
+            assert_eq!(chat.requests().len(), 1);
+        }
+        // Without a valid citation an empty keep_indices is still invalid: keep everything.
         let chat = ScriptedChat::new(vec![text_turn(
-            r#"{"keep_indices": [0], "already_raised": [{"finding": 0, "comment": 0}]}"#,
+            r#"{"keep_indices": [], "already_raised": [{"finding": 0, "comment": 5}]}"#,
         )]);
-        let outcome = dedup_with(&chat, findings(&["only"]), &[&thread]).await;
-        assert!(outcome.kept.is_empty());
-        assert_eq!(outcome.already_raised, 1);
-        assert_eq!(chat.requests().len(), 1);
+        let input = findings(&["only"]);
+        let outcome = dedup_with(&chat, input.clone(), &[&thread]).await;
+        assert_eq!(outcome.kept, suggestions(&input));
+        assert_eq!(outcome.already_raised, 0);
     }
 
     #[tokio::test]

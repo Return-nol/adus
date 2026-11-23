@@ -338,7 +338,8 @@ struct AzPosition {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzComment {
-    author: AzIdentity,
+    #[serde(default)]
+    author: Option<AzIdentity>,
     content: Option<String>,
     comment_type: Option<String>,
     #[serde(default)]
@@ -348,23 +349,26 @@ struct AzComment {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzIdentity {
-    unique_name: String,
+    #[serde(default)]
+    unique_name: Option<String>,
 }
 
 impl AzThread {
-    /// Drops system and deleted comments; `None` when nothing is left.
+    /// Drops system and deleted comments and comments without an author name (`uniqueName` is
+    /// deprecated in Azure's IdentityRef); `None` when nothing is left.
     fn into_thread(self) -> Option<PrThread> {
         let comments: Vec<PrThreadComment> = self
             .comments
             .into_iter()
             .filter(|c| !c.is_deleted && c.comment_type.as_deref() != Some("system"))
-            .map(|c| {
+            .filter_map(|c| {
+                let author = c.author.and_then(|a| a.unique_name)?;
                 let body = c.content.unwrap_or_default();
-                PrThreadComment {
-                    author: c.author.unique_name,
+                Some(PrThreadComment {
+                    author,
                     by_adus: body.contains(ADUDU_MARKER),
                     body,
-                }
+                })
             })
             .collect();
         if comments.is_empty() {

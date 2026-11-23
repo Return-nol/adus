@@ -24,6 +24,19 @@
           "author": { "displayName": "Dev", "uniqueName": "dev@acme.com" },
           "content": "Intended, input is validated upstream.",
           "commentType": "text"
+        },
+        {
+          "id": 3,
+          "parentCommentId": 1,
+          "content": "Comment with no author.",
+          "commentType": "text"
+        },
+        {
+          "id": 4,
+          "parentCommentId": 1,
+          "author": { "displayName": "Ghost" },
+          "content": "Author without uniqueName.",
+          "commentType": "text"
         }
       ]
     },

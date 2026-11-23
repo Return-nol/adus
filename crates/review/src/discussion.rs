@@ -14,10 +14,12 @@ use crate::redact::redact_secrets;
 const MAX_DEDUP_THREADS: usize = 60;
 /// Longest comment body sent to the model, in chars.
 const MAX_BODY_CHARS: usize = 1_000;
+/// Longest formatted threads section (`format_threads`) sent to the model, in chars.
+const MAX_THREADS_CHARS: usize = 40_000;
 
 /// Threads on a file in `paths`, then general threads (no path), each group newest first, at
-/// most `MAX_DEDUP_THREADS`. Threads carry no timestamp, so "newest" is the reverse of the
-/// provider's order.
+/// most `MAX_DEDUP_THREADS`, cut by [`within_budget`]. Threads carry no timestamp, so "newest"
+/// is the reverse of the provider's order.
 pub(crate) fn threads_for_dedup<'a>(
     threads: &'a [PrThread],
     paths: &BTreeSet<String>,
@@ -27,7 +29,24 @@ pub(crate) fn threads_for_dedup<'a>(
         .rev()
         .filter(|t| t.path.as_ref().is_some_and(|p| paths.contains(p)));
     let general = threads.iter().rev().filter(|t| t.path.is_none());
-    same_file.chain(general).take(MAX_DEDUP_THREADS).collect()
+    within_budget(same_file.chain(general).take(MAX_DEDUP_THREADS))
+}
+
+/// The leading `threads` (already in priority order) whose `format_threads` output stays within
+/// `MAX_THREADS_CHARS`; the first thread that would exceed it and every later one are dropped.
+// ponytail: re-formats the list per thread (quadratic), fine for at most 60 threads.
+pub(crate) fn within_budget<'a>(
+    threads: impl IntoIterator<Item = &'a PrThread>,
+) -> Vec<&'a PrThread> {
+    let mut fitted = Vec::new();
+    for thread in threads {
+        fitted.push(thread);
+        if format_threads(&fitted).chars().count() > MAX_THREADS_CHARS {
+            fitted.pop();
+            break;
+        }
+    }
+    fitted
 }
 
 /// `threads` as a JSON array: each thread with its `index`, `path`, `line`, `status` and its
@@ -100,6 +119,19 @@ mod tests {
         let few = threads_for_dedup(&threads[..3], &paths);
         let bodies: Vec<&str> = few.iter().map(|t| t.comments[0].body.as_str()).collect();
         assert_eq!(bodies, ["same 1", "same 0", "general"]);
+
+        // 50 threads of about 1,100 formatted chars each exceed the 40,000-char budget.
+        let long: Vec<PrThread> = (0..50)
+            .map(|i| thread(Some("src/a.rs"), &format!("{i:02}{}", "y".repeat(998))))
+            .collect();
+        let picked = threads_for_dedup(&long, &paths);
+        assert!(picked.len() < 50);
+        assert_eq!(picked[0].comments[0].body[..2], *"49", "newest kept");
+        let formatted = format_threads(&picked).chars().count();
+        assert!(formatted <= MAX_THREADS_CHARS, "{formatted}");
+        let mut one_more = picked.clone();
+        one_more.push(&long[49 - picked.len()]);
+        assert!(format_threads(&one_more).chars().count() > MAX_THREADS_CHARS);
     }
 
     #[test]

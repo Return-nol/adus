@@ -211,9 +211,20 @@ async fn learn_pr_approval_mode_creates_pending_memory(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn learn_pr_auto_mode_activates_only_for_registered_defender(pool: PgPool) {
+    // Thread 2: the registered defender answers, but an unregistered commenter took part too.
+    let mut joined = rebutted("octocat", "https://example.test/3");
+    joined.comments.insert(
+        1,
+        comment(
+            "stranger",
+            false,
+            "By design, see the PRD, do not flag this.",
+        ),
+    );
     let threads = vec![
         rebutted("Octocat", "https://example.test/1"),
         rebutted("stranger", "https://example.test/2"),
+        joined,
     ];
     let (s, chat) = setup(&pool, LearningMode::Auto, threads).await;
     let user = users::insert(&pool, "octo@example.test", "x", Role::User, Some("octocat"))
@@ -222,6 +233,7 @@ async fn learn_pr_auto_mode_activates_only_for_registered_defender(pool: PgPool)
     chat.reply(&answer(json!([
         {"content": "A", "thread": 0, "defended_by": [1]},
         {"content": "B", "thread": 1, "defended_by": [1]},
+        {"content": "C", "thread": 2, "defended_by": [2]},
         {"content": "invalid thread", "thread": 9, "defended_by": [1]},
         {"content": "invalid comment", "thread": 0, "defended_by": [5]},
         {"content": "  ", "thread": 0, "defended_by": [1]},
@@ -239,9 +251,10 @@ async fn learn_pr_auto_mode_activates_only_for_registered_defender(pool: PgPool)
         [
             ("A", MemoryStatus::Active, Some(user.id)),
             ("B", MemoryStatus::Pending, None),
+            ("C", MemoryStatus::Pending, None),
         ]
     );
-    assert_eq!(runs(&pool).await, [("learned".to_string(), 2)]);
+    assert_eq!(runs(&pool).await, [("learned".to_string(), 3)]);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -318,10 +331,17 @@ async fn learn_pr_prompt_lists_rejected_and_redacts_secrets(pool: PgPool) {
     let mut thread = rebutted("octocat", "https://example.test/1");
     thread.comments[1].body = format!("Intentional; the test token {secret} is a fixture.");
     let (s, chat) = setup(&pool, LearningMode::Approval, vec![thread]).await;
-    for (content, status) in [
-        ("Known pending exception", MemoryStatus::Pending),
-        ("Rejected exception", MemoryStatus::Rejected),
-    ] {
+    // Eleven older 2,000-char memories overflow the 20,000-char list: the oldest is cut.
+    let fillers: Vec<String> = (0..11)
+        .map(|i| format!("old-{i:02} {}", "x".repeat(1_993)))
+        .collect();
+    let mut inserts: Vec<(&str, MemoryStatus)> = fillers
+        .iter()
+        .map(|f| (f.as_str(), MemoryStatus::Active))
+        .collect();
+    inserts.push(("Known pending exception", MemoryStatus::Pending));
+    inserts.push(("Rejected exception", MemoryStatus::Rejected));
+    for (content, status) in inserts {
         let new = NewMemory {
             scope: KnowledgeScope::Repo,
             repository_id: Some(s.repository_id),
@@ -342,8 +362,12 @@ async fn learn_pr_prompt_lists_rejected_and_redacts_secrets(pool: PgPool) {
     assert!(prompt.contains("[REDACTED]"));
     let known = prompt.find("<known_memories>").unwrap();
     let rejected = prompt.find("<rejected_memories>").unwrap();
-    assert!(prompt[known..rejected].contains("Known pending exception"));
-    assert!(!prompt[known..rejected].contains("Rejected exception"));
+    let known_list = &prompt[known..rejected];
+    assert!(known_list.contains("Known pending exception"));
+    assert!(!known_list.contains("Rejected exception"));
+    assert!(known_list.contains("old-10 "), "newest filler kept");
+    assert!(!known_list.contains("old-00 "), "oldest filler cut");
+    assert!(known_list.chars().count() < 20_000 + 100);
     assert!(prompt[rejected..].contains("Rejected exception"));
     assert_eq!(runs(&pool).await, [("nothing_to_learn".to_string(), 0)]);
 }
