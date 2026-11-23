@@ -1,4 +1,4 @@
-use adus_core::types::ReviewMode;
+use adus_core::types::{LearningMode, ReviewMode};
 use adus_db::{
     ai, connections,
     repositories::{self, NewRepository, RepoPatch, Repository},
@@ -48,6 +48,7 @@ struct UpdateRepository {
     /// Ada dan `null` = ikuti bawaan global; tidak ada = biarkan.
     #[serde(default, deserialize_with = "present_or_null")]
     review_mode: Option<Option<ReviewMode>>,
+    learning_mode: Option<LearningMode>,
 }
 
 /// Membedakan field yang tidak dikirim (`None`) dari field yang dikirim `null` (`Some(None)`).
@@ -76,6 +77,7 @@ struct RepositoryJson {
     auto_review: bool,
     review_provider_id: Option<Uuid>,
     review_mode: Option<ReviewMode>,
+    learning_mode: LearningMode,
     webhook_count: usize,
     created_at: DateTime<Utc>,
 }
@@ -96,6 +98,7 @@ impl From<Repository> for RepositoryJson {
             auto_review: r.auto_review,
             review_provider_id: r.review_provider_id,
             review_mode: r.review_mode,
+            learning_mode: r.learning_mode,
             webhook_count: r.webhook_external_ids.len(),
             created_at: r.created_at,
         }
@@ -239,7 +242,7 @@ async fn update(
         auto_review: body.auto_review,
         review_provider_id: body.review_provider_id,
         review_mode: body.review_mode,
-        learning_mode: None,
+        learning_mode: body.learning_mode,
     };
     let repo = repositories::update(&state.db, id, patch)
         .await?
