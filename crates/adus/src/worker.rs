@@ -59,6 +59,10 @@ impl JobRunner for Engine {
                 .await
                 .map(|_review_id| ()),
             Job::PrComment { .. } => self.handle_comment(queue, job).await,
+            Job::LearnPr {
+                repository_id,
+                pr_number,
+            } => self.learn_pr(*repository_id, *pr_number).await,
         }
     }
 
@@ -175,6 +179,10 @@ pub async fn handle_delivery(
             pr_number,
             ..
         } => ("pr_comment", repository_id, pr_number),
+        Job::LearnPr {
+            repository_id,
+            pr_number,
+        } => ("learn_pr", repository_id, pr_number),
     };
     let span =
         tracing::info_span!("job", kind, %repository_id, pr_number, attempt = delivery.attempt);

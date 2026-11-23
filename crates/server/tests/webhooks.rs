@@ -359,15 +359,23 @@ async fn azure_pr_updated_enqueues_updated_trigger(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn azure_completed_pr_ignored(pool: PgPool) {
+async fn azure_closed_pr_queues_learning(pool: PgPool) {
     let hook = setup(pool, ConnectionKind::AzureDevops).await;
     for status in ["completed", "abandoned"] {
-        let body = edited(AZ_PR_UPDATED, |v| v["resource"]["status"] = json!(status));
+        // A distinct notification id per status, so delivery dedup does not drop the second.
+        let body = edited(AZ_PR_UPDATED, |v| {
+            v["resource"]["status"] = json!(status);
+            v["id"] = json!(format!("closed-{status}"));
+        });
         let reply = common::send(&hook.app, azure_request(hook.repo_id, TOKEN, &body)).await;
-        assert_eq!(reply.status, StatusCode::OK, "{status}");
-        assert_eq!(reply.body, status_body("ignored"));
+        assert_eq!(reply.status, StatusCode::ACCEPTED, "{status}");
+        assert_eq!(reply.body, status_body("queued"));
     }
-    assert!(queued_jobs(&hook.prefix).await.is_empty());
+    let learn = Job::LearnPr {
+        repository_id: hook.repo_id,
+        pr_number: 1,
+    };
+    assert_eq!(queued_jobs(&hook.prefix).await, vec![learn.clone(), learn]);
     common::cleanup_queue(&hook.prefix).await;
 }
 
