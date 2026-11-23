@@ -1,0 +1,16 @@
+[
+  {
+    "id": 301,
+    "user": { "login": "erin", "type": "User" },
+    "body": "Please split this PR.",
+    "state": "CHANGES_REQUESTED",
+    "html_url": "https://github.com/octocat/alpha/pull/7#pullrequestreview-301"
+  },
+  {
+    "id": 302,
+    "user": { "login": "frank", "type": "User" },
+    "body": "",
+    "state": "APPROVED",
+    "html_url": "https://github.com/octocat/alpha/pull/7#pullrequestreview-302"
+  }
+]

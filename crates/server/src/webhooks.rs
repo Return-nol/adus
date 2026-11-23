@@ -220,6 +220,7 @@ fn parse_github(event: &str, body: &Value, repo_id: Uuid) -> Option<Job> {
     let action = body["action"].as_str()?;
     match event {
         "pull_request" => {
+            let pr_number = pr_number(&body["pull_request"]["number"])?;
             let trigger = match action {
                 "opened" | "ready_for_review" => Trigger::Opened,
                 // Reopen: engine melewatinya jika head-nya sudah pernah direview.
@@ -227,11 +228,18 @@ fn parse_github(event: &str, body: &Value, repo_id: Uuid) -> Option<Job> {
                 // Judul diubah: kata kunci judul yang diabaikan mungkin baru dihapus. Edit lain
                 // (mis. deskripsi saja) diabaikan; head yang sama tetap dilewati engine.
                 "edited" if !body["changes"]["title"].is_null() => Trigger::Updated,
+                // Merged or not: learn from the PR's discussion.
+                "closed" => {
+                    return Some(Job::LearnPr {
+                        repository_id: repo_id,
+                        pr_number,
+                    });
+                }
                 _ => return None,
             };
             Some(Job::ReviewPr {
                 repository_id: repo_id,
-                pr_number: pr_number(&body["pull_request"]["number"])?,
+                pr_number,
                 trigger,
                 mode_override: None,
             })
@@ -278,12 +286,17 @@ fn parse_azure(body: &Value, repo_id: Uuid) -> Option<Job> {
         "ms.vss-code.git-pullrequest-comment-event" => return azure_comment(resource, repo_id),
         _ => return None,
     };
+    let pr_number = pr_number(&resource["pullRequestId"])?;
+    // A closed PR (merged or abandoned) is learned from, not reviewed.
     if matches!(resource["status"].as_str(), Some("completed" | "abandoned")) {
-        return None;
+        return Some(Job::LearnPr {
+            repository_id: repo_id,
+            pr_number,
+        });
     }
     Some(Job::ReviewPr {
         repository_id: repo_id,
-        pr_number: pr_number(&resource["pullRequestId"])?,
+        pr_number,
         trigger,
         mode_override: None,
     })
@@ -352,6 +365,13 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    fn learn(pr_number: i64) -> Option<Job> {
+        Some(Job::LearnPr {
+            repository_id: Uuid::nil(),
+            pr_number,
+        })
+    }
+
     fn review(pr_number: i64, trigger: Trigger) -> Option<Job> {
         Some(Job::ReviewPr {
             repository_id: Uuid::nil(),
@@ -413,7 +433,7 @@ mod tests {
             ("reopened", review(2, Trigger::Updated)),
             ("ready_for_review", review(2, Trigger::Opened)),
             ("synchronize", review(2, Trigger::Updated)),
-            ("closed", None),
+            ("closed", learn(2)),
             ("edited", None),
             ("labeled", None),
         ] {
@@ -545,7 +565,7 @@ mod tests {
         for status in ["completed", "abandoned"] {
             let mut body = fixture(AZ_PR_UPDATED);
             body["resource"]["status"] = json!(status);
-            assert_eq!(parse_azure(&body, id), None, "{status}");
+            assert_eq!(parse_azure(&body, id), learn(1), "{status}");
         }
 
         let mut body = fixture(AZ_PR_CREATED);

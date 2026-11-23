@@ -3,10 +3,12 @@ mod common;
 use adus_core::types::ConnectionKind;
 use adus_db::{
     connections,
+    memories::{self, MemorySource, MemoryStatus, NewMemory},
     repositories::{self, NewRepository},
+    rules::KnowledgeScope,
 };
 use axum::{Router, http::StatusCode};
-use common::{app, cookie_pair, get, json_req, post_json, send};
+use common::{app, cookie_pair, get, json_req, post_empty, post_json, send};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
@@ -396,4 +398,140 @@ async fn memory_list_patch_delete(pool: PgPool) {
     );
     let reply = patch(&app, &uri, &json!({ "enabled": true }), &user).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
+}
+
+/// Memory hasil belajar langsung lewat DB; mengembalikan id-nya.
+async fn learned_memory(pool: &PgPool, content: &str, status: MemoryStatus) -> String {
+    let memory = memories::insert(
+        pool,
+        NewMemory {
+            scope: KnowledgeScope::Global,
+            repository_id: None,
+            content,
+            source: MemorySource::PrLearning,
+            source_url: Some("https://example.com/pr/1"),
+            created_by: None,
+            status,
+        },
+    )
+    .await
+    .unwrap();
+    memory.id.to_string()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn approve_requires_admin_and_pending(pool: PgPool) {
+    let id = learned_memory(&pool, "learned", MemoryStatus::Pending).await;
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let user = login_as_user(&app, &admin).await;
+    let uri = format!("/api/v1/memories/{id}/approve");
+
+    assert_eq!(
+        post(&app, &uri, &json!({}), &user).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let reply = post(&app, &uri, &json!({ "content": "  " }), &admin).await;
+    assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(reply.body["error"]["code"], "validation_error");
+
+    let reply = post(&app, &uri, &json!({ "content": " edited " }), &admin).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["status"], "active");
+    assert_eq!(reply.body["source"], "pr_learning");
+    assert_eq!(reply.body["content"], "edited");
+
+    let reply = post(&app, &uri, &json!({}), &admin).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(reply.body["error"]["code"], "invalid_status");
+
+    let uri = format!("/api/v1/memories/{}/approve", uuid_nil());
+    assert_eq!(
+        post(&app, &uri, &json!({}), &admin).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reject_marks_rejected_and_hides_from_default_list(pool: PgPool) {
+    let id = learned_memory(&pool, "learned", MemoryStatus::Pending).await;
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let uri = format!("/api/v1/memories/{id}/reject");
+
+    let reply = send(&app, post_empty(&uri, Some(&admin))).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["status"], "rejected");
+    let reply = send(&app, post_empty(&uri, Some(&admin))).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(reply.body["error"]["code"], "invalid_status");
+
+    let reply = send(&app, get("/api/v1/memories", Some(&admin))).await;
+    assert!(reply.body.as_array().unwrap().is_empty());
+    let reply = send(&app, get("/api/v1/memories?status=rejected", Some(&admin))).await;
+    assert_eq!(ids(&reply.body), [id.as_str()]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn user_cannot_patch_or_delete_pending_memory(pool: PgPool) {
+    let pending = learned_memory(&pool, "pending", MemoryStatus::Pending).await;
+    let rejected = learned_memory(&pool, "rejected", MemoryStatus::Rejected).await;
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let user = login_as_user(&app, &admin).await;
+
+    for id in [&pending, &rejected] {
+        let uri = format!("/api/v1/memories/{id}");
+        let reply = patch(&app, &uri, &json!({ "enabled": false }), &user).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            delete(&app, &uri, &user).await.status,
+            StatusCode::FORBIDDEN
+        );
+    }
+    let uri = format!("/api/v1/memories/{pending}");
+    let reply = patch(&app, &uri, &json!({ "enabled": false }), &admin).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(
+        delete(&app, &uri, &admin).await.status,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn user_can_still_patch_active_memory(pool: PgPool) {
+    let id = learned_memory(&pool, "active", MemoryStatus::Active).await;
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let user = login_as_user(&app, &admin).await;
+    let uri = format!("/api/v1/memories/{id}");
+
+    let reply = patch(&app, &uri, &json!({ "content": "changed" }), &user).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["status"], "active");
+    assert_eq!(
+        delete(&app, &uri, &user).await.status,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_filters_by_status(pool: PgPool) {
+    let pending = learned_memory(&pool, "p", MemoryStatus::Pending).await;
+    let active = learned_memory(&pool, "a", MemoryStatus::Active).await;
+    learned_memory(&pool, "r", MemoryStatus::Rejected).await;
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+
+    let reply = send(&app, get("/api/v1/memories?status=pending", Some(&admin))).await;
+    assert_eq!(ids(&reply.body), [pending.as_str()]);
+    let uri = "/api/v1/memories?all=true&status=active";
+    let reply = send(&app, get(uri, Some(&admin))).await;
+    assert_eq!(ids(&reply.body), [active.as_str()]);
+    let reply = send(&app, get("/api/v1/memories", Some(&admin))).await;
+    assert_eq!(reply.body.as_array().unwrap().len(), 2);
+
+    let reply = send(&app, get("/api/v1/memories?status=nope", Some(&admin))).await;
+    assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(reply.body["error"]["code"], "validation_error");
 }

@@ -1,4 +1,4 @@
-use adus_core::types::{ConnectionKind, ReviewMode};
+use adus_core::types::{ConnectionKind, LearningMode, ReviewMode};
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
@@ -23,6 +23,7 @@ pub struct Repository {
     pub review_provider_id: Option<Uuid>,
     /// Per-repository review mode; NULL = use the global setting.
     pub review_mode: Option<ReviewMode>,
+    pub learning_mode: LearningMode,
     pub created_at: DateTime<Utc>,
 }
 
@@ -44,12 +45,13 @@ pub struct RepoPatch {
     pub auto_review: Option<bool>,
     pub review_provider_id: Option<Option<Uuid>>,
     pub review_mode: Option<Option<ReviewMode>>,
+    pub learning_mode: Option<LearningMode>,
 }
 
 // Semua query di bawah hanya melihat repo aktif (`deleted_at IS NULL`).
 const COLUMNS: &str = "id, connection_id, external_id, owner, project, project_name, name, default_branch, \
                        enabled, auto_review, webhook_external_ids, webhook_token, \
-                       review_provider_id, review_mode, created_at";
+                       review_provider_id, review_mode, learning_mode, created_at";
 
 /// `None` jika repo yang sama sudah aktif di connection ini.
 pub async fn insert(pool: &PgPool, new: NewRepository<'_>) -> Result<Option<Repository>> {
@@ -100,7 +102,8 @@ pub async fn update(pool: &PgPool, id: Uuid, patch: RepoPatch) -> Result<Option<
            enabled = COALESCE($2, enabled), \
            auto_review = COALESCE($3, auto_review), \
            review_provider_id = CASE WHEN $4 THEN $5 ELSE review_provider_id END, \
-           review_mode = CASE WHEN $6 THEN $7 ELSE review_mode END \
+           review_mode = CASE WHEN $6 THEN $7 ELSE review_mode END, \
+           learning_mode = COALESCE($8, learning_mode) \
          WHERE id = $1 AND deleted_at IS NULL RETURNING {COLUMNS}"
     ))
     .bind(id)
@@ -110,6 +113,7 @@ pub async fn update(pool: &PgPool, id: Uuid, patch: RepoPatch) -> Result<Option<
     .bind(patch.review_provider_id.flatten())
     .bind(patch.review_mode.is_some())
     .bind(patch.review_mode.flatten())
+    .bind(patch.learning_mode)
     .fetch_optional(pool)
     .await
 }
@@ -284,6 +288,7 @@ mod tests {
             webhook_token: None,
             review_provider_id: None,
             review_mode: None,
+            learning_mode: LearningMode::Approval,
             created_at: Utc::now(),
         }
     }
@@ -355,6 +360,7 @@ mod tests {
             webhook_token: Some("tok".into()),
             review_provider_id: None,
             review_mode: None,
+            learning_mode: LearningMode::Approval,
             created_at: Utc::now(),
         };
         let id = Uuid::nil();

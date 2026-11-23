@@ -11,8 +11,8 @@ pub use adus_core::types::{ConnectionKind, normalize_path};
 pub use azure::AzureProvider;
 pub use github::GithubProvider;
 pub use types::{
-    CloneSpec, FileDiff, FileStatus, GitError, InlineComment, PatOwner, PullRequest, RemoteRepo,
-    RepoRef,
+    CloneSpec, FileDiff, FileStatus, GitError, InlineComment, PatOwner, PrThread, PrThreadComment,
+    PullRequest, RemoteRepo, RepoRef,
 };
 
 #[async_trait]
@@ -58,6 +58,12 @@ pub trait GitProvider: Send + Sync {
         pr_number: i64,
         body: &str,
     ) -> Result<(), GitError>;
+    /// Discussion threads of a PR (inline threads and top-level comments), comments oldest first.
+    async fn list_pr_threads(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+    ) -> Result<Vec<PrThread>, GitError>;
     /// How to shallow-fetch the PR head with `git`. `None` when the provider cannot build one
     /// (the review then falls back to diff-only).
     fn clone_spec(&self, _repo: &RepoRef, _pr: &PullRequest) -> Option<CloneSpec> {

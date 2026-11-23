@@ -1,0 +1,79 @@
+{
+  "count": 4,
+  "value": [
+    {
+      "id": 11,
+      "status": "byDesign",
+      "threadContext": {
+        "filePath": "/src/a.rs",
+        "rightFileStart": { "line": 5, "offset": 1 },
+        "rightFileEnd": { "line": 5, "offset": 1 }
+      },
+      "comments": [
+        {
+          "id": 1,
+          "parentCommentId": 0,
+          "author": { "displayName": "Bot", "uniqueName": "adus@acme.com" },
+          "content": "Possible panic <!-- adudu -->",
+          "commentType": "text",
+          "isDeleted": false
+        },
+        {
+          "id": 2,
+          "parentCommentId": 1,
+          "author": { "displayName": "Dev", "uniqueName": "dev@acme.com" },
+          "content": "Intended, input is validated upstream.",
+          "commentType": "text"
+        },
+        {
+          "id": 3,
+          "parentCommentId": 1,
+          "content": "Comment with no author.",
+          "commentType": "text"
+        },
+        {
+          "id": 4,
+          "parentCommentId": 1,
+          "author": { "displayName": "Ghost" },
+          "content": "Author without uniqueName.",
+          "commentType": "text"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "status": "active",
+      "comments": [
+        {
+          "id": 1,
+          "author": { "displayName": "Lead", "uniqueName": "lead@acme.com" },
+          "content": "Looks good overall.",
+          "commentType": "text"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "comments": [
+        {
+          "id": 1,
+          "author": { "displayName": "Microsoft.VisualStudio.Services.TFS", "uniqueName": "00000002-0000-8888-8000-000000000000@2c895908-04e0-4952-89fd-54b0046d6288" },
+          "content": "Dev voted 10",
+          "commentType": "system"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "status": "active",
+      "comments": [
+        {
+          "id": 1,
+          "author": { "displayName": "Dev", "uniqueName": "dev@acme.com" },
+          "commentType": "text",
+          "isDeleted": true
+        }
+      ]
+    }
+  ]
+}

@@ -6,9 +6,12 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use adus_core::types::ADUDU_MARKER;
+
 use crate::{
-    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest,
-    RemoteRepo, RepoRef, basic_auth_header, decode, git_url, normalize_path,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PrThread,
+    PrThreadComment, PullRequest, RemoteRepo, RepoRef, basic_auth_header, decode, git_url,
+    normalize_path,
 };
 
 /// Batas halaman saat mengikuti header `Link` (30 x 100 = 3000 item).
@@ -237,6 +240,94 @@ impl GhFile {
     }
 }
 
+/// Comment author. `user` is null for deleted accounts.
+#[derive(Deserialize)]
+struct GhCommentUser {
+    login: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+/// Shared shape of review comments, issue comments and reviews (unused fields absent).
+#[derive(Deserialize)]
+struct GhComment {
+    id: i64,
+    in_reply_to_id: Option<i64>,
+    user: Option<GhCommentUser>,
+    body: Option<String>,
+    path: Option<String>,
+    line: Option<u32>,
+    html_url: Option<String>,
+}
+
+impl GhComment {
+    fn is_bot(&self) -> bool {
+        self.user.as_ref().is_some_and(|u| u.kind == "Bot")
+    }
+
+    fn into_comment(self) -> PrThreadComment {
+        let body = self.body.unwrap_or_default();
+        PrThreadComment {
+            // GitHub shows deleted accounts as `ghost`.
+            author: self.user.map_or_else(|| "ghost".into(), |u| u.login),
+            by_adus: body.contains(ADUDU_MARKER),
+            body,
+        }
+    }
+}
+
+fn http_url(url: Option<String>) -> Option<String> {
+    url.filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+}
+
+/// One top-level thread per comment.
+fn top_level_threads(comments: Vec<GhComment>) -> impl Iterator<Item = PrThread> {
+    comments.into_iter().map(|c| PrThread {
+        path: None,
+        line: None,
+        status: None,
+        url: http_url(c.html_url.clone()),
+        comments: vec![c.into_comment()],
+    })
+}
+
+/// Groups review comments into threads by `in_reply_to_id` (GitHub points replies at the root).
+/// A reply whose root is missing starts its own thread. Bot comments are dropped after
+/// grouping, so a human reply to a bot root still lands in that thread.
+fn review_comment_threads(mut comments: Vec<GhComment>) -> Vec<PrThread> {
+    comments.sort_by_key(|c| c.id);
+    let mut threads: Vec<(i64, PrThread)> = Vec::new();
+    for c in comments {
+        let root = c
+            .in_reply_to_id
+            .and_then(|r| threads.iter().position(|(id, _)| *id == r));
+        let i = match root {
+            Some(i) => i,
+            None => {
+                threads.push((
+                    c.id,
+                    PrThread {
+                        path: c.path.as_deref().map(normalize_path),
+                        line: c.line,
+                        status: None,
+                        url: http_url(c.html_url.clone()),
+                        comments: Vec::new(),
+                    },
+                ));
+                threads.len() - 1
+            }
+        };
+        if !c.is_bot() {
+            threads[i].1.comments.push(c.into_comment());
+        }
+    }
+    threads
+        .into_iter()
+        .map(|(_, t)| t)
+        .filter(|t| !t.comments.is_empty())
+        .collect()
+}
+
 #[async_trait]
 impl GitProvider for GithubProvider {
     async fn verify(&self) -> Result<PatOwner, GitError> {
@@ -440,6 +531,33 @@ impl GitProvider for GithubProvider {
         self.send(self.post(&url).json(&json!({ "body": body })))
             .await?;
         Ok(())
+    }
+
+    /// Inline review threads, then issue comments, then non-empty review bodies. GitHub REST
+    /// has no thread status, so `status` is always `None`. Bot users are skipped.
+    async fn list_pr_threads(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+    ) -> Result<Vec<PrThread>, GitError> {
+        let review: Vec<Vec<GhComment>> = self
+            .get_pages(self.repo_url(repo, &format!("/pulls/{pr_number}/comments?per_page=100")))
+            .await?;
+        let issue: Vec<Vec<GhComment>> = self
+            .get_pages(self.repo_url(repo, &format!("/issues/{pr_number}/comments?per_page=100")))
+            .await?;
+        let reviews: Vec<Vec<GhComment>> = self
+            .get_pages(self.repo_url(repo, &format!("/pulls/{pr_number}/reviews?per_page=100")))
+            .await?;
+        let mut threads = review_comment_threads(review.into_iter().flatten().collect());
+        let top = issue.into_iter().flatten().chain(
+            reviews
+                .into_iter()
+                .flatten()
+                .filter(|r| r.body.as_deref().is_some_and(|b| !b.trim().is_empty())),
+        );
+        threads.extend(top_level_threads(top.filter(|c| !c.is_bot()).collect()));
+        Ok(threads)
     }
 
     /// `https://api.github.com` clones from `https://github.com`, GHES `{origin}/api/v3` from

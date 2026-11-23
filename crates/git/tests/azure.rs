@@ -965,3 +965,50 @@ fn azure_clone_spec_uses_project_guid_and_basic_auth() {
     empty_name.name = String::new();
     assert!(p.clone_spec(&empty_name, &pull).is_none());
 }
+
+#[tokio::test]
+async fn list_pr_threads_maps_context_status_and_comments() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
+        .and(query_param("api-version", "7.1"))
+        .respond_with(json_body("threads.json"))
+        .mount(&server)
+        .await;
+
+    let threads = provider(&server).list_pr_threads(&repo(), 7).await.unwrap();
+    assert_eq!(threads.len(), 2);
+    let file = &threads[0];
+    assert_eq!(file.path.as_deref(), Some("src/a.rs"));
+    assert_eq!(file.line, Some(5));
+    assert_eq!(file.status.as_deref(), Some("byDesign"));
+    assert_eq!(file.url, None);
+    let authors: Vec<&str> = file.comments.iter().map(|c| c.author.as_str()).collect();
+    assert_eq!(authors, ["adus@acme.com", "dev@acme.com"]);
+    assert!(file.comments[0].by_adus);
+    assert!(!file.comments[1].by_adus);
+    assert_eq!(
+        file.comments[1].body,
+        "Intended, input is validated upstream."
+    );
+    let general = &threads[1];
+    assert_eq!(general.path, None);
+    assert_eq!(general.line, None);
+    assert_eq!(general.comments[0].author, "lead@acme.com");
+}
+
+#[tokio::test]
+async fn list_pr_threads_203_is_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
+        .respond_with(ResponseTemplate::new(203).set_body_string("<html>sign in</html>"))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server)
+        .list_pr_threads(&repo(), 7)
+        .await
+        .unwrap_err();
+    assert_eq!(err, GitError::Unauthorized);
+}

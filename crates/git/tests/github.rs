@@ -743,3 +743,116 @@ fn github_clone_spec_maps_ghes_and_test_servers_and_encodes_segments() {
     dots.owner = "..".into();
     assert!(local.clone_spec(&dots, &pr()).is_none());
 }
+
+async fn mount_thread_endpoints(
+    server: &MockServer,
+    review: ResponseTemplate,
+    issue: ResponseTemplate,
+    reviews: ResponseTemplate,
+) {
+    for (p, resp) in [
+        ("/repos/octocat/alpha/pulls/7/comments", review),
+        ("/repos/octocat/alpha/issues/7/comments", issue),
+        ("/repos/octocat/alpha/pulls/7/reviews", reviews),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .and(query_param("per_page", "100"))
+            .respond_with(resp)
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn list_pr_threads_groups_review_comments_by_reply() {
+    let server = MockServer::start().await;
+    mount_thread_endpoints(
+        &server,
+        json_body("pr_review_comments.json"),
+        json_body("pr_issue_comments.json"),
+        json_body("pr_reviews.json"),
+    )
+    .await;
+
+    let threads = provider(&server).list_pr_threads(&repo(), 7).await.unwrap();
+    assert_eq!(threads.len(), 4);
+
+    let a = threads
+        .iter()
+        .find(|t| t.path.as_deref() == Some("src/a.rs"))
+        .unwrap();
+    assert_eq!(a.line, Some(12));
+    assert_eq!(a.status, None);
+    assert_eq!(
+        a.url.as_deref(),
+        Some("https://github.com/octocat/alpha/pull/7#discussion_r101")
+    );
+    let authors: Vec<&str> = a.comments.iter().map(|c| c.author.as_str()).collect();
+    assert_eq!(authors, ["alice", "carol"]);
+    assert_eq!(a.comments[1].body, "By design: the value is checked above.");
+    assert!(!a.comments[0].by_adus);
+
+    let b = threads
+        .iter()
+        .find(|t| t.path.as_deref() == Some("src/b.rs"))
+        .unwrap();
+    assert_eq!(b.line, None, "outdated comment has no line");
+
+    let top: Vec<&str> = threads
+        .iter()
+        .filter(|t| t.path.is_none())
+        .map(|t| t.comments[0].body.as_str())
+        .collect();
+    assert_eq!(top.len(), 2, "issue comment + one non-empty review body");
+    assert!(top.contains(&"Looks fine overall."));
+    assert!(top.contains(&"Please split this PR."));
+}
+
+#[tokio::test]
+async fn list_pr_threads_skips_bot_users_and_flags_adus() {
+    let server = MockServer::start().await;
+    let empty = || ResponseTemplate::new(200).set_body_json(json!([]));
+    let issue = json!([
+        {
+            "id": 1,
+            "user": { "login": "dependabot[bot]", "type": "Bot" },
+            "body": "Bumped a dependency.",
+            "html_url": "https://github.com/octocat/alpha/pull/7#issuecomment-1"
+        },
+        {
+            "id": 2,
+            "user": { "login": "octocat", "type": "User" },
+            "body": "**Warning:** leak\n\n<!-- adudu -->",
+            "html_url": "javascript:alert(1)"
+        }
+    ]);
+    mount_thread_endpoints(
+        &server,
+        empty(),
+        ResponseTemplate::new(200).set_body_json(issue),
+        empty(),
+    )
+    .await;
+
+    let threads = provider(&server).list_pr_threads(&repo(), 7).await.unwrap();
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].comments[0].author, "octocat");
+    assert!(threads[0].comments[0].by_adus);
+    assert_eq!(threads[0].url, None, "only http(s) urls are kept");
+}
+
+#[tokio::test]
+async fn list_pr_threads_401_is_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server)
+        .list_pr_threads(&repo(), 7)
+        .await
+        .unwrap_err();
+    assert_eq!(err, GitError::Unauthorized);
+}

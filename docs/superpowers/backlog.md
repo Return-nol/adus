@@ -72,3 +72,11 @@ Task numbers below are this plan's tasks. Sources: the per-task reviews, final r
 - Final review #1: minor (deferred): `RepoWorkspace` drops its `TempDir` on an async worker thread (hand `remove_dir_all` to `spawn_blocking`); the PR manifest is uncapped and repeated in every batch/step (`compact` never shrinks `messages[0]`); no summary note when `clone_spec` is `None` (e.g. Azure repo without a project GUID); repository instructions are read from the PR head (consider the base commit); watch `verifier_dropped` before tuning `VERIFY_CONCURRENCY`
 - Final review #1 / fix-wave re-review: minor (deferred): `workspace.rs` doc comment not rewrapped
 - Provider models (merged plan): minor (deferred): bare `"thinking"` marker triggers the no-effort retry too broadly (narrow it, add a negative test); every call to a non-reasoning model costs one rejected request first (no per-model memory); `provider_error` echoes provider text (≤ 200 chars, never the key or URL) and a decrypt error maps to 502; provider + key create not atomic; edit dialog needs a live test; one failed request blanks the Repositories page; test gaps
+
+## PR discussion awareness & learning (plan 2026-11-23)
+
+- Azure thread links: `PrThread.url` is always `None` on Azure, so learned memories have no "View thread" link (needs the repo web URL to build one)
+- Engine deadline tests in `crates/review/tests/engine.rs` flake under full-workspace `-j 2` load (pass solo); widen their margins
+- Learned-memory inserts and the `pr_learning_runs` row are not one transaction: a DB failure between them can duplicate up to 5 memories on retry
+- Semantic Dedup's `already_raised` citation is not checked against the finding's file (only the prompt-level data guard stops an injected thread from suppressing an unrelated finding)
+- Memory prompt injection has no cap or relevance selection, so prompts grow with the number of active memories

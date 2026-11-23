@@ -9,7 +9,7 @@ use std::{
 use adus_core::{config::Config, crypto::Cipher};
 use adus_git::{
     ConnectionKind, FileDiff, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
-    PullRequest, RemoteRepo, RepoRef,
+    PrThread, PullRequest, RemoteRepo, RepoRef,
 };
 use adus_llm::router::LlmRouter;
 use adus_queue::Queue;
@@ -153,6 +153,10 @@ pub struct FakeGitState {
     pub registered_webhook_url: Option<String>,
     pub ensure_calls: Vec<EnsureCall>,
     pub delete_calls: Vec<DeleteCall>,
+    /// Result of `list_pr_threads`.
+    pub threads: Vec<PrThread>,
+    /// When set, `list_pr_threads` fails with this error.
+    pub threads_error: Option<GitError>,
 }
 
 impl Default for FakeGitState {
@@ -174,6 +178,8 @@ impl Default for FakeGitState {
             registered_webhook_url: None,
             ensure_calls: Vec::new(),
             delete_calls: Vec::new(),
+            threads: Vec::new(),
+            threads_error: None,
         }
     }
 }
@@ -293,6 +299,18 @@ impl GitProvider for FakeGit {
             .as_deref()
             .is_none_or(|registered| registered == url);
         Ok(url_matches && !state.missing_webhooks.contains(&repo.external_id))
+    }
+
+    async fn list_pr_threads(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+    ) -> Result<Vec<PrThread>, GitError> {
+        let state = self.state.lock().unwrap();
+        match &state.threads_error {
+            Some(err) => Err(err.clone()),
+            None => Ok(state.threads.clone()),
+        }
     }
 
     async fn get_pr(&self, _repo: &RepoRef, _number: i64) -> Result<PullRequest, GitError> {

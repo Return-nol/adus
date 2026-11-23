@@ -245,7 +245,9 @@ async fn remember_creates_repo_memory_and_replies(pool: PgPool) {
     let result = s.engine.handle_comment(&queue, &comment(&s, body)).await;
 
     assert_eq!(result, Ok(()));
-    let saved = memories::list(&pool, Some(s.repository_id)).await.unwrap();
+    let saved = memories::list(&pool, Some(s.repository_id), None)
+        .await
+        .unwrap();
     assert_eq!(saved.len(), 1);
     let memory = &saved[0];
     assert_eq!(memory.scope, KnowledgeScope::Repo);
@@ -274,7 +276,9 @@ async fn remember_creates_repo_memory_and_replies(pool: PgPool) {
         *comment_url = Some("javascript:alert(1)".into());
     }
     s.engine.handle_comment(&queue, &non_http).await.unwrap();
-    let saved = memories::list(&pool, Some(s.repository_id)).await.unwrap();
+    let saved = memories::list(&pool, Some(s.repository_id), None)
+        .await
+        .unwrap();
     assert_eq!(saved.len(), 2);
     let non_http_mem = saved
         .iter()
@@ -290,7 +294,7 @@ async fn remember_creates_repo_memory_and_replies(pool: PgPool) {
         .await;
     assert_eq!(result, Ok(()));
     assert_eq!(
-        memories::list(&pool, Some(s.repository_id))
+        memories::list(&pool, Some(s.repository_id), None)
             .await
             .unwrap()
             .len(),
@@ -309,7 +313,7 @@ async fn remember_too_long_replies_error(pool: PgPool) {
 
     assert_eq!(result, Ok(()));
     assert!(
-        memories::list(&pool, Some(s.repository_id))
+        memories::list(&pool, Some(s.repository_id), None)
             .await
             .unwrap()
             .is_empty()
@@ -325,7 +329,9 @@ async fn remember_too_long_replies_error(pool: PgPool) {
         .handle_comment(&queue, &comment(&s, &body))
         .await
         .unwrap();
-    let saved = memories::list(&pool, Some(s.repository_id)).await.unwrap();
+    let saved = memories::list(&pool, Some(s.repository_id), None)
+        .await
+        .unwrap();
     assert_eq!(saved.len(), 1);
 }
 

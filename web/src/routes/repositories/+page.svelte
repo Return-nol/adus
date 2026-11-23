@@ -26,6 +26,14 @@
 		specialists: 'Specialists'
 	};
 
+	type LearningMode = 'off' | 'approval' | 'auto';
+
+	const learningModeLabels: Record<LearningMode, string> = {
+		off: 'Off',
+		approval: 'Needs approval',
+		auto: 'Automatic'
+	};
+
 	type Repo = {
 		id: string;
 		connection_id: string;
@@ -34,6 +42,7 @@
 		auto_review: boolean;
 		review_provider_id: string | null;
 		review_mode: ReviewMode | null;
+		learning_mode: LearningMode;
 	};
 
 	let connections = $state<Connection[]>([]);
@@ -113,6 +122,7 @@
 			auto_review?: boolean;
 			review_provider_id?: string | null;
 			review_mode?: ReviewMode | null;
+			learning_mode?: LearningMode;
 		}
 	) {
 		try {
@@ -173,7 +183,15 @@
 			</Card.Header>
 			<Card.Content>
 				<TableSkeleton
-					headers={['Repository', 'Enabled', 'Auto review', 'Provider', 'Review mode', 'Actions']}
+					headers={[
+						'Repository',
+						'Enabled',
+						'Auto review',
+						'Provider',
+						'Review mode',
+						'Learning',
+						'Actions'
+					]}
 				/>
 			</Card.Content>
 		</Card.Root>
@@ -248,6 +266,7 @@
 							<Table.Head>Auto review</Table.Head>
 							<Table.Head>Provider</Table.Head>
 							<Table.Head>Review mode</Table.Head>
+							<Table.Head>Learning</Table.Head>
 							<Table.Head class="text-right">Actions</Table.Head>
 						</Table.Row>
 					</Table.Header>
@@ -331,6 +350,34 @@
 										<span class="text-muted-foreground">{reviewModeLabel(repo.review_mode)}</span>
 									{/if}
 								</Table.Cell>
+								<Table.Cell>
+									{#if isAdmin}
+										<Select.Root
+											type="single"
+											bind:value={
+												() => repo.learning_mode,
+												(v) => patchRepo(repo, { learning_mode: v as LearningMode })
+											}
+										>
+											<Select.Trigger
+												size="sm"
+												class="w-40"
+												aria-label={`Learning: ${repo.display_name}`}
+											>
+												<span class="truncate">{learningModeLabels[repo.learning_mode]}</span>
+											</Select.Trigger>
+											<Select.Content>
+												{#each Object.entries(learningModeLabels) as [value, label] (value)}
+													<Select.Item {value} {label}>{label}</Select.Item>
+												{/each}
+											</Select.Content>
+										</Select.Root>
+									{:else}
+										<span class="text-muted-foreground">
+											{learningModeLabels[repo.learning_mode]}
+										</span>
+									{/if}
+								</Table.Cell>
 								<Table.Cell class="text-right">
 									{#if isAdmin}
 										<Button
@@ -350,7 +397,7 @@
 							</Table.Row>
 						{:else}
 							<Table.Row>
-								<Table.Cell colspan={6} class="text-muted-foreground">
+								<Table.Cell colspan={7} class="text-muted-foreground">
 									No repositories yet.
 								</Table.Cell>
 							</Table.Row>

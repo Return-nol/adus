@@ -723,3 +723,25 @@ async fn github_resync_does_not_list_remote_repos(pool: PgPool) {
     assert_eq!(reply.body["synced"], 1);
     assert_eq!(git.with(|s| s.list_calls), before);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn repository_learning_mode_round_trip(pool: PgPool) {
+    let (app, _git, admin) = setup(pool).await;
+    let conn = connection_with_token(&app, &admin).await;
+    let repo = add_repo(&app, &admin, &conn, "1").await;
+    assert_eq!(repo.body["learning_mode"], "approval");
+    let uri = format!("/api/v1/repositories/{}", repo.body["id"].as_str().unwrap());
+
+    let body = json!({ "learning_mode": "auto" });
+    let reply = send(&app, json_req("PATCH", &uri, &body, Some(&admin))).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["learning_mode"], "auto");
+
+    let user_body = json!({ "email": "u@example.com", "password": PASSWORD, "role": "user" });
+    send(&app, post_json("/api/v1/users", &user_body, Some(&admin))).await;
+    let login = json!({ "email": "u@example.com", "password": PASSWORD });
+    let user = cookie_pair(&send(&app, post_json("/api/v1/auth/login", &login, None)).await);
+    let body = json!({ "learning_mode": "off" });
+    let reply = send(&app, json_req("PATCH", &uri, &body, Some(&user))).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+}

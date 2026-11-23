@@ -1,10 +1,10 @@
-use adus_core::types::{ConnectionKind, ReviewMode};
+use adus_core::types::{ConnectionKind, LearningMode, ReviewMode};
 use adus_db::connections;
 use adus_db::repositories::{self, NewRepository, RepoPatch};
 use sqlx::PgPool;
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn repository_review_mode_set_and_clear(pool: PgPool) {
+async fn repository_review_and_learning_mode_set_and_clear(pool: PgPool) {
     let conn = connections::insert(
         &pool,
         ConnectionKind::Github,
@@ -33,9 +33,11 @@ async fn repository_review_mode_set_and_clear(pool: PgPool) {
     .unwrap()
     .unwrap();
     assert_eq!(repo.review_mode, None);
+    assert_eq!(repo.learning_mode, LearningMode::Approval);
 
     let patch = RepoPatch {
         review_mode: Some(Some(ReviewMode::Specialists)),
+        learning_mode: Some(LearningMode::Auto),
         ..Default::default()
     };
     let set = repositories::update(&pool, repo.id, patch)
@@ -43,8 +45,9 @@ async fn repository_review_mode_set_and_clear(pool: PgPool) {
         .unwrap()
         .unwrap();
     assert_eq!(set.review_mode, Some(ReviewMode::Specialists));
+    assert_eq!(set.learning_mode, LearningMode::Auto);
 
-    // Patching another column leaves review_mode alone.
+    // Patching another column leaves review_mode and learning_mode alone.
     let patch = RepoPatch {
         enabled: Some(false),
         ..Default::default()
@@ -54,6 +57,7 @@ async fn repository_review_mode_set_and_clear(pool: PgPool) {
         .unwrap()
         .unwrap();
     assert_eq!(kept.review_mode, Some(ReviewMode::Specialists));
+    assert_eq!(kept.learning_mode, LearningMode::Auto);
 
     let patch = RepoPatch {
         review_mode: Some(None),

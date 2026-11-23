@@ -24,6 +24,8 @@ pub enum Job {
         author: CommentAuthor,
         body: String,
     },
+    /// Learn by-design exceptions from the discussion of a closed PR.
+    LearnPr { repository_id: Uuid, pr_number: i64 },
 }
 
 /// Apa yang memicu review PR. Juga disimpan di `reviews.trigger`.
@@ -81,6 +83,21 @@ mod tests {
         let json = serde_json::to_string(&comment).unwrap();
         assert!(json.contains(r#""type":"pr_comment""#));
         assert_eq!(serde_json::from_str::<Job>(&json).unwrap(), comment);
+
+        let learn = Job::LearnPr {
+            repository_id: Uuid::nil(),
+            pr_number: 9,
+        };
+        let json = serde_json::to_value(&learn).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "learn_pr",
+                "repository_id": "00000000-0000-0000-0000-000000000000",
+                "pr_number": 9,
+            })
+        );
+        assert_eq!(serde_json::from_value::<Job>(json).unwrap(), learn);
     }
 
     #[test]

@@ -120,6 +120,17 @@ Migrations run automatically at start. Stopping waits up to 35 s for running rev
 **Upgrading.**
 
 - Back up the database first (`pg_dump`, see Backup above). Migrations only go forward: once a newer version has migrated the database, rolling back to an older image fails at start. To go back, restore the backup taken before the upgrade.
+- The bundled Postgres moved from 16 to 18, which cannot read 16's data files and refuses to start on them. With `COMPOSE_PROFILES=bundled`, dump the database with the old stack still running (`pg_dump`, see Backup above), then move the old files out of the way, start the new stack and restore the dump:
+
+  ```sh
+  docker compose stop postgres
+  docker run --rm -v <project>_pgdata:/v alpine sh -c 'mkdir /v/pg16-old && find /v -mindepth 1 -maxdepth 1 ! -name pg16-old -exec mv {} /v/pg16-old/ \; && chown 70:70 /v'
+  docker compose up -d postgres
+  docker compose exec -T postgres psql -U adus adus < adus-backup.sql
+  docker compose up -d
+  ```
+
+  `<project>` is the compose project name (by default the folder name; see `docker volume ls`). Once the restore works, `pg16-old` can be deleted. An external `DATABASE_URL` is not affected.
 - Adus now skips files on a default ignore list (the Kodus defaults) before review. It covers many file types, including `**/*.json`, `**/*.xml` and `**/doc/**`. After upgrading, review it under Settings → Ignored files and remove anything you want reviewed.
 
 **Troubleshooting.** Start with the doctor. It is read-only and tells you whether reviews can run, and if not, what to fix:
