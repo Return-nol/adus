@@ -9,10 +9,13 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
+use adus_core::types::ADUDU_MARKER;
+
 use crate::diff::unified_patch;
 use crate::{
     CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PrThread,
-    PullRequest, RemoteRepo, RepoRef, basic_auth_header, decode, git_url, normalize_path,
+    PrThreadComment, PullRequest, RemoteRepo, RepoRef, basic_auth_header, decode, git_url,
+    normalize_path,
 };
 
 const API_VERSION: &str = "7.1";
@@ -310,6 +313,78 @@ struct AzCommit {
     commit_id: String,
 }
 
+/// PR discussion thread. Strings (`status`, `commentType`) are the REST GET enum names.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzThread {
+    status: Option<String>,
+    thread_context: Option<AzThreadContext>,
+    #[serde(default)]
+    comments: Vec<AzComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzThreadContext {
+    file_path: Option<String>,
+    right_file_start: Option<AzPosition>,
+}
+
+#[derive(Deserialize)]
+struct AzPosition {
+    line: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzComment {
+    author: AzIdentity,
+    content: Option<String>,
+    comment_type: Option<String>,
+    #[serde(default)]
+    is_deleted: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzIdentity {
+    unique_name: String,
+}
+
+impl AzThread {
+    /// Drops system and deleted comments; `None` when nothing is left.
+    fn into_thread(self) -> Option<PrThread> {
+        let comments: Vec<PrThreadComment> = self
+            .comments
+            .into_iter()
+            .filter(|c| !c.is_deleted && c.comment_type.as_deref() != Some("system"))
+            .map(|c| {
+                let body = c.content.unwrap_or_default();
+                PrThreadComment {
+                    author: c.author.unique_name,
+                    by_adus: body.contains(ADUDU_MARKER),
+                    body,
+                }
+            })
+            .collect();
+        if comments.is_empty() {
+            return None;
+        }
+        let ctx = self.thread_context;
+        Some(PrThread {
+            path: ctx
+                .as_ref()
+                .and_then(|c| c.file_path.as_deref())
+                .map(normalize_path),
+            line: ctx.and_then(|c| c.right_file_start).map(|p| p.line),
+            status: self.status,
+            // The threads response carries no web URL and the brief forbids an extra request.
+            url: None,
+            comments,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzIteration {
@@ -402,13 +477,20 @@ impl AzSubscription {
 
 #[async_trait]
 impl GitProvider for AzureProvider {
+    /// Threads without any text comment left (system-only, all deleted) are dropped.
     async fn list_pr_threads(
         &self,
-        _repo: &RepoRef,
-        _pr_number: i64,
+        repo: &RepoRef,
+        pr_number: i64,
     ) -> Result<Vec<PrThread>, GitError> {
-        // Implemented in the next change.
-        Ok(Vec::new())
+        let list: AzList<AzThread> = self
+            .get_json(&self.repo_url(repo, &format!("/pullRequests/{pr_number}/threads"))?)
+            .await?;
+        Ok(list
+            .value
+            .into_iter()
+            .filter_map(AzThread::into_thread)
+            .collect())
     }
 
     async fn verify(&self) -> Result<PatOwner, GitError> {
