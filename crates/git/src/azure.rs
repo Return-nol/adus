@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use crate::diff::unified_patch;
 use crate::{
-    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest,
-    RemoteRepo, RepoRef, basic_auth_header, decode, git_url, normalize_path,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PrThread,
+    PullRequest, RemoteRepo, RepoRef, basic_auth_header, decode, git_url, normalize_path,
 };
 
 const API_VERSION: &str = "7.1";
@@ -402,6 +402,15 @@ impl AzSubscription {
 
 #[async_trait]
 impl GitProvider for AzureProvider {
+    async fn list_pr_threads(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+    ) -> Result<Vec<PrThread>, GitError> {
+        // Implemented in the next change.
+        Ok(Vec::new())
+    }
+
     async fn verify(&self) -> Result<PatOwner, GitError> {
         // `connectionData` adalah endpoint legacy: dipanggil tanpa `api-version`.
         let url = self.org_url("/connectionData");

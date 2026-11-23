@@ -9,7 +9,7 @@ use adus_db::connections::{self, ConnectionStatus};
 use adus_db::{repositories, settings};
 use adus_git::{
     CloneSpec, FileDiff, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
-    PullRequest, RemoteRepo, RepoRef,
+    PrThread, PullRequest, RemoteRepo, RepoRef,
 };
 use adus_llm::router::ChatService;
 use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
@@ -58,6 +58,10 @@ pub struct GitState {
     pub comments: Vec<String>,
     /// Hasil `clone_spec` (`None`: provider tanpa clone, review diff-only).
     pub clone_spec: Option<CloneSpec>,
+    /// Result of `list_pr_threads`.
+    pub threads: Vec<PrThread>,
+    /// When set, `list_pr_threads` fails with this error.
+    pub threads_error: Option<GitError>,
 }
 
 /// Provider git palsu sekaligus pabriknya. Clone berbagi keadaan yang sama.
@@ -85,6 +89,8 @@ impl FakeGit {
                 reviews: Vec::new(),
                 comments: Vec::new(),
                 clone_spec: None,
+                threads: Vec::new(),
+                threads_error: None,
             })),
         }
     }
@@ -139,6 +145,18 @@ impl GitProvider for FakeGit {
         _url: &str,
     ) -> Result<bool, GitError> {
         unimplemented!("not used by the engine")
+    }
+
+    async fn list_pr_threads(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+    ) -> Result<Vec<PrThread>, GitError> {
+        let state = self.state();
+        match &state.threads_error {
+            Some(err) => Err(err.clone()),
+            None => Ok(state.threads.clone()),
+        }
     }
 
     async fn get_pr(&self, _repo: &RepoRef, _number: i64) -> Result<PullRequest, GitError> {

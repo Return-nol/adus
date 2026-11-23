@@ -85,6 +85,29 @@ pub struct FileDiff {
     pub patch: Option<String>,
 }
 
+/// One discussion thread on a PR: an inline thread (`path` set) or a top-level comment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrThread {
+    /// `normalize_path`-ed. `None` for top-level comments.
+    pub path: Option<String>,
+    /// New-side line. `None` when top-level or outdated.
+    pub line: Option<u32>,
+    /// Provider thread status (Azure). GitHub: `None`.
+    pub status: Option<String>,
+    /// Web link, only when it is http(s).
+    pub url: Option<String>,
+    /// Oldest first. Bot users' comments are left out.
+    pub comments: Vec<PrThreadComment>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrThreadComment {
+    pub author: String,
+    /// The body carries the Adus comment marker.
+    pub by_adus: bool,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct InlineComment {
     pub path: String,
