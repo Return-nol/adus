@@ -3,7 +3,8 @@
 # 1. Dashboard: SvelteKit static build (web/build). The Rust binary embeds it at compile time.
 FROM node:26-alpine AS web
 WORKDIR /app/web
-RUN corepack enable && corepack prepare pnpm@11 --activate
+# Node 25+ no longer ships corepack.
+RUN npm install -g pnpm@11
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./
