@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use adus_core::job::{CommentAuthor, Job, Trigger};
-use adus_queue::{MAX_ATTEMPTS, Queue, backoff};
+use adus_queue::{MAX_ATTEMPTS, Queue, RECLAIM_IDLE, backoff};
 use redis::AsyncCommands;
 use uuid::Uuid;
 
@@ -20,6 +20,7 @@ fn review_job(pr_number: i64) -> Job {
         repository_id: Uuid::new_v4(),
         pr_number,
         trigger: Trigger::Opened,
+        mode_override: None,
     }
 }
 
@@ -74,7 +75,7 @@ async fn enqueue_then_next_then_ack() {
     assert_eq!(delivery.job, job);
     assert_eq!(delivery.attempt, 1);
 
-    // Belum di-ack: konsumen lain tidak menerimanya lagi (belum idle 15 menit).
+    // Belum di-ack: konsumen lain tidak menerimanya lagi (belum idle 35 menit).
     assert!(queue.next("worker-2", SHORT_BLOCK).await.unwrap().is_none());
 
     queue.ack(&delivery).await.unwrap();
@@ -96,23 +97,6 @@ async fn enqueue_then_next_then_ack() {
 async fn connect_twice_ignores_existing_group() {
     let (_queue, prefix) = new_queue().await;
     Queue::connect(&redis_url(), &prefix).await.unwrap();
-    cleanup(&prefix).await;
-}
-
-#[tokio::test]
-async fn first_seen_true_once() {
-    let (queue, prefix) = new_queue().await;
-    assert!(queue.first_seen("github:delivery-1").await.unwrap());
-    assert!(!queue.first_seen("github:delivery-1").await.unwrap());
-    assert!(queue.first_seen("github:delivery-2").await.unwrap());
-
-    let mut conn = raw_connection().await;
-    let ttl: i64 = conn
-        .ttl(format!("{prefix}:dedup:github:delivery-1"))
-        .await
-        .unwrap();
-    assert!(ttl > 86_000 && ttl <= 86_400, "ttl was {ttl}");
-
     cleanup(&prefix).await;
 }
 
@@ -263,7 +247,8 @@ async fn malformed_entry_is_dead_lettered_and_queue_continues() {
     cleanup(&prefix).await;
 }
 
-/// Pura-pura pemilik entri mati 16 menit lalu: XCLAIM dengan IDLE mengatur waktu idle entri.
+/// Pura-pura pemilik entri mati semenit lebih lama dari `RECLAIM_IDLE`: XCLAIM dengan IDLE
+/// mengatur waktu idle entri.
 /// JUSTID membuat XCLAIM tidak menaikkan hitungan delivery; RETRYCOUNT menimpanya.
 async fn make_stale(prefix: &str, entry_id: &str, retry_count: Option<u32>) {
     let mut conn = raw_connection().await;
@@ -274,7 +259,7 @@ async fn make_stale(prefix: &str, entry_id: &str, retry_count: Option<u32>) {
         .arg(0)
         .arg(entry_id)
         .arg("IDLE")
-        .arg(16 * 60 * 1000);
+        .arg((RECLAIM_IDLE.as_secs() + 60) * 1000);
     if let Some(count) = retry_count {
         cmd.arg("RETRYCOUNT").arg(count);
     }
@@ -381,4 +366,32 @@ fn backoff_values() {
     assert_eq!(backoff(0), Duration::from_secs(10));
     assert_eq!(backoff(9), Duration::from_secs(160));
     assert_eq!(backoff(MAX_ATTEMPTS), Duration::from_secs(160));
+}
+
+#[tokio::test]
+async fn cache_set_get_and_del() {
+    let (queue, prefix) = new_queue().await;
+
+    assert_eq!(queue.cache_get("models:test").await.unwrap(), None);
+
+    queue
+        .cache_set("models:test", "[\"a\"]", Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        queue.cache_get("models:test").await.unwrap(),
+        Some("[\"a\"]".to_string())
+    );
+
+    let mut conn = raw_connection().await;
+    let ttl: i64 = conn
+        .ttl(format!("{prefix}:cache:models:test"))
+        .await
+        .unwrap();
+    assert!(ttl > 0 && ttl <= 60, "ttl was {ttl}");
+
+    queue.cache_del("models:test").await.unwrap();
+    assert_eq!(queue.cache_get("models:test").await.unwrap(), None);
+
+    cleanup(&prefix).await;
 }

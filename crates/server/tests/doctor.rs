@@ -42,7 +42,7 @@ async fn healthy_world(pool: PgPool) -> World {
     let git = Arc::new(FakeGitFactory::default());
     let state = app_state(pool.clone(), "http://localhost:8080", git.clone(), queue);
 
-    let provider = ai::insert_provider(&pool, ProviderKind::Openai, "OpenAI", None)
+    let provider = ai::insert_provider(&pool, ProviderKind::Openai, "OpenAI", None, "gpt-x", None)
         .await
         .unwrap();
     let encrypted = state.cipher.encrypt(API_KEY);
@@ -53,11 +53,13 @@ async fn healthy_world(pool: PgPool) -> World {
         &pool,
         &Settings {
             default_provider_id: Some(provider.id),
-            default_model: Some("gpt-x".into()),
-            max_files_per_review: 50,
-            max_patch_lines_per_file: 2000,
+            max_files_per_review: 30,
+            max_patch_lines_per_file: 1500,
             ignore_paths: None,
             ignored_title_keywords: vec![],
+            review_mode: Default::default(),
+            small_pr_max_lines: 100,
+            max_review_input_tokens: 2_000_000,
         },
     )
     .await
@@ -113,6 +115,19 @@ async fn doctor_ok_when_everything_is_healthy(pool: PgPool) {
     assert_eq!(report.verdict, Verdict::Ok);
     assert!(report.checks.iter().all(|c| c.status == Status::Ok));
     assert!(report.checks.len() >= 8, "{:?}", report.checks);
+    // The test host (and CI) has git 2.31+ on PATH.
+    let git: Vec<_> = report
+        .checks
+        .iter()
+        .filter(|c| c.name.starts_with("Git"))
+        .collect();
+    assert_eq!(git.len(), 1, "{:?}", report.checks);
+    assert_eq!(git[0].status, Status::Ok);
+    assert!(
+        git[0].name.starts_with("Git: git version 2."),
+        "{}",
+        git[0].name
+    );
     cleanup_queue(&w.prefix).await;
 }
 
@@ -134,26 +149,12 @@ async fn doctor_not_running_without_worker_heartbeat(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn doctor_not_running_with_blank_default_model(pool: PgPool) {
-    let w = healthy_world(pool.clone()).await;
-    sqlx::query("UPDATE settings SET default_model = '   '")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let report = doctor::run(&w.state).await;
-    assert_eq!(report.verdict, Verdict::NotRunning);
-    assert_eq!(fails(&report), vec!["Default model"]);
-    cleanup_queue(&w.prefix).await;
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn doctor_not_running_without_default_model(pool: PgPool) {
+async fn doctor_not_running_without_default_provider(pool: PgPool) {
     let w = healthy_world(pool.clone()).await;
     let current = settings::get(&pool).await.unwrap();
     settings::update(
         &pool,
         &Settings {
-            default_model: None,
             default_provider_id: None,
             ..current
         },
@@ -163,7 +164,47 @@ async fn doctor_not_running_without_default_model(pool: PgPool) {
 
     let report = doctor::run(&w.state).await;
     assert_eq!(report.verdict, Verdict::NotRunning);
-    assert_eq!(fails(&report), vec!["Default model"]);
+    assert_eq!(fails(&report), vec!["Default provider"]);
+    cleanup_queue(&w.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn doctor_not_running_when_default_provider_disabled(pool: PgPool) {
+    let w = healthy_world(pool.clone()).await;
+    let provider_id = settings::get(&pool)
+        .await
+        .unwrap()
+        .default_provider_id
+        .unwrap();
+    ai::update_provider(
+        &pool,
+        provider_id,
+        "OpenAI",
+        None,
+        Some("gpt-x"),
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let report = doctor::run(&w.state).await;
+    assert_eq!(report.verdict, Verdict::NotRunning);
+    assert_eq!(fails(&report), vec!["Default provider", "AI key"]);
+    cleanup_queue(&w.prefix).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn doctor_not_running_when_default_provider_has_no_model(pool: PgPool) {
+    let w = healthy_world(pool.clone()).await;
+    sqlx::query("UPDATE ai_providers SET primary_model = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = doctor::run(&w.state).await;
+    assert_eq!(report.verdict, Verdict::NotRunning);
+    assert_eq!(fails(&report), vec!["Default provider"]);
     cleanup_queue(&w.prefix).await;
 }
 
@@ -306,6 +347,7 @@ async fn doctor_warns_on_dead_letters(pool: PgPool) {
         repository_id: Uuid::new_v4(),
         pr_number: 1,
         trigger: Trigger::Opened,
+        mode_override: None,
     };
     w.state.queue.enqueue(&job).await.unwrap();
     let delivery = w
@@ -382,4 +424,19 @@ async fn user_role_cannot_run_doctor_403(pool: PgPool) {
     assert_eq!(first["status"], "fail");
     assert!(first["impact"].is_string() && first["fix"].is_string());
     cleanup_queue(&prefix).await;
+}
+
+#[tokio::test]
+async fn missing_git_binary_is_a_warning_not_a_failure() {
+    let check = doctor::git_binary_check("adus-no-such-git-binary").await;
+
+    assert_eq!(check.status, Status::Warn);
+    assert_eq!(check.name, "Git");
+    assert_eq!(
+        check.impact.as_deref(),
+        Some(
+            "`git` 2.31+ not found — reviews fall back to diff-only mode without codebase context"
+        )
+    );
+    assert!(check.fix.is_some());
 }

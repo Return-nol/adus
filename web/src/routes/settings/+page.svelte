@@ -14,11 +14,20 @@
 	import { Textarea } from '#lib/components/ui/textarea/index.js';
 	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
 
+	type ReviewMode = 'generalist' | 'specialists';
+
+	const reviewModeLabels: Record<ReviewMode, string> = {
+		generalist: 'Generalist — balanced single-pass review',
+		specialists: 'Specialists — parallel Bug, Security, Performance & Rules'
+	};
+
 	type Settings = {
 		default_provider_id: string | null;
-		default_model: string | null;
+		review_mode: ReviewMode;
 		max_files_per_review: number;
 		max_patch_lines_per_file: number;
+		small_pr_max_lines: number;
+		max_review_input_tokens: number;
 		ignore_paths: string[];
 		ignore_paths_is_default: boolean;
 		ignored_title_keywords: string[];
@@ -31,9 +40,11 @@
 	let busy = $state(false);
 	// '' = no default provider.
 	let providerId = $state('');
-	let model = $state('');
+	let reviewMode = $state<ReviewMode>('generalist');
 	let maxFiles = $state(0);
 	let maxPatchLines = $state(0);
+	let smallPrMaxLines = $state(0);
+	let maxInputTokens = $state(0);
 	// Ignored files: the textarea text, plus what the server last gave us.
 	let ignoreText = $state('');
 	let savedIgnore = $state<string[]>([]);
@@ -77,9 +88,11 @@
 		fillIgnore(s);
 		keywordsText = s.ignored_title_keywords.join('\n');
 		providerId = s.default_provider_id ?? '';
-		model = s.default_model ?? '';
+		reviewMode = s.review_mode;
 		maxFiles = s.max_files_per_review;
 		maxPatchLines = s.max_patch_lines_per_file;
+		smallPrMaxLines = s.small_pr_max_lines;
+		maxInputTokens = s.max_review_input_tokens;
 	}
 
 	async function load() {
@@ -110,9 +123,11 @@
 			fill(
 				await api<Settings>('PUT', '/settings', {
 					default_provider_id: providerId || null,
-					default_model: model.trim() || null,
+					review_mode: reviewMode,
 					max_files_per_review: maxFiles,
 					max_patch_lines_per_file: maxPatchLines,
+					small_pr_max_lines: smallPrMaxLines,
+					max_review_input_tokens: maxInputTokens,
 					// Omitted unless edited, so saving other settings never pins the defaults.
 					...(ignoreChanged ? { ignore_paths: patterns } : {}),
 					ignored_title_keywords: lines(keywordsText)
@@ -121,7 +136,7 @@
 			toast.success('Settings saved');
 		} catch (e) {
 			if (e instanceof ApiError && e.code === 'invalid_glob') ignoreError = e.message;
-			else fail(e); // e.g. 422 default_model required
+			else fail(e);
 		} finally {
 			busy = false;
 		}
@@ -147,7 +162,6 @@
 			fillIgnore(
 				await api<Settings>('PUT', '/settings', {
 					default_provider_id: saved.default_provider_id,
-					default_model: saved.default_model,
 					max_files_per_review: saved.max_files_per_review,
 					max_patch_lines_per_file: saved.max_patch_lines_per_file,
 					ignore_paths: null
@@ -198,7 +212,7 @@
 	<Card.Root class="max-w-2xl" aria-busy="true">
 		<Card.Content class="grid gap-4">
 			<span class="sr-only" role="status">Loading…</span>
-			{#each ['w-28', 'w-24', 'w-44', 'w-52'] as w, i (i)}
+			{#each ['w-28', 'w-24', 'w-44', 'w-52', 'w-56', 'w-52'] as w, i (i)}
 				<div class="grid gap-2">
 					<Skeleton class={`h-4 ${w}`} />
 					<Skeleton class="h-9 w-full rounded-sm" />
@@ -226,12 +240,21 @@
 					</Select.Root>
 				</div>
 				<div class="grid gap-2">
-					<Label for="s-model">Default model</Label>
-					<Input
-						id="s-model"
-						placeholder="Required when a default provider is set"
-						bind:value={model}
-					/>
+					<Label>Review mode</Label>
+					<Select.Root type="single" bind:value={reviewMode}>
+						<Select.Trigger class="w-full" aria-label="Review mode">
+							{reviewModeLabels[reviewMode]}
+						</Select.Trigger>
+						<Select.Content>
+							{#each Object.entries(reviewModeLabels) as [value, label] (value)}
+								<Select.Item {value} {label}>{label}</Select.Item>
+							{/each}
+						</Select.Content>
+					</Select.Root>
+					<p class="text-xs text-muted-foreground">
+						Repositories can override this. <code class="font-mono">@adudu review deep</code> runs the
+						specialists on any pull request.
+					</p>
 				</div>
 				<div class="grid gap-2">
 					<Label for="s-files">Max files per review (1-500)</Label>
@@ -247,6 +270,38 @@
 						required
 						bind:value={maxPatchLines}
 					/>
+				</div>
+				<div class="grid gap-2">
+					<Label for="s-small">Small PR threshold (changed lines)</Label>
+					<Input
+						id="s-small"
+						type="number"
+						min="0"
+						max="10000"
+						required
+						bind:value={smallPrMaxLines}
+					/>
+					<p class="text-xs text-muted-foreground">
+						PRs with at most this many changed lines in up to 3 files, outside sensitive paths, are
+						reviewed from the diff only, in one Generalist pass. 0 = always full review.
+						<code class="font-mono">@adudu review</code> always runs the full review.
+					</p>
+				</div>
+				<div class="grid gap-2">
+					<Label for="s-tokens">Max input tokens per review (0-100000000)</Label>
+					<Input
+						id="s-tokens"
+						type="number"
+						min="0"
+						max="100000000"
+						required
+						bind:value={maxInputTokens}
+					/>
+					<p class="text-xs text-muted-foreground">
+						Input tokens one review may send to the model, cached tokens included. When reached,
+						reviewers stop reading the repository, remaining findings are verified from the diff
+						only, and the review posts what it has. 0 = no limit.
+					</p>
 				</div>
 				<div class="grid gap-2">
 					<div class="flex flex-wrap items-center gap-2">

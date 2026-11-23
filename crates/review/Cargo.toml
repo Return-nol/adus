@@ -13,16 +13,23 @@ adus-db.workspace = true
 adus-git.workspace = true
 adus-llm.workspace = true
 adus-queue.workspace = true
+async-trait.workspace = true
+base64.workspace = true
 futures.workspace = true
+globset.workspace = true
+ignore.workspace = true
+regex.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 chrono.workspace = true
 redis.workspace = true
-tokio.workspace = true
+# `test-util`: paused clock (`start_paused`) for the agent's time-based wrap-up tests.
+tokio = { workspace = true, features = ["test-util"] }

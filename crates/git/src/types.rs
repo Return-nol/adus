@@ -36,6 +36,35 @@ pub struct PullRequest {
     /// Merge base.
     pub base_sha: String,
     pub is_draft: bool,
+    /// Source branch ref of the PR (Azure `sourceRefName`, e.g. `refs/heads/feature`).
+    /// GitHub: `None`.
+    pub source_ref: Option<String>,
+}
+
+/// Everything needed to shallow-fetch a PR head with `git`.
+#[derive(Clone)]
+pub struct CloneSpec {
+    pub url: String,
+    pub refspec: String,
+    /// Tried once when fetching `refspec` fails for a non-auth reason (Azure: the source branch ref).
+    pub fallback_refspec: Option<String>,
+    pub expected_sha: String,
+    /// Value for the `Authorization` HTTP header (e.g. `Basic <base64>`). Never embedded in
+    /// `url`, argv or `.git/config`.
+    pub auth_header: String,
+}
+
+/// Hand-written so the auth header never ends up in a log line through `{:?}`.
+impl std::fmt::Debug for CloneSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloneSpec")
+            .field("url", &self.url)
+            .field("refspec", &self.refspec)
+            .field("fallback_refspec", &self.fallback_refspec)
+            .field("expected_sha", &self.expected_sha)
+            .field("auth_header", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +88,12 @@ pub struct FileDiff {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InlineComment {
     pub path: String,
+    /// Inclusive first line for multi-line comments (must be `< line` and in the same diff hunk; `None` = single-line).
+    pub start_line: Option<u32>,
     pub line: u32,
+    /// 1-based UTF-16 end column offset on `line` for multi-line Azure DevOps threads (`None`
+    /// defaults to `1`). Azure only: the engine sets it for every provider, GitHub ignores it.
+    pub end_offset: Option<u32>,
     pub body: String,
 }
 

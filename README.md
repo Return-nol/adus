@@ -2,7 +2,7 @@
 
 Adus is a self-hosted AI code review platform. It reviews pull requests on **GitHub** and **Azure DevOps Services** with the LLM provider you choose (OpenAI, Anthropic, Gemini or any OpenAI-compatible endpoint), and answers `@adudu` commands in PR comments. Its bot is called `@adudu`. Adus is inspired by [Kodus](https://github.com/kodustech/kodus-ai) but is a rewrite, not a port.
 
-One installation is one organization. It runs as three containers: `adus` (a single Rust binary with the dashboard embedded), Postgres 16 and Redis 7.
+One installation is one organization. It runs as three containers: `adus` (a single Rust binary with the dashboard embedded), Postgres 18 and Redis 8.
 
 ## Quick start
 
@@ -25,8 +25,8 @@ It pulls the published `adus` image; if that pull fails, it builds the image fro
 Then:
 
 1. Open `<your URL>/setup` and create the first admin account.
-2. Add an AI provider with at least one API key.
-3. Choose a default model in Settings.
+2. Add an AI provider: enter an API key, test the connection, and pick its primary model (and optionally a cheaper fast model).
+3. Choose the default provider in Settings.
 4. Add a connection (a GitHub or Azure DevOps PAT) and pick the repositories to review.
 5. Check that reviews can run: `docker compose exec adus adus doctor`.
 
@@ -137,7 +137,7 @@ docker compose logs -f adus
 ## Development
 
 ```sh
-docker compose -f docker-compose.dev.yml up -d   # Postgres 16 (host port 55432) + Redis 7 (host port 55379)
+docker compose -f docker-compose.dev.yml up -d   # Postgres 18 (host port 55432) + Redis 8 (host port 55379)
 cargo test --workspace                            # needs the dev Postgres and Redis; env comes from .cargo/config.toml
 pnpm -C web install && pnpm -C web build          # the server embeds web/build
 ADUS_PUBLIC_URL=http://localhost:8080 cargo run -p adus   # http://localhost:8080

@@ -14,6 +14,10 @@ pub struct NewUsage<'a> {
     pub model: &'a str,
     pub input_tokens: i32,
     pub output_tokens: i32,
+    /// Part of `input_tokens` read from the provider's prompt cache.
+    pub cache_read_tokens: i32,
+    /// Part of `input_tokens` written to the provider's prompt cache.
+    pub cache_write_tokens: i32,
     pub latency_ms: i32,
     pub success: bool,
     pub error_kind: Option<&'a str>,
@@ -23,8 +27,8 @@ pub async fn insert(pool: &PgPool, new: NewUsage<'_>) -> Result<()> {
     sqlx::query(
         "INSERT INTO llm_usage \
          (review_id, repository_id, provider_id, key_id, model, input_tokens, output_tokens, \
-          latency_ms, success, error_kind) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          cache_read_tokens, cache_write_tokens, latency_ms, success, error_kind) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(new.review_id)
     .bind(new.repository_id)
@@ -33,6 +37,8 @@ pub async fn insert(pool: &PgPool, new: NewUsage<'_>) -> Result<()> {
     .bind(new.model)
     .bind(new.input_tokens)
     .bind(new.output_tokens)
+    .bind(new.cache_read_tokens)
+    .bind(new.cache_write_tokens)
     .bind(new.latency_ms)
     .bind(new.success)
     .bind(new.error_kind)
@@ -47,6 +53,8 @@ pub struct DailyUsage {
     pub date: NaiveDate,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub calls: i64,
     pub failed_calls: i64,
 }
@@ -67,6 +75,8 @@ pub struct UsageBreakdown {
     pub label: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub calls: i64,
 }
 
@@ -81,6 +91,8 @@ pub async fn daily(pool: &PgPool, from: NaiveDate, to: NaiveDate) -> Result<Vec<
         "SELECT d::date AS date, \
                 COALESCE(SUM(u.input_tokens), 0)::bigint AS input_tokens, \
                 COALESCE(SUM(u.output_tokens), 0)::bigint AS output_tokens, \
+                COALESCE(SUM(u.cache_read_tokens), 0)::bigint AS cache_read_tokens, \
+                COALESCE(SUM(u.cache_write_tokens), 0)::bigint AS cache_write_tokens, \
                 COUNT(u.id) AS calls, \
                 COUNT(u.id) FILTER (WHERE NOT u.success) AS failed_calls \
          FROM generate_series($1::timestamp, $2::timestamp, interval '1 day') AS d \
@@ -129,6 +141,8 @@ pub async fn breakdown(
         "SELECT {id} AS id, {label} AS label, \
                 COALESCE(SUM(u.input_tokens), 0)::bigint AS input_tokens, \
                 COALESCE(SUM(u.output_tokens), 0)::bigint AS output_tokens, \
+                COALESCE(SUM(u.cache_read_tokens), 0)::bigint AS cache_read_tokens, \
+                COALESCE(SUM(u.cache_write_tokens), 0)::bigint AS cache_write_tokens, \
                 COUNT(*) AS calls \
          FROM llm_usage u {join} WHERE {IN_RANGE} \
          GROUP BY 1, 2 \

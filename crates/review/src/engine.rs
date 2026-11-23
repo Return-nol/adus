@@ -1,45 +1,80 @@
-//! Mesin review: ambil diff PR, minta LLM mereview per file, posting temuan, catat di `reviews`.
+//! Mesin review: ambil diff PR, jalankan Finder → Verifier → Dedup, posting temuan, catat di
+//! `reviews`. The Finder stage lives in `finder.rs`; this file keeps the review-row lifecycle,
+//! the clone and its fallback, the stage sequencing and the deadlines, and posting.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use adus_core::crypto::Cipher;
 use adus_core::job::Trigger;
-use adus_core::types::{ConnectionKind, Severity};
+use adus_core::types::{ConnectionKind, ReviewMode, Severity, normalize_path};
 use adus_db::connections::{self, Connection, ConnectionStatus};
 use adus_db::ignore::{IgnoreMatcher, default_ignore_paths, effective_ignore_paths, title_matches};
+use adus_db::memories::Memory;
 use adus_db::repositories::{self, Repository};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
-use adus_db::{memories, rules, settings};
-use adus_git::diff::{added_line_count, commentable_lines};
+use adus_db::rules::Rule;
+use adus_db::{ai, memories, rules, settings};
+use adus_git::diff::{added_line_count, intersect_hunks, right_line_end_offset};
 use adus_git::{
-    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, RepoRef,
+    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PullRequest,
+    RepoRef,
 };
-use adus_llm::ChatRequest;
+use adus_llm::ReasoningEffort;
 use adus_llm::router::{ChatError, ChatService, UsageContext};
-use futures::StreamExt;
 use sqlx::PgPool;
+use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::{
-    MARKER, Suggestion, build_prompt, format_inline, format_summary, keep_valid, parse_suggestions,
+use crate::agent::AgentError;
+use crate::budget::TokenBudget;
+use crate::dedup::deduplicate_findings;
+use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
+use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
+use crate::prompt::{
+    DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, batch_targets, build_manifest, format_inline,
+    format_summary,
 };
+use crate::redact::{REDACTED, contains_secret, redact_secrets};
+use crate::repo_instructions::load_repo_instructions;
+use crate::small_pr::is_small_pr;
+use crate::tools::Toolbox;
+use crate::verifier::{CandidateFinding, VerifyContext, VerifyInput, verify_candidates};
+use crate::workspace::{RepoCloner, WorkspaceError};
 
-const MAX_OUTPUT_TOKENS: u32 = 8192;
-/// Maksimal file yang ditanyakan ke LLM bersamaan dalam satu review.
-const FILE_CONCURRENCY: usize = 4;
-/// Batas waktu bawaan satu review (`Engine::review_timeout`).
+/// Budget of one Generalist review (`Engine::review_timeout`), small PRs included.
 pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(12 * 60);
+/// Budget of one Specialists review (`Engine::specialists_review_timeout`): up to four agents
+/// per batch at `High` effort need more time than one Generalist agent.
+pub const SPECIALISTS_REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Summary note when the clone failed (not for auth) and the review saw only the diff.
+const CODEBASE_UNAVAILABLE: &str = "Codebase context unavailable — reviewed diff only";
+/// Summary note for a small, low-risk PR reviewed without the clone (not a failure).
+const SMALL_PR_NOTE: &str = "Small change — reviewed diff only";
+/// Summary note when the model rejected tool calling.
+const TOOLS_UNSUPPORTED: &str = "Model does not support tool calling — reviewed diff only";
+/// Last line of a comment whose suggestion was dropped because it held a secret.
+const SUGGESTION_OMITTED: &str =
+    "_Suggested code omitted: it contained a value that looks like a secret._";
 
 pub struct Engine {
     pub db: PgPool,
     pub cipher: Arc<Cipher>,
     pub git: Arc<dyn GitProviderFactory>,
     pub chat: Arc<dyn ChatService>,
-    /// Review yang lebih lama dari ini dihentikan dan dicatat gagal (Fatal). Produksi:
-    /// `REVIEW_TIMEOUT`; test memakai nilai pendek.
+    /// Shallow-clones the PR head for the agentic tools (`GitCliCloner` in production).
+    pub cloner: Arc<dyn RepoCloner>,
+    /// Budget of a Generalist review (small PRs and `@adudu review generalist` included): a
+    /// review still running when it is used up is stopped and recorded as failed (Fatal).
+    /// Production: `REVIEW_TIMEOUT`; tests use short values. The stage deadlines are fractions
+    /// of it.
     pub review_timeout: Duration,
+    /// Budget of a Specialists review, used like `review_timeout`. Production:
+    /// `SPECIALISTS_REVIEW_TIMEOUT`.
+    pub specialists_review_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -61,10 +96,72 @@ enum Outcome {
     Skipped(&'static str),
 }
 
-/// Satu file yang akan direview, beserta baris yang boleh dikomentari.
+/// Satu file yang akan direview, beserta baris dan rentang hunk yang boleh dikomentari.
 struct Target {
     file: FileDiff,
-    allowed: BTreeSet<u32>,
+    allowed: CommentableRange,
+}
+
+#[derive(Default)]
+struct ReviewOutput {
+    counts: BTreeMap<Severity, usize>,
+    comments: Vec<InlineComment>,
+    /// Tool results that had a secret masked.
+    redacted_tool_outputs: u64,
+    /// Inline comments that had a secret masked or their suggestion dropped.
+    redacted_comments: usize,
+}
+
+fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
+    match mode {
+        ReviewMode::Generalist => ReasoningEffort::Medium,
+        ReviewMode::Specialists => ReasoningEffort::High,
+    }
+}
+
+/// When each stage must be done, as fractions of the run's budget (`review_timeout` or
+/// `specialists_review_timeout`) from the run's start (spec 4.11): Finder (clone included)
+/// 60 %, Verifier 90 %, Dedup 97 %; the rest is for posting.
+#[derive(Debug, Clone, Copy)]
+struct Deadlines {
+    finder: Instant,
+    verifier: Instant,
+    dedup: Instant,
+}
+
+impl Deadlines {
+    fn new(start: Instant, budget: Duration) -> Self {
+        let at = |percent: u32| start + budget.saturating_mul(percent) / 100;
+        Self {
+            finder: at(60),
+            verifier: at(90),
+            dedup: at(97),
+        }
+    }
+}
+
+/// Everything the LLM stages of one review share.
+struct Stages<'a> {
+    conn: &'a Connection,
+    git: &'a dyn GitProvider,
+    repo_ref: &'a RepoRef,
+    pr: &'a PullRequest,
+    mode: ReviewMode,
+    provider_id: Uuid,
+    /// Finder model.
+    primary_model: &'a str,
+    /// Verifier and Dedup model (`effective_fast_model()`).
+    fast_model: &'a str,
+    rules: &'a [Rule],
+    memories: &'a [Memory],
+    usage: &'a UsageContext,
+    deadlines: Deadlines,
+    /// A small, low-risk PR: reviewed diff-only in one Generalist pass (`mode` is already
+    /// `Generalist`).
+    small: bool,
+    /// Input tokens this run may send (`settings.max_review_input_tokens`), shared by every
+    /// Finder, Verifier and Dedup call.
+    token_budget: Arc<TokenBudget>,
 }
 
 impl Engine {
@@ -77,6 +174,7 @@ impl Engine {
         repository_id: Uuid,
         pr_number: i64,
         trigger: Trigger,
+        mode_override: Option<ReviewMode>,
     ) -> Result<Option<Uuid>, EngineError> {
         let Some(repo) = repositories::get(&self.db, repository_id)
             .await
@@ -93,10 +191,13 @@ impl Engine {
 
         // Timeout di sini, bukan di worker, supaya baris review tetap dicatat gagal. Fatal:
         // mengulang PR yang sama hanya menghabiskan token LLM lagi sampai timeout lagi.
-        let run = self.run(&repo, review_id, pr_number, trigger);
-        let outcome = match tokio::time::timeout(self.review_timeout, run).await {
+        // The clone lives inside `run`, so a timeout (or an aborted job) drops and deletes it.
+        // `run` cuts itself at its own budget once the mode is known; this is the backstop.
+        let backstop = self.review_timeout.max(self.specialists_review_timeout);
+        let run = self.run(&repo, review_id, pr_number, trigger, mode_override);
+        let outcome = match tokio::time::timeout(backstop, run).await {
             Ok(outcome) => outcome,
-            Err(_elapsed) => Err(EngineError::Fatal("review timed out".into())),
+            Err(_elapsed) => Err(timed_out()),
         };
         let (status, posted, skip_reason) = match outcome {
             Ok(Outcome::Done { posted }) => (ReviewStatus::Done, posted, None),
@@ -131,7 +232,10 @@ impl Engine {
         review_id: Uuid,
         pr_number: i64,
         trigger: Trigger,
+        mode_override: Option<ReviewMode>,
     ) -> Result<Outcome, EngineError> {
+        // Every budget counts from here, so the fetches and the clone count too.
+        let start = Instant::now();
         if !repo.enabled {
             return Ok(Outcome::Skipped("repository_disabled"));
         }
@@ -162,13 +266,18 @@ impl Engine {
         {
             return Ok(Outcome::Skipped("ignored_title"));
         }
-        let model = match (&repo.review_provider_id, &repo.review_model) {
-            (Some(provider), Some(model)) => Some((*provider, model.clone())),
-            _ => settings
-                .default_provider_id
-                .zip(settings.default_model.clone()),
-        };
-        let Some((provider_id, model)) = model else {
+        let provider_id = repo.review_provider_id.or(settings.default_provider_id);
+        let provider = match provider_id {
+            Some(id) => ai::get_provider(&self.db, id).await.map_err(db_error)?,
+            None => None,
+        }
+        .filter(|p| p.enabled);
+        let models = provider.as_ref().and_then(|p| {
+            let primary = p.primary_model()?;
+            let fast = p.effective_fast_model().unwrap_or(primary);
+            Some((p.id, primary.to_string(), fast.to_string()))
+        });
+        let Some((provider_id, primary_model, fast_model)) = models else {
             // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
             // atau diminta lewat `@adudu review`, supaya tidak spam.
             // Bukan kegagalan: tanpa baris failed atau dead letter untuk setiap push.
@@ -177,7 +286,7 @@ impl Engine {
             }
             let body = format!(
                 "{MARKER}\nAdudu can't review yet: no AI model is configured. \
-                 An admin can set one under Settings."
+                 An admin can pick a provider under Settings and its model under AI Providers."
             );
             // Gagal posting tidak mengubah hasilnya: review tetap tidak bisa jalan.
             match git.post_comment(&repo_ref, pr_number, &body).await {
@@ -191,163 +300,412 @@ impl Engine {
             }
             return Err(EngineError::Fatal("no review model configured".into()));
         };
+        let mut mode = mode_override
+            .or(repo.review_mode)
+            .unwrap_or(settings.review_mode);
 
-        // Updated + review sebelumnya di commit lain → hanya baris dari commit baru.
-        let last = match trigger {
-            Trigger::Updated => reviews::last_done(&self.db, repo.id, pr_number)
-                .await
-                .map_err(db_error)?
-                .and_then(|review| review.head_sha),
-            _ => None,
-        };
-        if last.as_deref() == Some(pr.head_sha.as_str()) {
-            return Ok(Outcome::Skipped("already_reviewed"));
-        }
-        let full = match git.pr_diff(&repo_ref, &pr).await {
-            Ok(files) => files,
-            Err(err) => return Err(self.fetch_error(&conn, err).await),
-        };
-        let candidates = match last {
-            None => full_targets(full),
-            Some(last_head) => match git.diff_between(&repo_ref, &last_head, &pr.head_sha).await {
-                Ok(changed) => incremental_targets(changed, full),
-                // Setelah force-push commit lama bisa hilang; review penuh saja daripada gagal terus.
-                Err(GitError::NotFound) => {
-                    tracing::warn!(%review_id, "previous head not found, falling back to a full review");
-                    full_targets(full)
-                }
-                Err(err) => return Err(self.fetch_error(&conn, err).await),
-            },
-        };
-
-        let matcher = ignore_matcher(&effective_ignore_paths(&settings));
-        let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
-        let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
-        let mut targets = Vec::new();
-        let mut skipped: Vec<(String, &'static str)> = Vec::new();
-        let mut ignored = 0;
-        for target in candidates {
-            // File terhapus tidak pernah direview, jadi juga tidak dihitung sebagai di-ignore.
-            if target.file.status == FileStatus::Deleted {
-                continue;
-            }
-            // Hanya `path` baru yang dicocokkan, juga untuk file yang di-rename.
-            if let Some(matcher) = &matcher
-                && matcher.is_ignored(&target.file.path)
-            {
-                ignored += 1;
-                continue;
-            }
-            let Some(patch) = &target.file.patch else {
-                skipped.push((target.file.path, "no_patch"));
-                continue;
+        // From here on the run is bounded by the budget it can still end with: a Generalist run
+        // stays Generalist, a Specialists run may still be forced to Generalist (small PR). The
+        // cut inside, at the effective mode's budget, stays the real one.
+        let cut = start
+            + match mode {
+                ReviewMode::Generalist => self.review_timeout,
+                ReviewMode::Specialists => self.specialists_review_timeout.max(self.review_timeout),
             };
-            if target.allowed.is_empty() {
-                continue; // tidak ada baris baru yang bisa dikomentari
+        let rest = async {
+            // Updated + review sebelumnya di commit lain → hanya baris dari commit baru.
+            let last = match trigger {
+                Trigger::Updated => reviews::last_done(&self.db, repo.id, pr_number)
+                    .await
+                    .map_err(db_error)?
+                    .and_then(|review| review.head_sha),
+                _ => None,
+            };
+            if last.as_deref() == Some(pr.head_sha.as_str()) {
+                return Ok(Outcome::Skipped("already_reviewed"));
             }
-            if added_line_count(patch) > max_lines {
-                skipped.push((target.file.path, "too_large"));
-            } else if targets.len() >= max_files {
-                skipped.push((target.file.path, "file_limit"));
+            let full = match git.pr_diff(&repo_ref, &pr).await {
+                Ok(files) => files,
+                Err(err) => return Err(self.fetch_error(&conn, err).await),
+            };
+            // The PR file manifest lists every file of the PR, not only those reviewed now.
+            let manifest_files: Vec<ManifestFile> =
+                full.iter().map(ManifestFile::from_diff).collect();
+            let candidates = match last {
+                None => full_targets(full),
+                Some(last_head) => {
+                    match git.diff_between(&repo_ref, &last_head, &pr.head_sha).await {
+                        Ok(changed) => incremental_targets(changed, full),
+                        // Setelah force-push commit lama bisa hilang; review penuh saja daripada gagal terus.
+                        Err(GitError::NotFound) => {
+                            tracing::warn!(%review_id, "previous head not found, falling back to a full review");
+                            full_targets(full)
+                        }
+                        Err(err) => return Err(self.fetch_error(&conn, err).await),
+                    }
+                }
+            };
+
+            let matcher = ignore_matcher(&effective_ignore_paths(&settings));
+            let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
+            let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
+            let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
+            let mut files: Vec<FileDiff> = Vec::new();
+            let mut skipped: Vec<(String, &'static str)> = Vec::new();
+            let mut ignored_paths: Vec<String> = Vec::new();
+            for target in candidates {
+                // File terhapus tidak pernah direview, jadi juga tidak dihitung sebagai di-ignore.
+                if target.file.status == FileStatus::Deleted {
+                    continue;
+                }
+                // Hanya `path` baru yang dicocokkan, juga untuk file yang di-rename.
+                if let Some(matcher) = &matcher
+                    && matcher.is_ignored(&target.file.path)
+                {
+                    ignored_paths.push(target.file.path);
+                    continue;
+                }
+                let Some(patch) = &target.file.patch else {
+                    skipped.push((target.file.path, "no_patch"));
+                    continue;
+                };
+                if target.allowed.is_empty() {
+                    continue; // tidak ada baris baru yang bisa dikomentari
+                }
+                if added_line_count(patch) > max_lines {
+                    skipped.push((target.file.path, "too_large"));
+                } else if files.len() >= max_files {
+                    skipped.push((target.file.path, "file_limit"));
+                } else {
+                    allowed.insert(normalize_path(&target.file.path), target.allowed);
+                    files.push(target.file);
+                }
+            }
+            let ignored = ignored_paths.len();
+
+            if files.is_empty() && skipped.is_empty() {
+                return Ok(Outcome::Skipped("nothing_to_review"));
+            }
+
+            let (small, rules, memories, manifest) = if files.is_empty() {
+                (false, Vec::new(), Vec::new(), String::new())
             } else {
-                targets.push(target);
+                let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
+                let skipped_map: HashMap<&str, &'static str> = skipped
+                    .iter()
+                    .map(|(path, reason)| (path.as_str(), *reason))
+                    .collect();
+                let manifest = build_manifest(&manifest_files, &ignored_set, &skipped_map);
+                let rules = rules::applicable(&self.db, repo.id)
+                    .await
+                    .map_err(db_error)?;
+                let memories = memories::applicable(&self.db, repo.id)
+                    .await
+                    .map_err(db_error)?;
+                // A small, low-risk PR is reviewed from the diff alone, in one Generalist pass: no
+                // clone and no tools (the same diff-only path as a failed clone, but not a failure).
+                // A `Command` (`@adudu review`) always gets the full review.
+                let small_pr_max_lines = match trigger {
+                    Trigger::Command => 0,
+                    _ => u32::try_from(settings.small_pr_max_lines).unwrap_or(0),
+                };
+                let small = is_small_pr(&files, &rules, small_pr_max_lines);
+                if small {
+                    mode = ReviewMode::Generalist;
+                }
+                (small, rules, memories, manifest)
+            };
+
+            let budget = self.budget(mode);
+            let usage = UsageContext {
+                review_id: Some(review_id),
+                repository_id: Some(repo.id),
+            };
+            let stages = Stages {
+                conn: &conn,
+                git: git.as_ref(),
+                repo_ref: &repo_ref,
+                pr: &pr,
+                mode,
+                provider_id,
+                primary_model: &primary_model,
+                fast_model: &fast_model,
+                rules: &rules,
+                memories: &memories,
+                usage: &usage,
+                deadlines: Deadlines::new(start, budget),
+                small,
+                token_budget: Arc::new(TokenBudget::new(
+                    u64::try_from(settings.max_review_input_tokens).unwrap_or(0),
+                )),
+            };
+            let mut warnings: Vec<String> = Vec::new();
+            let finish = async {
+                // Only skipped files left: no clone and no LLM, just the summary.
+                let output = if files.is_empty() {
+                    ReviewOutput::default()
+                } else {
+                    self.review_targets(
+                        &stages,
+                        files,
+                        allowed,
+                        &manifest,
+                        &mut skipped,
+                        &mut warnings,
+                    )
+                    .await?
+                };
+                let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
+                let (summary, summary_redacted) = redact_owned(summary);
+                tracing::debug!(
+                    redacted_tool_outputs = output.redacted_tool_outputs,
+                    redacted_comments = output.redacted_comments + usize::from(summary_redacted),
+                    "secret redaction"
+                );
+                match git
+                    .post_review(&repo_ref, &pr, &output.comments, &summary)
+                    .await
+                {
+                    Ok(posted) => Ok(Outcome::Done { posted }),
+                    Err(err) => Err(self.post_error(&conn, err).await),
+                }
+            };
+            match tokio::time::timeout_at(start + budget, finish).await {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => Err(timed_out()),
             }
-        }
-
-        if targets.is_empty() && skipped.is_empty() {
-            return Ok(Outcome::Skipped("nothing_to_review"));
-        }
-
-        let rules = rules::applicable(&self.db, repo.id)
-            .await
-            .map_err(db_error)?;
-        let memories = memories::applicable(&self.db, repo.id)
-            .await
-            .map_err(db_error)?;
-        let ctx = UsageContext {
-            review_id: Some(review_id),
-            repository_id: Some(repo.id),
         };
-        let prompts: Vec<(String, String)> = targets
-            .iter()
-            .map(|target| build_prompt(&target.file, &rules, &memories, &pr))
-            .collect();
-        // Maksimal FILE_CONCURRENCY sekaligus; `buffered` menjaga urutan hasil = urutan file,
-        // jadi komentar selalu terposting dengan urutan yang sama.
-        let results: Vec<_> = futures::stream::iter(prompts)
-            .map(|(system, user)| self.ask(provider_id, &model, system, user, &ctx))
-            .buffered(FILE_CONCURRENCY)
-            .collect()
-            .await;
+        match tokio::time::timeout_at(cut, rest).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(timed_out()),
+        }
+    }
 
-        let sent = targets.len();
-        let mut rejected: Vec<ChatError> = Vec::new();
-        let mut found: Vec<Suggestion> = Vec::new();
-        for (target, result) in targets.into_iter().zip(results) {
-            match result {
-                Ok(Some(suggestions)) => {
-                    found.extend(keep_valid(suggestions, &target.file, &target.allowed));
+    /// The time budget of a review in `mode` (the effective mode, after the small-PR force).
+    fn budget(&self, mode: ReviewMode) -> Duration {
+        match mode {
+            ReviewMode::Generalist => self.review_timeout,
+            ReviewMode::Specialists => self.specialists_review_timeout,
+        }
+    }
+
+    /// Clone, Finder, Verifier and Dedup for `targets`. Returns the findings to post; files of
+    /// a batch no Finder agent reviewed go to `skipped`, and every degradation adds a note to
+    /// `warnings`.
+    async fn review_targets(
+        &self,
+        s: &Stages<'_>,
+        files: Vec<FileDiff>,
+        allowed: HashMap<String, CommentableRange>,
+        manifest: &str,
+        skipped: &mut Vec<(String, &'static str)>,
+        warnings: &mut Vec<String>,
+    ) -> Result<ReviewOutput, EngineError> {
+        let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS);
+        let mode = s.mode;
+
+        // Clone: auth failure is fatal; anything else, or a clone still running at the Finder
+        // deadline (spec decision 12: the clone is part of the Finder budget), falls back to
+        // the diff only.
+        let clone_started = Instant::now();
+        let mut fallback_reason = None;
+        let clone_spec = if s.small {
+            warnings.push(SMALL_PR_NOTE.into());
+            fallback_reason = Some("small_pr");
+            None
+        } else {
+            s.git.clone_spec(s.repo_ref, s.pr)
+        };
+        let workspace = match clone_spec {
+            None => None,
+            Some(spec) => {
+                let clone = self.cloner.clone_pr(&spec);
+                match tokio::time::timeout_at(s.deadlines.finder, clone).await {
+                    Ok(Ok(workspace)) => Some(Arc::new(workspace)),
+                    Ok(Err(WorkspaceError::Unauthorized)) => {
+                        return Err(self.unauthorized(s.conn).await);
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(error = %err, "clone failed; reviewing the diff only");
+                        warnings.push(CODEBASE_UNAVAILABLE.into());
+                        fallback_reason = Some("clone_failed");
+                        None
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!("clone cut by the finder deadline; reviewing the diff only");
+                        warnings.push(CODEBASE_UNAVAILABLE.into());
+                        fallback_reason = Some("clone_timed_out");
+                        None
+                    }
                 }
-                Ok(None) => skipped.push((target.file.path, "unparseable")),
-                // Satu file ditolak (mis. output kosong): lewati file itu saja.
-                Err(err @ ChatError::Invalid(_)) => {
-                    tracing::warn!(%review_id, error = %err, "LLM rejected one file; skipping it");
-                    skipped.push((target.file.path, "llm_error"));
-                    rejected.push(err);
-                }
-                Err(err) => return Err(chat_error(err)),
             }
-        }
-        // Semua ditolak (mis. nama model salah): gagal dengan jelas, jangan posting review kosong.
-        if sent > 0
-            && rejected.len() == sent
-            && let Some(err) = rejected.pop()
-        {
-            return Err(chat_error(err));
-        }
+        };
+        let clone_ms = clone_started.elapsed().as_millis();
+        let repo_instructions = match &workspace {
+            Some(workspace) => load_repo_instructions(Arc::clone(workspace)).await,
+            None => None,
+        };
+        // One cache for every agent of this review, Finder and Verifier alike.
+        let toolbox = workspace.map(Toolbox::new);
 
+        let input = FinderInput {
+            pr: s.pr,
+            manifest,
+            batches: &batches,
+            memories: s.memories,
+            repo_instructions: repo_instructions.as_deref(),
+            mode,
+        };
+        let llm = FinderLlm {
+            chat: self.chat.as_ref(),
+            provider_id: s.provider_id,
+            model: s.primary_model,
+            effort: finder_effort(mode),
+            usage: s.usage,
+            token_budget: Some(&s.token_budget),
+        };
+        let finder = run_finder(llm, &input, toolbox.as_ref(), s.deadlines.finder).await;
+        // Read now: the summary names Finder wrap-ups only, not the Verifier's.
+        let finder_wrap_ups = s.token_budget.wrap_ups();
+        // From the final tasks, so a re-run without tools does not count a batch twice.
+        let budget_skipped_batches = finder
+            .tasks
+            .iter()
+            .filter(|task| matches!(task.result, Err(FinderFailure::TokenBudget)))
+            .map(|task| task.batch)
+            .collect::<HashSet<_>>()
+            .len();
+        // Without tool support the Verifier works from the diff as well.
+        let verifier_toolbox = if finder.tools_unsupported {
+            warnings.push(TOOLS_UNSUPPORTED.into());
+            fallback_reason = Some("tools_unsupported");
+            None
+        } else {
+            toolbox.as_ref()
+        };
+        let finder_tasks = finder.tasks.len();
+        let (cache_read_tokens, cache_write_tokens) = finder_cache_tokens(&finder.tasks);
+        let candidates =
+            collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
+        let candidate_count = candidates.len();
+
+        let (verified, verifier_dropped) = if candidates.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            let ctx = VerifyContext {
+                chat: self.chat.as_ref(),
+                provider_id: s.provider_id,
+                model: s.fast_model,
+                usage: s.usage,
+                token_budget: Some(&s.token_budget),
+            };
+            let report = verify_candidates(
+                ctx,
+                VerifyInput {
+                    candidates,
+                    targets: &files,
+                    rules: s.rules,
+                    memories: s.memories,
+                    repo_instructions: repo_instructions.as_deref(),
+                    toolbox: verifier_toolbox,
+                    deadline: s.deadlines.verifier,
+                },
+            )
+            .await;
+            if let Some(err) = report.all_retryable_error {
+                return Err(chat_error(err));
+            }
+            if report.dropped_unverified > 0 {
+                warnings.push(format!(
+                    "{} candidate finding(s) could not be verified and were omitted",
+                    report.dropped_unverified
+                ));
+            }
+            if report.truncated_by_cap > 0 {
+                warnings.push(format!(
+                    "{} lower-priority findings exceeded the verification cap and were omitted",
+                    report.truncated_by_cap
+                ));
+            }
+            let dropped = report.dropped_refuted + report.dropped_unverified;
+            (report.kept, dropped)
+        };
+        let verified_kept = verified.len();
+
+        let found: Vec<Suggestion> = if verified.len() < 2 {
+            verified.into_iter().map(|c| c.suggestion).collect()
+        } else {
+            let fallback: Vec<Suggestion> = verified.iter().map(|c| c.suggestion.clone()).collect();
+            let dedup = deduplicate_findings(
+                self.chat.as_ref(),
+                s.provider_id,
+                s.fast_model,
+                s.usage,
+                Some(s.token_budget.as_ref()),
+                verified,
+            );
+            match tokio::time::timeout_at(s.deadlines.dedup, dedup).await {
+                Ok(kept) => kept,
+                Err(_elapsed) => {
+                    tracing::warn!("semantic dedup cut by the deadline; keeping all findings");
+                    fallback
+                }
+            }
+        };
+
+        let budget = s.token_budget.as_ref();
+        // Only when the ceiling changed something (spec decision 15).
+        if let Some(warning) = budget.warning(budget_skipped_batches, finder_wrap_ups) {
+            warnings.push(warning);
+        }
+        tracing::info!(
+            review_mode = ?mode,
+            clone_ms,
+            fallback_reason,
+            finder_tasks,
+            candidates = candidate_count,
+            verified_kept,
+            verifier_dropped,
+            dedup_dropped = verified_kept.saturating_sub(found.len()),
+            cache_read_tokens,
+            cache_write_tokens,
+            input_tokens = budget.used(),
+            token_budget_reached = budget.exhausted(),
+            "review stages finished"
+        );
+        let patches: HashMap<String, Option<&str>> = files
+            .iter()
+            .map(|file| (normalize_path(&file.path), file.patch.as_deref()))
+            .collect();
         let mut counts: BTreeMap<Severity, usize> = BTreeMap::new();
         for suggestion in &found {
             *counts.entry(suggestion.severity).or_default() += 1;
         }
-        let comments: Vec<InlineComment> = found
+        let mut redacted_comments = 0;
+        let comments = found
             .iter()
-            .map(|s| InlineComment {
-                path: s.file.clone(),
-                line: s.line,
-                body: format_inline(s),
+            .map(|s| {
+                let end_offset = s.start_line.and_then(|_| {
+                    let patch = patches.get(s.file.as_str()).copied().flatten()?;
+                    right_line_end_offset(patch, s.line)
+                });
+                let (body, redacted) = inline_body(s);
+                redacted_comments += usize::from(redacted);
+                InlineComment {
+                    path: s.file.clone(),
+                    start_line: s.start_line,
+                    line: s.line,
+                    end_offset,
+                    body,
+                }
             })
             .collect();
-        let summary = format_summary(&counts, &skipped, ignored);
-        match git.post_review(&repo_ref, &pr, &comments, &summary).await {
-            Ok(posted) => Ok(Outcome::Done { posted }),
-            Err(err) => Err(self.post_error(&conn, err).await),
-        }
-    }
-
-    /// Minta review satu file; output yang tak terbaca diulang sekali. `Ok(None)`: tetap tak
-    /// terbaca.
-    async fn ask(
-        &self,
-        provider_id: Uuid,
-        model: &str,
-        system: String,
-        user: String,
-        ctx: &UsageContext,
-    ) -> Result<Option<Vec<Suggestion>>, ChatError> {
-        for _attempt in 0..2 {
-            let req = ChatRequest {
-                model: model.to_string(),
-                system: system.clone(),
-                user: user.clone(),
-                max_tokens: MAX_OUTPUT_TOKENS,
-            };
-            let response = self.chat.chat(provider_id, req, ctx.clone()).await?;
-            if let Ok(suggestions) = parse_suggestions(&response.text) {
-                return Ok(Some(suggestions));
-            }
-        }
-        Ok(None)
+        Ok(ReviewOutput {
+            counts,
+            comments,
+            redacted_tool_outputs: toolbox.as_ref().map_or(0, Toolbox::redacted_outputs),
+            redacted_comments,
+        })
     }
 
     /// Connection milik repo.
@@ -418,6 +776,222 @@ impl Engine {
     }
 }
 
+/// The posted body of one finding with secrets masked. A suggestion that holds a secret, or a
+/// value already masked as [`REDACTED`], is dropped (the comment keeps its span, and its body
+/// ends with [`SUGGESTION_OMITTED`]), so "Apply suggestion" never writes `[REDACTED]` into
+/// code. The flag: something was masked or dropped.
+fn inline_body(s: &Suggestion) -> (String, bool) {
+    let leaks = s
+        .suggestion
+        .as_deref()
+        .is_some_and(|code| contains_secret(code) || code.contains(REDACTED));
+    let body = if leaks {
+        format_inline(&Suggestion {
+            suggestion: None,
+            ..s.clone()
+        })
+    } else {
+        format_inline(s)
+    };
+    let (mut body, masked) = redact_owned(body);
+    if leaks {
+        body.push_str("\n\n");
+        body.push_str(SUGGESTION_OMITTED);
+    }
+    (body, masked || leaks)
+}
+
+/// `text` with secrets masked, and whether anything was.
+fn redact_owned(text: String) -> (String, bool) {
+    if let Cow::Owned(masked) = redact_secrets(&text) {
+        return (masked, true);
+    }
+    (text, false)
+}
+
+/// Cache tokens summed over the Finder agents that finished.
+fn finder_cache_tokens(tasks: &[FinderTask]) -> (u32, u32) {
+    tasks
+        .iter()
+        .filter_map(|task| task.result.as_ref().ok())
+        .fold((0u32, 0u32), |(read, write), outcome| {
+            (
+                read.saturating_add(outcome.cache_read_tokens),
+                write.saturating_add(outcome.cache_write_tokens),
+            )
+        })
+}
+
+/// Turns Finder results into candidates for the Verifier, in (batch, specialist) order: each
+/// result is filtered to its batch's [`CommentableRange`]s (commentable lines, and hunks for a
+/// `start_line`), then exact `(file, line, title)` duplicates are merged across the whole
+/// review (see [`dedup_exact`]).
+///
+/// A failed task becomes a summary note when another agent reviewed its batch; when no agent
+/// reviewed a batch, its files are listed as skipped (reason `timed_out` when the Finder
+/// deadline cut every agent of it, `token_budget` when the batch was never started because
+/// the token budget was exhausted). When no task succeeded at all, the review fails (see
+/// [`all_failed`]); in `Generalist` mode it is also retried when every failure was retryable
+/// (see [`generalist_retry`]).
+fn collect_candidates(
+    tasks: Vec<FinderTask>,
+    mode: ReviewMode,
+    batches: &[DiffBatch<'_>],
+    allowed: &HashMap<String, CommentableRange>,
+    skipped: &mut Vec<(String, &'static str)>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<CandidateFinding>, EngineError> {
+    if !tasks.is_empty() && tasks.iter().all(|task| task.result.is_err()) {
+        return Err(all_failed(tasks));
+    }
+    if mode == ReviewMode::Generalist
+        && let Some(err) = generalist_retry(&tasks)
+    {
+        return Err(err);
+    }
+    let reviewed: HashSet<usize> = tasks
+        .iter()
+        .filter(|task| task.result.is_ok())
+        .map(|task| task.batch)
+        .collect();
+    let batch_allowed: Vec<HashMap<String, &CommentableRange>> = batches
+        .iter()
+        .map(|batch| {
+            batch
+                .files
+                .iter()
+                .filter_map(|file| {
+                    let path = normalize_path(&file.path);
+                    let range = allowed.get(&path)?;
+                    Some((path, range))
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut candidates = Vec::new();
+    // Batch index → skip reason, for batches no agent reviewed.
+    let mut unreviewed: BTreeMap<usize, &'static str> = BTreeMap::new();
+    for task in tasks {
+        let label = task.kind.label();
+        let reason = match task.result {
+            Ok(outcome) => {
+                let Some(range) = batch_allowed.get(task.batch) else {
+                    continue;
+                };
+                candidates.extend(keep_valid_batch(outcome.result, range).into_iter().map(
+                    |suggestion| CandidateFinding {
+                        suggestion,
+                        specialist: task.kind,
+                    },
+                ));
+                continue;
+            }
+            Err(FinderFailure::TimedOut) => {
+                push_once(warnings, format!("{label} reviewer did not finish in time"));
+                "timed_out"
+            }
+            // The summary's token-budget note covers it; no per-reviewer note.
+            Err(FinderFailure::TokenBudget) => "token_budget",
+            Err(FinderFailure::Agent(_)) if reviewed.contains(&task.batch) => {
+                push_once(warnings, format!("{label} reviewer did not complete"));
+                continue;
+            }
+            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => "unparseable",
+            Err(FinderFailure::Agent(_)) => "llm_error",
+        };
+        if reviewed.contains(&task.batch) {
+            continue;
+        }
+        // Differing reasons for one batch read as a plain LLM error.
+        unreviewed
+            .entry(task.batch)
+            .and_modify(|current| {
+                if *current != reason {
+                    *current = "llm_error";
+                }
+            })
+            .or_insert(reason);
+    }
+    for (index, reason) in unreviewed {
+        if let Some(batch) = batches.get(index) {
+            tracing::warn!(batch = index, reason, "no finder agent reviewed a batch");
+            skipped.extend(batch.files.iter().map(|file| (file.path.clone(), reason)));
+        }
+    }
+    Ok(dedup_exact(candidates, |c| &c.suggestion))
+}
+
+/// Generalist rule of spec decision 8: when some Finder task failed and every failure was a
+/// retryable chat error (`AllKeysFailed`, `NoKeys`, `Internal`), retry the review rather than
+/// post it with those files skipped. A deadline cut is never retryable. The retry waits for
+/// the first `AllKeysFailed`'s `retry_after`.
+fn generalist_retry(tasks: &[FinderTask]) -> Option<EngineError> {
+    let mut first_retryable: Option<&ChatError> = None;
+    let mut rate_limited: Option<&ChatError> = None;
+    for task in tasks {
+        let err = match &task.result {
+            Ok(_) => continue,
+            Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(err) => err,
+            Err(_) => return None,
+        };
+        first_retryable.get_or_insert(err);
+        if matches!(err, ChatError::AllKeysFailed { .. }) {
+            rate_limited.get_or_insert(err);
+        }
+    }
+    rate_limited.or(first_retryable).cloned().map(chat_error)
+}
+
+/// `AllKeysFailed`, `NoKeys` and `Internal` may pass when the job is retried later.
+pub(crate) fn is_retryable(err: &ChatError) -> bool {
+    matches!(
+        err,
+        ChatError::AllKeysFailed { .. } | ChatError::NoKeys | ChatError::Internal(_)
+    )
+}
+
+/// The error when no Finder task succeeded. Retryable only when every failure was a
+/// retryable chat error (`AllKeysFailed`, `NoKeys`, `Internal`); otherwise the first other
+/// failure decides, and a review cut entirely by the deadline is `review timed out`.
+fn all_failed(tasks: Vec<FinderTask>) -> EngineError {
+    let mut retryable: Option<ChatError> = None;
+    let mut fatal: Option<EngineError> = None;
+    for task in tasks {
+        let error = match task.result {
+            Ok(_) => continue,
+            Err(FinderFailure::TimedOut) => timed_out(),
+            // Never retryable: a retry would spend the same tokens again.
+            Err(FinderFailure::TokenBudget) => {
+                EngineError::Fatal("review stopped: token budget reached".into())
+            }
+            Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(&err) => {
+                retryable.get_or_insert(err);
+                continue;
+            }
+            Err(FinderFailure::Agent(AgentError::Chat(err))) => chat_error(err),
+            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => {
+                EngineError::Fatal("LLM: review output could not be parsed".into())
+            }
+            Err(FinderFailure::Agent(AgentError::ToolsUnsupported(message))) => {
+                chat_error(ChatError::ToolsUnsupported(message))
+            }
+        };
+        fatal.get_or_insert(error);
+    }
+    match (fatal, retryable) {
+        (Some(error), _) => error,
+        (None, Some(err)) => chat_error(err),
+        (None, None) => timed_out(),
+    }
+}
+
+fn push_once(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
+}
+
 /// Matcher daftar ignore. Daftar tersimpan yang tidak valid tidak boleh menggagalkan review:
 /// pakai daftar bawaan, dan bila itu pun gagal, review tanpa ignore (`None`).
 fn ignore_matcher(patterns: &[String]) -> Option<IgnoreMatcher> {
@@ -440,7 +1014,7 @@ fn ignore_matcher(patterns: &[String]) -> Option<IgnoreMatcher> {
 fn full_targets(full: Vec<FileDiff>) -> Vec<Target> {
     full.into_iter()
         .map(|file| {
-            let allowed = commentable_lines(file.patch.as_deref().unwrap_or(""));
+            let allowed = CommentableRange::from_patch(file.patch.as_deref().unwrap_or(""));
             Target { file, allowed }
         })
         .collect()
@@ -449,22 +1023,34 @@ fn full_targets(full: Vec<FileDiff>) -> Vec<Target> {
 /// File dari commit baru yang masih ada di diff PR penuh. Baris yang boleh dikomentari harus
 /// baru di commit ini DAN masih berubah di PR (supaya posisinya valid untuk provider).
 fn incremental_targets(changed: Vec<FileDiff>, full: Vec<FileDiff>) -> Vec<Target> {
-    let full_lines: HashMap<String, BTreeSet<u32>> = full
+    let full_ranges: HashMap<String, CommentableRange> = full
         .into_iter()
         .map(|file| {
-            let lines = commentable_lines(file.patch.as_deref().unwrap_or(""));
-            (file.path, lines)
+            let range = CommentableRange::from_patch(file.patch.as_deref().unwrap_or(""));
+            (file.path, range)
         })
         .collect();
     changed
         .into_iter()
         .filter_map(|file| {
-            let in_pr = full_lines.get(&file.path)?;
-            let new_lines = commentable_lines(file.patch.as_deref().unwrap_or(""));
-            let allowed = new_lines.intersection(in_pr).copied().collect();
+            let in_pr = full_ranges.get(&file.path)?;
+            let new_range = CommentableRange::from_patch(file.patch.as_deref().unwrap_or(""));
+            let allowed = CommentableRange {
+                lines: new_range
+                    .lines
+                    .intersection(&in_pr.lines)
+                    .copied()
+                    .collect(),
+                hunks: intersect_hunks(&new_range.hunks, &in_pr.hunks),
+            };
             Some(Target { file, allowed })
         })
         .collect()
+}
+
+/// A review cut by its time budget. Fatal: a retry would spend the same LLM tokens again.
+fn timed_out() -> EngineError {
+    EngineError::Fatal("review timed out".into())
 }
 
 pub(crate) fn db_error(err: sqlx::Error) -> EngineError {
@@ -479,6 +1065,8 @@ fn chat_error(err: ChatError) -> EngineError {
         ChatError::NoKeys | ChatError::Internal(_) => {
             EngineError::Retryable(format!("LLM: {err}"), None)
         }
-        ChatError::Invalid(_) => EngineError::Fatal(format!("LLM: {err}")),
+        ChatError::Invalid(_) | ChatError::ToolsUnsupported(_) | ChatError::ContextOverflow(_) => {
+            EngineError::Fatal(format!("LLM: {err}"))
+        }
     }
 }

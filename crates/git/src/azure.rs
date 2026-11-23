@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use crate::diff::unified_patch;
 use crate::{
-    FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest, RemoteRepo,
-    RepoRef, normalize_path,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest,
+    RemoteRepo, RepoRef, basic_auth_header, decode, git_url, normalize_path,
 };
 
 const API_VERSION: &str = "7.1";
@@ -233,12 +233,6 @@ impl AzureProvider {
     }
 }
 
-async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, GitError> {
-    resp.json::<T>()
-        .await
-        .map_err(|e| GitError::Decode(e.without_url().to_string()))
-}
-
 /// Thread status `1` = active; `commentType` 1 = text.
 fn thread_body(content: &str, context: Option<Value>) -> Value {
     let mut body = json!({
@@ -307,6 +301,7 @@ struct AzPull {
     #[serde(default)]
     is_draft: bool,
     last_merge_source_commit: AzCommit,
+    source_ref_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -540,6 +535,7 @@ impl GitProvider for AzureProvider {
             head_sha: pull.last_merge_source_commit.commit_id,
             base_sha: iteration.common_ref_commit.commit_id,
             is_draft: pull.is_draft,
+            source_ref: pull.source_ref_name,
         })
     }
 
@@ -594,11 +590,14 @@ impl GitProvider for AzureProvider {
         summary: &str,
     ) -> Result<usize, GitError> {
         for c in comments {
-            let position = json!({ "line": c.line, "offset": 1 });
+            let (start_line, end_offset) = match c.start_line.filter(|&s| s < c.line) {
+                Some(start) => (start, c.end_offset.filter(|&o| o >= 1).unwrap_or(1)),
+                None => (c.line, 1),
+            };
             let context = json!({
                 "filePath": format!("/{}", normalize_path(&c.path)),
-                "rightFileStart": position,
-                "rightFileEnd": position,
+                "rightFileStart": { "line": start_line, "offset": 1 },
+                "rightFileEnd": { "line": c.line, "offset": end_offset },
             });
             self.post_thread(repo, pr.number, &thread_body(&c.body, Some(context)))
                 .await?;
@@ -616,5 +615,21 @@ impl GitProvider for AzureProvider {
     ) -> Result<(), GitError> {
         self.post_thread(repo, pr_number, &thread_body(body, None))
             .await
+    }
+
+    /// Fetches the head commit by SHA; servers that refuse a bare SHA get the source branch.
+    fn clone_spec(&self, repo: &RepoRef, pr: &PullRequest) -> Option<CloneSpec> {
+        let project = repo.project.as_deref()?;
+        let url = git_url(
+            &self.base_url,
+            &[&self.organization, project, "_git", &repo.name],
+        )?;
+        Some(CloneSpec {
+            url,
+            refspec: pr.head_sha.clone(),
+            fallback_refspec: pr.source_ref.clone(),
+            expected_sha: pr.head_sha.clone(),
+            auth_header: basic_auth_header("", &self.token),
+        })
     }
 }

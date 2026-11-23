@@ -7,8 +7,8 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 
 use crate::{
-    FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest, RemoteRepo,
-    RepoRef, normalize_path,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PullRequest,
+    RemoteRepo, RepoRef, basic_auth_header, decode, git_url, normalize_path,
 };
 
 /// Batas halaman saat mengikuti header `Link` (30 x 100 = 3000 item).
@@ -111,12 +111,6 @@ impl GithubProvider {
         let pages: Vec<Vec<GhFile>> = self.get_pages(first_url).await?;
         Ok(pages.into_iter().flatten().map(GhFile::into_diff).collect())
     }
-}
-
-async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, GitError> {
-    resp.json::<T>()
-        .await
-        .map_err(|e| GitError::Decode(e.without_url().to_string()))
 }
 
 /// URL `rel="next"` dari nilai header `Link`, kalau ada. URL bisa memuat koma literal
@@ -371,6 +365,7 @@ impl GitProvider for GithubProvider {
             head_sha: pull.head.sha,
             base_sha: compare.merge_base_commit.sha,
             is_draft: pull.draft,
+            source_ref: None,
         })
     }
 
@@ -408,7 +403,21 @@ impl GitProvider for GithubProvider {
     ) -> Result<usize, GitError> {
         let inline: Vec<_> = comments
             .iter()
-            .map(|c| json!({ "path": c.path, "line": c.line, "side": "RIGHT", "body": c.body }))
+            .map(|c| {
+                let mut item = json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": "RIGHT",
+                    "body": c.body,
+                });
+                if let Some(start) = c.start_line.filter(|&s| s < c.line)
+                    && let Some(obj) = item.as_object_mut()
+                {
+                    obj.insert("start_line".into(), json!(start));
+                    obj.insert("start_side".into(), json!("RIGHT"));
+                }
+                item
+            })
             .collect();
         let body = json!({
             "commit_id": pr.head_sha,
@@ -431,5 +440,28 @@ impl GitProvider for GithubProvider {
         self.send(self.post(&url).json(&json!({ "body": body })))
             .await?;
         Ok(())
+    }
+
+    /// `https://api.github.com` clones from `https://github.com`, GHES `{origin}/api/v3` from
+    /// `{origin}`, any other base (test servers) from the base itself.
+    fn clone_spec(&self, repo: &RepoRef, pr: &PullRequest) -> Option<CloneSpec> {
+        let git_base = if self.base_url == "https://api.github.com" {
+            "https://github.com"
+        } else {
+            self.base_url
+                .strip_suffix("/api/v3")
+                .unwrap_or(&self.base_url)
+        };
+        if repo.name.is_empty() {
+            return None;
+        }
+        let url = git_url(git_base, &[&repo.owner, &format!("{}.git", repo.name)])?;
+        Some(CloneSpec {
+            url,
+            refspec: format!("refs/pull/{}/head", pr.number),
+            fallback_refspec: None,
+            expected_sha: pr.head_sha.clone(),
+            auth_header: basic_auth_header("x-access-token", &self.token),
+        })
     }
 }

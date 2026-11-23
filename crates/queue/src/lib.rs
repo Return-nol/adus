@@ -6,6 +6,7 @@
 //! - `{prefix}:delayed`     sorted set job retry, score = waktu jatuh tempo (unix ms)
 //! - `{prefix}:dedup:{key}` penanda delivery webhook yang sudah pernah dilihat
 //! - `{prefix}:lock:{key}`  lock dengan token
+//! - `{prefix}:cache:{key}` cache key dengan TTL
 //! - `{prefix}:worker:{name}:hb` heartbeat worker (unix detik), kedaluwarsa setelah 30 dtk
 //!
 //! Tiap entri stream punya field `job` (JSON) dan `attempt` (angka desimal, default 1).
@@ -24,8 +25,11 @@ use uuid::Uuid;
 pub const MAX_ATTEMPTS: u32 = 5;
 
 const GROUP: &str = "adus-workers";
-/// Entri yang belum di-ack selama ini dianggap milik worker yang mati, lalu diambil alih.
-const RECLAIM_IDLE_MS: u64 = 15 * 60 * 1000;
+/// An entry not acked for this long is taken to belong to a dead worker and is taken over.
+/// Longer than the worker's job backstop (a Specialists review runs up to 30 min), checked at
+/// compile time in `adus::worker`.
+pub const RECLAIM_IDLE: Duration = Duration::from_secs(35 * 60);
+const RECLAIM_IDLE_MS: u64 = RECLAIM_IDLE.as_secs() * 1000;
 const DEDUP_TTL_SECS: u64 = 86_400;
 /// Batas job yang dipindah satu kali `promote_due`.
 const PROMOTE_BATCH: u32 = 100;
@@ -138,19 +142,6 @@ impl Queue {
         Ok(queue)
     }
 
-    /// `true` hanya untuk pemanggilan pertama dengan `dedup_key` ini dalam 24 jam.
-    pub async fn first_seen(&self, dedup_key: &str) -> Result<bool, QueueError> {
-        let reply: Option<String> = redis::cmd("SET")
-            .arg(self.dedup_key(dedup_key))
-            .arg(1)
-            .arg("NX")
-            .arg("EX")
-            .arg(DEDUP_TTL_SECS)
-            .query_async(&mut self.conn.clone())
-            .await?;
-        Ok(reply.is_some())
-    }
-
     pub async fn enqueue(&self, job: &Job) -> Result<(), QueueError> {
         let job_json = serde_json::to_string(job)?;
         let _id: String = redis::cmd("XADD")
@@ -208,14 +199,14 @@ impl Queue {
 
     /// Ambil job berikutnya untuk `consumer`, menunggu paling lama `block`.
     ///
-    /// Entri yang belum di-ack lebih dari 15 menit dianggap milik worker yang mati dan
-    /// diambil alih lebih dulu. Tiap pengambilalihan menambah `attempt` satu; lewat dari
+    /// Entri yang belum di-ack lebih dari `RECLAIM_IDLE` (35 menit) dianggap milik worker yang
+    /// mati dan diambil alih lebih dulu. Tiap pengambilalihan menambah `attempt` satu; lewat dari
     /// `MAX_ATTEMPTS` job masuk stream dead. Artinya job wajib di-`ack`, di-`retry` atau
-    /// di-`dead_letter` dalam 15 menit (TTL lock juga diukur di bawah batas itu), kalau
-    /// tidak worker lain ikut mengerjakannya.
+    /// di-`dead_letter` dalam 35 menit (`JOB_TIMEOUT` worker, 31 menit, ada di bawah batas itu;
+    /// TTL lock sama, 35 menit), kalau tidak worker lain ikut mengerjakannya.
     ///
     /// Jika future ini dibatalkan tepat saat Redis sudah mengirim entri, entri itu tetap di
-    /// daftar pending (PEL) dan diambil alih setelah 15 menit. Entri dengan JSON rusak
+    /// daftar pending (PEL) dan diambil alih setelah 35 menit. Entri dengan JSON rusak
     /// dipindah ke stream dead lalu dilewati.
     pub async fn next(
         &self,
@@ -241,7 +232,7 @@ impl Queue {
         }
     }
 
-    /// Tandai job selesai dan hapus dari stream. Harus dalam 15 menit sejak `next`
+    /// Tandai job selesai dan hapus dari stream. Harus dalam 35 menit sejak `next`
     /// (lihat `next`), kalau tidak job sudah bisa diambil alih worker lain.
     pub async fn ack(&self, delivery: &Delivery) -> Result<(), QueueError> {
         let _: () = redis::pipe()
@@ -320,6 +311,37 @@ impl Queue {
         Ok(())
     }
 
+    /// Ambil nilai cache string untuk `key`, atau `None` jika tidak ada/kedaluwarsa.
+    pub async fn cache_get(&self, key: &str) -> Result<Option<String>, QueueError> {
+        let value: Option<String> = redis::cmd("GET")
+            .arg(self.cache_key(key))
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(value)
+    }
+
+    /// Simpan nilai cache string untuk `key` dengan TTL `ttl` (minimal 1 detik).
+    pub async fn cache_set(&self, key: &str, value: &str, ttl: Duration) -> Result<(), QueueError> {
+        let secs = ttl.as_secs().max(1);
+        let _: () = redis::cmd("SET")
+            .arg(self.cache_key(key))
+            .arg(value)
+            .arg("EX")
+            .arg(secs)
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(())
+    }
+
+    /// Hapus nilai cache untuk `key` jika ada.
+    pub async fn cache_del(&self, key: &str) -> Result<(), QueueError> {
+        let _: i64 = redis::cmd("DEL")
+            .arg(self.cache_key(key))
+            .query_async(&mut self.conn.clone())
+            .await?;
+        Ok(())
+    }
+
     /// Tandai `worker` masih hidup selama 30 dtk ke depan. Worker memanggilnya tiap 10 dtk.
     pub async fn heartbeat(&self, worker: &str) -> Result<(), QueueError> {
         let _: () = redis::cmd("SET")
@@ -372,7 +394,7 @@ impl Queue {
         Ok(count)
     }
 
-    /// XAUTOCLAIM satu entri yang idle lebih dari 15 menit.
+    /// XAUTOCLAIM satu entri yang idle lebih dari `RECLAIM_IDLE`.
     async fn reclaim_stale(&self, consumer: &str) -> Result<Option<StreamId>, QueueError> {
         let reply: StreamAutoClaimReply = redis::cmd("XAUTOCLAIM")
             .arg(self.jobs_key())
@@ -522,6 +544,10 @@ impl Queue {
 
     fn lock_key(&self, key: &str) -> String {
         format!("{}:lock:{key}", self.prefix)
+    }
+
+    fn cache_key(&self, key: &str) -> String {
+        format!("{}:cache:{key}", self.prefix)
     }
 
     fn heartbeat_key(&self, worker: &str) -> String {

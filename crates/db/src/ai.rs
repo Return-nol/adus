@@ -21,8 +21,33 @@ pub struct AiProvider {
     pub kind: ProviderKind,
     pub name: String,
     pub base_url: Option<String>,
+    /// `None` only for providers that had no model before migration 0008: they need setup
+    /// and are treated as "no model configured" until an admin picks one.
+    pub primary_model: Option<String>,
+    pub fast_model: Option<String>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+}
+
+impl AiProvider {
+    /// The model for the main review pass, or `None` when the provider still needs one.
+    pub fn primary_model(&self) -> Option<&str> {
+        non_blank(self.primary_model.as_deref())
+    }
+
+    /// The optional fast model configured on this provider, if non-blank.
+    pub fn fast_model(&self) -> Option<&str> {
+        non_blank(self.fast_model.as_deref())
+    }
+
+    /// The model for cheaper follow-up work: `fast_model`, else the primary model.
+    pub fn effective_fast_model(&self) -> Option<&str> {
+        self.fast_model().or_else(|| self.primary_model())
+    }
+}
+
+fn non_blank(model: Option<&str>) -> Option<&str> {
+    model.map(str::trim).filter(|m| !m.is_empty())
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -48,7 +73,8 @@ pub struct KeyPatch {
     pub secret: Option<(String, String)>,
 }
 
-const PROVIDER_COLUMNS: &str = "id, kind, name, base_url, enabled, created_at";
+const PROVIDER_COLUMNS: &str =
+    "id, kind, name, base_url, primary_model, fast_model, enabled, created_at";
 const KEY_COLUMNS: &str = "id, provider_id, label, encrypted_key, key_last4, enabled, status, \
                            cooldown_until, last_used_at, created_at";
 
@@ -57,14 +83,19 @@ pub async fn insert_provider(
     kind: ProviderKind,
     name: &str,
     base_url: Option<&str>,
+    primary_model: &str,
+    fast_model: Option<&str>,
 ) -> Result<AiProvider> {
     sqlx::query_as(&format!(
-        "INSERT INTO ai_providers (kind, name, base_url) VALUES ($1, $2, $3) \
+        "INSERT INTO ai_providers (kind, name, base_url, primary_model, fast_model) \
+         VALUES ($1, $2, $3, $4, $5) \
          RETURNING {PROVIDER_COLUMNS}"
     ))
     .bind(kind)
     .bind(name)
     .bind(base_url)
+    .bind(primary_model)
+    .bind(fast_model)
     .fetch_one(pool)
     .await
 }
@@ -92,15 +123,20 @@ pub async fn update_provider(
     id: Uuid,
     name: &str,
     base_url: Option<&str>,
+    primary_model: Option<&str>,
+    fast_model: Option<&str>,
     enabled: bool,
 ) -> Result<Option<AiProvider>> {
     sqlx::query_as(&format!(
-        "UPDATE ai_providers SET name = $2, base_url = $3, enabled = $4 WHERE id = $1 \
+        "UPDATE ai_providers SET name = $2, base_url = $3, primary_model = $4, fast_model = $5, \
+         enabled = $6 WHERE id = $1 \
          RETURNING {PROVIDER_COLUMNS}"
     ))
     .bind(id)
     .bind(name)
     .bind(base_url)
+    .bind(primary_model)
+    .bind(fast_model)
     .bind(enabled)
     .fetch_optional(pool)
     .await
@@ -246,4 +282,146 @@ pub async fn mark_invalid(pool: &PgPool, key_id: Uuid) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn provider_models_crud_optional_fast_model_and_effective_fallback(pool: PgPool) {
+        let created = insert_provider(
+            &pool,
+            ProviderKind::Anthropic,
+            "Anthropic",
+            None,
+            "claude-sonnet-4-5",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.primary_model(), Some("claude-sonnet-4-5"));
+        assert_eq!(created.fast_model, None);
+        assert_eq!(created.effective_fast_model(), Some("claude-sonnet-4-5"));
+
+        let with_fast = update_provider(
+            &pool,
+            created.id,
+            "Anthropic",
+            None,
+            Some("claude-sonnet-4-5"),
+            Some("claude-haiku-4-5"),
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(with_fast.fast_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(with_fast.effective_fast_model(), Some("claude-haiku-4-5"));
+
+        let cleared = update_provider(
+            &pool,
+            created.id,
+            "Anthropic",
+            None,
+            Some("claude-sonnet-4-5"),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cleared.fast_model, None);
+        assert_eq!(cleared.effective_fast_model(), Some("claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn provider_without_primary_model_has_no_model_at_all() {
+        let provider = AiProvider {
+            id: Uuid::nil(),
+            kind: ProviderKind::Openai,
+            name: "needs setup".into(),
+            base_url: None,
+            primary_model: None,
+            fast_model: Some("  ".into()),
+            enabled: true,
+            created_at: Utc::now(),
+        };
+        assert_eq!(provider.primary_model(), None);
+        assert_eq!(provider.effective_fast_model(), None);
+    }
+
+    /// Runs migrations 1–7, seeds an install that still has `settings.default_model` and
+    /// `repositories.review_model`, then runs migration 8 and checks the backfill.
+    #[sqlx::test(migrations = false)]
+    async fn migration_8_backfills_provider_models_without_inventing_one(pool: PgPool) {
+        for m in crate::MIGRATOR.iter().filter(|m| m.version < 8) {
+            sqlx::raw_sql(&m.sql).execute(&pool).await.unwrap();
+        }
+        let seed = r#"
+            INSERT INTO ai_providers (id, kind, name) VALUES
+                ('00000000-0000-0000-0000-00000000000a', 'openai', 'global default'),
+                ('00000000-0000-0000-0000-00000000000b', 'anthropic', 'repo override'),
+                ('00000000-0000-0000-0000-00000000000c', 'gemini', 'never used'),
+                ('00000000-0000-0000-0000-00000000000d', 'openai', 'only a deleted repo');
+            UPDATE settings SET default_provider_id = '00000000-0000-0000-0000-00000000000a',
+                                default_model = ' gpt-5 ' WHERE id = 1;
+            INSERT INTO connections (id, kind, name, org_or_owner, encrypted_token, token_last4)
+                VALUES ('00000000-0000-0000-0000-000000000001', 'github', 'c', 'o', 'x', 'xxxx');
+            INSERT INTO repositories (id, connection_id, external_id, owner, name,
+                                      review_provider_id, review_model, created_at, deleted_at) VALUES
+                ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000001',
+                 'r1', 'o', 'old', '00000000-0000-0000-0000-00000000000b', 'claude-old',
+                 now() - interval '2 days', NULL),
+                ('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-000000000001',
+                 'r2', 'o', 'new', '00000000-0000-0000-0000-00000000000b', 'claude-new',
+                 now() - interval '1 day', NULL),
+                ('00000000-0000-0000-0000-000000000013', '00000000-0000-0000-0000-000000000001',
+                 'r3', 'o', 'gone', '00000000-0000-0000-0000-00000000000d', 'deleted-model',
+                 now(), now()),
+                ('00000000-0000-0000-0000-000000000014', '00000000-0000-0000-0000-000000000001',
+                 'r4', 'o', 'provider only', '00000000-0000-0000-0000-00000000000c', NULL,
+                 now(), NULL),
+                ('00000000-0000-0000-0000-000000000015', '00000000-0000-0000-0000-000000000001',
+                 'r5', 'o', 'provider only, provider has a model',
+                 '00000000-0000-0000-0000-00000000000b', '  ', now(), NULL);
+        "#;
+        sqlx::raw_sql(seed).execute(&pool).await.unwrap();
+
+        let m8 = crate::MIGRATOR.iter().find(|m| m.version == 8).unwrap();
+        sqlx::raw_sql(&m8.sql).execute(&pool).await.unwrap();
+
+        let model = |id: u128| {
+            let pool = pool.clone();
+            async move {
+                get_provider(&pool, Uuid::from_u128(id))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .primary_model
+            }
+        };
+        assert_eq!(model(0xa).await.as_deref(), Some("gpt-5"));
+        assert_eq!(model(0xb).await.as_deref(), Some("claude-new"));
+        assert_eq!(model(0xc).await, None, "no model is invented");
+        assert_eq!(model(0xd).await, None, "deleted repos are ignored");
+
+        let overrides: Vec<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT external_id, review_provider_id FROM repositories ORDER BY external_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            overrides,
+            vec![
+                ("r1".into(), Some(Uuid::from_u128(0xb))),
+                ("r2".into(), Some(Uuid::from_u128(0xb))),
+                ("r3".into(), Some(Uuid::from_u128(0xd))),
+                // Provider-only overrides used the global provider+model before: still do.
+                ("r4".into(), None),
+                ("r5".into(), None),
+            ]
+        );
+    }
 }

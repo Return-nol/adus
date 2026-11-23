@@ -21,7 +21,7 @@ async fn call(app: &Router, method: &str, uri: &str, body: &Value, cookie: &str)
 
 /// Provider `openai` dengan satu key berlabel `label`; mengembalikan (provider_id, key_id).
 async fn provider_with_key(app: &Router, admin: &str, name: &str, label: &str) -> (String, String) {
-    let body = json!({ "kind": "openai", "name": name });
+    let body = json!({ "kind": "openai", "name": name, "primary_model": "gpt-5" });
     let provider = send(app, post_json("/api/v1/ai-providers", &body, Some(admin))).await;
     let provider = provider.body["id"].as_str().unwrap().to_string();
     let uri = format!("/api/v1/ai-providers/{provider}/keys");
@@ -39,13 +39,15 @@ struct Row<'a> {
     output: i32,
     success: bool,
     repo: Option<&'a str>,
+    cache_read: i32,
+    cache_write: i32,
 }
 
 async fn insert_usage(pool: &PgPool, row: Row<'_>) {
     sqlx::query(
         "INSERT INTO llm_usage (repository_id, provider_id, key_id, model, input_tokens, \
-         output_tokens, latency_ms, success, created_at) \
-         VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, 10, $7, $8::timestamptz)",
+         output_tokens, latency_ms, success, created_at, cache_read_tokens, cache_write_tokens) \
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, 10, $7, $8::timestamptz, $9, $10)",
     )
     .bind(row.repo)
     .bind(row.provider)
@@ -55,6 +57,8 @@ async fn insert_usage(pool: &PgPool, row: Row<'_>) {
     .bind(row.output)
     .bind(row.success)
     .bind(row.at)
+    .bind(row.cache_read)
+    .bind(row.cache_write)
     .execute(pool)
     .await
     .unwrap();
@@ -70,6 +74,8 @@ fn row<'a>(at: &'a str, provider: &'a str, key: &'a str, input: i32, output: i32
         output,
         success: true,
         repo: None,
+        cache_read: 0,
+        cache_write: 0,
     }
 }
 
@@ -79,7 +85,12 @@ async fn daily_usage_fills_missing_days_with_zero(pool: PgPool) {
     let admin = setup_admin(&app).await;
     let (p, k) = provider_with_key(&app, &admin, "OpenAI", "main").await;
 
-    insert_usage(&pool, row("2026-01-10T00:00:00Z", &p, &k, 100, 10)).await;
+    let cached = Row {
+        cache_read: 40,
+        cache_write: 20,
+        ..row("2026-01-10T00:00:00Z", &p, &k, 100, 10)
+    };
+    insert_usage(&pool, cached).await;
     let failed = Row {
         success: false,
         ..row("2026-01-10T23:59:59Z", &p, &k, 0, 0)
@@ -92,14 +103,14 @@ async fn daily_usage_fills_missing_days_with_zero(pool: PgPool) {
     let uri = "/api/v1/usage/daily?from=2026-01-09&to=2026-01-12";
     let reply = send(&app, get(uri, Some(&admin))).await;
     assert_eq!(reply.status, StatusCode::OK);
-    let day = |date: &str, i: i64, o: i64, calls: i64, failed: i64| json!({ "date": date, "input_tokens": i, "output_tokens": o, "calls": calls, "failed_calls": failed });
+    let day = |date: &str, i: i64, o: i64, cache: (i64, i64), calls: i64, failed: i64| json!({ "date": date, "input_tokens": i, "output_tokens": o, "cache_read_tokens": cache.0, "cache_write_tokens": cache.1, "calls": calls, "failed_calls": failed });
     assert_eq!(
         reply.body,
         json!([
-            day("2026-01-09", 0, 0, 0, 0),
-            day("2026-01-10", 100, 10, 2, 1),
-            day("2026-01-11", 0, 0, 0, 0),
-            day("2026-01-12", 5, 1, 1, 0),
+            day("2026-01-09", 0, 0, (0, 0), 0, 0),
+            day("2026-01-10", 100, 10, (40, 20), 2, 1),
+            day("2026-01-11", 0, 0, (0, 0), 0, 0),
+            day("2026-01-12", 5, 1, (0, 0), 1, 0),
         ])
     );
 }
@@ -148,7 +159,12 @@ async fn breakdown_by_key_uses_label(pool: PgPool) {
 
     insert_usage(&pool, row("2026-02-01T10:00:00Z", &p1, &k1, 10, 5)).await;
     insert_usage(&pool, row("2026-02-02T10:00:00Z", &p1, &k1, 10, 5)).await;
-    insert_usage(&pool, row("2026-02-02T11:00:00Z", &p2, &k2, 500, 100)).await;
+    let cached = Row {
+        cache_read: 300,
+        cache_write: 50,
+        ..row("2026-02-02T11:00:00Z", &p2, &k2, 500, 100)
+    };
+    insert_usage(&pool, cached).await;
 
     let q = "from=2026-02-01&to=2026-02-28";
     let by_key = send(
@@ -161,8 +177,8 @@ async fn breakdown_by_key_uses_label(pool: PgPool) {
     assert_eq!(
         by_key.body,
         json!([
-            { "id": k2, "label": "backup", "input_tokens": 500, "output_tokens": 100, "calls": 1 },
-            { "id": k1, "label": "primary", "input_tokens": 20, "output_tokens": 10, "calls": 2 },
+            { "id": k2, "label": "backup", "input_tokens": 500, "output_tokens": 100, "cache_read_tokens": 300, "cache_write_tokens": 50, "calls": 1 },
+            { "id": k1, "label": "primary", "input_tokens": 20, "output_tokens": 10, "cache_read_tokens": 0, "cache_write_tokens": 0, "calls": 2 },
         ])
     );
 
@@ -188,7 +204,7 @@ async fn breakdown_by_key_uses_label(pool: PgPool) {
     .await;
     assert_eq!(
         by_model.body,
-        json!([{ "label": "gpt-x", "input_tokens": 520, "output_tokens": 110, "calls": 3 }])
+        json!([{ "label": "gpt-x", "input_tokens": 520, "output_tokens": 110, "cache_read_tokens": 300, "cache_write_tokens": 50, "calls": 3 }])
     );
 
     // Key dihapus: usage-nya bertahan dengan label "(deleted)".
@@ -209,8 +225,8 @@ async fn breakdown_by_key_uses_label(pool: PgPool) {
     assert_eq!(
         after.body,
         json!([
-            { "id": k2, "label": "backup", "input_tokens": 500, "output_tokens": 100, "calls": 1 },
-            { "label": "(deleted)", "input_tokens": 20, "output_tokens": 10, "calls": 2 },
+            { "id": k2, "label": "backup", "input_tokens": 500, "output_tokens": 100, "cache_read_tokens": 300, "cache_write_tokens": 50, "calls": 1 },
+            { "label": "(deleted)", "input_tokens": 20, "output_tokens": 10, "cache_read_tokens": 0, "cache_write_tokens": 0, "calls": 2 },
         ])
     );
 
@@ -257,8 +273,8 @@ async fn breakdown_by_repository_uses_owner_name(pool: PgPool) {
     assert_eq!(
         reply.body,
         json!([
-            { "id": repo_id, "label": "acme/api", "input_tokens": 30, "output_tokens": 3, "calls": 1 },
-            { "label": "(deleted)", "input_tokens": 1, "output_tokens": 1, "calls": 1 },
+            { "id": repo_id, "label": "acme/api", "input_tokens": 30, "output_tokens": 3, "cache_read_tokens": 0, "cache_write_tokens": 0, "calls": 1 },
+            { "label": "(deleted)", "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0, "cache_write_tokens": 0, "calls": 1 },
         ])
     );
 }
@@ -298,7 +314,7 @@ async fn breakdown_by_repository_uses_azure_project_name(pool: PgPool) {
     let reply = send(&app, get(uri, Some(&admin))).await;
     assert_eq!(
         reply.body,
-        json!([{ "id": repo_id, "label": "myvalue/api", "input_tokens": 30, "output_tokens": 3, "calls": 1 }])
+        json!([{ "id": repo_id, "label": "myvalue/api", "input_tokens": 30, "output_tokens": 3, "cache_read_tokens": 0, "cache_write_tokens": 0, "calls": 1 }])
     );
 }
 
@@ -331,7 +347,7 @@ async fn user_role_can_read_usage_but_not_edit_keys(pool: PgPool) {
         (
             "POST",
             "/api/v1/ai-providers".to_string(),
-            json!({ "kind": "openai", "name": "x" }),
+            json!({ "kind": "openai", "name": "x", "primary_model": "gpt-5" }),
         ),
         ("PATCH", provider_uri.clone(), json!({ "name": "x" })),
         ("DELETE", provider_uri.clone(), Value::Null),
@@ -346,7 +362,7 @@ async fn user_role_can_read_usage_but_not_edit_keys(pool: PgPool) {
         (
             "PUT",
             "/api/v1/settings".to_string(),
-            json!({ "default_provider_id": null, "default_model": null,
+            json!({ "default_provider_id": null,
                     "max_files_per_review": 1, "max_patch_lines_per_file": 1 }),
         ),
     ];

@@ -1,16 +1,110 @@
 mod common;
 
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::Arc;
+
 use adus_core::job::{CommentAuthor, Job, Trigger};
-use adus_core::types::{ADUDU_MARKER, ConnectionKind};
-use adus_db::connections::{self, ConnectionStatus};
+use adus_core::types::{ADUDU_MARKER, ConnectionKind, ReviewMode};
+use adus_db::connections::ConnectionStatus;
 use adus_db::memories::{self, MemorySource};
 use adus_db::rules::KnowledgeScope;
 use adus_db::users::{self, Role, User, UserPatch};
-use adus_git::GitError;
-use adus_review::command::{Command, authorize, parse_command};
+use adus_git::{CloneSpec, GitError};
+use adus_llm::router::{ChatError, ChatService, UsageContext};
+use adus_llm::{ChatRequest, ChatResponse};
+use adus_review::command::authorize;
 use adus_review::engine::EngineError;
-use common::{FakeGit, Setup, cleanup_queue, pr, queued_jobs, setup, test_queue};
+use adus_review::workspace::{RepoCloner, RepoWorkspace, WorkspaceError};
+use async_trait::async_trait;
+use common::{FakeGit, Setup, conn_status, pr, setup};
 use sqlx::PgPool;
+use uuid::Uuid;
+
+struct NoopChat;
+
+#[async_trait]
+impl ChatService for NoopChat {
+    async fn chat(
+        &self,
+        _provider_id: Uuid,
+        _req: ChatRequest,
+        _ctx: UsageContext,
+    ) -> Result<ChatResponse, ChatError> {
+        unreachable!("command tests do not invoke LLM")
+    }
+}
+
+struct NoopCloner;
+
+#[async_trait]
+impl RepoCloner for NoopCloner {
+    async fn clone_pr(&self, _spec: &CloneSpec) -> Result<RepoWorkspace, WorkspaceError> {
+        unreachable!("command tests do not clone")
+    }
+}
+
+fn redis_url() -> String {
+    std::env::var("REDIS_URL").expect("REDIS_URL must be set (see .cargo/config.toml)")
+}
+
+/// Queue with a unique `test-{uuid}` prefix whose Redis keys are removed on drop, even on panic.
+struct TestQueue {
+    queue: adus_queue::Queue,
+    prefix: String,
+}
+
+impl TestQueue {
+    async fn new() -> Self {
+        let prefix = format!("test-{}", Uuid::new_v4());
+        let queue = adus_queue::Queue::connect(&redis_url(), &prefix)
+            .await
+            .unwrap();
+        Self { queue, prefix }
+    }
+
+    async fn jobs(&self) -> Vec<Job> {
+        let client = redis::Client::open(redis_url()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let entries: Vec<(String, HashMap<String, String>)> = redis::cmd("XRANGE")
+            .arg(format!("{}:jobs", self.prefix))
+            .arg("-")
+            .arg("+")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        entries
+            .iter()
+            .map(|(_, fields)| serde_json::from_str(&fields["job"]).unwrap())
+            .collect()
+    }
+}
+
+impl Deref for TestQueue {
+    type Target = adus_queue::Queue;
+
+    fn deref(&self) -> &Self::Target {
+        &self.queue
+    }
+}
+
+impl Drop for TestQueue {
+    fn drop(&mut self) {
+        use redis::Commands;
+        let Ok(client) = redis::Client::open(redis_url()) else {
+            return;
+        };
+        let Ok(mut conn) = client.get_connection() else {
+            return;
+        };
+        let Ok(keys): Result<Vec<String>, _> = conn.keys(format!("{}:*", self.prefix)) else {
+            return;
+        };
+        if !keys.is_empty() {
+            let _: Result<(), _> = conn.del(keys);
+        }
+    }
+}
 
 async fn user(pool: &PgPool, email: &str, github_login: Option<&str>) -> User {
     users::insert(pool, email, "x", Role::User, github_login)
@@ -37,92 +131,13 @@ fn comment(s: &Setup, body: &str) -> Job {
 }
 
 async fn github_setup(pool: &PgPool) -> Setup {
-    setup(pool, FakeGit::new(pr("h1"), Vec::new())).await
-}
-
-#[test]
-fn parse_review_case_insensitive() {
-    assert!(matches!(
-        parse_command("@Adudu REVIEW"),
-        Some(Command::Review)
-    ));
-    assert!(matches!(
-        parse_command("thanks! @adudu review please"),
-        Some(Command::Review)
-    ));
-}
-
-#[test]
-fn parse_remember_with_colon() {
-    let Some(Command::Remember(text)) = parse_command("@adudu remember:  use anyhow in bins \n")
-    else {
-        panic!("expected Remember");
-    };
-    assert_eq!(text, "use anyhow in bins");
-    let Some(Command::Remember(text)) = parse_command("@adudu Remember prefer tracing") else {
-        panic!("expected Remember");
-    };
-    assert_eq!(text, "prefer tracing");
-}
-
-#[test]
-fn parse_please_remember() {
-    let Some(Command::Remember(text)) = parse_command("@adudu please remember: no unwrap") else {
-        panic!("expected Remember");
-    };
-    assert_eq!(text, "no unwrap");
-    let Some(Command::Remember(text)) = parse_command("@adudu PLEASE Remember tabs") else {
-        panic!("expected Remember");
-    };
-    assert_eq!(text, "tabs");
-}
-
-#[test]
-fn remember_empty_is_unknown() {
-    assert!(matches!(
-        parse_command("@adudu remember:   "),
-        Some(Command::Unknown)
-    ));
-    assert!(matches!(
-        parse_command("@adudu remember"),
-        Some(Command::Unknown)
-    ));
-    assert!(matches!(
-        parse_command("@adudu dance"),
-        Some(Command::Unknown)
-    ));
-    assert!(matches!(parse_command("@adudu"), Some(Command::Unknown)));
-    assert!(matches!(
-        parse_command("@adudu reviewer"),
-        Some(Command::Unknown)
-    ));
-}
-
-#[test]
-fn no_mention_is_none() {
-    assert!(parse_command("please review this").is_none());
-    assert!(parse_command("adudu review").is_none());
-}
-
-#[test]
-fn adudu_prefix_word_is_none() {
-    assert!(parse_command("@aduduku review").is_none());
-}
-
-#[test]
-fn email_like_text_is_not_a_mention() {
-    assert!(parse_command("mail foo@adudu.com review").is_none());
-    // Hanya mention sungguhan yang dihitung, walau ada teks mirip sebelumnya.
-    assert!(matches!(
-        parse_command("foo@adudu.com — @adudu review"),
-        Some(Command::Review)
-    ));
-}
-
-#[test]
-fn marker_comment_is_none() {
-    let body = format!("{ADUDU_MARKER}\n@adudu review");
-    assert!(parse_command(&body).is_none());
+    setup(
+        pool,
+        FakeGit::new(pr("h1"), Vec::new()),
+        Arc::new(NoopChat),
+        Arc::new(NoopCloner),
+    )
+    .await
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -208,7 +223,7 @@ async fn disabled_user_not_authorized(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn unregistered_author_gets_no_reply(pool: PgPool) {
     let s = github_setup(&pool).await;
-    let (queue, prefix) = test_queue().await;
+    let queue = TestQueue::new().await;
 
     let result = s
         .engine
@@ -217,15 +232,14 @@ async fn unregistered_author_gets_no_reply(pool: PgPool) {
 
     assert_eq!(result, Ok(()));
     assert!(s.git.state().comments.is_empty());
-    assert!(queued_jobs(&prefix).await.is_empty());
-    cleanup_queue(&prefix).await;
+    assert!(queue.jobs().await.is_empty());
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn remember_creates_repo_memory_and_replies(pool: PgPool) {
     let s = github_setup(&pool).await;
     let octocat = user(&pool, "octo@acme.test", Some("octocat")).await;
-    let (queue, prefix) = test_queue().await;
+    let queue = TestQueue::new().await;
 
     let body = "@adudu remember: Use `thiserror` for library errors.\nNever `anyhow`.";
     let result = s.engine.handle_comment(&queue, &comment(&s, body)).await;
@@ -252,32 +266,43 @@ async fn remember_creates_repo_memory_and_replies(pool: PgPool) {
     assert_eq!(comments.len(), 1);
     assert!(comments[0].starts_with(ADUDU_MARKER));
     assert!(comments[0].contains("> Use `thiserror` for library errors.\n> Never `anyhow`."));
-    assert!(queued_jobs(&prefix).await.is_empty());
-    cleanup_queue(&prefix).await;
-}
+    assert!(queue.jobs().await.is_empty());
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn remember_drops_non_http_source_url(pool: PgPool) {
-    let s = github_setup(&pool).await;
-    user(&pool, "octo@acme.test", Some("octocat")).await;
-    let (queue, prefix) = test_queue().await;
-    let mut job = comment(&s, "@adudu remember: x");
-    if let Job::PrComment { comment_url, .. } = &mut job {
+    // Non-http(s) comment_url is dropped from source_url.
+    let mut non_http = comment(&s, "@adudu remember: drop js url");
+    if let Job::PrComment { comment_url, .. } = &mut non_http {
         *comment_url = Some("javascript:alert(1)".into());
     }
-
-    s.engine.handle_comment(&queue, &job).await.unwrap();
-
+    s.engine.handle_comment(&queue, &non_http).await.unwrap();
     let saved = memories::list(&pool, Some(s.repository_id)).await.unwrap();
-    assert_eq!(saved[0].source_url, None);
-    cleanup_queue(&prefix).await;
+    assert_eq!(saved.len(), 2);
+    let non_http_mem = saved
+        .iter()
+        .find(|m| m.content == "drop js url")
+        .expect("saved memory");
+    assert_eq!(non_http_mem.source_url, None);
+
+    // Memory was already saved: a reply failure does not retry.
+    s.git.state().comment_error = Some(GitError::RateLimited);
+    let result = s
+        .engine
+        .handle_comment(&queue, &comment(&s, "@adudu remember: after rate limit"))
+        .await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        memories::list(&pool, Some(s.repository_id))
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn remember_too_long_replies_error(pool: PgPool) {
     let s = github_setup(&pool).await;
     user(&pool, "octo@acme.test", Some("octocat")).await;
-    let (queue, prefix) = test_queue().await;
+    let queue = TestQueue::new().await;
     let body = format!("@adudu remember: {}", "x".repeat(2001));
 
     let result = s.engine.handle_comment(&queue, &comment(&s, &body)).await;
@@ -302,32 +327,13 @@ async fn remember_too_long_replies_error(pool: PgPool) {
         .unwrap();
     let saved = memories::list(&pool, Some(s.repository_id)).await.unwrap();
     assert_eq!(saved.len(), 1);
-    cleanup_queue(&prefix).await;
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn remember_reply_failure_does_not_retry(pool: PgPool) {
-    let s = github_setup(&pool).await;
-    user(&pool, "octo@acme.test", Some("octocat")).await;
-    let (queue, prefix) = test_queue().await;
-    s.git.state().comment_error = Some(GitError::RateLimited);
-
-    let result = s
-        .engine
-        .handle_comment(&queue, &comment(&s, "@adudu remember: x"))
-        .await;
-
-    assert_eq!(result, Ok(()));
-    let saved = memories::list(&pool, Some(s.repository_id)).await.unwrap();
-    assert_eq!(saved.len(), 1);
-    cleanup_queue(&prefix).await;
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn review_command_enqueues_job(pool: PgPool) {
     let s = github_setup(&pool).await;
     user(&pool, "octo@acme.test", Some("octocat")).await;
-    let (queue, prefix) = test_queue().await;
+    let queue = TestQueue::new().await;
 
     let result = s
         .engine
@@ -336,17 +342,42 @@ async fn review_command_enqueues_job(pool: PgPool) {
 
     assert_eq!(result, Ok(()));
     assert_eq!(
-        queued_jobs(&prefix).await,
+        queue.jobs().await,
         vec![Job::ReviewPr {
             repository_id: s.repository_id,
             pr_number: 7,
             trigger: Trigger::Command,
+            mode_override: None,
         }]
     );
     let comments = s.git.state().comments.clone();
     assert_eq!(comments.len(), 1);
     assert!(comments[0].starts_with(ADUDU_MARKER));
     assert!(comments[0].contains("On it — starting a review."));
+
+    // `@adudu review deep` enqueues with Specialists mode override.
+    let result = s
+        .engine
+        .handle_comment(&queue, &comment(&s, "@adudu review deep"))
+        .await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        queue.jobs().await,
+        vec![
+            Job::ReviewPr {
+                repository_id: s.repository_id,
+                pr_number: 7,
+                trigger: Trigger::Command,
+                mode_override: None,
+            },
+            Job::ReviewPr {
+                repository_id: s.repository_id,
+                pr_number: 7,
+                trigger: Trigger::Command,
+                mode_override: Some(ReviewMode::Specialists),
+            },
+        ]
+    );
 
     // Enqueue sudah berhasil: gagal membalas tidak boleh membuat job di-retry.
     s.git.state().comment_error = Some(GitError::Http("boom".into()));
@@ -355,15 +386,14 @@ async fn review_command_enqueues_job(pool: PgPool) {
         .handle_comment(&queue, &comment(&s, "@adudu review"))
         .await;
     assert_eq!(result, Ok(()));
-    assert_eq!(queued_jobs(&prefix).await.len(), 2);
-    cleanup_queue(&prefix).await;
+    assert_eq!(queue.jobs().await.len(), 3);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn unknown_command_lists_commands(pool: PgPool) {
     let s = github_setup(&pool).await;
     user(&pool, "octo@acme.test", Some("octocat")).await;
-    let (queue, prefix) = test_queue().await;
+    let queue = TestQueue::new().await;
 
     let result = s
         .engine
@@ -390,26 +420,24 @@ async fn unknown_command_lists_commands(pool: PgPool) {
         .handle_comment(&queue, &comment(&s, "@adudu dance"))
         .await;
     assert!(matches!(result, Err(EngineError::Fatal(_))));
-    let conn = connections::get(&pool, s.connection_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(conn.status, ConnectionStatus::Invalid);
-    cleanup_queue(&prefix).await;
+    assert_eq!(
+        conn_status(&pool, s.connection_id).await,
+        ConnectionStatus::Invalid
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn non_comment_job_is_fatal(pool: PgPool) {
     let s = github_setup(&pool).await;
-    let (queue, prefix) = test_queue().await;
+    let queue = TestQueue::new().await;
     let job = Job::ReviewPr {
         repository_id: s.repository_id,
         pr_number: 7,
         trigger: Trigger::Command,
+        mode_override: None,
     };
 
     let result = s.engine.handle_comment(&queue, &job).await;
 
     assert_eq!(result, Err(EngineError::Fatal("not a comment job".into())));
-    cleanup_queue(&prefix).await;
 }

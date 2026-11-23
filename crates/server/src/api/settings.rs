@@ -1,5 +1,6 @@
 use std::ops::RangeInclusive;
 
+use adus_core::types::ReviewMode;
 use adus_db::{
     ai,
     ignore::{self, IgnoreError, IgnoreMatcher},
@@ -29,6 +30,8 @@ pub fn routes() -> Router<AppState> {
 
 const FILES_RANGE: RangeInclusive<i32> = 1..=500;
 const PATCH_LINES_RANGE: RangeInclusive<i32> = 1..=100_000;
+const SMALL_PR_RANGE: RangeInclusive<i32> = 0..=10_000;
+const INPUT_TOKENS_RANGE: RangeInclusive<i32> = 0..=100_000_000;
 const MAX_KEYWORD_LEN: usize = 100;
 const MAX_KEYWORDS: usize = 500;
 const MAX_TEST_PATH_LEN: usize = 1000;
@@ -37,13 +40,15 @@ const MAX_TEST_PATH_LEN: usize = 1000;
 #[derive(Serialize)]
 struct SettingsJson {
     default_provider_id: Option<Uuid>,
-    default_model: Option<String>,
     max_files_per_review: i32,
     max_patch_lines_per_file: i32,
     /// Daftar yang berlaku: tersimpan, atau bawaan bila belum pernah disimpan.
     ignore_paths: Vec<String>,
     ignore_paths_is_default: bool,
     ignored_title_keywords: Vec<String>,
+    review_mode: ReviewMode,
+    small_pr_max_lines: i32,
+    max_review_input_tokens: i32,
 }
 
 impl From<Settings> for SettingsJson {
@@ -52,10 +57,12 @@ impl From<Settings> for SettingsJson {
             ignore_paths: ignore::effective_ignore_paths(&s),
             ignore_paths_is_default: s.ignore_paths.is_none(),
             default_provider_id: s.default_provider_id,
-            default_model: s.default_model,
             max_files_per_review: s.max_files_per_review,
             max_patch_lines_per_file: s.max_patch_lines_per_file,
             ignored_title_keywords: s.ignored_title_keywords,
+            review_mode: s.review_mode,
+            small_pr_max_lines: s.small_pr_max_lines,
+            max_review_input_tokens: s.max_review_input_tokens,
         }
     }
 }
@@ -63,7 +70,6 @@ impl From<Settings> for SettingsJson {
 #[derive(Deserialize)]
 struct SettingsBody {
     default_provider_id: Option<Uuid>,
-    default_model: Option<String>,
     max_files_per_review: i32,
     max_patch_lines_per_file: i32,
     /// Tidak ada = biarkan; `null` = kembali ke bawaan; array = ganti.
@@ -71,6 +77,12 @@ struct SettingsBody {
     ignore_paths: Option<Option<Vec<String>>>,
     /// Tidak ada = biarkan.
     ignored_title_keywords: Option<Vec<String>>,
+    /// Tidak ada = biarkan.
+    review_mode: Option<ReviewMode>,
+    /// Tidak ada = biarkan.
+    small_pr_max_lines: Option<i32>,
+    /// Tidak ada = biarkan.
+    max_review_input_tokens: Option<i32>,
 }
 
 impl From<IgnoreError> for ApiError {
@@ -135,21 +147,24 @@ async fn replace(
             "max_patch_lines_per_file must be between 1 and 100000",
         ));
     }
-    let model = body
-        .default_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .map(str::to_string);
-    if let Some(provider_id) = body.default_provider_id {
-        if model.is_none() {
-            return Err(ApiError::validation(
-                "default_model is required when default_provider_id is set",
-            ));
-        }
-        if ai::get_provider(&state.db, provider_id).await?.is_none() {
-            return Err(ApiError::not_found());
-        }
+    if let Some(lines) = body.small_pr_max_lines
+        && !SMALL_PR_RANGE.contains(&lines)
+    {
+        return Err(ApiError::validation(
+            "small_pr_max_lines must be between 0 and 10000",
+        ));
+    }
+    if let Some(tokens) = body.max_review_input_tokens
+        && !INPUT_TOKENS_RANGE.contains(&tokens)
+    {
+        return Err(ApiError::validation(
+            "max_review_input_tokens must be between 0 and 100000000",
+        ));
+    }
+    if let Some(provider_id) = body.default_provider_id
+        && ai::get_provider(&state.db, provider_id).await?.is_none()
+    {
+        return Err(ApiError::not_found());
     }
     // Semua validasi selesai sebelum satu-satunya penulisan di bawah.
     let current = settings::get(&state.db).await?;
@@ -169,11 +184,17 @@ async fn replace(
     };
     let new = Settings {
         default_provider_id: body.default_provider_id,
-        default_model: model,
         max_files_per_review: body.max_files_per_review,
         max_patch_lines_per_file: body.max_patch_lines_per_file,
         ignore_paths,
         ignored_title_keywords,
+        review_mode: body.review_mode.unwrap_or(current.review_mode),
+        small_pr_max_lines: body
+            .small_pr_max_lines
+            .unwrap_or(current.small_pr_max_lines),
+        max_review_input_tokens: body
+            .max_review_input_tokens
+            .unwrap_or(current.max_review_input_tokens),
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }

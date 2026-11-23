@@ -2,12 +2,15 @@ mod common;
 
 use adus_git::{RemoteRepo, RepoRef};
 use axum::{Router, http::StatusCode};
-use common::{app, app_and_git, cookie_pair, get, json_req, post_json, send, test_cipher};
+use common::{
+    app, app_and_git, app_with_queue, cleanup_queue, cookie_pair, get, json_req, post_json, send,
+    test_cipher, test_queue,
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
+    matchers::{header, method, path},
 };
 
 const PASSWORD: &str = "correct horse";
@@ -26,7 +29,12 @@ async fn create_provider(app: &Router, admin: &str, body: Value) -> common::Repl
 
 /// Provider `openai` dengan base URL bawaan; mengembalikan id-nya.
 async fn openai_provider(app: &Router, admin: &str) -> String {
-    let reply = create_provider(app, admin, json!({ "kind": "openai", "name": "OpenAI" })).await;
+    let reply = create_provider(
+        app,
+        admin,
+        json!({ "kind": "openai", "name": "OpenAI", "primary_model": "gpt-5" }),
+    )
+    .await;
     assert_eq!(reply.status, StatusCode::CREATED);
     reply.body["id"].as_str().unwrap().to_string()
 }
@@ -90,18 +98,23 @@ async fn compatible_without_base_url_422(pool: PgPool) {
     let admin = setup_admin(&app).await;
 
     for body in [
-        json!({ "kind": "openai_compatible", "name": "Local" }),
-        json!({ "kind": "openai_compatible", "name": "Local", "base_url": "  " }),
-        json!({ "kind": "openai_compatible", "name": "Local", "base_url": "ftp://x" }),
-        json!({ "kind": "openai", "name": "OpenAI", "base_url": "not a url" }),
-        json!({ "kind": "openai", "name": "  " }),
+        json!({ "kind": "openai_compatible", "name": "Local", "primary_model": "llama3" }),
+        json!({ "kind": "openai_compatible", "name": "Local", "base_url": "  ", "primary_model": "llama3" }),
+        json!({ "kind": "openai_compatible", "name": "Local", "base_url": "ftp://x", "primary_model": "llama3" }),
+        json!({ "kind": "openai", "name": "OpenAI", "base_url": "not a url", "primary_model": "gpt-5" }),
+        json!({ "kind": "openai", "name": "  ", "primary_model": "gpt-5" }),
     ] {
         let reply = create_provider(&app, &admin, body.clone()).await;
         assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(reply.body["error"]["code"], "validation_error");
     }
 
-    let ok = json!({ "kind": "openai_compatible", "name": "Local", "base_url": "http://localhost:11434/v1" });
+    let ok = json!({
+        "kind": "openai_compatible",
+        "name": "Local",
+        "base_url": "http://localhost:11434/v1",
+        "primary_model": "llama3"
+    });
     let created = create_provider(&app, &admin, ok).await;
     assert_eq!(created.status, StatusCode::CREATED);
     let id = created.body["id"].as_str().unwrap();
@@ -126,7 +139,13 @@ async fn compatible_without_base_url_422(pool: PgPool) {
 
 /// Provider compatible yang menunjuk ke server wiremock, dengan satu key.
 async fn mock_provider(app: &Router, admin: &str, server: &MockServer) -> (String, String) {
-    let body = json!({ "kind": "openai_compatible", "name": "Mock", "base_url": server.uri() });
+    let body = json!({
+        "kind": "openai_compatible",
+        "name": "Mock",
+        "base_url": server.uri(),
+        "primary_model": "gpt-primary",
+        "fast_model": "gpt-fast"
+    });
     let provider = create_provider(app, admin, body).await.body["id"]
         .as_str()
         .unwrap()
@@ -229,7 +248,7 @@ async fn test_key_success_sends_ping_and_records_tokens(pool: PgPool) {
     let sent = &server.received_requests().await.unwrap()[0];
     let body: Value = serde_json::from_slice(&sent.body).unwrap();
     assert_eq!(body["model"], "gpt-test");
-    assert_eq!(body["max_tokens"], 5);
+    assert_eq!(body["max_tokens"], 512);
     assert_eq!(body["messages"][1]["content"], "ping");
 
     let row: (bool, i32, i32) =
@@ -238,11 +257,6 @@ async fn test_key_success_sends_ping_and_records_tokens(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(row, (true, 7, 2));
-
-    // Model kosong ditolak sebelum memanggil provider.
-    let uri = format!("/api/v1/ai-keys/{key}/test");
-    let bad = call(&app, "POST", &uri, &json!({ "model": " " }), &admin).await;
-    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -315,8 +329,8 @@ async fn delete_provider_in_use_409(pool: PgPool) {
     add_key(&app, &admin, &unused, SECRET).await;
 
     let put = json!({
-        "default_provider_id": by_settings, "default_model": "gpt-x",
-        "max_files_per_review": 50, "max_patch_lines_per_file": 2000
+        "default_provider_id": by_settings,
+        "max_files_per_review": 30, "max_patch_lines_per_file": 1500
     });
     assert_eq!(
         call(&app, "PUT", "/api/v1/settings", &put, &admin)
@@ -331,7 +345,7 @@ async fn delete_provider_in_use_409(pool: PgPool) {
     let add = json!({ "connection_id": conn.body["id"], "external_id": "1" });
     let repo = send(&app, post_json("/api/v1/repositories", &add, Some(&admin))).await;
     let repo_uri = format!("/api/v1/repositories/{}", repo.body["id"].as_str().unwrap());
-    let set = json!({ "review_provider_id": by_repo, "review_model": "gpt-y" });
+    let set = json!({ "review_provider_id": by_repo });
     assert_eq!(
         call(&app, "PATCH", &repo_uri, &set, &admin).await.status,
         StatusCode::OK
@@ -393,43 +407,29 @@ async fn settings_roundtrip_and_validation(pool: PgPool) {
     let initial = send(&app, get("/api/v1/settings", Some(&admin))).await;
     assert_eq!(initial.status, StatusCode::OK);
     assert_eq!(initial.body["default_provider_id"], Value::Null);
-    assert_eq!(initial.body["max_files_per_review"], 50);
-    assert_eq!(initial.body["max_patch_lines_per_file"], 2000);
+    assert_eq!(initial.body["max_files_per_review"], 30);
+    assert_eq!(initial.body["max_patch_lines_per_file"], 1500);
 
-    let put = |provider: Value, model: Value, files: i64, lines: i64| {
+    let put = |provider: Value, files: i64, lines: i64| {
         json!({
-            "default_provider_id": provider, "default_model": model,
+            "default_provider_id": provider,
             "max_files_per_review": files, "max_patch_lines_per_file": lines
         })
     };
     let missing_provider = "00000000-0000-0000-0000-000000000001";
     let cases = [
+        (put(Value::Null, 0, 2000), StatusCode::UNPROCESSABLE_ENTITY),
         (
-            put(json!(provider), Value::Null, 50, 2000),
+            put(Value::Null, 501, 2000),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (put(Value::Null, 50, 0), StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            put(Value::Null, 50, 100_001),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
-            put(json!(provider), json!("  "), 50, 2000),
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
-            put(Value::Null, Value::Null, 0, 2000),
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
-            put(Value::Null, Value::Null, 501, 2000),
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
-            put(Value::Null, Value::Null, 50, 0),
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
-            put(Value::Null, Value::Null, 50, 100_001),
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ),
-        (
-            put(json!(missing_provider), json!("m"), 50, 2000),
+            put(json!(missing_provider), 50, 2000),
             StatusCode::NOT_FOUND,
         ),
     ];
@@ -441,11 +441,356 @@ async fn settings_roundtrip_and_validation(pool: PgPool) {
     let unchanged = send(&app, get("/api/v1/settings", Some(&admin))).await;
     assert_eq!(unchanged.body, initial.body);
 
-    let ok = put(json!(provider), json!(" gpt-4o "), 500, 100_000);
+    let ok = put(json!(provider), 500, 100_000);
     let saved = call(&app, "PUT", "/api/v1/settings", &ok, &admin).await;
     assert_eq!(saved.status, StatusCode::OK);
-    assert_eq!(saved.body["default_model"], "gpt-4o");
     assert_eq!(saved.body["default_provider_id"], json!(provider));
+    assert!(saved.body.get("default_model").is_none());
     let read = send(&app, get("/api/v1/settings", Some(&admin))).await;
     assert_eq!(read.body, saved.body);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn provider_requires_primary_model_allows_optional_fast_model_and_initial_key(pool: PgPool) {
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+
+    let blank = create_provider(
+        &app,
+        &admin,
+        json!({ "kind": "anthropic", "name": "Anthropic", "primary_model": "   " }),
+    )
+    .await;
+    assert_eq!(blank.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(blank.body["error"]["code"], "validation_error");
+
+    let created = create_provider(
+        &app,
+        &admin,
+        json!({
+            "kind": "anthropic",
+            "name": "Anthropic",
+            "primary_model": "claude-sonnet-4-5",
+            "fast_model": null,
+            "key": SECRET
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.body["primary_model"], "claude-sonnet-4-5");
+    assert_eq!(created.body["fast_model"], Value::Null);
+    assert_eq!(created.body["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(created.body["keys"][0]["label"], "Default");
+    assert_eq!(created.body["keys"][0]["key_last4"], "1234");
+    assert!(!created.body.to_string().contains(SECRET));
+
+    let id = created.body["id"].as_str().unwrap();
+    let uri = format!("/api/v1/ai-providers/{id}");
+
+    let set_fast = call(
+        &app,
+        "PATCH",
+        &uri,
+        &json!({ "fast_model": " claude-haiku-4-5 " }),
+        &admin,
+    )
+    .await;
+    assert_eq!(set_fast.status, StatusCode::OK);
+    assert_eq!(set_fast.body["fast_model"], "claude-haiku-4-5");
+
+    let cleared = call(&app, "PATCH", &uri, &json!({ "fast_model": null }), &admin).await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert_eq!(cleared.body["fast_model"], Value::Null);
+}
+
+async fn discover(app: &Router, cookie: &str, body: Value) -> common::Reply {
+    call(app, "POST", "/api/v1/ai-providers/models", &body, cookie).await
+}
+
+async fn mock_models(server: &MockServer, expected_secret: Option<&str>, ids: &[&str]) {
+    let data: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
+    let mut mock = Mock::given(method("GET")).and(path("/models"));
+    if let Some(secret) = expected_secret {
+        mock = mock.and(header("authorization", format!("Bearer {secret}").as_str()));
+    }
+    mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": data })))
+        .mount(server)
+        .await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_key_defaults_to_effective_fast_model_when_omitted(pool: PgPool) {
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{ "message": { "content": "pong" } }]
+        })))
+        .mount(&server)
+        .await;
+
+    let (provider_id, key_id) = mock_provider(&app, &admin, &server).await;
+
+    let reply = call(
+        &app,
+        "POST",
+        &format!("/api/v1/ai-keys/{key_id}/test"),
+        &json!({}),
+        &admin,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body, json!({ "ok": true }));
+
+    call(
+        &app,
+        "PATCH",
+        &format!("/api/v1/ai-providers/{provider_id}"),
+        &json!({ "fast_model": null }),
+        &admin,
+    )
+    .await;
+
+    let fallback = call(
+        &app,
+        "POST",
+        &format!("/api/v1/ai-keys/{key_id}/test"),
+        &json!({ "model": "  " }),
+        &admin,
+    )
+    .await;
+    assert_eq!(fallback.status, StatusCode::OK);
+    assert_eq!(fallback.body, json!({ "ok": true }));
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    let first: Value = reqs[0].body_json().unwrap();
+    let second: Value = reqs[1].body_json().unwrap();
+    assert_eq!(first["model"], "gpt-fast");
+    assert_eq!(second["model"], "gpt-primary");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn discover_models_caches_per_key_and_supports_refresh(pool: PgPool) {
+    let prefix = format!("test-{}", uuid::Uuid::new_v4());
+    let app = app_with_queue(pool, test_queue(&prefix).await);
+    let admin = setup_admin(&app).await;
+    let server = MockServer::start().await;
+
+    mock_models(&server, Some(SECRET), &["gpt-5"]).await;
+
+    let first = discover(
+        &app,
+        &admin,
+        json!({
+            "kind": "openai_compatible",
+            "base_url": server.uri(),
+            "key": SECRET
+        }),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(first.body["models"], json!(["gpt-5"]));
+    assert_eq!(first.body["cached"], false);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let cached_hit = discover(
+        &app,
+        &admin,
+        json!({
+            "kind": "openai_compatible",
+            "base_url": format!("{}/", server.uri()),
+            "key": SECRET
+        }),
+    )
+    .await;
+    assert_eq!(cached_hit.status, StatusCode::OK);
+    assert_eq!(cached_hit.body["models"], json!(["gpt-5"]));
+    assert_eq!(cached_hit.body["cached"], true);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    server.reset().await;
+    mock_models(&server, Some(SECRET), &["gpt-5", "gpt-5-mini"]).await;
+
+    let refreshed = discover(
+        &app,
+        &admin,
+        json!({
+            "kind": "openai_compatible",
+            "base_url": server.uri(),
+            "key": SECRET,
+            "refresh": true
+        }),
+    )
+    .await;
+    assert_eq!(refreshed.status, StatusCode::OK);
+    assert_eq!(refreshed.body["models"], json!(["gpt-5", "gpt-5-mini"]));
+    assert_eq!(refreshed.body["cached"], false);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let after_refresh = discover(
+        &app,
+        &admin,
+        json!({
+            "kind": "openai_compatible",
+            "base_url": server.uri(),
+            "key": SECRET
+        }),
+    )
+    .await;
+    assert_eq!(after_refresh.status, StatusCode::OK);
+    assert_eq!(after_refresh.body["models"], json!(["gpt-5", "gpt-5-mini"]));
+    assert_eq!(after_refresh.body["cached"], true);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let revoked = discover(
+        &app,
+        &admin,
+        json!({
+            "kind": "openai_compatible",
+            "base_url": server.uri(),
+            "key": SECRET,
+            "refresh": true
+        }),
+    )
+    .await;
+    assert_eq!(revoked.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(revoked.body["error"]["code"], "token_invalid");
+    assert!(!revoked.body.to_string().contains(SECRET));
+
+    let evicted = discover(
+        &app,
+        &admin,
+        json!({
+            "kind": "openai_compatible",
+            "base_url": server.uri(),
+            "key": SECRET
+        }),
+    )
+    .await;
+    assert_eq!(evicted.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(evicted.body["error"]["code"], "token_invalid");
+
+    cleanup_queue(&prefix).await;
+}
+
+/// Providers set up before models moved onto providers have no primary model: the API shows
+/// `null`, refuses a key test without a model, and still lets an admin toggle the provider.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provider_without_primary_model_needs_setup(pool: PgPool) {
+    let app = app(pool.clone()).await;
+    let admin = setup_admin(&app).await;
+    let server = MockServer::start().await;
+    let (provider_id, key_id) = mock_provider(&app, &admin, &server).await;
+    sqlx::query("UPDATE ai_providers SET primary_model = NULL, fast_model = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let list = send(&app, common::get("/api/v1/ai-providers", Some(&admin))).await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert_eq!(list.body[0]["primary_model"], Value::Null);
+
+    let test = call(
+        &app,
+        "POST",
+        &format!("/api/v1/ai-keys/{key_id}/test"),
+        &json!({}),
+        &admin,
+    )
+    .await;
+    assert_eq!(test.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(test.body["error"]["code"], "validation_error");
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    let toggled = call(
+        &app,
+        "PATCH",
+        &format!("/api/v1/ai-providers/{provider_id}"),
+        &json!({ "enabled": false }),
+        &admin,
+    )
+    .await;
+    assert_eq!(toggled.status, StatusCode::OK);
+    assert_eq!(toggled.body["primary_model"], Value::Null);
+
+    let fixed = call(
+        &app,
+        "PATCH",
+        &format!("/api/v1/ai-providers/{provider_id}"),
+        &json!({ "primary_model": "gpt-5" }),
+        &admin,
+    )
+    .await;
+    assert_eq!(fixed.status, StatusCode::OK);
+    assert_eq!(fixed.body["primary_model"], "gpt-5");
+}
+
+/// A saved key only goes to the provider's saved base URL: testing another URL needs the key
+/// typed in again, and nothing is sent to that URL without it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn discover_models_never_sends_a_stored_key_to_a_new_base_url(pool: PgPool) {
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+    let saved = MockServer::start().await;
+    let other = MockServer::start().await;
+    mock_models(&saved, Some(SECRET), &["gpt-5"]).await;
+    mock_models(&other, None, &["gpt-5"]).await;
+
+    let created = create_provider(
+        &app,
+        &admin,
+        json!({
+            "kind": "openai_compatible",
+            "name": "Local",
+            "base_url": saved.uri(),
+            "primary_model": "gpt-5",
+            "key": SECRET
+        }),
+    )
+    .await;
+    let provider_id = created.body["id"].as_str().unwrap();
+
+    // Omitting `base_url` uses the saved URL and stored provider key.
+    let stored = discover(&app, &admin, json!({ "provider_id": provider_id })).await;
+    assert_eq!(stored.status, StatusCode::OK);
+    assert_eq!(stored.body["models"], json!(["gpt-5"]));
+
+    let same_url = discover(
+        &app,
+        &admin,
+        json!({ "provider_id": provider_id, "base_url": format!("{}/", saved.uri()), "refresh": true }),
+    )
+    .await;
+    assert_eq!(same_url.status, StatusCode::OK);
+
+    let moved = discover(
+        &app,
+        &admin,
+        json!({ "provider_id": provider_id, "base_url": other.uri(), "refresh": true }),
+    )
+    .await;
+    assert_eq!(moved.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(moved.body["error"]["code"], "validation_error");
+    assert!(other.received_requests().await.unwrap().is_empty());
+
+    let retyped = discover(
+        &app,
+        &admin,
+        json!({ "provider_id": provider_id, "base_url": other.uri(), "key": "sk-other-key-9999", "refresh": true }),
+    )
+    .await;
+    assert_eq!(retyped.status, StatusCode::OK);
+    let sent = other.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].headers["authorization"], "Bearer sk-other-key-9999");
 }

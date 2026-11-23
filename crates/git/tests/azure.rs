@@ -50,6 +50,7 @@ fn pr() -> PullRequest {
         head_sha: "headsha".into(),
         base_sha: "mergebase".into(),
         is_draft: false,
+        source_ref: None,
     }
 }
 
@@ -204,6 +205,7 @@ async fn get_pr_reads_is_draft() {
     assert_eq!(got.head_sha, "headsha");
     // commonRefCommit dari iterasi terakhir (id 2), bukan iterasi 1.
     assert_eq!(got.base_sha, "mergebase");
+    assert_eq!(got.source_ref.as_deref(), Some("refs/heads/feature"));
 }
 
 #[tokio::test]
@@ -579,7 +581,9 @@ async fn post_review_thread_context_has_leading_slash() {
 
     let comments = [InlineComment {
         path: "src/a.rs".into(),
+        start_line: None,
         line: 12,
+        end_offset: None,
         body: "careful".into(),
     }];
     let n = provider(&server)
@@ -605,6 +609,74 @@ async fn post_review_thread_context_has_leading_slash() {
     assert_eq!(
         threads[1],
         json!({ "comments": [{ "content": "summary", "commentType": 1 }], "status": 1 })
+    );
+}
+
+#[tokio::test]
+async fn post_review_posts_multiline_thread_context() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
+        .and(query_param("api-version", "7.1"))
+        .and(header_exists("authorization"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 1 })))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let comments = [
+        InlineComment {
+            path: "src/a.rs".into(),
+            start_line: Some(10),
+            line: 12,
+            end_offset: Some(25),
+            body: "with offset".into(),
+        },
+        InlineComment {
+            path: "src/b.rs".into(),
+            start_line: Some(3),
+            line: 6,
+            end_offset: None,
+            body: "default offset".into(),
+        },
+        InlineComment {
+            path: "src/c.rs".into(),
+            start_line: Some(8),
+            line: 8,
+            end_offset: Some(25),
+            body: "invalid start_line".into(),
+        },
+    ];
+    let n = provider(&server)
+        .post_review(&repo(), &pr(), &comments, "summary")
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
+
+    let threads = captured_threads(&server).await;
+    assert_eq!(
+        threads[0]["threadContext"],
+        json!({
+            "filePath": "/src/a.rs",
+            "rightFileStart": { "line": 10, "offset": 1 },
+            "rightFileEnd": { "line": 12, "offset": 25 },
+        })
+    );
+    assert_eq!(
+        threads[1]["threadContext"],
+        json!({
+            "filePath": "/src/b.rs",
+            "rightFileStart": { "line": 3, "offset": 1 },
+            "rightFileEnd": { "line": 6, "offset": 1 },
+        })
+    );
+    assert_eq!(
+        threads[2]["threadContext"],
+        json!({
+            "filePath": "/src/c.rs",
+            "rightFileStart": { "line": 8, "offset": 1 },
+            "rightFileEnd": { "line": 8, "offset": 1 },
+        })
     );
 }
 
@@ -855,4 +927,41 @@ async fn rename_entries_and_submodules() {
         files[0].patch.as_deref(),
         Some("@@ -1,2 +1,2 @@\n 1\n-2\n+3\n")
     );
+}
+
+#[test]
+fn azure_clone_spec_uses_project_guid_and_basic_auth() {
+    use base64::Engine;
+    let p = AzureProvider::new(
+        reqwest::Client::new(),
+        "https://dev.azure.com/".into(),
+        "acme".into(),
+        "azpat".into(),
+    );
+    let mut r = repo();
+    r.name = "my repo".into();
+    let mut pull = pr();
+    pull.source_ref = Some("refs/heads/feature".into());
+
+    let spec = p.clone_spec(&r, &pull).unwrap();
+    assert_eq!(
+        spec.url,
+        format!("https://dev.azure.com/acme/{PROJECT}/_git/my%20repo")
+    );
+    assert_eq!(spec.refspec, "headsha");
+    assert_eq!(spec.fallback_refspec.as_deref(), Some("refs/heads/feature"));
+    assert_eq!(spec.expected_sha, "headsha");
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(":azpat")
+    );
+    assert_eq!(spec.auth_header, expected);
+    assert!(!format!("{spec:?}").contains(&spec.auth_header));
+
+    let mut no_project = repo();
+    no_project.project = None;
+    assert!(p.clone_spec(&no_project, &pull).is_none());
+    let mut empty_name = repo();
+    empty_name.name = String::new();
+    assert!(p.clone_spec(&empty_name, &pull).is_none());
 }

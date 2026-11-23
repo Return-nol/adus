@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: adus
       POSTGRES_PASSWORD: adus
@@ -8,6 +8,6 @@ services:
     ports:
       - "55432:5432"
   redis:
-    image: redis:7
+    image: redis:8-alpine
     ports:
       - "55379:6379"

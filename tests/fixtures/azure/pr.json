@@ -3,5 +3,6 @@
   "title": "Add feature",
   "description": null,
   "isDraft": true,
+  "sourceRefName": "refs/heads/feature",
   "lastMergeSourceCommit": { "commitId": "headsha" }
 }

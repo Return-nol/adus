@@ -21,7 +21,7 @@ services:
         required: false
 
   postgres:
-    image: postgres:16
+    image: postgres:18-alpine
     profiles: [bundled]
     environment:
       POSTGRES_USER: adus
@@ -37,7 +37,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7
+    image: redis:8-alpine
     profiles: [bundled]
     command: ["redis-server", "--appendonly", "yes"]
     volumes:

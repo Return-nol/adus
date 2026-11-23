@@ -125,7 +125,7 @@ pub async fn insert_failed(pool: &PgPool, new: NewReview, error: &str) -> Result
 
 /// Review `queued`/`running` tanpa kemajuan selama ini dianggap tidak dikerjakan siapa pun.
 /// Harus lebih lama dari `JOB_TIMEOUT` worker (dicek saat kompilasi di `adus::worker`).
-pub const STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+pub const STALE_AFTER: Duration = Duration::from_secs(35 * 60);
 
 /// Saat proses mulai dan berkala dari scheduler: review `queued`/`running` yang sudah lebih lama
 /// dari `STALE_AFTER` ditandai gagal. Return jumlah barisnya.
@@ -375,8 +375,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "UPDATE reviews SET created_at = now() - interval '20 minutes', \
-             started_at = started_at - interval '20 minutes'",
+            "UPDATE reviews SET created_at = now() - interval '40 minutes', \
+             started_at = started_at - interval '40 minutes'",
         )
         .execute(&pool)
         .await
@@ -388,7 +388,7 @@ mod tests {
             .unwrap();
         // Dibuat lama, tetapi baru mulai jalan: `started_at` yang dihitung.
         let restarted = insert(&pool, new(a)).await.unwrap();
-        sqlx::query("UPDATE reviews SET created_at = now() - interval '20 minutes' WHERE id = $1")
+        sqlx::query("UPDATE reviews SET created_at = now() - interval '40 minutes' WHERE id = $1")
             .bind(restarted.id)
             .execute(&pool)
             .await
@@ -404,7 +404,7 @@ mod tests {
             assert_eq!(row.status, ReviewStatus::Failed);
             assert_eq!(
                 row.error.as_deref(),
-                Some("interrupted (no progress for 15 min)")
+                Some("interrupted (no progress for 35 min)")
             );
             assert!(row.finished_at.is_some());
         }

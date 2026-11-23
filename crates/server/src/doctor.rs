@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use adus_db::{ai, connections, repositories, settings};
+use adus_review::workspace::{parse_git_version, version_supported};
 use serde::Serialize;
 
 use crate::{
@@ -17,6 +18,8 @@ use crate::{
 
 /// Satu panggilan ke provider git yang lebih lama dari ini dianggap gagal.
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+/// `git --version` yang lebih lama dari ini dianggap gagal.
+const GIT_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Urutan deklarasi = urutan tampil: Fail dulu, lalu Warn, lalu Ok.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -93,6 +96,7 @@ pub async fn run(state: &AppState) -> Report {
     }
     check_redis(state, &mut core, &mut extra).await;
     check_git(state, &mut extra).await;
+    check_git_binary(&mut extra).await;
 
     let verdict = if core.iter().any(|c| c.status == Status::Fail) {
         Verdict::NotRunning
@@ -141,44 +145,72 @@ async fn check_database(state: &AppState, out: &mut Vec<Check>) -> bool {
     true
 }
 
-/// Model default terisi dan provider default punya minimal satu key yang bisa dipakai.
+/// Provider default terisi (aktif + punya primary_model) dan punya minimal satu key yang bisa dipakai.
 async fn check_settings(state: &AppState, out: &mut Vec<Check>) {
     let Ok(settings) = settings::get(&state.db).await else {
         out.push(Check::problem(
             Status::Fail,
-            "Default model",
-            "Settings cannot be read, so no model can be chosen",
+            "Default provider",
+            "Settings cannot be read, so no provider can be chosen",
             "Check the database and run `adus doctor` again",
         ));
         return;
     };
-    let model = settings.default_model.filter(|m| !m.trim().is_empty());
-    let (Some(provider_id), Some(model)) = (settings.default_provider_id, model) else {
+    let Some(provider_id) = settings.default_provider_id else {
         out.push(Check::problem(
             Status::Fail,
-            "Default model",
-            "No default provider and model is set, so reviews have no model to use",
-            "Open Settings and choose a default provider and model",
+            "Default provider",
+            "No default AI provider is set, so reviews have no model to use",
+            "Open Settings and choose a default provider",
         ));
         return;
     };
-    out.push(Check::ok(format!("Default model: {model}")));
-
     let provider = ai::get_provider(&state.db, provider_id)
         .await
         .ok()
         .flatten();
-    let provider_name = provider.map_or("default provider".to_string(), |p| p.name);
+    let Some(provider) = provider else {
+        out.push(Check::problem(
+            Status::Fail,
+            "Default provider",
+            "The configured default provider could not be loaded",
+            "Open Settings and choose a valid default provider",
+        ));
+        return;
+    };
+    let primary = provider.primary_model().filter(|_| provider.enabled);
+    let fast = provider.fast_model();
+    match (primary, fast) {
+        (None, _) => out.push(Check::problem(
+            Status::Fail,
+            "Default provider",
+            &format!(
+                "{} is disabled or has no primary model configured, so reviews cannot run",
+                provider.name
+            ),
+            "Open AI Providers to enable the provider and configure its primary model",
+        )),
+        (Some(primary), Some(fast)) => out.push(Check::ok(format!(
+            "Default provider: {} ({primary} / {fast})",
+            provider.name
+        ))),
+        (Some(primary), None) => out.push(Check::ok(format!(
+            "Default provider: {} ({primary})",
+            provider.name
+        ))),
+    }
+
     let usable = ai::candidate_keys(&state.db, provider_id, chrono::Utc::now())
         .await
         .map(|keys| keys.len());
     match usable {
-        Ok(n) if n > 0 => out.push(Check::ok(format!("AI key: {provider_name} ({n} usable)"))),
+        Ok(n) if n > 0 => out.push(Check::ok(format!("AI key: {} ({n} usable)", provider.name))),
         _ => out.push(Check::problem(
             Status::Fail,
             "AI key",
             &format!(
-                "{provider_name} has no enabled key that is valid and out of cooldown, so every review fails"
+                "{} has no enabled key that is valid and out of cooldown, so every review fails",
+                provider.name
             ),
             "Open AI Providers and add a key, or fix or enable an existing one",
         )),
@@ -304,6 +336,41 @@ async fn check_git(state: &AppState, out: &mut Vec<Check>) {
                 )),
             }
         }
+    }
+}
+
+/// `git` 2.31+ di PATH, untuk clone review. Tanpa itu review tetap jalan dengan diff saja,
+/// jadi hanya `Warn`.
+async fn check_git_binary(out: &mut Vec<Check>) {
+    out.push(git_binary_check("git").await);
+}
+
+/// Jalankan `program --version` (tanpa shell, maks 5 dtk): `Ok` untuk git 2.31+, selain itu
+/// `Warn`. `program` adalah parameter supaya test bisa memakai binary yang tidak ada.
+pub async fn git_binary_check(program: &str) -> Check {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(GIT_VERSION_TIMEOUT, command.output()).await;
+    let version = match output {
+        Ok(Ok(output)) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            parse_git_version(&text)
+                .filter(|v| version_supported(*v))
+                .map(|_| text)
+        }
+        _ => None,
+    };
+    match version {
+        Some(text) => Check::ok(format!("Git: {text}")),
+        None => Check::problem(
+            Status::Warn,
+            "Git",
+            "`git` 2.31+ not found — reviews fall back to diff-only mode without codebase context",
+            "Install git 2.31 or newer on the host that runs `adus serve` and make sure it is on PATH (the Docker image already includes it)",
+        ),
     }
 }
 

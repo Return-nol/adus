@@ -39,6 +39,12 @@ pub enum ChatError {
     /// Request-nya sendiri ditolak provider; key lain tidak akan membantu.
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// The model or endpoint does not support tool calling; key lain tidak akan membantu.
+    #[error("tools not supported: {0}")]
+    ToolsUnsupported(String),
+    /// The prompt does not fit the model's context window; the caller must shrink it.
+    #[error("context window exceeded: {0}")]
+    ContextOverflow(String),
     /// Database tidak bisa dibaca, atau tidak ada key yang bisa didekripsi; LLM belum dipanggil.
     #[error("internal error: {0}")]
     Internal(String),
@@ -118,20 +124,43 @@ impl LlmRouter {
         response: Option<&ChatResponse>,
         error_kind: Option<&str>,
     ) {
-        let tokens = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
-        let new = NewUsage {
-            review_id: ctx.review_id,
-            repository_id: ctx.repository_id,
-            provider_id: key.provider_id,
-            key_id: key.id,
-            model: &req.model,
-            input_tokens: response.map_or(0, |r| tokens(r.input_tokens)),
-            output_tokens: response.map_or(0, |r| tokens(r.output_tokens)),
+        let new = new_usage(
+            ctx,
+            key.provider_id,
+            key.id,
+            &req.model,
             latency_ms,
-            success: error_kind.is_none(),
+            response,
             error_kind,
-        };
+        );
         warn_on_error("write usage row", usage::insert(&self.db, new).await);
+    }
+}
+
+/// Build a `NewUsage` row for one LLM attempt (router or key test).
+pub fn new_usage<'a>(
+    ctx: &UsageContext,
+    provider_id: Uuid,
+    key_id: Uuid,
+    model: &'a str,
+    latency_ms: i32,
+    response: Option<&ChatResponse>,
+    error_kind: Option<&'a str>,
+) -> NewUsage<'a> {
+    let tokens = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
+    NewUsage {
+        review_id: ctx.review_id,
+        repository_id: ctx.repository_id,
+        provider_id,
+        key_id,
+        model,
+        input_tokens: response.map_or(0, |r| tokens(r.input_tokens)),
+        output_tokens: response.map_or(0, |r| tokens(r.output_tokens)),
+        cache_read_tokens: response.map_or(0, |r| tokens(r.cache_read_tokens)),
+        cache_write_tokens: response.map_or(0, |r| tokens(r.cache_write_tokens)),
+        latency_ms,
+        success: error_kind.is_none(),
+        error_kind,
     }
 }
 
@@ -185,31 +214,35 @@ impl ChatService for LlmRouter {
                         .await;
                     return Ok(response);
                 }
-                Err(LlmError::RateLimited { retry_after }) => {
-                    let cooldown = retry_after.unwrap_or(DEFAULT_COOLDOWN);
-                    let wait = chrono::Duration::from_std(cooldown)
-                        .unwrap_or(chrono::Duration::seconds(60));
-                    warn_on_error(
-                        "start key cooldown",
-                        ai::mark_cooldown(&self.db, key.id, Utc::now() + wait).await,
-                    );
-                    soonest = Some(soonest.map_or(cooldown, |s| s.min(cooldown)));
-                    self.log_usage(&ctx, &key, &req, latency_ms, None, Some("rate_limited"))
+                Err(err) => {
+                    self.log_usage(&ctx, &key, &req, latency_ms, None, Some(err.error_kind()))
                         .await;
-                }
-                Err(LlmError::Unauthorized) => {
-                    warn_on_error("mark key invalid", ai::mark_invalid(&self.db, key.id).await);
-                    self.log_usage(&ctx, &key, &req, latency_ms, None, Some("unauthorized"))
-                        .await;
-                }
-                Err(LlmError::Transient(_)) => {
-                    self.log_usage(&ctx, &key, &req, latency_ms, None, Some("transient"))
-                        .await;
-                }
-                Err(LlmError::Invalid(message)) => {
-                    self.log_usage(&ctx, &key, &req, latency_ms, None, Some("invalid"))
-                        .await;
-                    return Err(ChatError::Invalid(message));
+                    let chat_err = match err {
+                        LlmError::RateLimited { retry_after } => {
+                            let cooldown = retry_after.unwrap_or(DEFAULT_COOLDOWN);
+                            let wait = chrono::Duration::from_std(cooldown)
+                                .unwrap_or(chrono::Duration::seconds(60));
+                            warn_on_error(
+                                "start key cooldown",
+                                ai::mark_cooldown(&self.db, key.id, Utc::now() + wait).await,
+                            );
+                            soonest = Some(soonest.map_or(cooldown, |s| s.min(cooldown)));
+                            continue;
+                        }
+                        LlmError::Unauthorized => {
+                            warn_on_error(
+                                "mark key invalid",
+                                ai::mark_invalid(&self.db, key.id).await,
+                            );
+                            continue;
+                        }
+                        LlmError::Transient(_) => continue,
+                        // Request-level errors: the key is fine, so its status is left alone.
+                        LlmError::Invalid(m) => ChatError::Invalid(m),
+                        LlmError::ToolsUnsupported(m) => ChatError::ToolsUnsupported(m),
+                        LlmError::ContextOverflow(m) => ChatError::ContextOverflow(m),
+                    };
+                    return Err(chat_err);
                 }
             }
         }

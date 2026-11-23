@@ -5,27 +5,180 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::header::HeaderValue;
 use reqwest::{RequestBuilder, Response, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Timeout satu request ke provider. Dipasang per request supaya `reqwest::Client` bisa dibagi.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Timeout for a request that asks for reasoning: thinking tokens add minutes of generation.
+const REASONING_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Batas panjang pesan error provider yang kita teruskan.
 const MAX_PROVIDER_MESSAGE: usize = 200;
 /// Batas atas `Retry-After`; mencegah overflow `Instant + Duration` di pemanggil.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 
+/// Effort level for reasoning/thinking models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    /// Output tokens reserved for reasoning on top of the answer's `max_tokens`. Providers
+    /// count reasoning tokens against the same output cap, so without this a long think
+    /// leaves no room for the answer.
+    pub(crate) fn output_reserve(self) -> u32 {
+        match self {
+            Self::Low => 2_048,
+            Self::Medium => 4_096,
+            Self::High => 8_192,
+        }
+    }
+}
+
+/// Per-request timeout: longer when the request asks for reasoning.
+pub(crate) fn request_timeout(effort: Option<ReasoningEffort>) -> Duration {
+    match effort {
+        Some(_) => REASONING_REQUEST_TIMEOUT,
+        None => REQUEST_TIMEOUT,
+    }
+}
+
+/// One LLM call: a system prompt, the conversation so far, and the tools the model may call.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatRequest {
     pub model: String,
     pub system: String,
-    pub user: String,
+    pub messages: Vec<Message>,
+    /// Empty: no tools are sent, and an error is never reported as `ToolsUnsupported`.
+    pub tools: Vec<ToolDef>,
     pub max_tokens: u32,
+    pub effort: Option<ReasoningEffort>,
+}
+
+impl ChatRequest {
+    /// Single-turn request: one user message, no tools.
+    pub fn text(
+        model: impl Into<String>,
+        system: impl Into<String>,
+        user: impl Into<String>,
+        max_tokens: u32,
+    ) -> Self {
+        Self {
+            model: model.into(),
+            system: system.into(),
+            messages: vec![Message::User {
+                parts: vec![UserPart::Text(user.into())],
+            }],
+            tools: Vec::new(),
+            max_tokens,
+            effort: None,
+        }
+    }
+
+    pub fn with_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.effort = Some(effort);
+        self
+    }
+
+    /// Number of tool calls the assistant already made in this conversation.
+    pub(crate) fn prior_tool_calls(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|m| match m {
+                Message::Assistant { parts } => parts
+                    .iter()
+                    .filter(|p| matches!(p, AssistantPart::ToolCall(_)))
+                    .count(),
+                Message::User { .. } | Message::Tool { .. } => 0,
+            })
+            .sum()
+    }
+}
+
+/// One turn of the conversation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum Message {
+    User {
+        parts: Vec<UserPart>,
+    },
+    Assistant {
+        parts: Vec<AssistantPart>,
+    },
+    /// Results of the tool calls from the previous assistant turn.
+    Tool {
+        results: Vec<ToolResult>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UserPart {
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum AssistantPart {
+    Text(String),
+    ToolCall(ToolCall),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Provider call id; Gemini has none, so its client assigns `gc_{prior}_{idx}`.
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+    /// Opaque provider metadata (Gemini `thoughtSignature`), sent back verbatim on the next turn.
+    pub provider_meta: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub tool_name: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// A tool the model may call; `parameters` is a JSON Schema object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+/// Why the model stopped generating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatResponse {
     pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub stop_reason: StopReason,
+    /// Total input tokens, cached ones included.
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -38,17 +191,108 @@ pub enum LlmError {
     Transient(String),
     #[error("invalid request: {0}")]
     Invalid(String),
+    /// The model or endpoint rejected the `tools` in the request.
+    #[error("tools not supported: {0}")]
+    ToolsUnsupported(String),
+    /// The prompt does not fit the model's context window (or the request is too large).
+    #[error("context window exceeded: {0}")]
+    ContextOverflow(String),
+}
+
+impl LlmError {
+    /// Canonical snake_case error kind stored in `llm_usage.error_kind`.
+    pub fn error_kind(&self) -> &'static str {
+        match self {
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Unauthorized => "unauthorized",
+            Self::Transient(_) => "transient",
+            Self::Invalid(_) => "invalid",
+            Self::ToolsUnsupported(_) => "tools_unsupported",
+            Self::ContextOverflow(_) => "context_overflow",
+        }
+    }
 }
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError>;
+    async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError>;
 }
+
+/// Substrings (lowercase) in a provider error that mean the model rejected reasoning/thinking params.
+const REASONING_UNSUPPORTED_MARKERS: [&str; 5] = [
+    "reasoning_effort",
+    "reasoning effort",
+    "thinking",
+    "budget_tokens",
+    "does not support reasoning",
+];
+
+fn is_reasoning_unsupported(err: &LlmError) -> bool {
+    let LlmError::Invalid(msg) = err else {
+        return false;
+    };
+    let lower = msg.to_lowercase();
+    !lower.starts_with("provider status 404")
+        && REASONING_UNSUPPORTED_MARKERS
+            .iter()
+            .any(|m| lower.contains(m))
+}
+
+/// Retries `call` once with `effort = None` when the provider rejects the reasoning parameter.
+pub(crate) async fn chat_with_effort_fallback<F, Fut>(
+    effort: Option<ReasoningEffort>,
+    call: F,
+) -> Result<ChatResponse, LlmError>
+where
+    F: Fn(Option<ReasoningEffort>) -> Fut,
+    Fut: std::future::Future<Output = Result<ChatResponse, LlmError>>,
+{
+    match call(effort).await {
+        Err(ref err) if effort.is_some() && is_reasoning_unsupported(err) => call(None).await,
+        other => other,
+    }
+}
+
+pub(crate) fn normalize_model_ids(ids: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Substrings (lowercase) in a provider error that mean the model or endpoint cannot use tools.
+const TOOLS_UNSUPPORTED_MARKERS: [&str; 5] = [
+    "does not support tools",
+    "tool_use is not supported",
+    "tools is not supported",
+    "function calling is not supported",
+    "tool calling is not supported",
+];
+/// Substrings (lowercase) in a provider error that mean the prompt is too long for the model.
+const CONTEXT_OVERFLOW_MARKERS: [&str; 6] = [
+    "context_length_exceeded",
+    "maximum context length",
+    "prompt is too long",
+    "exceeds the maximum number of tokens",
+    "token count exceeds",
+    "input is too long",
+];
 
 /// Kirim request lalu petakan status gagal ke `LlmError`.
 /// API key, URL, dan body request tidak pernah masuk pesan error.
-pub(crate) async fn send(req: RequestBuilder) -> Result<Response, LlmError> {
-    let resp = req.timeout(REQUEST_TIMEOUT).send().await.map_err(|e| {
+/// `has_tools`: the request carries tools, so a tools rejection becomes `ToolsUnsupported`.
+/// `timeout`: from [`request_timeout`] for chat calls, `REQUEST_TIMEOUT` for the rest.
+pub(crate) async fn send(
+    req: RequestBuilder,
+    has_tools: bool,
+    timeout: Duration,
+) -> Result<Response, LlmError> {
+    let resp = req.timeout(timeout).send().await.map_err(|e| {
         if e.is_builder() {
             LlmError::Invalid("invalid request".into())
         } else {
@@ -65,19 +309,55 @@ pub(crate) async fn send(req: RequestBuilder) -> Result<Response, LlmError> {
         },
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => LlmError::Unauthorized,
         s if s.is_server_error() => LlmError::Transient(format!("provider status {s}")),
-        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::UNPROCESSABLE_ENTITY => {
+        StatusCode::BAD_REQUEST
+        | StatusCode::NOT_FOUND
+        | StatusCode::UNPROCESSABLE_ENTITY
+        | StatusCode::PAYLOAD_TOO_LARGE => {
             // Body error bisa gagal dibaca/di-parse; itu tidak mengubah klasifikasi.
-            let body = resp.json::<Value>().await.unwrap_or(Value::Null);
+            let raw = resp.bytes().await.unwrap_or_default();
+            let body = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
             if is_bad_api_key(&body) {
                 return Err(LlmError::Unauthorized);
             }
-            LlmError::Invalid(format!(
-                "provider status {status}{}",
-                provider_message(&body)
-            ))
+            let message = format!("provider status {status}{}", provider_message(&body));
+            let lower = error_text(&body);
+            let too_large = status == StatusCode::PAYLOAD_TOO_LARGE;
+            if has_tools && !too_large && tools_unsupported(&lower) {
+                LlmError::ToolsUnsupported(message)
+            } else if too_large || (status != StatusCode::NOT_FOUND && context_overflow(&lower)) {
+                LlmError::ContextOverflow(message)
+            } else {
+                LlmError::Invalid(message)
+            }
         }
         other => LlmError::Invalid(format!("unexpected provider status {other}")),
     })
+}
+
+/// Lowercased `error.message`, `error.code`, `error.type`, or a plain-string `error`, one per
+/// line. Only these fields are scanned for markers: some servers echo the request input
+/// elsewhere in the body, and that input (PR code) may contain the marker phrases.
+fn error_text(body: &Value) -> String {
+    let error = &body["error"];
+    [&error["message"], &error["code"], &error["type"], error]
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase()
+}
+
+fn tools_unsupported(lower_error: &str) -> bool {
+    TOOLS_UNSUPPORTED_MARKERS
+        .iter()
+        .any(|m| lower_error.contains(m))
+        || (lower_error.contains("unknown field") && lower_error.contains("tools"))
+}
+
+fn context_overflow(lower_error: &str) -> bool {
+    CONTEXT_OVERFLOW_MARKERS
+        .iter()
+        .any(|m| lower_error.contains(m))
 }
 
 /// `Retry-After` dalam detik. Bentuk HTTP-date diabaikan.
@@ -103,14 +383,18 @@ fn is_bad_api_key(body: &Value) -> bool {
 
 /// `: <error.message>` dari body error provider (OpenAI, Anthropic, Gemini sama-sama
 /// memakai `error.message`), dipotong 200 karakter. Kosong kalau tidak ada.
+/// Some OpenAI-compatible servers (e.g. Ollama) send `error` as a plain string instead.
 fn provider_message(body: &Value) -> String {
-    match body["error"]["message"].as_str() {
-        Some(m) if !m.is_empty() => {
-            let short: String = m.chars().take(MAX_PROVIDER_MESSAGE).collect();
-            format!(": {short}")
-        }
+    let error = &body["error"];
+    match error["message"].as_str().or_else(|| error.as_str()) {
+        Some(m) if !m.is_empty() => format_provider_message(m),
         _ => String::new(),
     }
+}
+
+pub(crate) fn format_provider_message(msg: &str) -> String {
+    let short: String = msg.chars().take(MAX_PROVIDER_MESSAGE).collect();
+    format!(": {short}")
 }
 
 /// Header berisi API key, ditandai sensitif supaya tidak muncul di log/Debug.
@@ -131,9 +415,9 @@ pub(crate) async fn decode<T: serde::de::DeserializeOwned>(resp: Response) -> Re
     serde_json::from_slice(&bytes).map_err(|_| LlmError::Invalid("malformed response".into()))
 }
 
-/// Teks hasil harus tidak kosong.
-pub(crate) fn non_empty(text: String) -> Result<String, LlmError> {
-    if text.trim().is_empty() {
+/// A response must carry text or at least one tool call.
+pub(crate) fn non_empty(text: String, tool_calls: &[ToolCall]) -> Result<String, LlmError> {
+    if text.trim().is_empty() && tool_calls.is_empty() {
         Err(LlmError::Invalid("empty response".into()))
     } else {
         Ok(text)

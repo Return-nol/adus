@@ -38,6 +38,7 @@ fn pr() -> PullRequest {
         head_sha: "headsha".into(),
         base_sha: "mergebase".into(),
         is_draft: false,
+        source_ref: None,
     }
 }
 
@@ -343,6 +344,7 @@ async fn get_pr_uses_merge_base_from_compare() {
     assert_eq!(got.head_sha, "headsha");
     assert_eq!(got.base_sha, "mergebase");
     assert!(got.is_draft);
+    assert_eq!(got.source_ref, None);
 }
 
 #[tokio::test]
@@ -420,12 +422,16 @@ async fn post_review_sends_right_side_lines() {
     let comments = vec![
         InlineComment {
             path: "src/a.rs".into(),
+            start_line: None,
             line: 12,
+            end_offset: None,
             body: "perbaiki".into(),
         },
         InlineComment {
             path: "src/b.rs".into(),
+            start_line: None,
             line: 3,
+            end_offset: None,
             body: "oke?".into(),
         },
     ];
@@ -434,6 +440,73 @@ async fn post_review_sends_right_side_lines() {
         .await
         .unwrap();
     assert_eq!(n, 2);
+}
+
+#[tokio::test]
+async fn post_review_sends_multiline_start_line_and_drops_invalid_start_line() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/alpha/pulls/7/reviews"))
+        .and(body_json(json!({
+            "commit_id": "headsha",
+            "event": "COMMENT",
+            "body": "summary",
+            "comments": [
+                {
+                    "path": "src/a.rs",
+                    "start_line": 10,
+                    "start_side": "RIGHT",
+                    "line": 12,
+                    "side": "RIGHT",
+                    "body": "multi",
+                },
+                {
+                    "path": "src/b.rs",
+                    "line": 5,
+                    "side": "RIGHT",
+                    "body": "equal",
+                },
+                {
+                    "path": "src/c.rs",
+                    "line": 4,
+                    "side": "RIGHT",
+                    "body": "inverted",
+                },
+            ],
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 1 })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let comments = vec![
+        InlineComment {
+            path: "src/a.rs".into(),
+            start_line: Some(10),
+            line: 12,
+            end_offset: Some(18),
+            body: "multi".into(),
+        },
+        InlineComment {
+            path: "src/b.rs".into(),
+            start_line: Some(5),
+            line: 5,
+            end_offset: None,
+            body: "equal".into(),
+        },
+        InlineComment {
+            path: "src/c.rs".into(),
+            start_line: Some(8),
+            line: 4,
+            end_offset: None,
+            body: "inverted".into(),
+        },
+    ];
+    let n = provider(&server)
+        .post_review(&repo(), &pr(), &comments, "summary")
+        .await
+        .unwrap();
+    assert_eq!(n, 3);
 }
 
 #[tokio::test]
@@ -617,4 +690,56 @@ async fn ensure_webhooks_keeps_live_hook_and_drops_missing_one() {
         .await
         .unwrap();
     assert_eq!(ids, vec!["56".to_string()]);
+}
+
+fn basic(user_pass: &str) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(user_pass)
+    )
+}
+
+#[test]
+fn github_clone_spec_uses_pr_ref_and_x_access_token() {
+    let p = GithubProvider::new(
+        reqwest::Client::new(),
+        "https://api.github.com".into(),
+        "ghp_secret".into(),
+    );
+    let spec = p.clone_spec(&repo(), &pr()).unwrap();
+    assert_eq!(spec.url, "https://github.com/octocat/alpha.git");
+    assert_eq!(spec.refspec, "refs/pull/7/head");
+    assert_eq!(spec.fallback_refspec, None);
+    assert_eq!(spec.expected_sha, "headsha");
+    assert_eq!(spec.auth_header, basic("x-access-token:ghp_secret"));
+    assert!(!format!("{spec:?}").contains(&spec.auth_header));
+}
+
+#[test]
+fn github_clone_spec_maps_ghes_and_test_servers_and_encodes_segments() {
+    let ghes = GithubProvider::new(
+        reqwest::Client::new(),
+        "https://ghe.example.com/api/v3/".into(),
+        "t".into(),
+    );
+    let spec = ghes.clone_spec(&repo(), &pr()).unwrap();
+    assert_eq!(spec.url, "https://ghe.example.com/octocat/alpha.git");
+
+    let local = GithubProvider::new(
+        reqwest::Client::new(),
+        "http://127.0.0.1:9999".into(),
+        "t".into(),
+    );
+    let mut odd = repo();
+    odd.name = "my repo#1".into();
+    let spec = local.clone_spec(&odd, &pr()).unwrap();
+    assert_eq!(spec.url, "http://127.0.0.1:9999/octocat/my%20repo%231.git");
+
+    let mut empty = repo();
+    empty.owner = String::new();
+    assert!(local.clone_spec(&empty, &pr()).is_none());
+    let mut dots = repo();
+    dots.owner = "..".into();
+    assert!(local.clone_spec(&dots, &pr()).is_none());
 }

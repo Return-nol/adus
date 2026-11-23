@@ -15,7 +15,8 @@ use adus_db::{connections, repositories};
 use adus_git::HttpGitProviderFactory;
 use adus_llm::router::LlmRouter;
 use adus_queue::{Delivery, Queue};
-use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT};
+use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
+use adus_review::workspace::GitCliCloner;
 use async_trait::async_trait;
 use redis::AsyncCommands;
 use sqlx::PgPool;
@@ -104,6 +105,7 @@ fn review_job(repository_id: Uuid, pr_number: i64) -> Job {
         repository_id,
         pr_number,
         trigger: Trigger::Opened,
+        mode_override: None,
     }
 }
 
@@ -245,7 +247,9 @@ async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool)
         cipher: cipher.clone(),
         git: Arc::new(git),
         chat: Arc::new(LlmRouter::new(pool.clone(), cipher, http)),
+        cloner: Arc::new(GitCliCloner::default()),
         review_timeout: REVIEW_TIMEOUT,
+        specialists_review_timeout: SPECIALISTS_REVIEW_TIMEOUT,
     };
     let delivery = deliver(&queue, &review_job(repo.id, 7), 5).await;
 
@@ -492,7 +496,7 @@ async fn scheduler_sweeps_stale_reviews(pool: PgPool) {
     };
     let stale = reviews::insert(&pool, new(1)).await.unwrap().id;
     let fresh = reviews::insert(&pool, new(2)).await.unwrap().id;
-    sqlx::query("UPDATE reviews SET created_at = now() - interval '20 minutes' WHERE id = $1")
+    sqlx::query("UPDATE reviews SET created_at = now() - interval '40 minutes' WHERE id = $1")
         .bind(stale)
         .execute(&pool)
         .await

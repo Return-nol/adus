@@ -7,20 +7,23 @@ use std::time::Duration;
 
 use adus_core::job::Job;
 use adus_db::reviews::{self, NewReview};
-use adus_queue::{Delivery, MAX_ATTEMPTS, Queue, QueueError, backoff};
-use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT};
+use adus_queue::{Delivery, MAX_ATTEMPTS, Queue, QueueError, RECLAIM_IDLE, backoff};
+use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
 use async_trait::async_trait;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-/// Batas waktu cadangan satu job. Review sudah dibatasi 12 menit di dalam engine (supaya baris
-/// `reviews` tercatat gagal); ini menjaga sisanya. Di bawah TTL lock dan batas ambil-alih antrian
-/// (keduanya 15 menit), jadi job yang macet tidak pernah dikerjakan dua worker sekaligus.
-pub const JOB_TIMEOUT: Duration = Duration::from_secs(13 * 60);
-const LOCK_TTL: Duration = Duration::from_secs(15 * 60);
+/// Backstop of one job. The engine already bounds a review by its budget (12 min Generalist,
+/// 30 min Specialists) so its `reviews` row is recorded as failed; this guards the rest. It is
+/// below the lock TTL and the queue's take-over limit (both 35 min), so a stuck job is never
+/// worked on by two workers at once.
+pub const JOB_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+const LOCK_TTL: Duration = Duration::from_secs(35 * 60);
 const _: () = assert!(REVIEW_TIMEOUT.as_secs() < JOB_TIMEOUT.as_secs());
+const _: () = assert!(SPECIALISTS_REVIEW_TIMEOUT.as_secs() < JOB_TIMEOUT.as_secs());
 const _: () = assert!(JOB_TIMEOUT.as_secs() < LOCK_TTL.as_secs());
+const _: () = assert!(JOB_TIMEOUT.as_secs() < RECLAIM_IDLE.as_secs());
 const _: () = assert!(JOB_TIMEOUT.as_secs() < reviews::STALE_AFTER.as_secs());
 /// Jeda sebelum mencoba lagi job yang PR-nya sedang dikerjakan worker lain.
 const LOCK_BUSY_DELAY: Duration = Duration::from_secs(30);
@@ -50,8 +53,9 @@ impl JobRunner for Engine {
                 repository_id,
                 pr_number,
                 trigger,
+                mode_override,
             } => self
-                .review_pr(*repository_id, *pr_number, *trigger)
+                .review_pr(*repository_id, *pr_number, *trigger, *mode_override)
                 .await
                 .map(|_review_id| ()),
             Job::PrComment { .. } => self.handle_comment(queue, job).await,
@@ -65,6 +69,7 @@ impl JobRunner for Engine {
             repository_id,
             pr_number,
             trigger,
+            ..
         } = job
         else {
             return;

@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::types::ReviewMode;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Job {
@@ -10,6 +12,10 @@ pub enum Job {
         repository_id: Uuid,
         pr_number: i64,
         trigger: Trigger,
+        /// Forces a review mode for this run (`@adudu review deep`); `None` = configured mode.
+        /// `default` keeps jobs queued before this field existed readable.
+        #[serde(default)]
+        mode_override: Option<ReviewMode>,
     },
     PrComment {
         repository_id: Uuid,
@@ -47,6 +53,7 @@ mod tests {
             repository_id: Uuid::nil(),
             pr_number: 42,
             trigger: Trigger::Opened,
+            mode_override: None,
         };
         let json = serde_json::to_value(&review).unwrap();
         assert_eq!(
@@ -56,6 +63,7 @@ mod tests {
                 "repository_id": "00000000-0000-0000-0000-000000000000",
                 "pr_number": 42,
                 "trigger": "opened",
+                "mode_override": null,
             })
         );
         assert_eq!(serde_json::from_value::<Job>(json).unwrap(), review);
@@ -73,5 +81,33 @@ mod tests {
         let json = serde_json::to_string(&comment).unwrap();
         assert!(json.contains(r#""type":"pr_comment""#));
         assert_eq!(serde_json::from_str::<Job>(&json).unwrap(), comment);
+    }
+
+    #[test]
+    fn job_review_pr_without_mode_override_deserializes_none() {
+        // Jobs queued before `mode_override` existed must still load.
+        let legacy = r#"{"type":"review_pr","repository_id":"00000000-0000-0000-0000-000000000000","pr_number":1,"trigger":"updated"}"#;
+        assert_eq!(
+            serde_json::from_str::<Job>(legacy).unwrap(),
+            Job::ReviewPr {
+                repository_id: Uuid::nil(),
+                pr_number: 1,
+                trigger: Trigger::Updated,
+                mode_override: None,
+            }
+        );
+    }
+
+    #[test]
+    fn job_review_pr_mode_override_roundtrip() {
+        let job = Job::ReviewPr {
+            repository_id: Uuid::nil(),
+            pr_number: 1,
+            trigger: Trigger::Command,
+            mode_override: Some(ReviewMode::Specialists),
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        assert!(json.contains(r#""mode_override":"specialists""#));
+        assert_eq!(serde_json::from_str::<Job>(&json).unwrap(), job);
     }
 }

@@ -1,19 +1,22 @@
-pub mod anthropic;
-pub mod gemini;
-pub mod openai;
+mod anthropic;
+mod gemini;
+mod openai;
 pub mod router;
-pub mod types;
+mod types;
 
 use async_trait::async_trait;
 
 pub use adus_core::types::ProviderKind;
-pub use anthropic::AnthropicClient;
-pub use gemini::GeminiClient;
-pub use openai::OpenAiClient;
-pub use types::{ChatRequest, ChatResponse, LlmClient, LlmError};
+use anthropic::AnthropicClient;
+use gemini::GeminiClient;
+use openai::OpenAiClient;
+pub use types::{
+    AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
+    StopReason, ToolCall, ToolDef, ToolResult, UserPart,
+};
 
 /// Base URL bawaan tiap provider. `OpenaiCompatible` tidak punya (wajib diisi admin).
-pub fn default_base_url(kind: ProviderKind) -> Option<&'static str> {
+pub(crate) fn default_base_url(kind: ProviderKind) -> Option<&'static str> {
     match kind {
         ProviderKind::Openai => Some("https://api.openai.com/v1"),
         ProviderKind::Anthropic => Some("https://api.anthropic.com"),
@@ -46,6 +49,12 @@ struct MissingBaseUrl;
 #[async_trait]
 impl LlmClient for MissingBaseUrl {
     async fn chat(&self, _api_key: &str, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        Err(LlmError::Invalid(
+            "base_url required for openai_compatible".into(),
+        ))
+    }
+
+    async fn list_models(&self, _api_key: &str) -> Result<Vec<String>, LlmError> {
         Err(LlmError::Invalid(
             "base_url required for openai_compatible".into(),
         ))

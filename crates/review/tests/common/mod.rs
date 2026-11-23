@@ -1,20 +1,19 @@
-//! Fake git dan LLM untuk test engine, plus helper seed database.
-#![allow(dead_code)]
+//! Shared test harness for review integration tests.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use adus_core::crypto::Cipher;
-use adus_core::types::{ConnectionKind, ProviderKind};
-use adus_db::{ai, connections, repositories, settings};
+use adus_core::types::ConnectionKind;
+use adus_db::connections::{self, ConnectionStatus};
+use adus_db::{repositories, settings};
 use adus_git::{
-    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
+    CloneSpec, FileDiff, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
     PullRequest, RemoteRepo, RepoRef,
 };
-use adus_llm::router::{ChatError, ChatService, UsageContext};
-use adus_llm::{ChatRequest, ChatResponse};
-use adus_review::engine::{Engine, REVIEW_TIMEOUT};
+use adus_llm::router::ChatService;
+use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
+use adus_review::workspace::RepoCloner;
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -43,6 +42,8 @@ pub struct GitState {
     pub get_pr_delay: Duration,
     /// Jika diisi, `pr_diff` gagal dengan error ini.
     pub pr_diff_error: Option<GitError>,
+    /// `pr_diff` waits this long before it answers (a slow provider).
+    pub pr_diff_delay: Duration,
     /// Jika diisi, `diff_between` gagal dengan error ini.
     pub diff_between_error: Option<GitError>,
     /// Jika diisi, `post_review` gagal dengan error ini.
@@ -55,6 +56,8 @@ pub struct GitState {
     pub diff_between_calls: Vec<(String, String)>,
     pub reviews: Vec<PostedReview>,
     pub comments: Vec<String>,
+    /// Hasil `clone_spec` (`None`: provider tanpa clone, review diff-only).
+    pub clone_spec: Option<CloneSpec>,
 }
 
 /// Provider git palsu sekaligus pabriknya. Clone berbagi keadaan yang sama.
@@ -73,6 +76,7 @@ impl FakeGit {
                 get_pr_error: None,
                 get_pr_delay: Duration::ZERO,
                 pr_diff_error: None,
+                pr_diff_delay: Duration::ZERO,
                 diff_between_error: None,
                 post_error: None,
                 comment_error: None,
@@ -80,6 +84,7 @@ impl FakeGit {
                 diff_between_calls: Vec::new(),
                 reviews: Vec::new(),
                 comments: Vec::new(),
+                clone_spec: None,
             })),
         }
     }
@@ -147,6 +152,8 @@ impl GitProvider for FakeGit {
     }
 
     async fn pr_diff(&self, _repo: &RepoRef, _pr: &PullRequest) -> Result<Vec<FileDiff>, GitError> {
+        let delay = self.state().pr_diff_delay;
+        tokio::time::sleep(delay).await;
         let state = self.state();
         match &state.pr_diff_error {
             Some(err) => Err(err.clone()),
@@ -181,11 +188,18 @@ impl GitProvider for FakeGit {
         if let Some(err) = &state.post_error {
             return Err(err.clone());
         }
-        state.reviews.push(PostedReview {
+        let review = PostedReview {
             comments: comments.to_vec(),
             summary: summary.to_string(),
-        });
-        Ok(comments.len())
+        };
+        let count = review.comments.len();
+        tracing::trace!(
+            comments = count,
+            summary_len = review.summary.len(),
+            "fake post_review"
+        );
+        state.reviews.push(review);
+        Ok(count)
     }
 
     async fn post_comment(
@@ -201,102 +215,26 @@ impl GitProvider for FakeGit {
         state.comments.push(body.to_string());
         Ok(())
     }
-}
 
-/// Satu panggilan `chat` yang tercatat.
-#[derive(Debug, Clone)]
-pub struct ChatCall {
-    pub provider_id: Uuid,
-    pub model: String,
-    pub user: String,
-    pub max_tokens: u32,
-    pub ctx: UsageContext,
-}
-
-/// LLM palsu: jawaban diambil berurutan dari `script`; habis → `[]`. Prompt yang memuat path di
-/// `delays` dijawab setelah jeda itu (urutan pengambilan jawaban tetap urutan panggilan).
-#[derive(Default)]
-pub struct FakeChat {
-    script: Mutex<VecDeque<Result<String, ChatError>>>,
-    calls: Mutex<Vec<ChatCall>>,
-    delays: Mutex<Vec<(String, Duration)>>,
-    in_flight: Mutex<(usize, usize)>,
-}
-
-impl FakeChat {
-    pub fn push(&self, result: Result<&str, ChatError>) {
-        self.script
-            .lock()
-            .unwrap()
-            .push_back(result.map(str::to_string));
-    }
-
-    pub fn calls(&self) -> Vec<ChatCall> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    /// Jawaban untuk file `path` ditunda selama `delay`.
-    pub fn delay(&self, path: &str, delay: Duration) {
-        self.delays.lock().unwrap().push((path.to_string(), delay));
-    }
-
-    /// Jumlah panggilan terbanyak yang pernah berjalan bersamaan.
-    pub fn max_in_flight(&self) -> usize {
-        self.in_flight.lock().unwrap().1
+    fn clone_spec(&self, _repo: &RepoRef, _pr: &PullRequest) -> Option<CloneSpec> {
+        self.state().clone_spec.clone()
     }
 }
 
-#[async_trait]
-impl ChatService for FakeChat {
-    async fn chat(
-        &self,
-        provider_id: Uuid,
-        req: ChatRequest,
-        ctx: UsageContext,
-    ) -> Result<ChatResponse, ChatError> {
-        let delay = self
-            .delays
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(path, _)| req.user.contains(&format!("<file_path>\n{path}\n")))
-            .map(|(_, delay)| *delay);
-        self.calls.lock().unwrap().push(ChatCall {
-            provider_id,
-            model: req.model,
-            user: req.user,
-            max_tokens: req.max_tokens,
-            ctx,
-        });
-        let next = self.script.lock().unwrap().pop_front();
-        {
-            let mut in_flight = self.in_flight.lock().unwrap();
-            in_flight.0 += 1;
-            in_flight.1 = in_flight.1.max(in_flight.0);
-        }
-        // Selalu menunggu sebentar, supaya panggilan lain sempat mulai (concurrency terlihat).
-        tokio::time::sleep(delay.unwrap_or(Duration::from_millis(5))).await;
-        self.in_flight.lock().unwrap().0 -= 1;
-        next.unwrap_or(Ok("[]".to_string()))
-            .map(|text| ChatResponse {
-                text,
-                input_tokens: 1,
-                output_tokens: 1,
-            })
-    }
-}
-
-/// Database yang sudah berisi connection GitHub, satu repo, dan model default.
+/// Database seeded with a GitHub connection and one repository.
 pub struct Setup {
     pub engine: Engine,
     pub git: FakeGit,
-    pub chat: Arc<FakeChat>,
     pub connection_id: Uuid,
     pub repository_id: Uuid,
-    pub provider_id: Uuid,
 }
 
-pub async fn setup(pool: &PgPool, git: FakeGit) -> Setup {
+pub async fn setup(
+    pool: &PgPool,
+    git: FakeGit,
+    chat: Arc<dyn ChatService>,
+    cloner: Arc<dyn RepoCloner>,
+) -> Setup {
     let cipher = Cipher::from_base64_key(TEST_KEY).unwrap();
     let conn = connections::insert(
         pool,
@@ -320,28 +258,24 @@ pub async fn setup(pool: &PgPool, git: FakeGit) -> Setup {
         webhook_token: "t",
     };
     let repo = repositories::insert(pool, repo).await.unwrap().unwrap();
-    let provider = ai::insert_provider(pool, ProviderKind::Openai, "openai", None)
-        .await
-        .unwrap();
     let mut current = settings::get(pool).await.unwrap();
-    current.default_provider_id = Some(provider.id);
-    current.default_model = Some("gpt-test".into());
+    // The small-PR path is opt-in per test: most tests use tiny diffs and expect the full path.
+    current.small_pr_max_lines = 0;
     settings::update(pool, &current).await.unwrap();
 
-    let chat = Arc::new(FakeChat::default());
     Setup {
         engine: Engine {
             db: pool.clone(),
             cipher: Arc::new(cipher),
             git: Arc::new(git.clone()),
-            chat: chat.clone(),
+            chat,
+            cloner,
             review_timeout: REVIEW_TIMEOUT,
+            specialists_review_timeout: SPECIALISTS_REVIEW_TIMEOUT,
         },
         git,
-        chat,
         connection_id: conn.id,
         repository_id: repo.id,
-        provider_id: provider.id,
     }
 }
 
@@ -353,62 +287,14 @@ pub fn pr(head_sha: &str) -> PullRequest {
         head_sha: head_sha.into(),
         base_sha: "base".into(),
         is_draft: false,
+        source_ref: None,
     }
 }
 
-pub fn file(path: &str, patch: &str) -> FileDiff {
-    FileDiff {
-        path: path.into(),
-        old_path: None,
-        status: FileStatus::Modified,
-        patch: Some(patch.into()),
-    }
-}
-
-/// Jawaban LLM berisi satu temuan.
-pub fn finding(path: &str, line: u32, title: &str) -> String {
-    format!(
-        r#"[{{"file":"{path}","line":{line},"severity":"warning","title":"{title}","body":"why"}}]"#
-    )
-}
-
-pub fn redis_url() -> String {
-    std::env::var("REDIS_URL").expect("REDIS_URL must be set (see .cargo/config.toml)")
-}
-
-/// Antrian dengan prefix unik `test-{uuid}`; panggil `cleanup_queue` di akhir test.
-pub async fn test_queue() -> (adus_queue::Queue, String) {
-    let prefix = format!("test-{}", Uuid::new_v4());
-    let queue = adus_queue::Queue::connect(&redis_url(), &prefix)
+pub async fn conn_status(pool: &PgPool, connection_id: Uuid) -> ConnectionStatus {
+    connections::get(pool, connection_id)
         .await
-        .unwrap();
-    (queue, prefix)
-}
-
-/// Hapus semua key Redis milik prefix test.
-pub async fn cleanup_queue(prefix: &str) {
-    use redis::AsyncCommands;
-    let client = redis::Client::open(redis_url()).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
-    let keys: Vec<String> = conn.keys(format!("{prefix}:*")).await.unwrap();
-    if !keys.is_empty() {
-        let _: () = conn.del(keys).await.unwrap();
-    }
-}
-
-/// Semua job di stream antrian test, urut masuk.
-pub async fn queued_jobs(prefix: &str) -> Vec<adus_core::job::Job> {
-    let client = redis::Client::open(redis_url()).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
-    let entries: Vec<(String, std::collections::HashMap<String, String>)> = redis::cmd("XRANGE")
-        .arg(format!("{prefix}:jobs"))
-        .arg("-")
-        .arg("+")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
-    entries
-        .iter()
-        .map(|(_, fields)| serde_json::from_str(&fields["job"]).unwrap())
-        .collect()
+        .unwrap()
+        .unwrap()
+        .status
 }

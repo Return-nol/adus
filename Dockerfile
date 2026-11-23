@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # 1. Dashboard: SvelteKit static build (web/build). The Rust binary embeds it at compile time.
-FROM node:22-bookworm AS web
+FROM node:26-alpine AS web
 WORKDIR /app/web
 RUN corepack enable && corepack prepare pnpm@11 --activate
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
@@ -10,7 +10,7 @@ COPY web/ ./
 RUN pnpm build
 
 # 2. Rust dependencies, cached by cargo-chef: this layer only rebuilds when a Cargo.toml/Cargo.lock changes.
-FROM rust:1-bookworm AS chef
+FROM rust:1-trixie AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -31,9 +31,9 @@ COPY --from=web /app/web/build web/build
 RUN cargo build --release -p adus
 
 # 4. Runtime image.
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin adus
 COPY --from=build /app/target/release/adus /usr/local/bin/adus

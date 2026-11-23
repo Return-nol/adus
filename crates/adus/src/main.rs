@@ -8,7 +8,8 @@ use adus_core::{
 use adus_git::{GitProviderFactory, HttpGitProviderFactory};
 use adus_llm::router::{ChatService, LlmRouter};
 use adus_queue::Queue;
-use adus_review::engine::{Engine, REVIEW_TIMEOUT};
+use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
+use adus_review::workspace::{GitCliCloner, cleanup_orphaned_workspaces};
 use adus_server::{
     AppState,
     doctor::{self, Report, Verdict},
@@ -112,6 +113,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         Ok(count) => tracing::warn!(count, "marked interrupted reviews as failed"),
         Err(err) => tracing::warn!(error = %err, "could not mark interrupted reviews as failed"),
     }
+    // Also before workers run: clone directories left behind by a crash.
+    let removed = cleanup_orphaned_workspaces().await;
+    if removed > 0 {
+        tracing::info!(removed, "removed orphaned review workspaces");
+    }
     let listener = tokio::net::TcpListener::bind(&state.config.bind_addr).await?;
     tracing::info!("listening on {}", state.config.bind_addr);
     let engine = Arc::new(Engine {
@@ -119,7 +125,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         cipher: state.cipher.clone(),
         git: state.git.clone(),
         chat: state.chat.clone(),
+        cloner: Arc::new(GitCliCloner::default()),
         review_timeout: REVIEW_TIMEOUT,
+        specialists_review_timeout: SPECIALISTS_REVIEW_TIMEOUT,
     });
 
     let shutdown = CancellationToken::new();

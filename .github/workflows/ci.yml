@@ -2,7 +2,11 @@ name: ci
 
 on:
   push:
+    branches:
+      - feat/adus-v1
   pull_request:
+    branches:
+      - feat/adus-v1
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -12,12 +16,37 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'migrations/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+            web:
+              - 'web/**'
+              - '.github/workflows/ci.yml'
+
   rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     services:
       # Same host ports as .cargo/config.toml, so the tests need no env override.
       postgres:
-        image: postgres:16
+        image: postgres:18
         env:
           POSTGRES_USER: adus
           POSTGRES_PASSWORD: adus
@@ -30,7 +59,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       redis:
-        image: redis:7
+        image: redis:8
         ports:
           - 55379:6379
         options: >-
@@ -39,17 +68,17 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 11
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       # rust-embed needs web/build to exist
@@ -60,15 +89,17 @@ jobs:
       - run: cargo test --workspace
 
   web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 11
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       - run: pnpm -C web install --frozen-lockfile

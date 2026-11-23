@@ -1,31 +1,64 @@
 //! Parsing dan validasi jawaban LLM menjadi daftar temuan review.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
+use std::ops::RangeInclusive;
 
 use adus_core::types::{Severity, normalize_path};
-use adus_git::FileDiff;
-use serde_json::{Map, Value};
+use adus_git::diff::{commentable_hunks, commentable_lines, same_hunk};
+use adus_llm::ToolDef;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-/// Satu temuan dari LLM untuk satu baris di file baru.
+/// Satu temuan dari LLM untuk satu baris (atau rentang baris) di file baru.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Suggestion {
+pub(crate) struct Suggestion {
     pub file: String,
+    /// First line of the span `start_line..=line` of existing new-file lines that `suggestion`
+    /// replaces. `None`, or a value equal to `line` (which parsing turns into `None`), means a
+    /// single-line finding.
+    pub start_line: Option<u32>,
     pub line: u32,
     pub severity: Severity,
     pub title: String,
     pub body: String,
-    /// Kode pengganti untuk baris itu (opsional).
+    /// Kode pengganti untuk baris/rentang itu (opsional).
     pub suggestion: Option<String>,
+}
+
+/// Baris dan rentang hunk sisi kanan pada satu file yang valid untuk dikomentari.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CommentableRange {
+    pub lines: BTreeSet<u32>,
+    pub hunks: Vec<RangeInclusive<u32>>,
+}
+
+impl CommentableRange {
+    pub(crate) fn from_patch(patch: &str) -> Self {
+        Self {
+            lines: commentable_lines(patch),
+            hunks: commentable_hunks(patch),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Whether `start_line < line` and both lie in one diff hunk.
+    fn spans_one_hunk(&self, start_line: u32, line: u32) -> bool {
+        same_hunk(&self.hunks, start_line, line)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("no JSON array found in the model output")]
-pub struct ParseError;
+pub(crate) struct ParseError;
 
 /// Ambil array JSON pertama dari jawaban model (boleh dibungkus ```json atau diapit prosa).
 /// Objek yang kurang field wajib (`file`, `line`, `title`, `body`) dilewati, bukan menggagalkan parse.
-pub fn parse_suggestions(raw: &str) -> Result<Vec<Suggestion>, ParseError> {
+pub(crate) fn parse_suggestions(raw: &str) -> Result<Vec<Suggestion>, ParseError> {
     let items = first_json_array(raw).ok_or(ParseError)?;
     Ok(items.iter().filter_map(to_suggestion).collect())
 }
@@ -50,12 +83,41 @@ fn first_json_array(raw: &str) -> Option<Vec<Map<String, Value>>> {
     saw_empty.then(Vec::new)
 }
 
-fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
-    let text = |key: &str| item.get(key)?.as_str().map(str::to_string);
-    let line = match item.get("line")? {
+/// The first JSON object in `raw` (fenced or surrounded by prose) that deserializes into `T`.
+/// Objects that do not fit `T` (for example a quoted finding) are skipped; text after the
+/// object is ignored.
+// ponytail: O(n²) on text with many `{` that are not JSON; model replies are small.
+pub(crate) fn first_json_object<T: DeserializeOwned>(raw: &str) -> Option<T> {
+    raw.match_indices('{').find_map(|(start, _)| {
+        serde_json::Deserializer::from_str(&raw[start..])
+            .into_iter::<T>()
+            .next()?
+            .ok()
+    })
+}
+
+fn parse_u32_field(val: &Value) -> Option<u32> {
+    let n = match val {
         Value::Number(n) => n.as_u64()?,
         Value::String(s) => s.trim().parse().ok()?,
         _ => return None,
+    };
+    u32::try_from(n).ok()
+}
+
+fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
+    let text = |key: &str| item.get(key)?.as_str().map(str::to_string);
+    let line = parse_u32_field(item.get("line")?)?;
+    // `range_ok == false`: the model asked for a range that cannot be valid (zero, after
+    // `line`, not a number). Its suggestion was written for lines that will not be replaced, so
+    // it goes too; an equal `start_line` is simply a single-line finding.
+    let (start_line, range_ok) = match item.get("start_line") {
+        None | Some(Value::Null) => (None, true),
+        Some(value) => match parse_u32_field(value) {
+            Some(start) if start == line => (None, true),
+            Some(start) if start > 0 && start < line => (Some(start), true),
+            _ => (None, false),
+        },
     };
     let severity = match text("severity")
         .unwrap_or_default()
@@ -69,51 +131,160 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
     let file = text("file").filter(|f| !f.trim().is_empty())?;
     Some(Suggestion {
         file,
-        line: u32::try_from(line).ok()?,
+        start_line,
+        line,
         severity,
         title: text("title")?,
         body: text("body")?,
-        suggestion: text("suggestion"),
+        suggestion: text("suggestion").filter(|_| range_ok),
     })
 }
 
-/// Buang temuan untuk file lain atau baris yang tidak bisa dikomentari, lalu dedup `(file, line, title)`.
-/// `file` di hasil diganti dengan path file yang sudah dinormalisasi.
-pub fn keep_valid(
+/// The Finder's terminal tool. Uses only `type`, `properties`, `required`, `description`,
+/// `items` and `enum`, the JSON-schema subset every provider (Gemini included) accepts.
+pub(crate) fn submit_findings_tool_def() -> ToolDef {
+    ToolDef {
+        name: "submit_findings".into(),
+        description: "Submit your final review findings and end the review. Call it exactly \
+            once, with every finding you confirmed, or with an empty list when nothing is worth \
+            reporting."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "description": "The confirmed findings; empty when there is nothing to report.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "file": {
+                                "type": "string",
+                                "description": "Path of the changed file exactly as shown in <diffs>."
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "Optional. Set it only when `suggestion` replaces more than one EXISTING line of the new file: the first of those lines (a \"+\" or \" \" line in the same diff hunk, strictly less than `line`). The suggestion then replaces exactly lines start_line..line, so it must hold the full new text for all of them. Leave it out when the suggestion replaces only `line` (even if the new code has several lines), when it only inserts code, and when there is no suggestion."
+                            },
+                            "line": {
+                                "type": "integer",
+                                "description": "New-file line number of a \"+\" line in that file's diff (the end line when `start_line` is set)."
+                            },
+                            "severity": {
+                                "type": "string",
+                                "enum": ["info", "warning", "critical"],
+                                "description": "critical: will break, lose data or open a security hole; warning: likely bug or real performance or maintainability problem; info: worth knowing, low risk."
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "One-line summary of the problem."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Why it is a problem and how to fix it."
+                            },
+                            "suggestion": {
+                                "type": "string",
+                                "description": "Optional exact replacement for the existing lines it covers: `line` alone, or start_line..line when `start_line` is set. Keep their indentation; it may span several lines. Leave it out when unsure."
+                            }
+                        },
+                        "required": ["file", "line", "severity", "title", "body"]
+                    }
+                }
+            },
+            "required": ["findings"]
+        }),
+    }
+}
+
+/// Arguments of `submit_findings`. Elements stay untyped so one malformed finding is skipped
+/// instead of rejecting the whole submission.
+#[derive(Deserialize)]
+struct SubmitFindingsArgs {
+    findings: Vec<Value>,
+}
+
+/// Reads the `submit_findings` arguments. Elements that are not objects or lack a required
+/// field are skipped, as in [`parse_suggestions`]. The error text is shown to the model.
+pub(crate) fn parse_submit_findings(args: &Value) -> Result<Vec<Suggestion>, String> {
+    let parsed = SubmitFindingsArgs::deserialize(args).map_err(|err| {
+        format!("{err}; expected an object with a `findings` array of finding objects")
+    })?;
+    Ok(parsed
+        .findings
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(to_suggestion)
+        .collect())
+}
+
+/// Keeps the findings of one Finder batch that can be posted: the normalized file is a key of
+/// `allowed_by_file` (normalized paths) and `line` is in that file's commentable lines.
+/// `start_line` survives only when `start_line..=line` lies in one diff hunk; when a requested
+/// range is dropped, the `suggestion` goes too, because a multi-line replacement anchored to
+/// `line` alone duplicates code on "Apply suggestion". Exact duplicates are then merged (see
+/// `dedup_exact`). `file` in the result is the normalized path.
+pub(crate) fn keep_valid_batch(
     suggestions: Vec<Suggestion>,
-    file: &FileDiff,
-    allowed_lines: &BTreeSet<u32>,
+    allowed_by_file: &HashMap<String, &CommentableRange>,
 ) -> Vec<Suggestion> {
-    let path = normalize_path(&file.path);
-    let mut seen = HashSet::new();
-    suggestions
-        .into_iter()
-        .filter(|s| normalize_path(&s.file) == path && allowed_lines.contains(&s.line))
-        .map(|s| Suggestion {
-            file: path.clone(),
+    let valid = suggestions.into_iter().filter_map(|s| {
+        let file = normalize_path(&s.file);
+        let allowed = allowed_by_file.get(&file)?;
+        if !allowed.lines.contains(&s.line) {
+            return None;
+        }
+        let (start_line, suggestion) = match s.start_line {
+            Some(start) if start == s.line => (None, s.suggestion),
+            Some(start) if !allowed.spans_one_hunk(start, s.line) => (None, None),
+            start_line => (start_line, s.suggestion),
+        };
+        Some(Suggestion {
+            file,
+            start_line,
+            suggestion,
             ..s
         })
-        .filter(|s| seen.insert((s.file.clone(), s.line, s.title.clone())))
-        .collect()
+    });
+    dedup_exact(valid, |s| s)
+}
+
+/// Drops exact `(file, line, title)` duplicates of `items`, keeping the first position. When
+/// the kept entry has no `start_line` and a later duplicate has one, the later entry takes that
+/// position: its suggestion was written for the span it replaces.
+pub(crate) fn dedup_exact<T>(
+    items: impl IntoIterator<Item = T>,
+    finding: impl Fn(&T) -> &Suggestion,
+) -> Vec<T> {
+    let mut kept: Vec<T> = Vec::new();
+    let mut positions: HashMap<(String, u32, String), usize> = HashMap::new();
+    for item in items {
+        let s = finding(&item);
+        let key = (s.file.clone(), s.line, s.title.clone());
+        let has_range = s.start_line.is_some();
+        match positions.get(&key).and_then(|&at| kept.get_mut(at)) {
+            Some(slot) => {
+                if has_range && finding(slot).start_line.is_none() {
+                    *slot = item;
+                }
+            }
+            None => {
+                positions.insert(key, kept.len());
+                kept.push(item);
+            }
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adus_git::FileStatus;
-
-    fn file(path: &str) -> FileDiff {
-        FileDiff {
-            path: path.into(),
-            old_path: None,
-            status: FileStatus::Modified,
-            patch: Some("@@ -1,1 +1,2 @@\n a\n+b\n".into()),
-        }
-    }
 
     fn sugg(file: &str, line: u32, title: &str) -> Suggestion {
         Suggestion {
             file: file.into(),
+            start_line: None,
             line,
             severity: Severity::Warning,
             title: title.into(),
@@ -122,15 +293,22 @@ mod tests {
         }
     }
 
+    fn sugg_span(file: &str, start_line: Option<u32>, line: u32, title: &str) -> Suggestion {
+        Suggestion {
+            start_line,
+            ..sugg(file, line, title)
+        }
+    }
+
     #[test]
-    fn parses_fenced_json() {
-        let raw = "```json\n[{\"file\":\"src/a.rs\",\"line\":3,\"severity\":\"critical\",\
-                   \"title\":\"T\",\"body\":\"B\",\"suggestion\":\"let x = 1;\"}]\n```";
-        let got = parse_suggestions(raw).unwrap();
+    fn parses_suggestions_formats_and_errors() {
+        let fenced = "```json\n[{\"file\":\"src/a.rs\",\"line\":3,\"severity\":\"critical\",\
+                      \"title\":\"T\",\"body\":\"B\",\"suggestion\":\"let x = 1;\"}]\n```";
         assert_eq!(
-            got,
+            parse_suggestions(fenced).unwrap(),
             vec![Suggestion {
                 file: "src/a.rs".into(),
+                start_line: None,
                 line: 3,
                 severity: Severity::Critical,
                 title: "T".into(),
@@ -138,112 +316,229 @@ mod tests {
                 suggestion: Some("let x = 1;".into()),
             }]
         );
-    }
 
-    #[test]
-    fn parses_with_leading_prose() {
-        let raw = "Sure! Here is the review [see below]:\n\
-                   [{\"file\":\"a.rs\",\"line\":\"7\",\"severity\":\"warning\",\"title\":\"T\",\"body\":\"B\"}]\n\
-                   Let me know if you need more.";
-        let got = parse_suggestions(raw).unwrap();
+        let prose = "Sure! Here is the review [see below]:\n\
+                     [{\"file\":\"a.rs\",\"line\":\"7\",\"severity\":\"warning\",\"title\":\"T\",\"body\":\"B\"}]\n\
+                     Let me know if you need more.";
+        let got = parse_suggestions(prose).unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].line, 7, "numeric string line is accepted");
+        assert_eq!(got[0].line, 7);
         assert_eq!(got[0].severity, Severity::Warning);
         assert_eq!(got[0].suggestion, None);
+
+        // Empty brackets in prose do not mask a real finding array; empty arrays still parse.
+        let with_brackets = "Found 1 issue in `main(String[] args)`:\n\
+                             [{\"file\":\"a.rs\",\"line\":2,\"title\":\"T\",\"body\":\"B\"}]";
+        assert_eq!(parse_suggestions(with_brackets).unwrap().len(), 1);
+        for empty in ["- [ ] todo\n[]", "[]", "```json\n[ ]\n```"] {
+            assert_eq!(parse_suggestions(empty).unwrap(), vec![], "{empty}");
+        }
+        for bad in ["I found no issues.", "[not json", ""] {
+            assert_eq!(parse_suggestions(bad), Err(ParseError), "{bad}");
+        }
     }
 
     #[test]
-    fn empty_bracket_in_prose_does_not_hide_findings() {
-        let raw = "Found 1 issue in `main(String[] args)`:
-                   [{\"file\":\"a.rs\",\"line\":2,\"title\":\"T\",\"body\":\"B\"}]";
-        assert_eq!(parse_suggestions(raw).unwrap().len(), 1);
-        assert_eq!(
-            parse_suggestions(
-                "- [ ] todo
-[]"
-            )
-            .unwrap(),
-            vec![]
-        );
-    }
-
-    #[test]
-    fn empty_array_ok() {
-        assert_eq!(parse_suggestions("[]").unwrap(), vec![]);
-        assert_eq!(parse_suggestions("```json\n[ ]\n```").unwrap(), vec![]);
-    }
-
-    #[test]
-    fn garbage_is_error() {
-        assert_eq!(parse_suggestions("I found no issues."), Err(ParseError));
-        assert_eq!(parse_suggestions("[not json"), Err(ParseError));
-        assert_eq!(parse_suggestions(""), Err(ParseError));
-    }
-
-    #[test]
-    fn unknown_severity_defaults_info() {
+    fn skips_incomplete_items_defaults_severity_and_sanitizes_start_line() {
         let raw = r#"[{"file":"a.rs","line":1,"severity":"blocker","title":"T","body":"B"},
                       {"file":"a.rs","line":2,"title":"T","body":"B"},
                       {"file":"a.rs","line":3,"severity":"CRITICAL","title":"T","body":"B"}]"#;
-        let got = parse_suggestions(raw).unwrap();
-        let severities: Vec<_> = got.iter().map(|s| s.severity).collect();
+        let severities: Vec<_> = parse_suggestions(raw)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.severity)
+            .collect();
         assert_eq!(
             severities,
             vec![Severity::Info, Severity::Info, Severity::Critical]
         );
-    }
 
-    #[test]
-    fn skips_objects_missing_required_fields() {
-        let raw = r#"[{"line":1,"title":"no file","body":"B"},
-                      {"file":"a.rs","title":"no line","body":"B"},
-                      {"file":"a.rs","line":-1,"title":"bad line","body":"B"},
-                      {"file":"a.rs","line":"x","title":"bad line","body":"B"},
-                      {"file":"a.rs","line":1,"body":"no title"},
-                      {"file":"a.rs","line":1,"title":"no body"},
-                      {"file":"a.rs","line":9,"title":"ok","body":"B"}]"#;
-        let got = parse_suggestions(raw).unwrap();
+        let incomplete = r#"[{"line":1,"title":"no file","body":"B"},
+                             {"file":"a.rs","title":"no line","body":"B"},
+                             {"file":"a.rs","line":-1,"title":"bad line","body":"B"},
+                             {"file":"a.rs","line":"x","title":"bad line","body":"B"},
+                             {"file":"a.rs","line":1,"body":"no title"},
+                             {"file":"a.rs","line":1,"title":"no body"},
+                             {"file":"a.rs","line":9,"title":"ok","body":"B"}]"#;
+        let got = parse_suggestions(incomplete).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].title, "ok");
-    }
 
-    #[test]
-    fn drops_lines_outside_diff() {
-        let allowed = BTreeSet::from([2]);
-        let got = keep_valid(
-            vec![sugg("a.rs", 2, "in"), sugg("a.rs", 1, "context line")],
-            &file("a.rs"),
-            &allowed,
+        let ranges = r#"[
+            {"file":"a.rs","start_line":2,"line":5,"title":"num","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":"3","line":5,"title":"str","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":5,"line":5,"title":"equal","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":null,"line":5,"title":"null","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":7,"line":5,"title":"inverted","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":0,"line":5,"title":"zero","body":"B","suggestion":"x"},
+            {"file":"a.rs","start_line":"bad","line":5,"title":"bad_str","body":"B","suggestion":"x"}
+        ]"#;
+        let parsed: Vec<(String, Option<u32>, bool)> = parse_suggestions(ranges)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.title, s.start_line, s.suggestion.is_some()))
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                ("num".into(), Some(2), true),
+                ("str".into(), Some(3), true),
+                ("equal".into(), None, true),
+                ("null".into(), None, true),
+                ("inverted".into(), None, false),
+                ("zero".into(), None, false),
+                ("bad_str".into(), None, false),
+            ]
         );
-        assert_eq!(got, vec![sugg("a.rs", 2, "in")]);
     }
 
     #[test]
-    fn drops_other_files() {
-        let allowed = BTreeSet::from([2]);
-        let got = keep_valid(
+    fn parse_submit_findings_validates_and_sanitizes() {
+        let args = json!({"findings": [
+            {"file": "src/a.rs", "start_line": 2, "line": 3, "severity": "critical", "title": "T",
+             "body": "B", "suggestion": "let x = 1;"},
+            {"file": "src/a.rs", "title": "no line", "body": "B"},
+            "not an object",
+            {"file": "src/b.rs", "start_line": "bad", "line": "4", "title": "T2", "body": "B2", "suggestion": "y"}
+        ]});
+        let got = parse_submit_findings(&args).unwrap();
+        assert_eq!(
+            got,
             vec![
-                sugg("/src/a.rs", 2, "azure style path"),
-                sugg("src/b.rs", 2, "other file"),
-            ],
-            &file("src/a.rs"),
-            &allowed,
+                Suggestion {
+                    file: "src/a.rs".into(),
+                    start_line: Some(2),
+                    line: 3,
+                    severity: Severity::Critical,
+                    title: "T".into(),
+                    body: "B".into(),
+                    suggestion: Some("let x = 1;".into()),
+                },
+                Suggestion {
+                    file: "src/b.rs".into(),
+                    start_line: None,
+                    line: 4,
+                    severity: Severity::Info,
+                    title: "T2".into(),
+                    body: "B2".into(),
+                    suggestion: None,
+                },
+            ]
         );
-        assert_eq!(got, vec![sugg("src/a.rs", 2, "azure style path")]);
+        assert_eq!(
+            parse_submit_findings(&json!({"findings": []})).unwrap(),
+            vec![]
+        );
+        for bad in [json!({}), json!({"findings": "none"})] {
+            let err = parse_submit_findings(&bad).unwrap_err();
+            assert!(err.contains("findings"), "{err}");
+        }
     }
 
     #[test]
-    fn dedups_same_file_line_title() {
-        let allowed = BTreeSet::from([2]);
-        let got = keep_valid(
+    fn submit_findings_tool_def_uses_portable_schema() {
+        let def = submit_findings_tool_def();
+        assert_eq!(def.name, "submit_findings");
+        let params = &def.parameters;
+        assert_eq!(params["required"], json!(["findings"]));
+        let item = &params["properties"]["findings"]["items"];
+        assert_eq!(
+            item["required"],
+            json!(["file", "line", "severity", "title", "body"])
+        );
+        assert_eq!(item["properties"]["start_line"]["type"], json!("integer"));
+        assert_eq!(
+            item["properties"]["severity"]["enum"],
+            json!(["info", "warning", "critical"])
+        );
+        let text = params.to_string();
+        for banned in ["additionalProperties", "$schema", "oneOf"] {
+            assert!(!text.contains(banned), "schema uses {banned}");
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::single_range_in_vec_init,
+        reason = "hunk list contains a single inclusive line range"
+    )]
+    fn keep_valid_batch_filters_files_lines_hunks_and_dedups() {
+        let ra = CommentableRange {
+            lines: BTreeSet::from([2, 3]),
+            hunks: vec![1..=4],
+        };
+        let rb = CommentableRange {
+            lines: BTreeSet::from([5]),
+            hunks: vec![4..=6],
+        };
+        let allowed = HashMap::from([("src/a.rs".to_string(), &ra), ("src/b.rs".to_string(), &rb)]);
+        let got = keep_valid_batch(
             vec![
-                sugg("a.rs", 2, "T"),
-                sugg("/a.rs", 2, "T"),
-                sugg("a.rs", 2, "other"),
+                sugg("/src/a.rs", 2, "T"),
+                sugg("src/a.rs", 2, "T"),
+                sugg("src/a.rs", 4, "context line"),
+                sugg("src/b.rs", 5, "B"),
+                sugg("src/b.rs", 2, "line of another file"),
+                sugg("src/c.rs", 5, "file outside the batch"),
+                sugg("src/a.rs", 2, "other title"),
             ],
-            &file("a.rs"),
             &allowed,
         );
-        assert_eq!(got, vec![sugg("a.rs", 2, "T"), sugg("a.rs", 2, "other")]);
+        assert_eq!(
+            got,
+            vec![
+                sugg("src/a.rs", 2, "T"),
+                sugg("src/b.rs", 5, "B"),
+                sugg("src/a.rs", 2, "other title"),
+            ]
+        );
+
+        let patch = "@@ -1,2 +1,3 @@\n ctx\n+a\n+b\n@@ -10,2 +11,3 @@\n x\n+y\n z\n";
+        let range = CommentableRange::from_patch(patch);
+        let allowed = HashMap::from([("src/a.rs".to_string(), &range)]);
+        let with_fence = |start_line, line, title| Suggestion {
+            suggestion: Some("one\ntwo".into()),
+            ..sugg_span("src/a.rs", start_line, line, title)
+        };
+        let batch = keep_valid_batch(
+            vec![
+                with_fence(Some(1), 3, "context start in same hunk"),
+                with_fence(Some(2), 12, "cross hunk"),
+                with_fence(Some(9), 12, "before hunk"),
+                with_fence(None, 12, "single line"),
+            ],
+            &allowed,
+        );
+        let kept: Vec<_> = batch
+            .iter()
+            .map(|s| (s.start_line, s.suggestion.is_some()))
+            .collect();
+        assert_eq!(
+            kept,
+            [(Some(1), true), (None, false), (None, false), (None, true)]
+        );
+    }
+
+    #[test]
+    fn exact_duplicates_prefer_a_valid_range_and_keep_the_first_position() {
+        let patch = "@@ -1,1 +1,4 @@\n a\n+b\n+c\n+d\n";
+        let range = CommentableRange::from_patch(patch);
+        let allowed = HashMap::from([("src/a.rs".to_string(), &range)]);
+        let got = keep_valid_batch(
+            vec![
+                sugg("src/a.rs", 3, "T"),
+                sugg("src/a.rs", 4, "other"),
+                sugg_span("src/a.rs", Some(2), 3, "T"),
+                sugg_span("src/a.rs", Some(3), 3, "T"),
+            ],
+            &allowed,
+        );
+        assert_eq!(
+            got,
+            vec![
+                sugg_span("src/a.rs", Some(2), 3, "T"),
+                sugg("src/a.rs", 4, "other"),
+            ]
+        );
     }
 }

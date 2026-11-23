@@ -12,24 +12,33 @@
 	import { Badge } from '#lib/components/ui/badge/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
+	import * as Select from '#lib/components/ui/select/index.js';
 	import { Switch } from '#lib/components/ui/switch/index.js';
 	import * as Table from '#lib/components/ui/table/index.js';
 	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
 	import TableSkeleton from '#lib/components/table-skeleton.svelte';
+	import type { Provider } from '#lib/components/provider-dialog.svelte';
+
+	type ReviewMode = 'generalist' | 'specialists';
+
+	const reviewModeLabels: Record<ReviewMode, string> = {
+		generalist: 'Generalist',
+		specialists: 'Specialists'
+	};
 
 	type Repo = {
 		id: string;
 		connection_id: string;
 		display_name: string;
-		name: string;
 		enabled: boolean;
 		auto_review: boolean;
-		review_model: string | null;
-		webhook_count: number;
+		review_provider_id: string | null;
+		review_mode: ReviewMode | null;
 	};
 
 	let connections = $state<Connection[]>([]);
 	let repos = $state<Repo[]>([]);
+	let providers = $state<Provider[]>([]);
 	let loaded = $state(false);
 	let connDialogOpen = $state(false);
 	let addOpen = $state(false);
@@ -48,14 +57,23 @@
 
 	async function load() {
 		try {
-			[connections, repos] = await Promise.all([
+			[connections, repos, providers] = await Promise.all([
 				api<Connection[]>('GET', '/connections'),
-				api<Repo[]>('GET', '/repositories')
+				api<Repo[]>('GET', '/repositories'),
+				api<Provider[]>('GET', '/ai-providers')
 			]);
 		} catch (e) {
 			fail(e);
 		}
 		loaded = true;
+	}
+
+	function reviewModeLabel(mode: ReviewMode | null): string {
+		return mode ? reviewModeLabels[mode] : 'Default (global)';
+	}
+
+	function providerLabel(id: string | null): string {
+		return (id && providers.find((p) => p.id === id)?.name) || 'Default (global)';
 	}
 
 	onMount(load);
@@ -88,7 +106,15 @@
 		}
 	}
 
-	async function patchRepo(repo: Repo, patch: { enabled?: boolean; auto_review?: boolean }) {
+	async function patchRepo(
+		repo: Repo,
+		patch: {
+			enabled?: boolean;
+			auto_review?: boolean;
+			review_provider_id?: string | null;
+			review_mode?: ReviewMode | null;
+		}
+	) {
 		try {
 			await api('PATCH', `/repositories/${repo.id}`, patch);
 		} catch (e) {
@@ -147,7 +173,7 @@
 			</Card.Header>
 			<Card.Content>
 				<TableSkeleton
-					headers={['Repository', 'Enabled', 'Auto review', 'Model override', 'Actions']}
+					headers={['Repository', 'Enabled', 'Auto review', 'Provider', 'Review mode', 'Actions']}
 				/>
 			</Card.Content>
 		</Card.Root>
@@ -220,7 +246,8 @@
 							<Table.Head>Repository</Table.Head>
 							<Table.Head>Enabled</Table.Head>
 							<Table.Head>Auto review</Table.Head>
-							<Table.Head>Model override</Table.Head>
+							<Table.Head>Provider</Table.Head>
+							<Table.Head>Review mode</Table.Head>
 							<Table.Head class="text-right">Actions</Table.Head>
 						</Table.Row>
 					</Table.Header>
@@ -244,8 +271,65 @@
 										}
 									/>
 								</Table.Cell>
-								<Table.Cell class="text-muted-foreground">
-									{repo.review_model ?? 'default'}
+								<Table.Cell>
+									{#if isAdmin}
+										<Select.Root
+											type="single"
+											bind:value={
+												() => repo.review_provider_id ?? '',
+												(v) => patchRepo(repo, { review_provider_id: v || null })
+											}
+										>
+											<Select.Trigger
+												size="sm"
+												class="w-48"
+												aria-label={`Provider: ${repo.display_name}`}
+											>
+												<span class="truncate">{providerLabel(repo.review_provider_id)}</span>
+											</Select.Trigger>
+											<Select.Content>
+												<Select.Item value="" label="Default (global)">
+													Default (global)
+												</Select.Item>
+												{#each providers as p (p.id)}
+													<Select.Item value={p.id} label={p.name}>{p.name}</Select.Item>
+												{/each}
+											</Select.Content>
+										</Select.Root>
+									{:else}
+										<span class="text-muted-foreground">
+											{providerLabel(repo.review_provider_id)}
+										</span>
+									{/if}
+								</Table.Cell>
+								<Table.Cell>
+									{#if isAdmin}
+										<Select.Root
+											type="single"
+											bind:value={
+												() => repo.review_mode ?? '',
+												(v) => patchRepo(repo, { review_mode: (v || null) as ReviewMode | null })
+											}
+										>
+											<Select.Trigger
+												size="sm"
+												class="w-40"
+												aria-label={`Review mode: ${repo.display_name}`}
+											>
+												<span class="truncate">{reviewModeLabel(repo.review_mode)}</span>
+											</Select.Trigger>
+											<Select.Content>
+												<Select.Item value="" label="Default (global)">
+													Default (global)
+												</Select.Item>
+												{#each Object.entries(reviewModeLabels) as [value, label] (value)}
+													<Select.Item {value} {label}>{label}</Select.Item>
+												{/each}
+											</Select.Content>
+										</Select.Root>
+									{:else}
+										<span class="text-muted-foreground">{reviewModeLabel(repo.review_mode)}</span>
+									{/if}
 								</Table.Cell>
 								<Table.Cell class="text-right">
 									{#if isAdmin}
@@ -266,7 +350,7 @@
 							</Table.Row>
 						{:else}
 							<Table.Row>
-								<Table.Cell colspan={5} class="text-muted-foreground">
+								<Table.Cell colspan={6} class="text-muted-foreground">
 									No repositories yet.
 								</Table.Cell>
 							</Table.Row>
