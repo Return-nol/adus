@@ -1,5 +1,5 @@
 use adus_db::{
-    memories::{self, Memory, MemoryPatch, MemorySource, NewMemory},
+    memories::{self, Memory, MemoryPatch, MemorySource, MemoryStatus, NewMemory},
     rules::KnowledgeScope,
 };
 use axum::{
@@ -85,10 +85,10 @@ async fn list(
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<Vec<MemoryJson>>, ApiError> {
     let found = if query.all {
-        memories::list_all(&state.db).await?
+        memories::list_all(&state.db, None).await?
     } else {
         check_repo(&state, query.repository_id).await?;
-        memories::list(&state.db, query.repository_id).await?
+        memories::list(&state.db, query.repository_id, None).await?
     };
     Ok(Json(found.into_iter().map(MemoryJson::from).collect()))
 }
@@ -110,6 +110,7 @@ async fn create(
             source: MemorySource::Manual,
             source_url: None,
             created_by: Some(user.id),
+            status: MemoryStatus::Active,
         },
     )
     .await?;

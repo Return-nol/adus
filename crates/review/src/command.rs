@@ -4,7 +4,7 @@
 use adus_core::job::{CommentAuthor, Job, Trigger};
 use adus_core::types::{ConnectionKind, ReviewMode};
 use adus_db::connections::Connection;
-use adus_db::memories::{self, MemorySource, NewMemory};
+use adus_db::memories::{self, MemorySource, MemoryStatus, NewMemory};
 use adus_db::repositories;
 use adus_db::rules::KnowledgeScope;
 use adus_db::users::{self, User};
@@ -188,6 +188,7 @@ impl Engine {
                     source: MemorySource::PrComment,
                     source_url,
                     created_by: Some(user.id),
+                    status: MemoryStatus::Active,
                 };
                 memories::insert(&self.db, new).await.map_err(db_error)?;
                 let quoted: Vec<String> = text.lines().map(|line| format!("> {line}")).collect();

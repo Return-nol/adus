@@ -239,6 +239,7 @@ async fn update(
         auto_review: body.auto_review,
         review_provider_id: body.review_provider_id,
         review_mode: body.review_mode,
+        learning_mode: None,
     };
     let repo = repositories::update(&state.db, id, patch)
         .await?

@@ -45,6 +45,21 @@ pub enum ReviewMode {
     Specialists,
 }
 
+/// Whether a repository learns "by design" exceptions from closed PRs.
+/// Stored in `repositories.learning_mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "learning_mode", rename_all = "snake_case")]
+pub enum LearningMode {
+    /// Never learn.
+    Off,
+    /// Learned memories wait for an admin (`pending`).
+    #[default]
+    Approval,
+    /// Learned memories are active at once when a registered Adus user defended them.
+    Auto,
+}
+
 /// Path file di dalam Adus tidak punya `/` di depan (Azure mengembalikan `/src/a.rs`).
 pub fn normalize_path(path: &str) -> String {
     path.trim_start_matches('/').to_string()
