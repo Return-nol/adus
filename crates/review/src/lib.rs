@@ -5,6 +5,7 @@ mod dedup;
 mod discussion;
 pub mod engine;
 pub mod finder;
+mod learn;
 mod parse;
 mod prompt;
 mod redact;

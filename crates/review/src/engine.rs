@@ -16,6 +16,7 @@ use adus_db::memories::Memory;
 use adus_db::repositories::{self, Repository};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::rules::Rule;
+use adus_db::settings::Settings;
 use adus_db::{ai, memories, rules, settings};
 use adus_git::diff::{added_line_count, intersect_hunks, right_line_end_offset};
 use adus_git::{
@@ -269,18 +270,8 @@ impl Engine {
         {
             return Ok(Outcome::Skipped("ignored_title"));
         }
-        let provider_id = repo.review_provider_id.or(settings.default_provider_id);
-        let provider = match provider_id {
-            Some(id) => ai::get_provider(&self.db, id).await.map_err(db_error)?,
-            None => None,
-        }
-        .filter(|p| p.enabled);
-        let models = provider.as_ref().and_then(|p| {
-            let primary = p.primary_model()?;
-            let fast = p.effective_fast_model().unwrap_or(primary);
-            Some((p.id, primary.to_string(), fast.to_string()))
-        });
-        let Some((provider_id, primary_model, fast_model)) = models else {
+        let Some((provider_id, primary_model, fast_model)) = self.models(repo, &settings).await?
+        else {
             // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
             // atau diminta lewat `@adudu review`, supaya tidak spam.
             // Bukan kegagalan: tanpa baris failed atau dead letter untuk setiap push.
@@ -737,6 +728,25 @@ impl Engine {
         })
     }
 
+    /// The repo's review provider (else the default one) when it is enabled and has a model:
+    /// `(provider id, primary model, fast model)`, the fast model falling back to the primary.
+    pub(crate) async fn models(
+        &self,
+        repo: &Repository,
+        settings: &Settings,
+    ) -> Result<Option<(Uuid, String, String)>, EngineError> {
+        let provider = match repo.review_provider_id.or(settings.default_provider_id) {
+            Some(id) => ai::get_provider(&self.db, id).await.map_err(db_error)?,
+            None => None,
+        }
+        .filter(|p| p.enabled);
+        Ok(provider.as_ref().and_then(|p| {
+            let primary = p.primary_model()?;
+            let fast = p.effective_fast_model().unwrap_or(primary);
+            Some((p.id, primary.to_string(), fast.to_string()))
+        }))
+    }
+
     /// Connection milik repo.
     pub(crate) async fn connection(&self, repo: &Repository) -> Result<Connection, EngineError> {
         connections::get(&self.db, repo.connection_id)
@@ -766,7 +776,7 @@ impl Engine {
     }
 
     /// Saat mengambil data, semua error selain token ditolak dianggap sementara.
-    async fn fetch_error(&self, conn: &Connection, err: GitError) -> EngineError {
+    pub(crate) async fn fetch_error(&self, conn: &Connection, err: GitError) -> EngineError {
         match err {
             GitError::Unauthorized => self.unauthorized(conn).await,
             other => EngineError::Retryable(format!("git provider: {other}"), None),
@@ -1086,7 +1096,7 @@ pub(crate) fn db_error(err: sqlx::Error) -> EngineError {
     EngineError::Retryable(format!("database: {err}"), None)
 }
 
-fn chat_error(err: ChatError) -> EngineError {
+pub(crate) fn chat_error(err: ChatError) -> EngineError {
     match err {
         ChatError::AllKeysFailed { retry_after } => {
             EngineError::Retryable(format!("LLM: {err}"), retry_after)

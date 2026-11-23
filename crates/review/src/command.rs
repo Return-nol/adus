@@ -17,7 +17,7 @@ use crate::prompt::MARKER;
 
 const MENTION: &str = "@adudu";
 /// Batas panjang isi `remember`, dalam karakter.
-const MAX_MEMORY_CHARS: usize = 2000;
+pub(crate) const MAX_MEMORY_CHARS: usize = 2000;
 const HELP: &str = "I didn't understand that. I know these commands:\n\n\
                     - `@adudu review` — run a full review of this pull request\n\
                     - `@adudu review deep` — run a multi-specialist deep review (Bug, Security, Performance, Rules)\n\
