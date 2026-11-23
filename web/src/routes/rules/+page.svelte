@@ -3,6 +3,7 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import { toast } from 'svelte-sonner';
 	import { api, ApiError } from '#lib/api.js';
+	import { session } from '#lib/session.svelte.js';
 	import MemoryDialog, { type Memory } from '#lib/components/memory-dialog.svelte';
 	import RuleDialog, {
 		severityLabel,
@@ -25,6 +26,11 @@
 
 	const GLOBAL = 'global';
 	const MEMORY_PREVIEW = 120;
+	const sourceLabel: Record<Memory['source'], string> = {
+		manual: 'manual',
+		pr_comment: 'PR comment',
+		pr_learning: 'Learned from PR'
+	};
 	const severityVariant: Record<Severity, 'secondary' | 'default' | 'destructive'> = {
 		info: 'secondary',
 		warning: 'default',
@@ -37,6 +43,11 @@
 	let memories = $state<Memory[]>([]);
 	let loaded = $state(false);
 	let loadError = $state(false);
+	// Learned memories awaiting a decision, across all repositories (not tied to `scope`).
+	let pending = $state<Memory[]>([]);
+	let rejected = $state<Memory[]>([]);
+	let learnedLoaded = $state(false);
+	let learnedError = $state(false);
 	// Ids (rule, memory) with a request in flight; their controls are disabled.
 	const busy = new SvelteSet<string>();
 
@@ -44,8 +55,20 @@
 	let editRule = $state<Rule | null>(null);
 	let memoryOpen = $state(false);
 	let editMemory = $state<Memory | null>(null);
+	let approveMemory = $state(false);
 	let confirmOpen = $state(false);
-	let confirm = $state<{ title: string; text: string; run: () => Promise<void> } | null>(null);
+	let confirm = $state<{
+		title: string;
+		text: string;
+		action: string;
+		run: () => Promise<void>;
+	} | null>(null);
+
+	// The server enforces admin too; this only hides pending/rejected controls for role `user`.
+	const isAdmin = $derived(session.user?.role === 'admin');
+	const learnedHeaders = $derived(
+		isAdmin ? ['Content', 'Repository', 'Source', 'Actions'] : ['Content', 'Repository', 'Source']
+	);
 
 	const repositoryId = $derived(scope === GLOBAL ? null : scope);
 	const scopeLabel = $derived.by(() => {
@@ -63,10 +86,11 @@
 		const mine = ++seq;
 		loadError = false;
 		const q = repositoryId ? `?repository_id=${repositoryId}` : '';
+		const mq = repositoryId ? `?status=active&repository_id=${repositoryId}` : '?status=active';
 		try {
 			const [r, m] = await Promise.all([
 				api<Rule[]>('GET', `/rules${q}`),
-				api<Memory[]>('GET', `/memories${q}`)
+				api<Memory[]>('GET', `/memories${mq}`)
 			]);
 			if (mine !== seq) return;
 			rules = r;
@@ -80,7 +104,30 @@
 		if (mine === seq) loaded = true;
 	}
 
+	async function loadLearned() {
+		learnedError = false;
+		try {
+			[pending, rejected] = await Promise.all([
+				api<Memory[]>('GET', '/memories?all=true&status=pending'),
+				api<Memory[]>('GET', '/memories?all=true&status=rejected')
+			]);
+		} catch (e) {
+			learnedError = true;
+			fail(e);
+		}
+		learnedLoaded = true;
+	}
+
+	function reloadAll() {
+		return Promise.all([load(), loadLearned()]);
+	}
+
+	function repoName(id: string | null): string {
+		return repos.find((r) => r.id === id)?.display_name ?? '—';
+	}
+
 	onMount(async () => {
+		loadLearned();
 		try {
 			repos = await api<Repo[]>('GET', '/repositories');
 		} catch (e) {
@@ -106,7 +153,7 @@
 		} catch (e) {
 			fail(e);
 		}
-		await load();
+		await reloadAll();
 		busy.delete(id);
 	}
 
@@ -114,7 +161,35 @@
 		confirm = {
 			title,
 			text: 'This cannot be undone.',
+			action: 'Delete',
 			run: () => guarded(id, () => api('DELETE', path))
+		};
+		confirmOpen = true;
+	}
+
+	function approve(m: Memory) {
+		guarded(m.id, async () => {
+			await api('POST', `/memories/${m.id}/approve`, {});
+			toast.success('Memory approved');
+		});
+	}
+
+	function openMemory(m: Memory | null, approving: boolean) {
+		editMemory = m;
+		approveMemory = approving;
+		memoryOpen = true;
+	}
+
+	function askReject(m: Memory) {
+		confirm = {
+			title: 'Reject this memory?',
+			text: 'It will not be used in reviews. Deleting it later from Rejected lets it be proposed again.',
+			action: 'Reject',
+			run: () =>
+				guarded(m.id, async () => {
+					await api('POST', `/memories/${m.id}/reject`, {});
+					toast.success('Memory rejected');
+				})
 		};
 		confirmOpen = true;
 	}
@@ -133,19 +208,121 @@
 	</Select.Root>
 </div>
 
-{#snippet loadFailed()}
+{#snippet loadFailed(text: string, retry: () => void)}
 	<div
 		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 	>
-		Could not load this scope.
-		<Button variant="outline" size="sm" class="ml-2" onclick={load}>Retry</Button>
+		{text}
+		<Button variant="outline" size="sm" class="ml-2" onclick={retry}>Retry</Button>
 	</div>
+{/snippet}
+
+{#snippet emptyState(text: string)}
+	<div
+		class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
+	>
+		{text}
+	</div>
+{/snippet}
+
+{#snippet memoryContent(m: Memory)}
+	{#if m.content.length > MEMORY_PREVIEW}
+		<Tooltip.Root>
+			<Tooltip.Trigger class="text-left" title={m.content}>
+				{m.content.slice(0, MEMORY_PREVIEW)}…
+			</Tooltip.Trigger>
+			<Tooltip.Content class="max-w-sm whitespace-pre-wrap">
+				{m.content}
+			</Tooltip.Content>
+		</Tooltip.Root>
+	{:else}
+		{m.content}
+	{/if}
+{/snippet}
+
+<!-- Pending or rejected learned memories; only admins get the actions column. -->
+{#snippet learnedTable(items: Memory[])}
+	<Card.Root class="py-0">
+		<Card.Content class="px-0">
+			<Table.Root>
+				<Table.Header>
+					<Table.Row>
+						<Table.Head>Content</Table.Head>
+						<Table.Head>Repository</Table.Head>
+						<Table.Head>Source</Table.Head>
+						{#if isAdmin}<Table.Head class="text-right">Actions</Table.Head>{/if}
+					</Table.Row>
+				</Table.Header>
+				<Table.Body>
+					{#each items as m (m.id)}
+						<Table.Row>
+							<Table.Cell class="max-w-md whitespace-normal">{@render memoryContent(m)}</Table.Cell>
+							<Table.Cell>{repoName(m.repository_id)}</Table.Cell>
+							<Table.Cell>
+								{#if safeHttpUrl(m.source_url)}
+									<a
+										href={safeHttpUrl(m.source_url)}
+										target="_blank"
+										rel="noopener noreferrer"
+										class="text-sm text-primary underline-offset-4 hover:underline"
+									>
+										View thread
+									</a>
+								{:else}
+									<span class="text-muted-foreground">—</span>
+								{/if}
+							</Table.Cell>
+							{#if isAdmin}
+								<Table.Cell class="space-x-2 text-right">
+									{#if m.status === 'pending'}
+										<Button size="sm" disabled={busy.has(m.id)} onclick={() => approve(m)}>
+											Approve
+										</Button>
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={busy.has(m.id)}
+											onclick={() => openMemory(m, true)}
+										>
+											Edit
+										</Button>
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={busy.has(m.id)}
+											onclick={() => askReject(m)}
+										>
+											Reject
+										</Button>
+									{:else}
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={busy.has(m.id)}
+											onclick={() => askDelete(m.id, 'Delete this memory?', `/memories/${m.id}`)}
+										>
+											Delete
+										</Button>
+									{/if}
+								</Table.Cell>
+							{/if}
+						</Table.Row>
+					{/each}
+				</Table.Body>
+			</Table.Root>
+		</Card.Content>
+	</Card.Root>
 {/snippet}
 
 <Tabs.Root value="rules">
 	<Tabs.List>
 		<Tabs.Trigger value="rules">Rules</Tabs.Trigger>
 		<Tabs.Trigger value="memory">Memory</Tabs.Trigger>
+		<Tabs.Trigger value="pending">
+			Pending
+			{#if pending.length > 0}<Badge variant="secondary">{pending.length}</Badge>{/if}
+		</Tabs.Trigger>
+		{#if isAdmin}<Tabs.Trigger value="rejected">Rejected</Tabs.Trigger>{/if}
 	</Tabs.List>
 
 	<Tabs.Content value="rules" class="space-y-4">
@@ -161,7 +338,7 @@
 			</Button>
 		</div>
 		{#if loadError}
-			{@render loadFailed()}
+			{@render loadFailed('Could not load this scope.', load)}
 		{:else if !loaded}
 			<TableSkeleton card headers={['Title', 'Path glob', 'Severity', 'Enabled', 'Actions']} />
 		{:else if rules.length === 0}
@@ -237,18 +414,10 @@
 
 	<Tabs.Content value="memory" class="space-y-4">
 		<div class="flex justify-end">
-			<Button
-				disabled={!loaded}
-				onclick={() => {
-					editMemory = null;
-					memoryOpen = true;
-				}}
-			>
-				Add memory
-			</Button>
+			<Button disabled={!loaded} onclick={() => openMemory(null, false)}>Add memory</Button>
 		</div>
 		{#if loadError}
-			{@render loadFailed()}
+			{@render loadFailed('Could not load this scope.', load)}
 		{:else if !loaded}
 			<TableSkeleton card headers={['Content', 'Source', 'Created by', 'Enabled', 'Actions']} />
 		{:else if memories.length === 0}
@@ -275,22 +444,11 @@
 							{#each memories as m (m.id)}
 								<Table.Row>
 									<Table.Cell class="max-w-md whitespace-normal">
-										{#if m.content.length > MEMORY_PREVIEW}
-											<Tooltip.Root>
-												<Tooltip.Trigger class="text-left" title={m.content}>
-													{m.content.slice(0, MEMORY_PREVIEW)}…
-												</Tooltip.Trigger>
-												<Tooltip.Content class="max-w-sm whitespace-pre-wrap">
-													{m.content}
-												</Tooltip.Content>
-											</Tooltip.Root>
-										{:else}
-											{m.content}
-										{/if}
+										{@render memoryContent(m)}
 									</Table.Cell>
 									<Table.Cell>
 										<Badge variant="secondary">
-											{m.source === 'manual' ? 'manual' : 'PR comment'}
+											{sourceLabel[m.source]}
 										</Badge>
 										{#if safeHttpUrl(m.source_url)}
 											<a
@@ -322,10 +480,7 @@
 											variant="outline"
 											size="sm"
 											disabled={busy.has(m.id)}
-											onclick={() => {
-												editMemory = m;
-												memoryOpen = true;
-											}}
+											onclick={() => openMemory(m, false)}
 										>
 											Edit
 										</Button>
@@ -346,10 +501,44 @@
 			</Card.Root>
 		{/if}
 	</Tabs.Content>
+
+	<Tabs.Content value="pending" class="space-y-4">
+		{#if learnedError}
+			{@render loadFailed('Could not load learned memories.', loadLearned)}
+		{:else if !learnedLoaded}
+			<TableSkeleton card headers={learnedHeaders} />
+		{:else if pending.length === 0}
+			{@render emptyState(
+				'No learned memories are waiting for approval. Closed pull requests propose them when a repository learns with approval.'
+			)}
+		{:else}
+			{@render learnedTable(pending)}
+		{/if}
+	</Tabs.Content>
+
+	{#if isAdmin}
+		<Tabs.Content value="rejected" class="space-y-4">
+			{#if learnedError}
+				{@render loadFailed('Could not load learned memories.', loadLearned)}
+			{:else if !learnedLoaded}
+				<TableSkeleton card headers={learnedHeaders} />
+			{:else if rejected.length === 0}
+				{@render emptyState('No rejected memories.')}
+			{:else}
+				{@render learnedTable(rejected)}
+			{/if}
+		</Tabs.Content>
+	{/if}
 </Tabs.Root>
 
 <RuleDialog bind:open={ruleOpen} rule={editRule} {repositoryId} onsaved={load} />
-<MemoryDialog bind:open={memoryOpen} memory={editMemory} {repositoryId} onsaved={load} />
+<MemoryDialog
+	bind:open={memoryOpen}
+	memory={editMemory}
+	{repositoryId}
+	approve={approveMemory}
+	onsaved={reloadAll}
+/>
 
 <AlertDialog.Root bind:open={confirmOpen}>
 	<AlertDialog.Content>
@@ -365,7 +554,7 @@
 					confirm?.run();
 				}}
 			>
-				Delete
+				{confirm?.action}
 			</AlertDialog.Action>
 		</AlertDialog.Footer>
 	</AlertDialog.Content>

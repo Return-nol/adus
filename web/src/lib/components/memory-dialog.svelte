@@ -2,10 +2,12 @@
 	export type Memory = {
 		id: string;
 		content: string;
-		source: 'manual' | 'pr_comment';
+		repository_id: string | null;
+		source: 'manual' | 'pr_comment' | 'pr_learning';
 		source_url: string | null;
 		created_by: { id: string; email: string } | null;
 		enabled: boolean;
+		status: 'pending' | 'active' | 'rejected';
 	};
 </script>
 
@@ -17,16 +19,19 @@
 	import { Label } from '#lib/components/ui/label/index.js';
 	import { Textarea } from '#lib/components/ui/textarea/index.js';
 
-	// `memory` set = edit its content; null = create one in `repositoryId` (null = global).
+	// `memory` set = edit its content (`approve`: edit a pending one and approve it);
+	// null = create one in `repositoryId` (null = global).
 	let {
 		open = $bindable(false),
 		memory,
 		repositoryId,
+		approve = false,
 		onsaved
 	}: {
 		open: boolean;
 		memory: Memory | null;
 		repositoryId: string | null;
+		approve?: boolean;
 		onsaved: () => void;
 	} = $props();
 
@@ -46,7 +51,9 @@
 		busy = true;
 		formError = '';
 		try {
-			if (memory) {
+			if (memory && approve) {
+				await api('POST', `/memories/${memory.id}/approve`, { content });
+			} else if (memory) {
 				await api('PATCH', `/memories/${memory.id}`, { content });
 			} else {
 				await api('POST', '/memories', {
@@ -56,7 +63,7 @@
 				});
 			}
 			open = false;
-			toast.success(memory ? 'Memory updated' : 'Memory added');
+			toast.success(approve ? 'Memory approved' : memory ? 'Memory updated' : 'Memory added');
 			onsaved();
 		} catch (e) {
 			if (e instanceof ApiError && e.code === 'validation_error') formError = e.message;
@@ -70,7 +77,9 @@
 <Dialog.Root bind:open>
 	<Dialog.Content>
 		<Dialog.Header>
-			<Dialog.Title>{memory ? 'Edit memory' : 'Add memory'}</Dialog.Title>
+			<Dialog.Title>
+				{approve ? 'Edit and approve memory' : memory ? 'Edit memory' : 'Add memory'}
+			</Dialog.Title>
 		</Dialog.Header>
 		<form class="grid gap-4" onsubmit={submit}>
 			<div class="grid gap-2">
@@ -79,7 +88,9 @@
 			</div>
 			{#if formError}<p role="alert" class="text-sm text-destructive">{formError}</p>{/if}
 			<Dialog.Footer>
-				<Button type="submit" disabled={busy}>{memory ? 'Save' : 'Add'}</Button>
+				<Button type="submit" disabled={busy}>
+					{approve ? 'Approve' : memory ? 'Save' : 'Add'}
+				</Button>
 			</Dialog.Footer>
 		</form>
 	</Dialog.Content>
