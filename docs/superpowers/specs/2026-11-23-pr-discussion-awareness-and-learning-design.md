@@ -1,6 +1,6 @@
 # PR Discussion Awareness & Learning from Closed PRs — Design Specification
 
-Date: 2026-11-23 · Status: approved (brainstormed with the user; builder-check questions answered 2026-11-23)
+Date: 2026-11-23 · Status: implemented (consolidated into [docs/SPEC.md](../../SPEC.md) §1, §3.1, §4.3, §5, §7, §8.4, §8.5, §9)
 
 > **Binding scope & policy:** Extends [docs/SPEC.md](../../SPEC.md) and the agentic review engine spec ([2026-11-21-agentic-review-engine-design.md](2026-11-21-agentic-review-engine-design.md)). The clean-room and no-assumption rule in `AGENTS.md` applies: Kodus community code may be read as a behaviour reference only (cite it), Kodus enterprise code (`libs/ee/**`, `*.ee.*`) is never opened. All prompts, schemas and code are written fresh for Adus.
 

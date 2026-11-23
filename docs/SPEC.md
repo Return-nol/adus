@@ -18,7 +18,8 @@ Adus is a self-hosted, open-source (AGPL-3.0) AI code review platform inspired b
 - **Multi-key AI Providers:** Each `AiProvider` (`openai`, `anthropic`, `gemini`, `openai_compatible`) holds a required `primary_model`, an optional `fast_model`, and any number of API keys rotated round-robin/LRU with automatic cooldowns and invalidation.
 - **Rules vs. Memory:**
   - **Rules** define what to flag (`global` or `repo` scope, optional `path_glob`, severity `info | warning | critical`).
-  - **Memory** is always-injected team context (`global` or `repo` scope), created in the dashboard or via `@adudu remember: ...` in a PR comment. No automatic conflict/dedup resolution.
+  - **Memory** is always-injected team context (`global` or `repo` scope), created in the dashboard or via `@adudu remember: ...` in a PR comment. No automatic conflict/dedup resolution. Only `active` memories reach review prompts.
+- **PR discussion awareness & learned memories:** Semantic Dedup reads the PR's existing discussion threads and drops findings already raised there (§8.4). When a PR closes (merged or abandoned), one silent learning call turns "this is intentional because …" answers into repo-scoped memories (`source = pr_learning`, §8.5). Per repository `learning_mode`: `off`, `approval` (default; learned memories start `pending` until an admin approves or rejects them) or `auto` (`active` at once only when a registered Adus user defended the exception, else `pending`). Rejected memories are kept so they are never proposed again.
 - **Clean-room policy:** Kodus non-EE code (outside `libs/ee/**` and `*.ee.*`) may be consulted as behavioral reference with citation, never ported line-by-line. Kodus Enterprise code (`libs/ee/**`, `*.ee.*`) must never be opened, fetched, or searched; EE-equivalent features are specified solely from public docs and observed behavior.
 
 ---
@@ -31,11 +32,11 @@ Dependencies remain strictly acyclic:
 
 ```text
 crates/core     config, AES-256-GCM cipher (Cipher, last4), default ignore list, shared domain types & ReviewMode, Job payloads, normalize_path
-crates/db       sqlx Postgres pool + embedded migrations (0001..0008), users, sessions, connections, repositories, ai, settings, usage, reviews
+crates/db       sqlx Postgres pool + embedded migrations (0001..0009), users, sessions, connections, repositories, ai, settings, usage, reviews, rules, memories, learning_runs
 crates/git      GitProvider trait, GitProviderFactory, CloneSpec, diff utilities (commentable_lines, commentable_hunks, unified_patch), GitHub & Azure clients
 crates/llm      LlmClient trait, OpenAI / Anthropic / Gemini / OpenAI-compatible clients, ReasoningEffort, LlmRouter (ChatService)
 crates/queue    Redis Streams job queue (XADD / XREADGROUP / XAUTOCLAIM), delivery dedup, per-PR lock, worker heartbeats
-crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, specialists, finder, verifier, dedup, budget, small_pr, prompt, parse, command, engine
+crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, specialists, finder, verifier, discussion, dedup, budget, small_pr, prompt, parse, command, learn, engine
 crates/server   axum REST API (/api/v1/*), webhook handlers (/webhooks/*), auth extractors, doctor checks, embedded SPA (rust-embed)
 crates/adus     binary entrypoint (serve, gen-secret, check-config, doctor, healthcheck), worker loop & scheduler
 migrations/     embedded SQL migrations
@@ -65,7 +66,7 @@ Dependency order:
 
 ## 3. Data Model & Security Invariants
 
-### 3.1 Database Schema (`migrations/0001` – `0008`)
+### 3.1 Database Schema (`migrations/0001` – `0009`)
 
 - `users`: `id`, `email` (`citext`), `password_hash`, `role` (`admin | user`), `disabled`, `github_login` (`citext` nullable), `created_at`.
   - Always bind `citext` lookups as `$1::citext` and select as `::text`.
@@ -73,14 +74,16 @@ Dependency order:
 - `sessions`: `token_hash` (hex SHA-256 of 32-byte base64url cookie token), `user_id`, expiry (30 days).
   - Disabling a user or resetting their password deletes all their sessions; changing one's own password preserves the current session.
 - `connections`: `id`, `kind` (`azure_devops | github`), `name`, `org_or_owner`, `base_url`, `encrypted_token`, `token_last4`, `status` (`ok | invalid | unverified`), `last_verified_at`, `pat_owner`.
-- `repositories`: `id`, `connection_id`, `external_id`, `project` (Azure project GUID), `project_name` (Azure project display name, nullable, migration 0006), `name`, `default_branch`, `enabled`, `auto_review`, `webhook_external_id`, `webhook_secret`, `review_provider_id` (nullable), `review_mode` (nullable `review_mode`, migration 0008), `deleted_at` (soft-delete).
+- `repositories`: `id`, `connection_id`, `external_id`, `project` (Azure project GUID), `project_name` (Azure project display name, nullable, migration 0006), `name`, `default_branch`, `enabled`, `auto_review`, `webhook_external_id`, `webhook_secret`, `review_provider_id` (nullable), `review_mode` (nullable `review_mode`, migration 0008), `learning_mode` (`off | approval | auto`, `NOT NULL DEFAULT 'approval'`, migration 0009), `deleted_at` (soft-delete).
   - Duplicate active repos prevented via `ON CONFLICT` on a partial unique index.
   - **Display name invariant:** Computed server-side only via `repositories::label` (Rust) and `display_name_sql` (SQL): Azure `project_name/name` (fallback `owner/name` if `project_name` is `NULL`), GitHub `owner/name`. Never reconstructed in `web/`.
 - `ai_providers`: `id`, `kind` (`openai | anthropic | gemini | openai_compatible`), `name`, `base_url`, `primary_model` (nullable in DB after migration 0008 = "needs setup", required on create), `fast_model` (nullable; `effective_fast_model()` falls back to `primary_model`), `enabled`.
 - `ai_keys`: `id`, `provider_id`, `label`, `encrypted_key`, `key_last4`, `enabled`, `status` (`ok | invalid | rate_limited`), `cooldown_until`, `last_used_at`.
 - `settings` (single row `id = 1`): `default_provider_id`, `ignore_paths` (`text[] NULL`, `NULL` = Kodus defaults, migration 0007), `ignored_title_keywords` (`text[] NOT NULL DEFAULT '{}'`), `review_mode` (`generalist | specialists`, default `generalist`), `max_files_per_review` (default `30`, `1..=500`), `max_patch_lines_per_file` (default `1500`, `1..=100000`), `small_pr_max_lines` (default `100`, `0..=10000`, `0` = off), `max_review_input_tokens` (default `2_000_000`, `0..=100_000_000`, `0` = no limit).
 - `rules`: `id`, `scope` (`global | repo`), `repository_id`, `title`, `body`, `path_glob`, `severity` (`info | warning | critical`), `enabled`.
-- `memories`: `id`, `scope` (`global | repo`), `repository_id`, `content`, `source` (`manual | pr_comment`), `source_url`, `created_by`, `enabled`.
+- `memories`: `id`, `scope` (`global | repo`), `repository_id`, `content`, `source` (`manual | pr_comment | pr_learning`), `source_url`, `created_by`, `enabled`, `status` (`memory_status`: `pending | active | rejected`, `NOT NULL DEFAULT 'active'`, migration 0009; existing rows became `active`).
+  - **Invariant:** Only `enabled` + `active` memories (`memories::applicable`) are injected into review prompts; `pending` and `rejected` never are. Manual and `@adudu remember` memories are created `active`.
+- `pr_learning_runs` (migration 0009): `id`, `repository_id` (FK, `ON DELETE CASCADE`), `pr_number`, `head_sha`, `outcome` (text: `learned | nothing_to_learn | skipped | failed`), `learned_count`, `created_at`; `UNIQUE (repository_id, pr_number, head_sha)` so a PR head is learned at most once (`learning_runs::record` uses `ON CONFLICT DO NOTHING`).
 - `reviews`: `id`, `repository_id`, `pr_number`, `base_sha`, `head_sha`, `trigger` (`opened | updated | command`), `status` (`queued | running | done | failed | skipped`), `error`, `started_at`, `finished_at`, `comments_posted`.
 - `llm_usage`: `id`, `review_id`, `repository_id`, `provider_id`, `key_id`, `model`, `input_tokens` (total input, cached included), `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `latency_ms`, `success`, `error_kind`, `created_at`.
 
@@ -101,7 +104,7 @@ Dependency order:
 - Cookie: `adus_session` (`HttpOnly`, `SameSite=Lax`, `Path=/`, 30-day max-age, `Secure` when `ADUS_PUBLIC_URL` is `https://`).
 - Passwords hashed/verified with `argon2` in `spawn_blocking`. Login against an unknown email verifies a dummy hash to prevent timing side-channels.
 - Route extractors: `CurrentUser(User)` and `AdminUser(User)`.
-  - `user` role: read-only access across pages + full management of `rules` and `memories` + own password/profile + viewing token usage.
+  - `user` role: read-only access across pages + full management of `rules` and `active` `memories` + own password/profile + viewing token usage. `pending`/`rejected` memories can only be edited, deleted, approved or rejected by an admin (`403 forbidden` otherwise).
   - `admin` role: everything plus `connections`, `repositories`, `ai_providers`/`ai_keys`, `settings`, `users`, and `admin/doctor`.
 
 ### 4.2 API Contract & SPA
@@ -110,6 +113,14 @@ Dependency order:
 - Handlers always use `ApiJson<T>`, `ApiPath<T>`, and `ApiQuery<T>` (never bare `axum::Json`, `Path`, or `Query`).
 - `crates/server/src/spa.rs` embeds `web/build` via `rust-embed` (`#[allow_missing = true]`). Unknown `/api/*` and `/webhooks/*` routes return JSON 404; other `GET`/`HEAD` requests serve `index.html` with `Cache-Control: no-cache`; `_app/immutable/*` is served with `public, max-age=31536000, immutable`.
 - Release/Docker builds must run `pnpm -C web build` before `cargo build --release`.
+
+### 4.3 Memories & Learning Mode API
+
+- `GET /api/v1/memories?repository_id=…` or `?all=true`, optional `&status=pending|active|rejected`: without `status`, every status except `rejected`; an unknown `status` → `422 validation_error`.
+- `POST /api/v1/memories/{id}/approve` (admin): requires a JSON body (`{}` allowed; optional `content`, trimmed, ≤ 2,000 chars, replaces the text). `pending` → `active`.
+- `POST /api/v1/memories/{id}/reject` (admin): has no body extractor (any or no body is accepted; the dashboard sends `{}`). `pending` → `rejected`.
+- Both transitions are guarded in SQL (`WHERE status = 'pending'`): unknown id → `404 not_found`; a memory that is not `pending` → `409 invalid_status`.
+- `PATCH /api/v1/repositories/{id}` (admin) accepts `learning_mode` (`off | approval | auto`; absent = unchanged); repository JSON includes `learning_mode`.
 
 ---
 
@@ -120,14 +131,17 @@ Dependency order:
 - **GitHub:**
   - Maps `401` → `Unauthorized`; `429`, `403` with `x-ratelimit-remaining: 0`, or `403` with `Retry-After` → `RateLimited`; other unmapped errors → `Status(u16)`; network/timeout → `Http`.
   - Follows `Link` pagination only under its own base URL.
-  - Webhooks: `pull_request`, `issue_comment`, `pull_request_review_comment`, verified via `X-Hub-Signature-256` HMAC. `ensure_webhooks` PATCHes an inactive or mismatched-URL hook (preserving its ID). `edited` webhook with a title change re-triggers a review.
+  - Webhooks: `pull_request`, `issue_comment`, `pull_request_review_comment`, verified via `X-Hub-Signature-256` HMAC. `ensure_webhooks` PATCHes an inactive or mismatched-URL hook (preserving its ID). `edited` webhook with a title change re-triggers a review. `pull_request` `closed` (merged or not) enqueues `Job::LearnPr`.
   - `CloneSpec`: `refs/pull/{pr.number}/head`, `Basic x-access-token:{pat}`.
 - **Azure DevOps Services:**
   - `RepoRef.owner` = organization, `RepoRef.project` = project **GUID**, `RepoRef.external_id` = repo GUID. Every URL uses GUIDs.
   - `connectionData` is called **without** `api-version`. Maps both **203** (sign-in HTML) and **401** to `Unauthorized`.
   - Diffs are computed locally: file contents fetched via `items?$format=octetStream` and diffed via `similar` (`unified_patch`). A `404` on an expected side is an error (never an empty patch). `pr_diff` selects the iteration where `sourceRefCommit == pr.head_sha`, skipping `sourceRename`, folders, and submodules.
-  - Webhooks: one service hook subscription per event (`git.pullrequest.created`, `git.pullrequest.updated`, `ms.vss-code.git-pullrequest-comment-event`), authenticated via `?token={webhook_secret}` in the URL. Inactive or wrong-URL subscriptions are recreated.
+  - Webhooks: one service hook subscription per event (`git.pullrequest.created`, `git.pullrequest.updated`, `ms.vss-code.git-pullrequest-comment-event`), authenticated via `?token={webhook_secret}` in the URL. Inactive or wrong-URL subscriptions are recreated. A PR created/updated event whose `resource.status` is `completed` or `abandoned` enqueues `Job::LearnPr` instead of a review.
   - `CloneSpec`: `pr.head_sha` with `fallback_refspec = pr.source_ref`, `Basic :{pat}`.
+- **`list_pr_threads(repo, pr_number) -> Vec<PrThread>`:** A PR's discussion. `PrThread { path (normalized; None = top-level), line (new side; None when top-level/outdated), status, url, comments }`, `PrThreadComment { author, by_adus (body carries `<!-- adudu -->`), body }`, comments oldest first.
+  - GitHub: review comments (`/pulls/{n}/comments`) grouped into threads by `in_reply_to_id` (a reply whose root is missing starts its own thread), then each issue comment and each non-empty review body as a one-comment top-level thread. Users with `type: "Bot"` are dropped (after grouping); deleted accounts appear as `ghost`; `status` is always `None`; `url` is the `html_url` only when http(s).
+  - Azure: `/pullRequests/{n}/threads` (one request); system and deleted comments dropped, then threads left empty; `author` = `uniqueName` (email); `status` = Azure thread status (e.g. `byDesign`, `wontFix`); `line` = `rightFileStart.line`. `url` is always `None` (the threads API carries no web URL), so learned memories from Azure have `source_url` `NULL`.
 - **`webhooks_exist(repo, ids, url)`:** True on both providers only when every hook/subscription is active and targets `url`.
 - **Multi-line inline comments:**
   - `InlineComment` carries optional `start_line` and `end_offset` (`start_line..=line` is the span of existing RIGHT-side lines replaced by a suggestion).
@@ -169,12 +183,12 @@ Dependency order:
 
 ## 7. Queue, Worker & Review Lifecycle (`crates/queue`, `crates/adus`)
 
-- **Ingestion:** `POST /webhooks/github/{repo_id}` or `POST /webhooks/azure/{repo_id}?token=...` verifies signature/token, filters supported events, deduplicates delivery IDs in Redis (`SET NX`, 24 h TTL), enqueues `Job` onto `adus:jobs`, and returns `200`.
+- **Ingestion:** `POST /webhooks/github/{repo_id}` or `POST /webhooks/azure/{repo_id}?token=...` verifies signature/token, filters supported events, deduplicates delivery IDs in Redis (`SET NX`, 24 h TTL), enqueues `Job` onto `adus:jobs`, and returns `200`. Job kinds (`adus_core::job::Job`, serde tag `type`): `review_pr` (`repository_id`, `pr_number`, `trigger`, `mode_override`), `pr_comment` (`@adudu` command candidate), `learn_pr` (`repository_id`, `pr_number`; runs `Engine::learn_pr`, §8.5).
 - **Execution (`crates/adus/src/worker.rs`):**
-  - Per-PR distributed lock `pr:{repo_id}:{pr_number}` (`LOCK_TTL` = 35 min). Lock busy → `queue.retry` without incrementing attempt (30 s delay).
+  - Per-PR distributed lock `pr:{repo_id}:{pr_number}` (`LOCK_TTL` = 35 min) for every job kind. Lock busy → `queue.retry` without incrementing attempt (30 s delay).
   - Jobs run inside `tokio::spawn` (`JOB_TIMEOUT` = 31 min backstop; panics return `Retryable("job panicked")`).
   - Compile-time assertions guarantee `REVIEW_TIMEOUT < SPECIALISTS_REVIEW_TIMEOUT < JOB_TIMEOUT < LOCK_TTL` and `JOB_TIMEOUT < RECLAIM_IDLE` (35 min) and `JOB_TIMEOUT < reviews::STALE_AFTER` (35 min).
-  - `Retryable` → `queue.retry(attempt + 1, max(retry_after, backoff(attempt)))` while `attempt < MAX_ATTEMPTS` (5), else `dead_letter` (`adus:jobs:dead`) and `JobRunner::gave_up` (inserts one `failed` `reviews` row if repo still exists).
+  - `Retryable` → `queue.retry(attempt + 1, max(retry_after, backoff(attempt)))` while `attempt < MAX_ATTEMPTS` (5), else `dead_letter` (`adus:jobs:dead`) and `JobRunner::gave_up` (for `review_pr` only: inserts one `failed` `reviews` row if repo still exists; `pr_comment` and `learn_pr` record nothing).
   - `Fatal` → `dead_letter` immediately.
   - Redis errors in the worker loop log and sleep 1 s. Heartbeat key `{prefix}:worker:{name}:hb` (`EX 30`) refreshes every 10 s.
   - Shutdown via shared `CancellationToken` gives in-flight jobs 30 s to drain.
@@ -237,7 +251,7 @@ A non-command PR is reviewed **diff-only** (no clone, no tools, forced to `Gener
   1. **Clone + Finder (`60 %`):** Diffs grouped into directory-clustered ~40K-char batches (`BATCH_CONCURRENCY = 2`, full PR manifest included). `Generalist` runs 1 agent/batch (20 steps, 2 wrap-up); `Specialists` runs `Bug`, `Security`, `Performance` + conditional `Rules` in parallel. Static prompt sections precede `<Role>` for prefix caching. `ToolsUnsupported` retries Finder once in diff-only mode.
   2. **Deterministic Filter & Exact Dedup:** Validates batch membership, RIGHT-side commentable line, `same_hunk` for `start_line` (drops `suggestion` if `start_line` is invalid), and deduplicates `(file, line, title)`.
   3. **Verifier (`90 %`):** Up to `MAX_VERIFY_CANDIDATES = 25` sorted `Critical > Warning > Info` (`VERIFY_CONCURRENCY = 4`, 6 steps, 1 wrap-up). Refute-to-drop, keep-by-default; **fail-closed** on error/timeout/unparseable. Switches remaining candidates to single-turn diff-only on `ToolsUnsupported` or `TokenBudget` exhaustion.
-  4. **Semantic Dedup (`97 %`, last 3 % reserved for posting):** Single-turn call when `verified.len() >= 2`; safe fallback keeps `verified` unchanged on error/timeout.
+  4. **Semantic Dedup (`97 %`, last 3 % reserved for posting, `dedup.rs`):** Single-turn call (fast model, `Low` effort, ≤ 1,024 output tokens) that merges duplicates (`keep_indices`, never empty) and drops findings an existing PR thread already raised (`already_raised: [{finding, comment}]`). No call when there are no findings, or one finding and no existing thread. Threads come from one `list_pr_threads` per review (only when there are files to review; on error the review continues without them, logged). `discussion::threads_for_dedup` picks threads on a finding's file, then top-level threads, each newest first (reverse provider order), at most 60; bodies are secret-redacted and cut to 1,000 chars, Adus's comments are labelled author `"adus"`, and the block is wrapped as `<existing_comments>` data. A citation of a nonexistent thread is ignored (the finding stays); the cited thread is not checked against the finding's file. Safe fallback keeps `verified` unchanged on error/timeout/unparseable answer/invalid `keep_indices`. When `already_raised > 0` the summary adds `"{N} finding(s) skipped: already raised in this PR's discussion."`.
 - **ReAct Agent Loop (`crates/review/src/agent.rs`):**
   - Enters wrap-up (read-only tools dropped, only submit tool offered + 1 reminder) on last `wrap_up_steps`, when remaining stage deadline `< 2 × slowest_step`, or when `TokenBudget` is exhausted (after ≥ 1 step). Sends one halfway budget note when `max_steps >= 4`.
   - Compacts oldest tool results > 120 chars when prompt exceeds `160_000` chars; performs one-shot aggressive compaction on `ContextOverflow`.
@@ -249,11 +263,24 @@ A non-command PR is reviewed **diff-only** (no clone, no tools, forced to `Gener
   - `Fatal`: deadline cut all Finder tasks (`review timed out`), all Finder tasks failed with `token_budget` as first non-retryable failure (`review stopped: token budget reached`), or unrecoverable error.
   - Posting errors: GitHub rate-limit/5xx/network → `Retryable`; GitHub other 4xx / all Azure post errors → `Fatal`.
 
+### 8.5 Learning from Closed PRs (`crates/review/src/learn.rs`)
+
+- Runs for `Job::LearnPr`. Silent: never comments on the PR.
+- **Nothing happens (no run row):** repo missing/deleted or disabled, or `learning_mode = off` (so a later mode change can still learn that PR); the PR head already has a `pr_learning_runs` row. PR not found → `Fatal`.
+- **Recorded outcome (one row per PR head):** `skipped` when no provider/model resolves (same rule as reviews), `nothing_to_learn` when no thread qualifies or no valid exception remains, `learned` with `learned_count`, `failed` for an unparseable answer or a non-retryable LLM error. Retryable LLM, git and DB errors return `Retryable` with no row.
+- **Qualifying threads:** ≥ 2 comments from ≥ 2 authors (Adus's comments count as author `"adus"`), first 60 in provider order, formatted as in §8.4.
+- **Extraction call:** fast model, `Low` effort, ≤ 4,096 output tokens; prompt sections `<threads>`, `<known_memories>` (global + repo memories of every status except `rejected`, enabled or not) and `<rejected_memories>`, all wrapped as data; answer `{"exceptions": [{"content", "thread", "defended_by": [comment index]}]}`.
+- **Validation:** unknown thread or empty / > 2,000-char content dropped; `defended_by` keeps only existing comments not by Adus, and an exception with none left is dropped; at most 5 per PR head.
+- **Storing:** each exception becomes a repo-scoped memory (`source = pr_learning`, `source_url` = thread `url`, `NULL` on Azure). In `auto` mode the first `defended_by` author who is a registered, non-disabled Adus user (same matching as `@adudu` commands; the Azure author is matched as email) becomes `created_by` and the memory is `active`; otherwise, and always in `approval` mode, it is `pending` with no creator. Comments by Adus never count as a defender.
+- Memory inserts and the run row are not one transaction (a DB error between them may store exceptions twice on retry).
+
 ---
 
 ## 9. Dashboard, CLI & Deployment
 
 - **Dashboard pages (`web/`):** Login, Setup, Repositories (connections + repos), AI Providers (providers + keys), Review Rules (Rules & Memory tabs), Reviews, Token Usage, Users (admin), Settings (admin), System Status (admin doctor), Profile. See [DESIGN.md](./DESIGN.md) and [web/AGENTS.md](../web/AGENTS.md).
+  - Repositories table: per-repo **Learning** select (`Off` / `Needs approval` / `Automatic`).
+  - Review Rules tabs: Rules, Memory (`active` only), **Pending** (learned memories awaiting approval, count badge; visible to all, actions admin-only: Approve, Edit (edit-and-approve dialog), Reject), **Rejected** (admin only; Delete). "View thread" appears only when `source_url` is an http(s) URL.
 - **CLI subcommands (`crates/adus`):**
   - `adus serve` (default): sweeps orphaned clone workspaces + stale reviews, runs HTTP server + workers + scheduler.
   - `adus gen-secret`: prints 32 random base64 bytes.
@@ -272,3 +299,4 @@ A non-command PR is reviewed **diff-only** (no clone, no tools, forced to `Gener
 | 2026-11-20 | [2026-11-20-ignored-files-and-azure-project-design.md](superpowers/specs/2026-11-20-ignored-files-and-azure-project-design.md) | Consolidated (Azure `project_name`, ignore paths & title keywords) |
 | 2026-11-21 | [2026-11-21-agentic-review-engine-design.md](superpowers/specs/2026-11-21-agentic-review-engine-design.md) | Consolidated (ephemeral clone, ReAct Finder/Verifier/Dedup, Small PR, token ceiling) |
 | 2026-11-21 | [2026-11-21-provider-models-and-reasoning-design.md](superpowers/specs/2026-11-21-provider-models-and-reasoning-design.md) | Consolidated (`primary_model`/`fast_model`, model discovery, `ReasoningEffort`) |
+| 2026-11-23 | [2026-11-23-pr-discussion-awareness-and-learning-design.md](superpowers/specs/2026-11-23-pr-discussion-awareness-and-learning-design.md) | Consolidated (`list_pr_threads`, Dedup against PR discussion, learning from closed PRs, memory approval, `learning_mode`) |
