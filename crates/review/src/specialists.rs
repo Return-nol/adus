@@ -24,7 +24,8 @@ Playbook:
 2. Trace modified callers, schemas/migrations, type contracts, and error-return paths across the \
 codebase (using repository tools when available).
 3. Check matching <rules> and <repository_instructions> against the changed hunks.
-4. Stop and submit [] as soon as all hunks pass without concrete defects.
+4. Submit once every hunk is checked: each suspicion is either a finding or dismissed with a \
+stated reason.
 </Role>";
 
 const BUG_ROLE: &str = "<Role>
@@ -37,7 +38,7 @@ Playbook:
 swallowed errors, partial updates, resource/file leaks, stale index/cache state, migration or ORM \
 mismatches, and concurrency/race hazards.
 2. Use grep and read_file to trace callers, callees, and sibling implementations for cross-file \
-contract drift before keeping a finding.
+contract drift before promoting or dismissing it.
 Other reviewers cover security, performance and the team rules. Leave those and unrequested style \
 to them.
 </Role>";
@@ -52,7 +53,7 @@ Playbook:
 swallowed errors, partial updates, resource/file leaks, stale index/cache state, migration or ORM \
 mismatches, and concurrency/race hazards.
 2. Check callers, callees, and sibling implementations visible in the diff and context for \
-contract drift before keeping a finding.
+contract drift before promoting or dismissing it.
 Other reviewers cover security, performance and the team rules. Leave those and unrequested style \
 to them.
 </Role>";
@@ -182,5 +183,15 @@ mod tests {
                 .role_block()
                 .contains("<repository_instructions>")
         );
+        let generalist = SpecialistKind::Generalist.role_block();
+        assert!(generalist.contains("dismissed with a stated reason"));
+        assert!(!generalist.contains("submit []"));
+        for with_tools in [true, false] {
+            assert!(
+                SpecialistKind::Bug
+                    .role_block_for(with_tools)
+                    .contains("promoting or dismissing")
+            );
+        }
     }
 }
