@@ -138,7 +138,10 @@ async fn run_all(
                 input.repo_instructions,
                 with_tools,
             );
-            let kinds = active_specialists(input.mode, !batch.rules.is_empty());
+            let kinds = active_specialists(
+                input.mode,
+                !batch.rules.is_empty() || input.repo_instructions.is_some(),
+            );
             let submit = &submit;
             async move {
                 // Checked when the batch starts (the stream polls it), not when it is built.

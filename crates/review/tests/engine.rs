@@ -2053,6 +2053,20 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
             .user
             .contains("Always log with tracing, never println.")
     );
+
+    let before = s.chat.finder_calls().len();
+    run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+    let finder = &s.chat.finder_calls()[before..];
+    assert_eq!(finder.len(), 4);
+    assert_eq!(
+        finder
+            .iter()
+            .filter(|c| c.system.contains(RULES_ROLE))
+            .count(),
+        1
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
