@@ -33,7 +33,7 @@ use crate::agent::AgentError;
 use crate::budget::TokenBudget;
 use crate::dedup::{DedupOutcome, deduplicate_findings};
 use crate::discussion::threads_for_dedup;
-use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
+use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, batch_allowed, run_finder};
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
     DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, batch_targets, build_manifest, format_inline,
@@ -558,6 +558,7 @@ impl Engine {
             pr: s.pr,
             manifest,
             batches: &batches,
+            allowed: &allowed,
             memories: s.memories,
             repo_instructions: repo_instructions.as_deref(),
             mode,
@@ -591,7 +592,7 @@ impl Engine {
         };
         let finder_tasks = finder.tasks.len();
         let (cache_read_tokens, cache_write_tokens) = finder_cache_tokens(&finder.tasks);
-        let candidates =
+        let (candidates, filtered_dropped) =
             collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
         let candidate_count = candidates.len();
 
@@ -682,6 +683,7 @@ impl Engine {
             clone_ms,
             fallback_reason,
             finder_tasks,
+            filtered_dropped,
             candidates = candidate_count,
             verified_kept,
             verifier_dropped,
@@ -879,7 +881,7 @@ fn collect_candidates(
     allowed: &HashMap<String, CommentableRange>,
     skipped: &mut Vec<(String, &'static str)>,
     warnings: &mut Vec<String>,
-) -> Result<Vec<CandidateFinding>, EngineError> {
+) -> Result<(Vec<CandidateFinding>, usize), EngineError> {
     if !tasks.is_empty() && tasks.iter().all(|task| task.result.is_err()) {
         return Err(all_failed(tasks));
     }
@@ -893,37 +895,29 @@ fn collect_candidates(
         .filter(|task| task.result.is_ok())
         .map(|task| task.batch)
         .collect();
-    let batch_allowed: Vec<HashMap<String, &CommentableRange>> = batches
+    let batch_ranges: Vec<HashMap<String, &CommentableRange>> = batches
         .iter()
-        .map(|batch| {
-            batch
-                .files
-                .iter()
-                .filter_map(|file| {
-                    let path = normalize_path(&file.path);
-                    let range = allowed.get(&path)?;
-                    Some((path, range))
-                })
-                .collect()
-        })
+        .map(|batch| batch_allowed(batch, allowed))
         .collect();
 
     let mut candidates = Vec::new();
+    let mut filtered_dropped = 0usize;
     // Batch index → skip reason, for batches no agent reviewed.
     let mut unreviewed: BTreeMap<usize, &'static str> = BTreeMap::new();
     for task in tasks {
         let label = task.kind.label();
         let reason = match task.result {
             Ok(outcome) => {
-                let Some(range) = batch_allowed.get(task.batch) else {
+                let Some(range) = batch_ranges.get(task.batch) else {
                     continue;
                 };
-                candidates.extend(keep_valid_batch(outcome.result, range).into_iter().map(
-                    |suggestion| CandidateFinding {
-                        suggestion,
-                        specialist: task.kind,
-                    },
-                ));
+                let raw_count = outcome.result.len();
+                let valid = keep_valid_batch(outcome.result, range);
+                filtered_dropped += raw_count.saturating_sub(valid.len());
+                candidates.extend(valid.into_iter().map(|suggestion| CandidateFinding {
+                    suggestion,
+                    specialist: task.kind,
+                }));
                 continue;
             }
             Err(FinderFailure::TimedOut) => {
@@ -958,7 +952,7 @@ fn collect_candidates(
             skipped.extend(batch.files.iter().map(|file| (file.path.clone(), reason)));
         }
     }
-    Ok(dedup_exact(candidates, |c| &c.suggestion))
+    Ok((dedup_exact(candidates, |c| &c.suggestion), filtered_dropped))
 }
 
 /// Generalist rule of spec decision 8: when some Finder task failed and every failure was a

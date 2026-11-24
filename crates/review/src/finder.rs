@@ -5,9 +5,11 @@
 //! When the model rejects tool calling, the whole Finder is run again without tools.
 //! A batch that would start once the review's token budget is exhausted is not started.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use adus_core::types::ReviewMode;
+use adus_core::types::{ReviewMode, normalize_path};
 use adus_db::memories::Memory;
 use adus_git::PullRequest;
 use adus_llm::ReasoningEffort;
@@ -22,7 +24,8 @@ use crate::agent::run_react_loop;
 use crate::agent::{AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec};
 use crate::budget::TokenBudget;
 use crate::parse::{
-    Suggestion, parse_submit_findings, parse_suggestions, submit_findings_tool_def,
+    CommentableRange, Suggestion, parse_submit_findings, parse_suggestions,
+    submit_findings_tool_def, validate_batch_anchors,
 };
 use crate::prompt::{DiffBatch, build_finder_system_prompt, build_finder_user_prompt};
 use crate::specialists::{SpecialistKind, active_specialists};
@@ -52,9 +55,26 @@ pub(crate) struct FinderInput<'a> {
     pub pr: &'a PullRequest,
     pub manifest: &'a str,
     pub batches: &'a [DiffBatch<'a>],
+    pub allowed: &'a HashMap<String, CommentableRange>,
     pub memories: &'a [Memory],
     pub repo_instructions: Option<&'a str>,
     pub mode: ReviewMode,
+}
+
+/// Commentable ranges for the files in one `DiffBatch`, keyed by normalized path.
+pub(crate) fn batch_allowed<'a>(
+    batch: &DiffBatch<'_>,
+    allowed: &'a HashMap<String, CommentableRange>,
+) -> HashMap<String, &'a CommentableRange> {
+    batch
+        .files
+        .iter()
+        .filter_map(|file| {
+            let path = normalize_path(&file.path);
+            let range = allowed.get(&path)?;
+            Some((path, range))
+        })
+        .collect()
 }
 
 /// Why a Finder task has no result.
@@ -122,7 +142,7 @@ async fn run_all(
     deadline: Instant,
 ) -> Vec<FinderTask> {
     let with_tools = matches!(tools, AgentTools::Full(_));
-    let submit = SubmitFindings(submit_findings_tool_def());
+    let submit_def = submit_findings_tool_def();
     // Futures are built up front: a closure inside the stream would make the future lose
     // `Send` (higher-ranked lifetime inference), as in `agent.rs`.
     let batches: Vec<_> = input
@@ -142,7 +162,8 @@ async fn run_all(
                 input.mode,
                 !batch.rules.is_empty() || input.repo_instructions.is_some(),
             );
-            let submit = &submit;
+            let allowed = batch_allowed(batch, input.allowed);
+            let submit_def = &submit_def;
             async move {
                 // Checked when the batch starts (the stream polls it), not when it is built.
                 if llm.token_budget.is_some_and(|budget| budget.exhausted()) {
@@ -158,7 +179,14 @@ async fn run_all(
                 }
                 let agents: Vec<_> = kinds
                     .into_iter()
-                    .map(|kind| run_one(llm, index, kind, prompt.clone(), tools, submit, deadline))
+                    .map(|kind| {
+                        let submit = SubmitFindings {
+                            def: submit_def.clone(),
+                            allowed: allowed.clone(),
+                            anchor_retried: AtomicBool::new(false),
+                        };
+                        run_one(llm, index, kind, prompt.clone(), tools, submit, deadline)
+                    })
                     .collect();
                 future::join_all(agents).await
             }
@@ -179,7 +207,7 @@ async fn run_one(
     kind: SpecialistKind,
     prompt: String,
     tools: AgentTools<'_>,
-    submit: &SubmitFindings,
+    submit: SubmitFindings<'_>,
     deadline: Instant,
 ) -> FinderTask {
     let system = build_finder_system_prompt(kind, matches!(tools, AgentTools::Full(_)));
@@ -198,7 +226,7 @@ async fn run_one(
         token_budget: llm.token_budget.cloned(),
         ..AgentConfig::new(FINDER_MAX_STEPS)
     };
-    let run = run_react_loop(&agent, tools, submit, &config, prompt);
+    let run = run_react_loop(&agent, tools, &submit, &config, prompt);
     let result = match tokio::time::timeout_at(deadline, run).await {
         Ok(Ok(outcome)) => {
             tracing::debug!(
@@ -231,20 +259,221 @@ async fn run_one(
 
 /// The Finder's terminal tool, `submit_findings`. A reply without a tool call is read as the
 /// JSON array of the diff-only output format.
-struct SubmitFindings(ToolDef);
+struct SubmitFindings<'a> {
+    def: ToolDef,
+    allowed: HashMap<String, &'a CommentableRange>,
+    anchor_retried: AtomicBool,
+}
 
-impl SubmitSpec for SubmitFindings {
+impl SubmitSpec for SubmitFindings<'_> {
     type Output = Vec<Suggestion>;
 
     fn tool_def(&self) -> &ToolDef {
-        &self.0
+        &self.def
     }
 
-    fn parse_arguments(&self, arguments: &Value) -> Result<Vec<Suggestion>, String> {
-        parse_submit_findings(arguments)
+    fn parse_arguments(
+        &self,
+        arguments: &Value,
+        can_retry: bool,
+    ) -> Result<Vec<Suggestion>, String> {
+        let suggestions = parse_submit_findings(arguments)?;
+        if can_retry && !self.anchor_retried.swap(true, Ordering::Relaxed) {
+            validate_batch_anchors(&suggestions, &self.allowed)?;
+        }
+        Ok(suggestions)
     }
 
     fn parse_prose(&self, text: &str) -> Result<Vec<Suggestion>, String> {
         parse_suggestions(text).map_err(|err| err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use adus_core::types::{ReviewMode, Severity};
+    use adus_git::{FileDiff, FileStatus, PullRequest};
+    use adus_llm::{Message, ReasoningEffort};
+    use serde_json::json;
+    use tokio::time::Instant;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::parse::CommentableRange;
+    use crate::test_support::{ScriptedChat, call, tools_turn};
+    use crate::workspace::RepoWorkspace;
+
+    fn sample_pr() -> PullRequest {
+        PullRequest {
+            number: 7,
+            title: "Test".into(),
+            description: "Desc".into(),
+            head_sha: "h1".into(),
+            base_sha: "b1".into(),
+            is_draft: false,
+            source_ref: None,
+        }
+    }
+
+    fn finding_arg(file: &str, line: u32, title: &str) -> serde_json::Value {
+        json!({
+            "file": file,
+            "line": line,
+            "severity": "warning",
+            "title": title,
+            "body": "why",
+        })
+    }
+
+    fn submit_turn(
+        id: &str,
+        findings: Vec<serde_json::Value>,
+    ) -> Result<adus_llm::ChatResponse, adus_llm::router::ChatError> {
+        tools_turn(vec![call(
+            id,
+            "submit_findings",
+            json!({ "findings": findings }),
+        )])
+    }
+
+    #[tokio::test]
+    async fn finder_bounces_off_line_anchor_once_then_accepts_partial_on_second_or_last_step() {
+        let pr = sample_pr();
+        let patch = "@@ -1,1 +1,3 @@\n a\n+b\n+c\n";
+        let file = FileDiff {
+            path: "src/a.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            patch: Some(patch.into()),
+        };
+        let batches = vec![DiffBatch {
+            files: vec![&file],
+            rules: Vec::new(),
+        }];
+        let allowed =
+            HashMap::from([("src/a.rs".to_string(), CommentableRange::from_patch(patch))]);
+        let usage = UsageContext {
+            review_id: Some(Uuid::from_u128(1)),
+            repository_id: Some(Uuid::from_u128(2)),
+        };
+        let input = FinderInput {
+            pr: &pr,
+            manifest: "src/a.rs",
+            batches: &batches,
+            allowed: &allowed,
+            memories: &[],
+            repo_instructions: None,
+            mode: ReviewMode::Generalist,
+        };
+        let toolbox = Toolbox::new(Arc::new(RepoWorkspace::from_files(&[(
+            "src/a.rs",
+            b"a\nb\nc\n",
+        )])));
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        // 1. First submit on off-line anchor bounces with nearest '+' lines; second submit on valid line succeeds.
+        let chat = ScriptedChat::new(vec![
+            submit_turn("s1", vec![finding_arg("src/a.rs", 1, "Off-line")]),
+            submit_turn("s2", vec![finding_arg("src/a.rs", 2, "Re-anchored")]),
+        ]);
+        let llm = FinderLlm {
+            chat: &chat,
+            provider_id: Uuid::from_u128(1),
+            model: "m",
+            effort: ReasoningEffort::Medium,
+            usage: &usage,
+            token_budget: None,
+        };
+        let run = run_finder(llm, &input, Some(&toolbox), deadline).await;
+        assert_eq!(run.tasks.len(), 1);
+        let outcome = run.tasks[0]
+            .result
+            .as_ref()
+            .expect("re-anchored submit succeeds");
+        assert_eq!(outcome.steps_used, 2);
+        assert_eq!(outcome.result.len(), 1);
+        assert_eq!(outcome.result[0].line, 2);
+        assert_eq!(outcome.result[0].title, "Re-anchored");
+        let reqs = chat.requests();
+        assert_eq!(reqs.len(), 2);
+        let tool_err = reqs[1]
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                Message::Tool { results } => {
+                    results.first().map(|r| (r.is_error, r.content.as_str()))
+                }
+                _ => None,
+            })
+            .expect("bounce tool error");
+        assert!(tool_err.0);
+        assert!(tool_err.1.contains("2, 3"), "{}", tool_err.1);
+
+        // 2. Second submit with mixed valid + invalid anchors succeeds without AgentError::Unparseable.
+        let chat = ScriptedChat::new(vec![
+            submit_turn("s1", vec![finding_arg("src/a.rs", 1, "Off-line")]),
+            submit_turn(
+                "s2",
+                vec![
+                    finding_arg("src/a.rs", 2, "Valid"),
+                    finding_arg("src/a.rs", 1, "Still off-line"),
+                ],
+            ),
+        ]);
+        let llm = FinderLlm {
+            chat: &chat,
+            provider_id: Uuid::from_u128(1),
+            model: "m",
+            effort: ReasoningEffort::Medium,
+            usage: &usage,
+            token_budget: None,
+        };
+        let run = run_finder(llm, &input, Some(&toolbox), deadline).await;
+        let outcome = run.tasks[0]
+            .result
+            .as_ref()
+            .expect("second submit with partial invalid keeps findings");
+        assert_eq!(outcome.steps_used, 2);
+        assert_eq!(outcome.result.len(), 2);
+        assert_eq!(outcome.result[0].severity, Severity::Warning);
+
+        // 3. On the final step (can_retry == false), SubmitFindings accepts mixed findings immediately.
+        let mut batch_map = HashMap::new();
+        batch_map.insert("src/a.rs".to_string(), &allowed["src/a.rs"]);
+        let submit = SubmitFindings {
+            def: submit_findings_tool_def(),
+            allowed: batch_map,
+            anchor_retried: AtomicBool::new(false),
+        };
+        let chat = ScriptedChat::new(vec![submit_turn(
+            "s1",
+            vec![
+                finding_arg("src/a.rs", 3, "Valid on last step"),
+                finding_arg("src/a.rs", 1, "Invalid on last step"),
+            ],
+        )]);
+        let agent_llm = AgentLlm {
+            chat: &chat,
+            provider_id: Uuid::from_u128(1),
+            model: "m",
+            system: "sys",
+            effort: Some(ReasoningEffort::Medium),
+            usage: &usage,
+        };
+        let outcome = run_react_loop(
+            &agent_llm,
+            AgentTools::Full(&toolbox),
+            &submit,
+            &AgentConfig::new(1),
+            "PROMPT".into(),
+        )
+        .await
+        .expect("final step must not fail Unparseable on invalid anchor");
+        assert_eq!(outcome.steps_used, 1);
+        assert_eq!(outcome.result.len(), 2);
     }
 }

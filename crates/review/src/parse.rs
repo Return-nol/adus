@@ -218,6 +218,53 @@ pub(crate) fn parse_submit_findings(args: &Value) -> Result<Vec<Suggestion>, Str
         .collect())
 }
 
+/// Validates that every finding in a `submit_findings` batch targets a file in `allowed_by_file`
+/// and a commentable `+` line in that file. Used for a one-shot re-anchor bounce while steps
+/// remain.
+pub(crate) fn validate_batch_anchors(
+    suggestions: &[Suggestion],
+    allowed_by_file: &HashMap<String, &CommentableRange>,
+) -> Result<(), String> {
+    for s in suggestions {
+        let file = normalize_path(&s.file);
+        let Some(allowed) = allowed_by_file.get(&file) else {
+            let mut valid_files: Vec<&str> = allowed_by_file.keys().map(String::as_str).collect();
+            valid_files.sort_unstable();
+            let valid_list = if valid_files.is_empty() {
+                "(none)".to_string()
+            } else {
+                valid_files.join(", ")
+            };
+            return Err(format!(
+                "file `{}` is not in this batch (valid files: {valid_list})",
+                s.file
+            ));
+        };
+        if !allowed.lines.contains(&s.line) {
+            let mut nearest: Vec<u32> = allowed.lines.iter().copied().collect();
+            nearest.sort_by_key(|&candidate| (candidate.abs_diff(s.line), candidate));
+            nearest.truncate(5);
+            nearest.sort_unstable();
+            if nearest.is_empty() {
+                return Err(format!(
+                    "line {} in `{file}` is not a commentable `+` line (no commentable `+` lines in this file)",
+                    s.line
+                ));
+            }
+            let line_list = nearest
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "line {} in `{file}` is not a commentable `+` line (nearest valid `+` lines: {line_list})",
+                s.line
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Keeps the findings of one Finder batch that can be posted: the normalized file is a key of
 /// `allowed_by_file` (normalized paths) and `line` is in that file's commentable lines.
 /// `start_line` survives only when `start_line..=line` lies in one diff hunk; when a requested
@@ -540,5 +587,40 @@ mod tests {
                 sugg("src/a.rs", 4, "other"),
             ]
         );
+    }
+
+    #[test]
+    fn validate_batch_anchors_rejects_bad_file_or_line_and_suggests_nearest() {
+        let range = CommentableRange {
+            lines: BTreeSet::from([10, 12, 20, 21, 22, 30]),
+            hunks: Vec::new(),
+        };
+        let allowed = HashMap::from([("src/a.rs".to_string(), &range)]);
+
+        let bad_file = vec![sugg("src/missing.rs", 10, "Wrong file")];
+        let err = validate_batch_anchors(&bad_file, &allowed).unwrap_err();
+        assert!(err.contains("src/missing.rs"), "{err}");
+        assert!(err.contains("src/a.rs"), "{err}");
+
+        let bad_line = vec![sugg("src/a.rs", 14, "Off-line")];
+        let err = validate_batch_anchors(&bad_line, &allowed).unwrap_err();
+        assert!(err.contains("14"), "{err}");
+        assert!(err.contains("src/a.rs"), "{err}");
+        assert!(err.contains("10, 12, 20, 21, 22"), "{err}");
+        assert!(!err.contains("30"), "{err}");
+
+        // Tie-breaking: distance 7 from line 17 to both 10 and 24 picks smaller 10.
+        let tie_range = CommentableRange {
+            lines: BTreeSet::from([10, 12, 16, 20, 22, 24]),
+            hunks: Vec::new(),
+        };
+        let tie_allowed = HashMap::from([("src/a.rs".to_string(), &tie_range)]);
+        let tie_err =
+            validate_batch_anchors(&[sugg("src/a.rs", 17, "Tie")], &tie_allowed).unwrap_err();
+        assert!(tie_err.contains("10, 12, 16, 20, 22"), "{tie_err}");
+        assert!(!tie_err.contains("24"), "{tie_err}");
+
+        let normalized_ok = vec![sugg("/src/a.rs", 12, "Valid")];
+        assert_eq!(validate_batch_anchors(&normalized_ok, &allowed), Ok(()));
     }
 }

@@ -110,8 +110,9 @@ pub(crate) trait SubmitSpec: Send + Sync {
     /// Definition sent to the model (for example `submit_findings`).
     fn tool_def(&self) -> &ToolDef;
 
-    /// Reads the terminal tool's arguments. The error text is shown to the model.
-    fn parse_arguments(&self, arguments: &Value) -> Result<Self::Output, String>;
+    /// Reads the terminal tool's arguments. The error text is shown to the model;
+    /// `can_retry` is `true` when at least one step remains after this turn.
+    fn parse_arguments(&self, arguments: &Value, can_retry: bool) -> Result<Self::Output, String>;
 
     /// Recovers the result from a reply that did not call the terminal tool.
     fn parse_prose(&self, text: &str) -> Result<Self::Output, String>;
@@ -261,13 +262,14 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
         }
 
         // The first valid submit ends the run; other calls of that turn are not executed.
+        let can_retry = tally.steps_used < config.max_steps;
         let mut submit_errors = Vec::with_capacity(tool_calls.len());
         for call in &tool_calls {
             if call.name != submit_name {
                 submit_errors.push(None);
                 continue;
             }
-            match submit.parse_arguments(&call.arguments) {
+            match submit.parse_arguments(&call.arguments, can_retry) {
                 Ok(result) => return Ok(tally.finish(result, false)),
                 Err(err) => submit_errors.push(Some(err)),
             }
@@ -646,7 +648,7 @@ mod tests {
             &self.def
         }
 
-        fn parse_arguments(&self, arguments: &Value) -> Result<String, String> {
+        fn parse_arguments(&self, arguments: &Value, _can_retry: bool) -> Result<String, String> {
             arguments
                 .get("answer")
                 .and_then(Value::as_str)
@@ -659,7 +661,7 @@ mod tests {
             let end = text.rfind('}').ok_or("no JSON object")?;
             let value: Value = serde_json::from_str(text.get(start..=end).ok_or("no JSON object")?)
                 .map_err(|e| e.to_string())?;
-            self.parse_arguments(&value)
+            self.parse_arguments(&value, false)
         }
     }
 

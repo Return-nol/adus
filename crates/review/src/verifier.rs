@@ -421,7 +421,7 @@ impl SubmitSpec for SubmitVerdict {
         &self.0
     }
 
-    fn parse_arguments(&self, arguments: &Value) -> Result<bool, String> {
+    fn parse_arguments(&self, arguments: &Value, _can_retry: bool) -> Result<bool, String> {
         SubmitVerdictArgs::deserialize(arguments)
             .map(|args| args.keep)
             .map_err(|err| {

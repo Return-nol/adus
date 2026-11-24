@@ -2603,3 +2603,37 @@ async fn finder_still_sees_the_raw_diff(pool: PgPool) {
     let git = s.git.state();
     assert!(!git.reviews[0].comments[0].body.contains(FAKE_AWS_KEY));
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn finder_anchor_bounce_then_mixed_final_submission_posts_valid_finding(pool: PgPool) {
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    s.chat.finder(Reply::submit(json!([finding_json(
+        "src/a.rs", 1, "warning", "Off-line"
+    )])));
+    s.chat.finder(Reply::submit(json!([
+        finding_json("src/a.rs", 2, "critical", "Valid bug"),
+        finding_json("src/a.rs", 1, "warning", "Still off-line"),
+    ])));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 2);
+    assert_eq!(finder[1].tool_results.len(), 1);
+    assert!(
+        finder[1].tool_results[0].contains("2, 3, 4"),
+        "{}",
+        finder[1].tool_results[0]
+    );
+
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert_eq!(posted.comments.len(), 1);
+    assert_eq!(posted.comments[0].line, 2);
+    assert!(posted.comments[0].body.contains("Valid bug"));
+    assert!(!posted.summary.contains("review output could not be parsed"));
+}
