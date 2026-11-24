@@ -1529,78 +1529,26 @@ async fn gemini_sends_thinking_budget_and_filters_thought_parts() {
 
 #[tokio::test]
 async fn gemini_3_plus_sends_thinking_level() {
-    let level_cases = [
-        (
-            "gemini-3-flash-preview",
-            ReasoningEffort::Medium,
-            12_000,
-            "MEDIUM",
-        ),
-        (
-            "gemini-3-pro-preview",
-            ReasoningEffort::Medium,
-            12_000,
-            "HIGH",
-        ),
-        (
-            "gemini-3.1-pro-preview",
-            ReasoningEffort::High,
-            23_000,
-            "HIGH",
-        ),
-        ("gemini-3-flash-preview", ReasoningEffort::Low, 4_096, "LOW"),
-        ("gemini-4-pro", ReasoningEffort::Medium, 12_000, "MEDIUM"),
-        ("gemini-10-pro", ReasoningEffort::Low, 4_096, "LOW"),
-    ];
-    for (model, effort, reserve, level) in level_cases {
-        let route = format!("/v1beta/models/{model}:generateContent");
-        let server = serve(
-            &route,
-            ok(json!({
-                "candidates": [{
-                    "content": {"parts": [{"text": "ok"}]},
-                    "finishReason": "STOP"
-                }]
-            })),
-        )
-        .await;
-        let req = ChatRequest::text(model, "sys", "hi", 200).with_effort(effort);
-        chat_with(ProviderKind::Gemini, &server, &req)
-            .await
-            .unwrap();
-        assert_eq!(
-            sent_body(&server).await["generationConfig"],
-            json!({"maxOutputTokens": 200 + reserve, "thinkingConfig": {"thinkingLevel": level}}),
-            "model={model} effort={effort:?}"
-        );
-    }
-
-    let budget_cases = [
-        ("gemini-2.5-flash", ReasoningEffort::High, 23_000),
-        ("gemini-flash-latest", ReasoningEffort::Low, 4_096),
-    ];
-    for (model, effort, budget) in budget_cases {
-        let route = format!("/v1beta/models/{model}:generateContent");
-        let server = serve(
-            &route,
-            ok(json!({
-                "candidates": [{
-                    "content": {"parts": [{"text": "ok"}]},
-                    "finishReason": "STOP"
-                }]
-            })),
-        )
-        .await;
-        let req = ChatRequest::text(model, "sys", "hi", 200).with_effort(effort);
-        chat_with(ProviderKind::Gemini, &server, &req)
-            .await
-            .unwrap();
-        assert_eq!(
-            sent_body(&server).await["generationConfig"],
-            json!({"maxOutputTokens": 200 + budget, "thinkingConfig": {"thinkingBudget": budget}}),
-            "model={model} effort={effort:?}"
-        );
-    }
+    let model = "gemini-3-flash-preview";
+    let route = format!("/v1beta/models/{model}:generateContent");
+    let server = serve(
+        &route,
+        ok(json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "ok"}]},
+                "finishReason": "STOP"
+            }]
+        })),
+    )
+    .await;
+    let req = ChatRequest::text(model, "sys", "hi", 200).with_effort(ReasoningEffort::Medium);
+    chat_with(ProviderKind::Gemini, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(
+        sent_body(&server).await["generationConfig"],
+        json!({"maxOutputTokens": 200 + 12_000, "thinkingConfig": {"thinkingLevel": "MEDIUM"}})
+    );
 }
 
 #[tokio::test]
@@ -1703,23 +1651,51 @@ async fn openai_compatible_surfaces_http_200_error_body() {
 
 #[tokio::test]
 async fn openai_compatible_reports_reasoning_budget_exhaustion() {
+    for message in [
+        json!({"content": "", "reasoning": "thinking step 1..."}),
+        json!({
+            "content": null,
+            "reasoning_details": [{"type": "reasoning.text", "text": "thinking..."}]
+        }),
+    ] {
+        let server = serve(
+            OPENAI_PATH,
+            ok(json!({
+                "choices": [{
+                    "message": message,
+                    "finish_reason": "length"
+                }]
+            })),
+        )
+        .await;
+        let err = chat(ProviderKind::OpenaiCompatible, &server)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::Invalid("empty response: model exhausted max_tokens during reasoning".into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn openai_compatible_ignores_blank_reasoning_metadata() {
     let server = serve(
         OPENAI_PATH,
         ok(json!({
             "choices": [{
-                "message": {"content": "", "reasoning": "thinking step 1..."},
-                "finish_reason": "length"
+                "message": {
+                    "content": "ok",
+                    "reasoning_content": "   ",
+                    "reasoning_details": []
+                },
+                "finish_reason": "stop"
             }]
         })),
     )
     .await;
-    let err = chat(ProviderKind::OpenaiCompatible, &server)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        err,
-        LlmError::Invalid("empty response: model exhausted max_tokens during reasoning".into())
-    );
+    let resp = chat(ProviderKind::OpenaiCompatible, &server).await.unwrap();
+    assert_eq!(resp.provider_meta, None);
 }
 
 #[tokio::test]
@@ -1777,46 +1753,6 @@ async fn openai_compatible_replays_returned_reasoning_fields() {
     assert_eq!(
         serde_json::from_str::<Value>(&meta_2).unwrap(),
         json!({"reasoning": "r", "reasoning_details": details})
-    );
-
-    let server_3 = serve(
-        OPENAI_PATH,
-        ok(json!({
-            "choices": [{
-                "message": {
-                    "content": "ok",
-                    "reasoning_content": "   ",
-                    "reasoning_details": []
-                },
-                "finish_reason": "stop"
-            }]
-        })),
-    )
-    .await;
-    let resp_3 = chat(ProviderKind::OpenaiCompatible, &server_3)
-        .await
-        .unwrap();
-    assert_eq!(resp_3.provider_meta, None);
-
-    let server_4 = serve(
-        OPENAI_PATH,
-        ok(json!({
-            "choices": [{
-                "message": {
-                    "content": null,
-                    "reasoning_details": [{"type": "reasoning.text", "text": "thinking..."}]
-                },
-                "finish_reason": "length"
-            }]
-        })),
-    )
-    .await;
-    let err_4 = chat(ProviderKind::OpenaiCompatible, &server_4)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        err_4,
-        LlmError::Invalid("empty response: model exhausted max_tokens during reasoning".into())
     );
 
     let mut req = with_tools();
@@ -1919,7 +1855,6 @@ async fn provider_meta_part_is_never_sent_to_anthropic_or_gemini() {
         chat_with(kind, &meta_server, &with_meta).await.unwrap();
         let sent = sent_body(&meta_server).await;
 
-        assert!(!sent.to_string().contains("reasoning_content"), "{kind:?}");
         assert_eq!(sent, baseline, "{kind:?}");
     }
 }

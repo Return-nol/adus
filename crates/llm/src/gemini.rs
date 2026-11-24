@@ -316,3 +316,51 @@ fn stop_reason(finish_reason: Option<&str>) -> StopReason {
         _ => StopReason::Other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{thinking_config, thinking_level};
+    use crate::ReasoningEffort;
+    use serde_json::json;
+
+    #[test]
+    fn thinking_level_matches_gemini_3_and_later() {
+        for model in [
+            "gemini-3-flash-preview",
+            "gemini-3-pro-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-4-pro",
+            "gemini-10-pro",
+        ] {
+            assert!(thinking_level(model), "{model} should use thinkingLevel");
+        }
+
+        for model in ["gemini-2.5-flash", "gemini-flash-latest", "m-1"] {
+            assert!(!thinking_level(model), "{model} should use thinkingBudget");
+        }
+    }
+
+    #[test]
+    fn thinking_config_maps_levels_and_budget_reserves() {
+        assert_eq!(
+            thinking_config("gemini-3-flash-preview", ReasoningEffort::Low),
+            json!({"thinkingLevel": "LOW"})
+        );
+        assert_eq!(
+            thinking_config("gemini-3-flash-preview", ReasoningEffort::Medium),
+            json!({"thinkingLevel": "MEDIUM"})
+        );
+        assert_eq!(
+            thinking_config("gemini-3-pro-preview", ReasoningEffort::Medium),
+            json!({"thinkingLevel": "HIGH"})
+        );
+        assert_eq!(
+            thinking_config("gemini-3.1-pro-preview", ReasoningEffort::High),
+            json!({"thinkingLevel": "HIGH"})
+        );
+        assert_eq!(
+            thinking_config("gemini-2.5-flash", ReasoningEffort::High),
+            json!({"thinkingBudget": 23_000})
+        );
+    }
+}
