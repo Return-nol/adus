@@ -609,6 +609,8 @@ impl Engine {
             let report = verify_candidates(
                 ctx,
                 VerifyInput {
+                    pr: s.pr,
+                    manifest,
                     candidates,
                     targets: &files,
                     rules: s.rules,

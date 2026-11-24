@@ -57,6 +57,11 @@ pub(crate) fn truncate_with_marker<'a>(text: &'a str, max: usize, marker: &str) 
     }
 }
 
+/// Format a PR description for prompt inclusion, truncating at [`MAX_DESCRIPTION_CHARS`].
+pub(crate) fn format_pr_description(description: &str) -> String {
+    truncate_with_marker(description, MAX_DESCRIPTION_CHARS, "\n[truncated]").into_owned()
+}
+
 /// Awali tiap baris `+` dan ` ` di hunk dengan nomor baris file baru, mis. `   42 + let x = 1;`,
 /// supaya model bisa menyebut nomor baris yang benar. Baris `-` diberi spasi sebagai ganti nomor.
 fn annotate_patch(patch: &str) -> String {
@@ -195,10 +200,7 @@ pub(crate) fn build_finder_user_prompt(
 
     let mut sections = vec![
         wrap("pr_title", &pr.title),
-        wrap(
-            "pr_description",
-            &truncate_with_marker(&pr.description, MAX_DESCRIPTION_CHARS, "\n[truncated]"),
-        ),
+        wrap("pr_description", &format_pr_description(&pr.description)),
         wrap("pr_manifest", manifest),
         wrap("rules", &or_none(format_rules(&batch.rules))),
         wrap("memories", &or_none(format_memories(memories))),
@@ -520,7 +522,9 @@ mod tests {
             truncate_with_marker(&long, MAX_DESCRIPTION_CHARS, "\n[truncated]"),
             expected
         );
+        assert_eq!(format_pr_description(&long), expected);
         assert_eq!(truncate_with_marker("abc", 3, "\n[truncated]"), "abc");
+        assert_eq!(format_pr_description("abc"), "abc");
         assert_eq!(wrap("patch", "x"), "<patch>\nx\n</patch>");
     }
 
