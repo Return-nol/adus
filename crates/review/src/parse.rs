@@ -240,8 +240,9 @@ pub(crate) struct Dismissal {
 }
 
 /// Reads the optional `dismissed` list. Never fails: a missing or non-array list yields nothing,
-/// and malformed entries are skipped. Texts are cut to [`DISMISSED_TEXT_CHARS`] and
-/// secret-redacted, so every returned value is safe to log.
+/// and malformed entries are skipped. Every text (`file` included) is secret-redacted and then
+/// cut to [`DISMISSED_TEXT_CHARS`], so every returned value is safe to log. Redacting first
+/// keeps a cut from splitting a secret into an unrecognisable, partly logged prefix.
 pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal> {
     let Some(items) = args.get("dismissed").and_then(Value::as_array) else {
         return Vec::new();
@@ -252,9 +253,11 @@ pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
     }
-    let clean = |s: &str| {
-        let cut: String = s.chars().take(DISMISSED_TEXT_CHARS).collect();
-        crate::redact::redact_secrets(&cut).into_owned()
+    let clean = |s: &str| -> String {
+        crate::redact::redact_secrets(s)
+            .chars()
+            .take(DISMISSED_TEXT_CHARS)
+            .collect()
     };
     items
         .iter()
@@ -265,7 +268,7 @@ pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal> {
                 text(item, "why_safe")?,
             );
             Some(Dismissal {
-                file: file.to_owned(),
+                file: clean(file),
                 line: item
                     .get("line")
                     .and_then(Value::as_u64)
@@ -468,6 +471,22 @@ mod tests {
         ] {
             assert!(parse_dismissed(&absent).is_empty());
         }
+        // A token straddling the cut, and an over-long `file` holding one, leak no part of it.
+        let token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let straddling = format!("{} {token}", "x".repeat(DISMISSED_TEXT_CHARS - 10));
+        let long_file = format!("{token}/{}", "d/".repeat(400));
+        let cut = parse_dismissed(&json!({"dismissed": [
+            {"file": long_file, "suspicion": straddling, "why_safe": "w"},
+        ]}));
+        assert_eq!(cut.len(), 1);
+        for text in [&cut[0].file, &cut[0].suspicion] {
+            assert!(text.chars().count() <= DISMISSED_TEXT_CHARS);
+            assert!(
+                !text.contains("ghp_") && !text.contains("aaaaaaaa"),
+                "{text}"
+            );
+        }
+
         let many: Vec<Value> = (0..40).map(|i| ok(&format!("f{i}.go"))).collect();
         assert_eq!(
             parse_dismissed(&json!({"dismissed": many})).len(),
