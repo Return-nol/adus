@@ -21,17 +21,17 @@ use crate::prompt::truncate_with_marker;
 use crate::tools::{ToolOutput, Toolbox};
 
 /// Default `AgentConfig::compaction_char_limit`.
-const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 160_000;
+const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 320_000;
 const MAX_OUTPUT_TOKENS: u32 = 8_192;
 /// Default `AgentConfig::max_concurrent_tools`.
 const DEFAULT_MAX_CONCURRENT_TOOLS: usize = 4;
 /// Default `AgentConfig::wrap_up_steps`: only the final step is a wrap-up step.
 const DEFAULT_WRAP_UP_STEPS: usize = 1;
 
-/// Replaces old tool output when the conversation grows past the compaction limit.
-const OMITTED_TOOL_OUTPUT: &str = "[earlier tool output omitted to save context]";
-/// Only tool outputs longer than this are compacted.
-const COMPACT_MIN_CHARS: usize = 120;
+/// Prefix length preserved when shortening older tool outputs during compaction.
+const COMPACT_EXCERPT_CHARS: usize = 400;
+/// Appended to a shortened tool output during compaction.
+const COMPACTED_MARKER: &str = "\n[older tool output shortened to save context]";
 /// The newest messages (two turns) are never compacted.
 const COMPACT_KEEP_TAIL: usize = 4;
 /// A run with a `deadline` wraps up once the time left is less than this many times its
@@ -205,7 +205,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             && tally.steps_used == config.max_steps / 2
         {
             messages.push(user_message(format!(
-                "Step budget: {} of {} steps used. Gather only the evidence you still need, then call {submit_name}.",
+                "Step budget: {} of {} steps used. Batch remaining lookups in parallel, and call {submit_name} as soon as your checks are complete — do not spend extra steps once you have enough evidence.",
                 tally.steps_used, config.max_steps
             )));
         }
@@ -501,10 +501,11 @@ fn assistant_message(text: &str, calls: &[ToolCall], provider_meta: Option<Strin
     Message::Assistant { parts }
 }
 
-/// Replaces the oldest tool outputs longer than `COMPACT_MIN_CHARS`, oldest first, until the
-/// conversation fits `limit`. The prompt and the last `COMPACT_KEEP_TAIL` messages are never
-/// touched, and only `ToolResult.content` changes, so call/result pairing holds. One pass:
-/// when nothing is left to replace it stops, even above the limit.
+/// Shortens the oldest tool outputs longer than `COMPACT_EXCERPT_CHARS` plus
+/// `COMPACTED_MARKER` (saving at least one character), oldest first, until the conversation fits
+/// `limit`. The prompt and the last `COMPACT_KEEP_TAIL` messages are never touched, and only
+/// `ToolResult.content` changes, so call/result pairing holds. One pass: when nothing is left to
+/// shorten it stops, even above the limit.
 fn compact(messages: &mut [Message], limit: usize) {
     let mut total = messages_char_len(messages);
     if total <= limit {
@@ -514,7 +515,7 @@ fn compact(messages: &mut [Message], limit: usize) {
     let Some(candidates) = messages.get_mut(1..protected_from) else {
         return;
     };
-    let omitted_len = OMITTED_TOOL_OUTPUT.chars().count();
+    let min_compact_chars = COMPACT_EXCERPT_CHARS + COMPACTED_MARKER.chars().count();
     for message in candidates {
         let Message::Tool { results } = message else {
             continue;
@@ -524,9 +525,15 @@ fn compact(messages: &mut [Message], limit: usize) {
                 return;
             }
             let len = result.content.chars().count();
-            if len > COMPACT_MIN_CHARS {
-                total = total.saturating_sub(len) + omitted_len;
-                OMITTED_TOOL_OUTPUT.clone_into(&mut result.content);
+            if len <= min_compact_chars || result.content.ends_with(COMPACTED_MARKER) {
+                continue;
+            }
+            if let Cow::Owned(short) =
+                truncate_with_marker(&result.content, COMPACT_EXCERPT_CHARS, COMPACTED_MARKER)
+            {
+                let new_len = short.chars().count();
+                result.content = short;
+                total = total.saturating_sub(len.saturating_sub(new_len));
             }
         }
     }
@@ -1123,14 +1130,21 @@ mod tests {
         assert_eq!(msgs.len(), 7);
         assert_eq!(msgs[0], user("PROMPT"));
         assert_paired(msgs);
-        // The oldest output is omitted; the last 4 messages (2 turns) stay whole.
-        assert_eq!(tool_results(&msgs[2])[0].content, OMITTED_TOOL_OUTPUT);
+        // The oldest output is shortened to a 400-char excerpt; the last 4 messages stay whole.
+        let excerpt: String = tool_results(&msgs[4])[0]
+            .content
+            .chars()
+            .take(COMPACT_EXCERPT_CHARS)
+            .collect();
+        let expected_short = format!("{excerpt}{COMPACTED_MARKER}");
+        assert_eq!(tool_results(&msgs[2])[0].content, expected_short);
         assert!(tool_results(&msgs[4])[0].content.contains(&big));
         assert!(tool_results(&msgs[6])[0].content.contains(&big));
     }
 
     #[test]
     fn compact_respects_limit_protects_tail_and_terminates() {
+        assert_eq!(AgentConfig::new(20).compaction_char_limit, 320_000);
         let long = "y".repeat(1_000);
         let mut msgs = vec![
             user(&"p".repeat(500)),
@@ -1145,18 +1159,42 @@ mod tests {
         ];
         let before = msgs.clone();
         compact(&mut msgs, messages_char_len(&before) - 100);
-        assert_eq!(tool_results(&msgs[2])[0].content, OMITTED_TOOL_OUTPUT);
+        let expected_short = format!("{}{COMPACTED_MARKER}", "y".repeat(COMPACT_EXCERPT_CHARS));
+        assert_eq!(tool_results(&msgs[2])[0].content, expected_short);
         assert_eq!(msgs[3..], before[3..]);
         assert_eq!(msgs[0], before[0]);
 
+        let at_guard = "z".repeat(446);
+        let already_marked = format!("{}{COMPACTED_MARKER}", "z".repeat(500));
         let mut protected = vec![
             user(&long),
-            assistant_calls(&["a"]),
-            tool_msg(&["a"], "short output"),
-            assistant_calls(&["b"]),
-            tool_msg(&["b"], &long),
-            assistant_calls(&["c"]),
-            tool_msg(&["c"], &long),
+            assistant_calls(&["a", "b", "c"]),
+            Message::Tool {
+                results: vec![
+                    ToolResult {
+                        call_id: "a".into(),
+                        tool_name: "read_file".into(),
+                        content: "short output".into(),
+                        is_error: false,
+                    },
+                    ToolResult {
+                        call_id: "b".into(),
+                        tool_name: "read_file".into(),
+                        content: at_guard,
+                        is_error: false,
+                    },
+                    ToolResult {
+                        call_id: "c".into(),
+                        tool_name: "read_file".into(),
+                        content: already_marked,
+                        is_error: false,
+                    },
+                ],
+            },
+            assistant_calls(&["d"]),
+            tool_msg(&["d"], &long),
+            assistant_calls(&["e"]),
+            tool_msg(&["e"], &long),
         ];
         let before = protected.clone();
         compact(&mut protected, 0);
@@ -1317,12 +1355,17 @@ mod tests {
             .await
             .unwrap();
         let reqs = chat.requests();
-        let note = "Step budget: 3 of 6 steps used. Gather only the evidence you still need, then call submit_answer.";
+        let note = "Step budget: 3 of 6 steps used. Batch remaining lookups in parallel, and call submit_answer as soon as your checks are complete — do not spend extra steps once you have enough evidence.";
         for (step, req) in reqs.iter().enumerate() {
             assert_eq!(count_notes(req), usize::from(step >= 3), "step {step}");
             assert_paired(&req.messages);
         }
-        assert_eq!(msg_text(reqs[3].messages.last().unwrap()), Some(note));
+        let actual_note = msg_text(reqs[3].messages.last().unwrap());
+        assert_eq!(actual_note, Some(note));
+        assert!(
+            actual_note
+                .is_some_and(|t| t.contains("do not spend extra steps") && t.contains("parallel"))
+        );
         assert_eq!(count_user(&reqs[3], WRAP_UP), 0);
         assert_eq!(count_user(&reqs[5], WRAP_UP), 1);
 
