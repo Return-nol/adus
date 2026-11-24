@@ -1604,7 +1604,7 @@ async fn invalid_stored_ignore_list_falls_back_to_defaults(pool: PgPool) {
 async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
     let s = setup_files(&pool, vec![file("src/login.rs", PATCH_234)]).await;
     s.enable_clone(&[
-        ("src/login.rs", "a\nb\nc\nd\n"),
+        ("src/login.rs", "a\nb\nc\nd\nfn after_hunk() {}\n"),
         (
             "src/helper.rs",
             "pub fn is_admin() -> bool {\n    false\n}\n",
@@ -1648,6 +1648,11 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
         ]
     );
     assert!(finder[0].tool_results.is_empty());
+    assert!(
+        finder[0].user.contains("    5 : fn after_hunk() {}"),
+        "{}",
+        finder[0].user
+    );
     assert_eq!(finder[1].tool_results.len(), 1);
     assert!(finder[1].tool_results[0].contains("pub fn is_admin() -> bool"));
 
@@ -1852,7 +1857,7 @@ async fn enable_small_pr(pool: &PgPool) {
 async fn small_pr_skips_clone_and_tools_but_still_verifies(pool: PgPool) {
     let s = setup_one(&pool).await;
     enable_small_pr(&pool).await;
-    s.enable_clone(&[]);
+    s.enable_clone(&[("a.rs", "a\nb\nextra_context\n")]);
     s.chat.finder(Reply::finding("a.rs", 2, "Bug"));
 
     let id = run(&s, Trigger::Opened).await.unwrap();
@@ -1861,6 +1866,11 @@ async fn small_pr_skips_clone_and_tools_but_still_verifies(pool: PgPool) {
     assert!(s.cloner.urls().is_empty(), "no clone for a small PR");
     let finder = s.chat.finder_calls();
     assert_eq!(finder.len(), 1);
+    assert!(
+        !finder[0].user.contains(" : ") && !finder[0].user.contains("extra_context"),
+        "{}",
+        finder[0].user
+    );
     assert_eq!(
         finder[0].tools,
         vec!["submit_findings"],
@@ -2551,7 +2561,8 @@ async fn posted_output_redacts_comments_summary_and_drops_secret_suggestions(poo
 async fn finder_still_sees_the_raw_diff(pool: PgPool) {
     let patch = format!("@@ -1,1 +1,2 @@\n a\n+let key = \"{FAKE_AWS_KEY}\";\n");
     let s = setup_files(&pool, vec![file("src/a.rs", &patch)]).await;
-    let content = format!("a\nlet key = \"{FAKE_AWS_KEY}\";\n");
+    let content =
+        format!("a\nlet key = \"{FAKE_AWS_KEY}\";\nb\nlet outside = \"{FAKE_GITHUB_TOKEN}\";\n");
     s.enable_clone(&[("src/a.rs", content.as_str())]);
     s.chat
         .finder(Reply::tool("read_file", json!({"path": "src/a.rs"})));
@@ -2568,6 +2579,22 @@ async fn finder_still_sees_the_raw_diff(pool: PgPool) {
     assert!(
         finder[0].user.contains(FAKE_AWS_KEY),
         "the diff is not redacted"
+    );
+    assert!(
+        finder[0].user.contains("    3 : b"),
+        "surrounding context is expanded: {}",
+        finder[0].user
+    );
+    assert!(
+        finder[0]
+            .user
+            .contains("    4 : let outside = \"[REDACTED]\";"),
+        "secrets in expanded ':' context are redacted: {}",
+        finder[0].user
+    );
+    assert!(
+        !finder[0].user.contains(FAKE_GITHUB_TOKEN),
+        "raw secret outside hunk must not leak into prompt"
     );
     assert!(
         finder[0]

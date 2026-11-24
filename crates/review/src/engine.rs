@@ -42,7 +42,7 @@ use crate::prompt::{
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
 use crate::small_pr::is_small_pr;
-use crate::tools::Toolbox;
+use crate::tools::{Toolbox, load_expanded_diffs};
 use crate::verifier::{CandidateFinding, VerifyContext, VerifyInput, verify_candidates};
 use crate::workspace::{RepoCloner, WorkspaceError};
 
@@ -507,7 +507,6 @@ impl Engine {
         skipped: &mut Vec<(String, &'static str)>,
         warnings: &mut Vec<String>,
     ) -> Result<ReviewOutput, EngineError> {
-        let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS);
         let mode = s.mode;
 
         // Clone: auth failure is fatal; anything else, or a clone still running at the Finder
@@ -547,10 +546,14 @@ impl Engine {
             }
         };
         let clone_ms = clone_started.elapsed().as_millis();
-        let repo_instructions = match &workspace {
-            Some(workspace) => load_repo_instructions(Arc::clone(workspace)).await,
-            None => None,
+        let (repo_instructions, expanded) = match &workspace {
+            Some(workspace) => tokio::join!(
+                load_repo_instructions(Arc::clone(workspace)),
+                load_expanded_diffs(Arc::clone(workspace), &files),
+            ),
+            None => (None, HashMap::new()),
         };
+        let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS, &expanded);
         // One cache for every agent of this review, Finder and Verifier alike.
         let toolbox = workspace.map(Toolbox::new);
 
@@ -559,6 +562,7 @@ impl Engine {
             manifest,
             batches: &batches,
             allowed: &allowed,
+            expanded: &expanded,
             memories: s.memories,
             repo_instructions: repo_instructions.as_deref(),
             mode,

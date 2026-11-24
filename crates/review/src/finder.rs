@@ -56,6 +56,7 @@ pub(crate) struct FinderInput<'a> {
     pub manifest: &'a str,
     pub batches: &'a [DiffBatch<'a>],
     pub allowed: &'a HashMap<String, CommentableRange>,
+    pub expanded: &'a HashMap<String, String>,
     pub memories: &'a [Memory],
     pub repo_instructions: Option<&'a str>,
     pub mode: ReviewMode,
@@ -156,6 +157,7 @@ async fn run_all(
                 batch,
                 input.memories,
                 input.repo_instructions,
+                input.expanded,
                 with_tools,
             );
             let kinds = active_specialists(
@@ -360,11 +362,13 @@ mod tests {
             review_id: Some(Uuid::from_u128(1)),
             repository_id: Some(Uuid::from_u128(2)),
         };
+        let expanded = HashMap::new();
         let input = FinderInput {
             pr: &pr,
             manifest: "src/a.rs",
             batches: &batches,
             allowed: &allowed,
+            expanded: &expanded,
             memories: &[],
             repo_instructions: None,
             mode: ReviewMode::Generalist,
