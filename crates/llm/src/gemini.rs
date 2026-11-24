@@ -90,11 +90,28 @@ struct GeminiModel {
     supported_generation_methods: Option<Vec<String>>,
 }
 
-fn thinking_budget(effort: ReasoningEffort) -> u32 {
-    match effort {
-        ReasoningEffort::Low => 1_024,
-        ReasoningEffort::Medium => 4_096,
-        ReasoningEffort::High => 8_192,
+/// Gemini 3+ models take `thinkingLevel` rather than `thinkingBudget`.
+fn thinking_level(model: &str) -> bool {
+    let Some((_, rest)) = model.split_once("gemini-") else {
+        return false;
+    };
+    let token = rest.split(['.', '-']).next().unwrap_or("");
+    !token.is_empty()
+        && token.bytes().all(|b| b.is_ascii_digit())
+        && token.parse::<u32>().is_ok_and(|n| n >= 3)
+}
+
+fn thinking_config(model: &str, effort: ReasoningEffort) -> Value {
+    if thinking_level(model) {
+        let level = match effort {
+            ReasoningEffort::Low => "LOW",
+            ReasoningEffort::Medium if model.contains("gemini-3-pro-preview") => "HIGH",
+            ReasoningEffort::Medium => "MEDIUM",
+            ReasoningEffort::High => "HIGH",
+        };
+        json!({"thinkingLevel": level})
+    } else {
+        json!({"thinkingBudget": effort.output_reserve()})
     }
 }
 
@@ -105,12 +122,12 @@ impl GeminiClient {
         req: &ChatRequest,
         effort: Option<ReasoningEffort>,
     ) -> Result<ChatResponse, LlmError> {
-        // Thinking tokens count against maxOutputTokens: add the budget on top of the answer.
-        let budget = effort.map(thinking_budget);
+        // Thinking tokens count against maxOutputTokens: add the reserve on top of the answer.
+        let reserve = effort.map(ReasoningEffort::output_reserve);
         let mut generation_config =
-            json!({"maxOutputTokens": req.max_tokens.saturating_add(budget.unwrap_or(0))});
-        if let Some(budget) = budget {
-            generation_config["thinkingConfig"] = json!({"thinkingBudget": budget});
+            json!({"maxOutputTokens": req.max_tokens.saturating_add(reserve.unwrap_or(0))});
+        if let Some(e) = effort {
+            generation_config["thinkingConfig"] = thinking_config(req.model.as_str(), e);
         }
         let mut body = json!({
             "systemInstruction": {"parts": [{"text": req.system}]},
@@ -191,6 +208,7 @@ impl GeminiClient {
             output_tokens: field(|u| u.candidates_token_count),
             cache_read_tokens: field(|u| u.cached_content_token_count),
             cache_write_tokens: 0,
+            provider_meta: None,
         })
     }
 }
@@ -274,18 +292,19 @@ fn wire_contents(messages: &[Message]) -> Vec<Value> {
 fn model_parts(parts: &[AssistantPart]) -> Vec<Value> {
     parts
         .iter()
-        // The API rejects empty text parts.
-        .filter(|p| !matches!(p, AssistantPart::Text(t) if t.is_empty()))
-        .map(|p| match p {
-            AssistantPart::Text(t) => json!({"text": t}),
+        // The API rejects empty text parts and ignores opaque per-turn provider metadata.
+        .filter_map(|p| match p {
+            AssistantPart::Text(t) if t.is_empty() => None,
+            AssistantPart::Text(t) => Some(json!({"text": t})),
             AssistantPart::ToolCall(c) => {
                 let mut part = json!({"functionCall": {"name": c.name, "args": c.arguments}});
                 // Thinking models reject a replayed call that lost its signature.
                 if let Some(signature) = &c.provider_meta {
                     part["thoughtSignature"] = signature.as_str().into();
                 }
-                part
+                Some(part)
             }
+            AssistantPart::ProviderMeta(_) => None,
         })
         .collect()
 }
@@ -295,5 +314,53 @@ fn stop_reason(finish_reason: Option<&str>) -> StopReason {
         Some("MAX_TOKENS") => StopReason::MaxTokens,
         Some("STOP") => StopReason::EndTurn,
         _ => StopReason::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{thinking_config, thinking_level};
+    use crate::ReasoningEffort;
+    use serde_json::json;
+
+    #[test]
+    fn thinking_level_matches_gemini_3_and_later() {
+        for model in [
+            "gemini-3-flash-preview",
+            "gemini-3-pro-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-4-pro",
+            "gemini-10-pro",
+        ] {
+            assert!(thinking_level(model), "{model} should use thinkingLevel");
+        }
+
+        for model in ["gemini-2.5-flash", "gemini-flash-latest", "m-1"] {
+            assert!(!thinking_level(model), "{model} should use thinkingBudget");
+        }
+    }
+
+    #[test]
+    fn thinking_config_maps_levels_and_budget_reserves() {
+        assert_eq!(
+            thinking_config("gemini-3-flash-preview", ReasoningEffort::Low),
+            json!({"thinkingLevel": "LOW"})
+        );
+        assert_eq!(
+            thinking_config("gemini-3-flash-preview", ReasoningEffort::Medium),
+            json!({"thinkingLevel": "MEDIUM"})
+        );
+        assert_eq!(
+            thinking_config("gemini-3-pro-preview", ReasoningEffort::Medium),
+            json!({"thinkingLevel": "HIGH"})
+        );
+        assert_eq!(
+            thinking_config("gemini-3.1-pro-preview", ReasoningEffort::High),
+            json!({"thinkingLevel": "HIGH"})
+        );
+        assert_eq!(
+            thinking_config("gemini-2.5-flash", ReasoningEffort::High),
+            json!({"thinkingBudget": 23_000})
+        );
     }
 }

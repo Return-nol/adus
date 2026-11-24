@@ -82,7 +82,7 @@ Full subsystem specs live in [docs/SPEC.md](docs/SPEC.md). Follow these standing
   - Never send a saved LLM key to a modified `base_url`; model-list cache uses HMAC under `ADUS_SECRET_KEY`.
 - **Frontend (`web/`):** Read [web/AGENTS.md](web/AGENTS.md) and [DESIGN.md](docs/DESIGN.md) before touching `web/`. Always use `#lib/...` (never `$lib`), follow [DESIGN.md](docs/DESIGN.md) OKLCH theming, and ship matching skeletons on every data page. Release/Docker builds must run `pnpm -C web build` before `cargo build --release`.
 - **Testing (no redundant tests):** Check existing tests before writing new ones; extend or parameterize existing cases instead of duplicating them. Do not write unit tests that mirror coverage already verified by integration tests or that only test trivial wrappers, getters, or `serde` derives — every test must cover a distinct behavior, edge case, invariant, or regression. Reuse existing fakes/fixtures (`FakeGitFactory`/`FakeGit`, `crates/review/tests/common/mod.rs`, `#[sqlx::test(migrations = "../../migrations")]`).
-- **Commits:** Conventional Commits ending with a `Co-Authored-By:` trailer naming the model. Commit on the feature branch; never push without the user asking.
+- **Commits:** Commit on the feature branch; never push without the user asking.
 
 ## Clean-Room and No-Assumption Rule (Binding for Every Plan and Every Agent)
 

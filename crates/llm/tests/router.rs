@@ -65,6 +65,7 @@ fn ok_response() -> ChatResponse {
         output_tokens: 5,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        provider_meta: None,
     }
 }
 

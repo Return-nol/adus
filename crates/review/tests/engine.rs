@@ -349,6 +349,7 @@ mod support {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                provider_meta: None,
             };
             match reply {
                 Reply::Text(text) => Ok(response(text, Vec::new())),
