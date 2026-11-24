@@ -77,6 +77,37 @@ struct Usage {
     cache_creation_input_tokens: Option<u32>,
 }
 
+/// Claude 4.6+ and non-(opus|sonnet|haiku) Claude models use adaptive thinking and
+/// `output_config.effort`; older Claude models and non-Claude proxies use `budget_tokens`.
+fn adaptive_thinking(model: &str) -> bool {
+    let Some((_, rest)) = model.split_once("claude-") else {
+        return false;
+    };
+    if model.contains("claude-3") {
+        return false;
+    }
+    let mut parts = rest.split(['-', '.']);
+    let Some(family) = parts.next() else {
+        return true;
+    };
+    if !matches!(family, "opus" | "sonnet" | "haiku") {
+        return true;
+    }
+    let Some(major) = parts
+        .next()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u32>().ok())
+    else {
+        return true;
+    };
+    let minor = parts
+        .next()
+        .filter(|s| (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    major > 4 || (major == 4 && minor > 5)
+}
+
 impl AnthropicClient {
     async fn chat_once(
         &self,
@@ -84,19 +115,22 @@ impl AnthropicClient {
         req: &ChatRequest,
         effort: Option<ReasoningEffort>,
     ) -> Result<ChatResponse, LlmError> {
-        let mut max_tokens = req.max_tokens;
-        let thinking = effort.map(|e| {
-            let budget = e.output_reserve();
-            max_tokens = req.max_tokens.saturating_add(budget);
-            json!({"type": "enabled", "budget_tokens": budget})
-        });
+        let max_tokens = match effort {
+            Some(e) => req.max_tokens.saturating_add(e.output_reserve()),
+            None => req.max_tokens,
+        };
         let mut body = json!({
             "model": req.model,
             "max_tokens": max_tokens,
             "messages": wire_messages(&req.messages),
         });
-        if let Some(thinking) = thinking {
-            body["thinking"] = thinking;
+        if let Some(e) = effort {
+            if adaptive_thinking(&req.model) {
+                body["thinking"] = json!({"type": "adaptive"});
+                body["output_config"] = json!({"effort": e.as_str()});
+            } else {
+                body["thinking"] = json!({"type": "enabled", "budget_tokens": e.output_reserve()});
+            }
         }
         // Up to three cache breakpoints (system, last tool, last user turn); the API allows four.
         if !req.system.is_empty() {
@@ -294,5 +328,41 @@ fn stop_reason(stop_reason: Option<&str>) -> StopReason {
         Some("max_tokens") => StopReason::MaxTokens,
         Some("end_turn" | "stop_sequence") => StopReason::EndTurn,
         _ => StopReason::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adaptive_thinking;
+
+    #[test]
+    fn adaptive_thinking_follows_model_generation() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5",
+            "claude-haiku-5-5",
+            "claude-fable-5-2",
+            "claude-opus-4-6",
+            "claude-opus-4.6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-8",
+        ] {
+            assert!(adaptive_thinking(model), "{model} should use adaptive");
+        }
+
+        for model in [
+            "claude-haiku-4-5",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4.5",
+            "claude-opus-4-5-20251101",
+            "claude-opus-4-1",
+            "claude-sonnet-4-20250514",
+            "claude-3-7-sonnet-latest",
+            "kimi-k2",
+            "m-1",
+        ] {
+            assert!(!adaptive_thinking(model), "{model} should use budget");
+        }
     }
 }

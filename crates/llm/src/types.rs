@@ -221,11 +221,12 @@ pub trait LlmClient: Send + Sync {
 }
 
 /// Substrings (lowercase) in a provider error that mean the model rejected reasoning/thinking params.
-const REASONING_UNSUPPORTED_MARKERS: [&str; 5] = [
+const REASONING_UNSUPPORTED_MARKERS: [&str; 6] = [
     "reasoning_effort",
     "reasoning effort",
     "thinking",
     "budget_tokens",
+    "output_config",
     "does not support reasoning",
 ];
 

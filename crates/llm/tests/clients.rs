@@ -1408,6 +1408,7 @@ async fn anthropic_sends_thinking_budget_and_replays_thinking_blocks_on_tool_tur
         json!({"type": "enabled", "budget_tokens": 12000})
     );
     assert_eq!(first_body["max_tokens"], 8192 + 12000);
+    assert!(first_body.get("output_config").is_none());
 
     let second_body: Value = requests[1].body_json().unwrap();
     assert_eq!(
@@ -1421,6 +1422,75 @@ async fn anthropic_sends_thinking_budget_and_replays_thinking_blocks_on_tool_tur
             ]
         })
     );
+}
+
+#[tokio::test]
+async fn anthropic_current_model_sends_adaptive_thinking_and_effort() {
+    let server = serve(
+        ANTHROPIC_PATH,
+        ok(json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn"
+        })),
+    )
+    .await;
+
+    let req =
+        ChatRequest::text("claude-opus-5-5", "sys", "hi", 8192).with_effort(ReasoningEffort::High);
+    let resp = chat_with(ProviderKind::Anthropic, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(resp.text, "ok");
+
+    let body = sent_body(&server).await;
+    assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(body["output_config"], json!({"effort": "high"}));
+    assert_eq!(body["max_tokens"], 8192 + 23_000);
+    assert!(!body.to_string().contains("budget_tokens"));
+}
+
+#[tokio::test]
+async fn anthropic_adaptive_falls_back_when_output_config_rejected() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ANTHROPIC_PATH))
+        .and(body_partial_json(
+            json!({"output_config": {"effort": "medium"}}),
+        ))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "output_config: Extra inputs are not permitted"
+            }
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(ANTHROPIC_PATH))
+        .respond_with(ok(json!({
+            "content": [{"type": "text", "text": "recovered"}],
+            "stop_reason": "end_turn"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req =
+        ChatRequest::text("claude-opus-5-5", "sys", "hi", 100).with_effort(ReasoningEffort::Medium);
+    let resp = chat_with(ProviderKind::Anthropic, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(resp.text, "recovered");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let second: Value = requests[1].body_json().unwrap();
+    assert!(second.get("thinking").is_none());
+    assert!(second.get("output_config").is_none());
+    assert_eq!(second["max_tokens"], 100);
 }
 
 #[tokio::test]
