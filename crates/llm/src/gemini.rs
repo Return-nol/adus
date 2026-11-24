@@ -90,11 +90,28 @@ struct GeminiModel {
     supported_generation_methods: Option<Vec<String>>,
 }
 
-fn thinking_budget(effort: ReasoningEffort) -> u32 {
-    match effort {
-        ReasoningEffort::Low => 1_024,
-        ReasoningEffort::Medium => 4_096,
-        ReasoningEffort::High => 8_192,
+/// Gemini 3+ models take `thinkingLevel` rather than `thinkingBudget`.
+fn thinking_level(model: &str) -> bool {
+    let Some((_, rest)) = model.split_once("gemini-") else {
+        return false;
+    };
+    let token = rest.split(['.', '-']).next().unwrap_or("");
+    !token.is_empty()
+        && token.bytes().all(|b| b.is_ascii_digit())
+        && token.parse::<u32>().is_ok_and(|n| n >= 3)
+}
+
+fn thinking_config(model: &str, effort: ReasoningEffort) -> Value {
+    if thinking_level(model) {
+        let level = match effort {
+            ReasoningEffort::Low => "LOW",
+            ReasoningEffort::Medium if model.contains("gemini-3-pro-preview") => "HIGH",
+            ReasoningEffort::Medium => "MEDIUM",
+            ReasoningEffort::High => "HIGH",
+        };
+        json!({"thinkingLevel": level})
+    } else {
+        json!({"thinkingBudget": effort.output_reserve()})
     }
 }
 
@@ -105,12 +122,12 @@ impl GeminiClient {
         req: &ChatRequest,
         effort: Option<ReasoningEffort>,
     ) -> Result<ChatResponse, LlmError> {
-        // Thinking tokens count against maxOutputTokens: add the budget on top of the answer.
-        let budget = effort.map(thinking_budget);
+        // Thinking tokens count against maxOutputTokens: add the reserve on top of the answer.
+        let reserve = effort.map(ReasoningEffort::output_reserve);
         let mut generation_config =
-            json!({"maxOutputTokens": req.max_tokens.saturating_add(budget.unwrap_or(0))});
-        if let Some(budget) = budget {
-            generation_config["thinkingConfig"] = json!({"thinkingBudget": budget});
+            json!({"maxOutputTokens": req.max_tokens.saturating_add(reserve.unwrap_or(0))});
+        if let Some(e) = effort {
+            generation_config["thinkingConfig"] = thinking_config(req.model.as_str(), e);
         }
         let mut body = json!({
             "systemInstruction": {"parts": [{"text": req.system}]},

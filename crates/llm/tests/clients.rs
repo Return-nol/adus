@@ -1305,9 +1305,46 @@ async fn retries_without_effort_when_provider_rejects_reasoning_param() {
     let first: Value = requests[0].body_json().unwrap();
     let second: Value = requests[1].body_json().unwrap();
     assert_eq!(first["reasoning_effort"], "high");
-    assert_eq!(first["max_completion_tokens"], 100 + 8192);
+    assert_eq!(first["max_completion_tokens"], 100 + 23_000);
     assert!(second.get("reasoning_effort").is_none());
     assert_eq!(second["max_completion_tokens"], 100);
+}
+
+#[tokio::test]
+async fn retries_without_effort_when_reserve_exceeds_model_max_tokens() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(OPENAI_PATH))
+        .and(body_partial_json(
+            json!({"max_completion_tokens": 8192 + 23_000}),
+        ))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": "max_completion_tokens exceeds maximum of 16384"}
+        })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(OPENAI_PATH))
+        .respond_with(ok(json!({
+            "choices": [{"message": {"content": "recovered"}, "finish_reason": "stop"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let req = ChatRequest::text("gpt-4o", "sys", "hi", 8192).with_effort(ReasoningEffort::High);
+    let resp = chat_with(ProviderKind::Openai, &server, &req)
+        .await
+        .unwrap();
+    assert_eq!(resp.text, "recovered");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let second: Value = requests[1].body_json().unwrap();
+    assert_eq!(second["max_completion_tokens"], 8192);
+    assert!(second.get("reasoning_effort").is_none());
 }
 
 #[tokio::test]
@@ -1368,9 +1405,9 @@ async fn anthropic_sends_thinking_budget_and_replays_thinking_blocks_on_tool_tur
     let first_body: Value = requests[0].body_json().unwrap();
     assert_eq!(
         first_body["thinking"],
-        json!({"type": "enabled", "budget_tokens": 4096})
+        json!({"type": "enabled", "budget_tokens": 12000})
     );
-    assert_eq!(first_body["max_tokens"], 8192 + 4096);
+    assert_eq!(first_body["max_tokens"], 8192 + 12000);
 
     let second_body: Value = requests[1].body_json().unwrap();
     assert_eq!(
@@ -1410,8 +1447,84 @@ async fn gemini_sends_thinking_budget_and_filters_thought_parts() {
     assert_eq!(resp.text, "visible answer");
     assert_eq!(
         sent_body(&server).await["generationConfig"],
-        json!({"maxOutputTokens": 200 + 1024, "thinkingConfig": {"thinkingBudget": 1024}})
+        json!({"maxOutputTokens": 200 + 4096, "thinkingConfig": {"thinkingBudget": 4096}})
     );
+}
+
+#[tokio::test]
+async fn gemini_3_plus_sends_thinking_level() {
+    let level_cases = [
+        (
+            "gemini-3-flash-preview",
+            ReasoningEffort::Medium,
+            12_000,
+            "MEDIUM",
+        ),
+        (
+            "gemini-3-pro-preview",
+            ReasoningEffort::Medium,
+            12_000,
+            "HIGH",
+        ),
+        (
+            "gemini-3.1-pro-preview",
+            ReasoningEffort::High,
+            23_000,
+            "HIGH",
+        ),
+        ("gemini-3-flash-preview", ReasoningEffort::Low, 4_096, "LOW"),
+        ("gemini-4-pro", ReasoningEffort::Medium, 12_000, "MEDIUM"),
+        ("gemini-10-pro", ReasoningEffort::Low, 4_096, "LOW"),
+    ];
+    for (model, effort, reserve, level) in level_cases {
+        let route = format!("/v1beta/models/{model}:generateContent");
+        let server = serve(
+            &route,
+            ok(json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "ok"}]},
+                    "finishReason": "STOP"
+                }]
+            })),
+        )
+        .await;
+        let req = ChatRequest::text(model, "sys", "hi", 200).with_effort(effort);
+        chat_with(ProviderKind::Gemini, &server, &req)
+            .await
+            .unwrap();
+        assert_eq!(
+            sent_body(&server).await["generationConfig"],
+            json!({"maxOutputTokens": 200 + reserve, "thinkingConfig": {"thinkingLevel": level}}),
+            "model={model} effort={effort:?}"
+        );
+    }
+
+    let budget_cases = [
+        ("gemini-2.5-flash", ReasoningEffort::High, 23_000),
+        ("gemini-flash-latest", ReasoningEffort::Low, 4_096),
+    ];
+    for (model, effort, budget) in budget_cases {
+        let route = format!("/v1beta/models/{model}:generateContent");
+        let server = serve(
+            &route,
+            ok(json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "ok"}]},
+                    "finishReason": "STOP"
+                }]
+            })),
+        )
+        .await;
+        let req = ChatRequest::text(model, "sys", "hi", 200).with_effort(effort);
+        chat_with(ProviderKind::Gemini, &server, &req)
+            .await
+            .unwrap();
+        assert_eq!(
+            sent_body(&server).await["generationConfig"],
+            json!({"maxOutputTokens": 200 + budget, "thinkingConfig": {"thinkingBudget": budget}}),
+            "model={model} effort={effort:?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -35,14 +35,15 @@ impl ReasoningEffort {
         }
     }
 
-    /// Output tokens reserved for reasoning on top of the answer's `max_tokens`. Providers
-    /// count reasoning tokens against the same output cap, so without this a long think
+    /// Output tokens reserved for reasoning on top of the answer's `max_tokens` (also used as
+    /// `thinkingBudget` on Gemini 2.5 / unversioned Gemini models and legacy Claude models).
+    /// Providers count reasoning tokens against the same output cap, so without this a long think
     /// leaves no room for the answer.
     pub(crate) fn output_reserve(self) -> u32 {
         match self {
-            Self::Low => 2_048,
-            Self::Medium => 4_096,
-            Self::High => 8_192,
+            Self::Low => 4_096,
+            Self::Medium => 12_000,
+            Self::High => 23_000,
         }
     }
 }
@@ -228,18 +229,45 @@ const REASONING_UNSUPPORTED_MARKERS: [&str; 5] = [
     "does not support reasoning",
 ];
 
-fn is_reasoning_unsupported(err: &LlmError) -> bool {
+/// Substrings (lowercase) in a provider error naming a max-tokens parameter.
+const MAX_TOKENS_PARAM_MARKERS: [&str; 3] =
+    ["max_tokens", "max_completion_tokens", "maxoutputtokens"];
+/// Substrings (lowercase) in a provider error indicating an exceeded or out-of-range limit.
+const MAX_TOKENS_LIMIT_MARKERS: [&str; 7] = [
+    "exceed",
+    "maximum",
+    "at most",
+    "must be <=",
+    "less than",
+    "too large",
+    " > ",
+];
+
+fn invalid_non_404_lower(err: &LlmError) -> Option<String> {
     let LlmError::Invalid(msg) = err else {
-        return false;
+        return None;
     };
     let lower = msg.to_lowercase();
-    !lower.starts_with("provider status 404")
-        && REASONING_UNSUPPORTED_MARKERS
-            .iter()
-            .any(|m| lower.contains(m))
+    (!lower.starts_with("provider status 404")).then_some(lower)
 }
 
-/// Retries `call` once with `effort = None` when the provider rejects the reasoning parameter.
+fn is_reasoning_unsupported(err: &LlmError) -> bool {
+    invalid_non_404_lower(err).is_some_and(|lower| {
+        REASONING_UNSUPPORTED_MARKERS
+            .iter()
+            .any(|m| lower.contains(m))
+    })
+}
+
+fn is_max_tokens_exceeded(err: &LlmError) -> bool {
+    invalid_non_404_lower(err).is_some_and(|lower| {
+        MAX_TOKENS_PARAM_MARKERS.iter().any(|m| lower.contains(m))
+            && MAX_TOKENS_LIMIT_MARKERS.iter().any(|m| lower.contains(m))
+    })
+}
+
+/// Retries `call` once with `effort = None` when the provider rejects the reasoning parameter
+/// or rejects the reasoning-inflated output token cap.
 pub(crate) async fn chat_with_effort_fallback<F, Fut>(
     effort: Option<ReasoningEffort>,
     call: F,
@@ -249,7 +277,12 @@ where
     Fut: std::future::Future<Output = Result<ChatResponse, LlmError>>,
 {
     match call(effort).await {
-        Err(ref err) if effort.is_some() && is_reasoning_unsupported(err) => call(None).await,
+        Err(ref err)
+            if effort.is_some()
+                && (is_reasoning_unsupported(err) || is_max_tokens_exceeded(err)) =>
+        {
+            call(None).await
+        }
         other => other,
     }
 }
