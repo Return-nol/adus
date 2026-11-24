@@ -177,7 +177,7 @@ pub(crate) fn build_finder_system_prompt(kind: SpecialistKind, with_tools: bool)
         "<ReviewInstructions>\n{FINDER_MINDSET}\n\n{workflow}\n\n{FINDER_SCOPE}\n\n\
          {FINDER_UNTRUSTED_INPUT}\n\n{FINDER_SEVERITY}\n\n<Output>\n{output}\n</Output>\n\
          </ReviewInstructions>\n\n{}",
-        kind.role_block()
+        kind.role_block_for(with_tools)
     )
 }
 
@@ -667,7 +667,7 @@ mod tests {
             for (prompt, kind) in prompts.iter().zip(ALL_KINDS) {
                 assert_eq!(prompt.matches("<Role>").count(), 1, "{kind:?}");
                 let prefix = prompt
-                    .strip_suffix(kind.role_block())
+                    .strip_suffix(kind.role_block_for(with_tools))
                     .expect("the role block ends the system prompt");
                 prefixes.push(prefix);
             }
@@ -688,14 +688,24 @@ mod tests {
         ] {
             assert!(tools.contains(name), "{name} missing from the tool prompt");
         }
-        let plain = build_finder_system_prompt(SpecialistKind::Generalist, false);
-        for name in ["read_file", "grep", "list_dir", "find_files"] {
-            assert!(!plain.contains(name), "{name} in the diff-only prompt");
+        for kind in ALL_KINDS {
+            let plain = build_finder_system_prompt(kind, false);
+            for name in [
+                "read_file",
+                "grep",
+                "list_dir",
+                "find_files",
+                "submit_findings",
+            ] {
+                assert!(
+                    !plain.contains(name),
+                    "{name} in the {kind:?} diff-only prompt"
+                );
+            }
         }
         assert!(tools.contains("empty list") || tools.contains("[]"));
         assert!(tools.contains("up to 4") || tools.contains("parallel"));
         assert!(tools.contains("`:`") || tools.contains("lines marked \":\""));
-        assert!(!plain.contains("submit_findings"));
     }
 
     #[test]

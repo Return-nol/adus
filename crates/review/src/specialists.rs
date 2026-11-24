@@ -42,6 +42,21 @@ Other reviewers cover security, performance and the team rules. Leave those and 
 to them.
 </Role>";
 
+const BUG_ROLE_DIFF_ONLY: &str = "<Role>
+You are the correctness reviewer. Look for code that does the wrong thing: wrong conditions and \
+off-by-one errors, missing or mishandled None/null and error cases, unhandled edge cases (empty, \
+zero, very large, unicode), broken invariants or contracts that callers rely on, races and \
+ordering problems, resource leaks, and changes that lose or corrupt data.
+Playbook:
+1. Sweep all changed hunks first; focus on state transitions, boundary/empty/zero/Unicode inputs, \
+swallowed errors, partial updates, resource/file leaks, stale index/cache state, migration or ORM \
+mismatches, and concurrency/race hazards.
+2. Check callers, callees, and sibling implementations visible in the diff and context for \
+contract drift before keeping a finding.
+Other reviewers cover security, performance and the team rules. Leave those and unrequested style \
+to them.
+</Role>";
+
 const SECURITY_ROLE: &str = "<Role>
 You are the security reviewer. Look for ways the change can be abused: injection (SQL, shell, \
 template, path), missing or wrong authentication and authorization checks, untrusted input used \
@@ -95,14 +110,22 @@ impl SpecialistKind {
         }
     }
 
-    /// The `<Role>...</Role>` block placed at the end of the Finder system prompt.
+    /// The `<Role>...</Role>` block placed at the end of the Finder system prompt (tool-enabled).
+    #[cfg(test)]
     pub(crate) fn role_block(&self) -> &'static str {
-        match self {
-            Self::Generalist => GENERALIST_ROLE,
-            Self::Bug => BUG_ROLE,
-            Self::Security => SECURITY_ROLE,
-            Self::Performance => PERFORMANCE_ROLE,
-            Self::Rules => RULES_ROLE,
+        self.role_block_for(true)
+    }
+
+    /// The `<Role>...</Role>` block for either tool-enabled (`with_tools = true`) or diff-only
+    /// (`with_tools = false`) Finder runs.
+    pub(crate) fn role_block_for(&self, with_tools: bool) -> &'static str {
+        match (self, with_tools) {
+            (Self::Generalist, _) => GENERALIST_ROLE,
+            (Self::Bug, true) => BUG_ROLE,
+            (Self::Bug, false) => BUG_ROLE_DIFF_ONLY,
+            (Self::Security, _) => SECURITY_ROLE,
+            (Self::Performance, _) => PERFORMANCE_ROLE,
+            (Self::Rules, _) => RULES_ROLE,
         }
     }
 }
