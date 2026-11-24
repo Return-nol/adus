@@ -38,7 +38,7 @@ impl Config {
             bind_addr: vars
                 .get("ADUS_BIND_ADDR")
                 .cloned()
-                .unwrap_or_else(|| "0.0.0.0:8080".to_string()),
+                .unwrap_or_else(|| "0.0.0.0:8000".to_string()),
             workers,
         })
     }
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn check_warns_on_http_and_localhost() {
-        let issues = check(&good(&[("ADUS_PUBLIC_URL", "http://localhost:8080")]));
+        let issues = check(&good(&[("ADUS_PUBLIC_URL", "http://localhost:8000")]));
         assert_eq!(issues.len(), 2);
         assert!(issues.iter().all(|i| i.level == Level::Warn));
         assert!(issues.iter().any(|i| i.message.contains("webhooks")));
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn defaults_bind_addr_and_workers() {
         let c = Config::from_map(&full_map_without(&["ADUS_BIND_ADDR", "ADUS_WORKERS"])).unwrap();
-        assert_eq!(c.bind_addr, "0.0.0.0:8080");
+        assert_eq!(c.bind_addr, "0.0.0.0:8000");
         assert_eq!(c.workers, 2);
     }
 

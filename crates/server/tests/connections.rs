@@ -281,7 +281,7 @@ async fn add_repo_registers_webhook_and_stores_ids(pool: PgPool) {
     assert_eq!(calls.len(), 1);
     assert_eq!(
         calls[0].url,
-        format!("http://localhost:8080/webhooks/github/{id}")
+        format!("http://localhost:8000/webhooks/github/{id}")
     );
     assert!(calls[0].existing.is_empty());
 
@@ -329,7 +329,7 @@ async fn azure_repo_webhook_url_carries_token(pool: PgPool) {
     let id = reply.body["id"].as_str().unwrap();
     assert_eq!(
         git.ensure_calls()[0].url,
-        format!("http://localhost:8080/webhooks/azure/{id}?token={token}")
+        format!("http://localhost:8000/webhooks/azure/{id}?token={token}")
     );
 }
 
@@ -345,7 +345,7 @@ async fn add_repo_webhook_failure_502_and_not_stored(pool: PgPool) {
     let reply = add_repo(&app, &admin, &conn, "1").await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
     assert_eq!(reply.body["error"]["code"], "webhook_failed");
-    // Test memakai http://localhost:8080: provider tidak bisa menjangkaunya.
+    // Test memakai http://localhost:8000: provider tidak bisa menjangkaunya.
     let message = reply.body["error"]["message"].as_str().unwrap();
     assert!(
         message.ends_with(

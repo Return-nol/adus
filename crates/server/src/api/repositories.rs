@@ -281,9 +281,9 @@ mod tests {
     fn hint_only_for_non_public_urls() {
         for url in [
             "http://adus.example.com",
-            "https://localhost:8080",
+            "https://localhost:8000",
             "https://127.0.0.1",
-            "https://0.0.0.0:8080",
+            "https://0.0.0.0:8000",
             "not a url",
         ] {
             assert!(

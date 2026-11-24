@@ -221,9 +221,9 @@ async fn doctor() -> ExitCode {
     }
 }
 
-/// Hanya membaca `ADUS_BIND_ADDR` (bawaan `0.0.0.0:8080`) dan memeriksa port itu di 127.0.0.1.
+/// Hanya membaca `ADUS_BIND_ADDR` (bawaan `0.0.0.0:8000`) dan memeriksa port itu di 127.0.0.1.
 async fn healthcheck() -> ExitCode {
-    let bind = std::env::var("ADUS_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let bind = std::env::var("ADUS_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let Some((_, port)) = bind.rsplit_once(':') else {
         eprintln!("ADUS_BIND_ADDR must look like host:port");
         return ExitCode::FAILURE;

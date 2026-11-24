@@ -87,7 +87,7 @@ if (-not (Get-EnvValue 'POSTGRES_PASSWORD')) {
 
 # 4. Public URL
 $port = Get-EnvValue 'ADUS_PORT'
-if (-not $port) { $port = '8080' }
+if (-not $port) { $port = '8000' }
 if (-not (Get-EnvValue 'ADUS_PUBLIC_URL')) {
     $default = "http://localhost:$port"
     $url = $default

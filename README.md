@@ -40,7 +40,7 @@ Settings live in `.env` (copy of [`.env.example`](.env.example)).
 |---|---|---|
 | `COMPOSE_PROFILES` | `bundled` | `bundled` starts Postgres and Redis in Docker; add `https` for the Caddy proxy. Empty = use your own Postgres and Redis. |
 | `ADUS_VERSION` | `latest` | Image tag (`ghcr.io/return-nol/adus`). |
-| `ADUS_PORT` | `8080` | Host port for the dashboard and webhooks. |
+| `ADUS_PORT` | `8000` | Host port for the dashboard and webhooks. |
 | `ADUS_PUBLIC_URL` | (required) | Address that browsers and GitHub/Azure use to reach Adus. Webhooks are registered with it. An `https` URL makes the session cookie `Secure`. |
 | `ADUS_SECRET_KEY` | (required) | base64 of 32 bytes (`adus gen-secret`). Encrypts PATs and LLM keys. |
 | `POSTGRES_PASSWORD` | (required with `bundled`) | Password of the bundled Postgres. |
@@ -54,7 +54,7 @@ To use an external database or Redis, set `COMPOSE_PROFILES=` (empty), fill `DAT
 
 ## HTTPS / public URL
 
-GitHub and Azure DevOps must be able to reach `ADUS_PUBLIC_URL` to deliver webhooks, so `http://localhost:8080` only works for looking around.
+GitHub and Azure DevOps must be able to reach `ADUS_PUBLIC_URL` to deliver webhooks, so `http://localhost:8000` only works for looking around.
 
 - **Your own domain:** point DNS at the host, open ports 80 and 443, then set in `.env`:
 
@@ -65,10 +65,10 @@ GitHub and Azure DevOps must be able to reach `ADUS_PUBLIC_URL` to deliver webho
   ```
 
   and run `docker compose up -d`. Caddy gets and renews the certificate automatically.
-- **Local testing:** run a tunnel, for example `cloudflared tunnel --url http://localhost:8080`, put the printed `https://...` address in `ADUS_PUBLIC_URL`, and run `docker compose up -d`.
+- **Local testing:** run a tunnel, for example `cloudflared tunnel --url http://localhost:8000`, put the printed `https://...` address in `ADUS_PUBLIC_URL`, and run `docker compose up -d`.
 - **Another reverse proxy:** forward to `localhost:${ADUS_PORT}` and set `ADUS_PUBLIC_URL` to the public address.
 
-With the `https` profile, `ADUS_PORT` is still published on all interfaces, so Adus stays reachable over plain HTTP. When Caddy is in front, bind it to localhost with a `docker-compose.override.yml` (`services: adus: ports: !override ["127.0.0.1:8080:8080"]`) or block the port with a firewall.
+With the `https` profile, `ADUS_PORT` is still published on all interfaces, so Adus stays reachable over plain HTTP. When Caddy is in front, bind it to localhost with a `docker-compose.override.yml` (`services: adus: ports: !override ["127.0.0.1:8000:8000"]`) or block the port with a firewall.
 
 After changing `ADUS_PUBLIC_URL`, open the connection in the dashboard and use "Resync webhooks".
 
@@ -96,7 +96,7 @@ Commands are matched case-insensitively and only work for registered Adus users.
 
 | Port | Service | When |
 |---|---|---|
-| `8080` (`ADUS_PORT`) | Adus dashboard, API, webhooks | always |
+| `8000` (`ADUS_PORT`) | Adus dashboard, API, webhooks | always |
 | `80`, `443` | Caddy | profile `https` |
 
 Postgres and Redis publish no host ports.
@@ -151,8 +151,8 @@ docker compose logs -f adus
 docker compose -f docker-compose.dev.yml up -d   # Postgres 18 (host port 55432) + Redis 8 (host port 55379)
 cargo test --workspace                            # needs the dev Postgres and Redis; env comes from .cargo/config.toml
 pnpm -C web install && pnpm -C web build          # the server embeds web/build
-ADUS_PUBLIC_URL=http://localhost:8080 cargo run -p adus   # http://localhost:8080
-pnpm -C web dev                                   # dashboard with hot reload on :5173, proxies /api to :8080
+ADUS_PUBLIC_URL=http://localhost:8000 cargo run -p adus   # http://localhost:8000
+pnpm -C web dev                                   # dashboard with hot reload on :5173, proxies /api to :8000
 ```
 
 The tests and the CI need Postgres and Redis, which the dev compose file provides. On Windows, `cargo test --workspace` can run out of paging file; use `cargo test --workspace -j 2`.

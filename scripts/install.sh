@@ -80,7 +80,7 @@ fi
 
 # 4. Public URL
 port=$(get ADUS_PORT)
-port=${port:-8080}
+port=${port:-8000}
 if [ -z "$(get ADUS_PUBLIC_URL)" ]; then
   default="http://localhost:$port"
   url=$default

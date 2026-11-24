@@ -40,7 +40,7 @@ async fn healthy_world(pool: PgPool) -> World {
     let queue = test_queue(&prefix).await;
     queue.heartbeat("worker-1").await.unwrap();
     let git = Arc::new(FakeGitFactory::default());
-    let state = app_state(pool.clone(), "http://localhost:8080", git.clone(), queue);
+    let state = app_state(pool.clone(), "http://localhost:8000", git.clone(), queue);
 
     let provider = ai::insert_provider(&pool, ProviderKind::Openai, "OpenAI", None, "gpt-x", None)
         .await
