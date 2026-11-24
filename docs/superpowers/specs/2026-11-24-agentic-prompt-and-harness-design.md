@@ -1,6 +1,6 @@
 # Agentic Prompt Redesign & Review Harness Improvements — Design Specification
 
-Date: 2026-11-24 · Status: §1–§11 implemented (consolidated into [docs/SPEC.md](../../SPEC.md) §8.3–§8.4); §12 amendment approved, pending implementation
+Date: 2026-11-24 · Status: implemented (consolidated into [docs/SPEC.md](../../SPEC.md) §8.3–§8.4, including the §12 amendment)
 
 > **Binding scope & policy:** Extends [docs/SPEC.md](../../SPEC.md) §8.3–§8.4 and the agentic review engine spec ([2026-11-21-agentic-review-engine-design.md](2026-11-21-agentic-review-engine-design.md)). The clean-room and no-assumption rule in `AGENTS.md` applies: Kodus community code may be read as a behaviour reference only (cite it), Kodus enterprise code (`libs/ee/**`, `*.ee.*`) is never opened. All prompts, schemas, and code are written fresh for Adus.
 
