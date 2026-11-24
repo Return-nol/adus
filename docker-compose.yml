@@ -8,7 +8,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgres://adus:${POSTGRES_PASSWORD}@postgres:5432/adus}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
     ports:
-      - "${ADUS_PORT:-8080}:8080"
+      - "${ADUS_PORT:-8000}:8000"
     restart: unless-stopped
     # The binary drains in-flight jobs for 30 s after SIGTERM.
     stop_grace_period: 35s

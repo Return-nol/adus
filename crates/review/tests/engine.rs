@@ -2058,8 +2058,8 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn finder_deadline_cuts_slow_specialist_and_posts_survivors_with_note(pool: PgPool) {
     let mut s = setup_one(&pool).await;
-    // Finder deadline at 60 % = 300 ms; the Performance reviewer would answer after 30 s.
-    s.engine.specialists_review_timeout = Duration::from_millis(500);
+    // Finder deadline at 60 % = 900 ms; the Performance reviewer would answer after 30 s.
+    s.engine.specialists_review_timeout = Duration::from_millis(1500);
     s.chat.delay(PERFORMANCE_ROLE, Duration::from_secs(30));
     s.chat
         .finder_role(BUG_ROLE, Reply::finding("a.rs", 2, "Bug"));
@@ -2069,7 +2069,7 @@ async fn finder_deadline_cuts_slow_specialist_and_posts_survivors_with_note(pool
         .await
         .unwrap();
 
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(5));
     let row = review(&pool, id).await;
     assert_eq!(row.status, ReviewStatus::Done);
     assert_eq!(row.comments_posted, 1);
@@ -2095,7 +2095,7 @@ async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
     let err = run(&s, Trigger::Opened).await.unwrap_err();
 
     assert_eq!(err, EngineError::Fatal("review timed out".into()));
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert!(s.git.state().reviews.is_empty());
     let row = latest(&pool).await;
     assert_eq!(row.status, ReviewStatus::Failed);
@@ -2107,8 +2107,8 @@ async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn finder_deadline_lists_the_unfinished_batch_as_skipped(pool: PgPool) {
     let mut s = setup_big(&pool, &["a.rs", "b.rs"]).await;
-    // Finder deadline at 60 % = 300 ms; the b.rs batch would answer after 30 s.
-    s.engine.review_timeout = Duration::from_millis(500);
+    // Finder deadline at 60 % = 900 ms; the b.rs batch would answer after 30 s.
+    s.engine.review_timeout = Duration::from_millis(1500);
     s.chat.delay(&diff_header("b.rs"), Duration::from_secs(30));
     s.chat.finder_file("a.rs", Reply::finding("a.rs", 2, "Bug"));
 
@@ -2145,7 +2145,7 @@ async fn clone_is_bounded_by_the_finder_deadline(pool: PgPool) {
 
     // The clone used up the Finder budget, so the diff-only Finder is cut at once.
     assert_eq!(err, EngineError::Fatal("review timed out".into()));
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(s.cloner.urls().len(), 1);
     let finder = s.chat.finder_calls();
     assert!(

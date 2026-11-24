@@ -313,7 +313,7 @@ chart dan template Railway. Adus mengambil pola yang sama, disederhanakan untuk
   `${ADUS_IMAGE:-ghcr.io/return-nol/adus}:${ADUS_VERSION:-latest}`; README
   menyarankan pin versi. Repo: https://github.com/Return-nol/adus (nama image GHCR wajib huruf kecil).
 - **`docker-compose.yml`:**
-  - `adus` (port `8080`), `postgres:16` + `redis:7` (`appendonly yes`) dengan
+  - `adus` (port `8000`), `postgres:16` + `redis:7` (`appendonly yes`) dengan
     healthcheck dan volume `pgdata`, `redisdata`. DB/Redis tidak dipublish ke host.
   - Postgres dan Redis berada di profile `bundled`; `.env.example` mengisi
     `COMPOSE_PROFILES=bundled`. Pengguna DB/Redis eksternal menghapus profile itu

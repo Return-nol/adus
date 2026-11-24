@@ -434,8 +434,8 @@ mod tests {
     #[test]
     fn named_assignments_on_env_style_lines() {
         assert_eq!(
-            redacted("API_KEY=abcdefgh123\nexport DB_PASSWORD=s3cr3tvalue\nPORT=8080\n"),
-            "API_KEY=[REDACTED]\nexport DB_PASSWORD=[REDACTED]\nPORT=8080\n"
+            redacted("API_KEY=abcdefgh123\nexport DB_PASSWORD=s3cr3tvalue\nPORT=8000\n"),
+            "API_KEY=[REDACTED]\nexport DB_PASSWORD=[REDACTED]\nPORT=8000\n"
         );
         // Tool line-number prefixes and CRLF endings.
         assert_eq!(

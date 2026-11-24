@@ -101,20 +101,20 @@ pub async fn app_with_git(pool: PgPool, public_url: &str, git: Arc<FakeGitFactor
 }
 
 pub async fn app(pool: PgPool) -> Router {
-    app_with_url(pool, "http://localhost:8080").await
+    app_with_url(pool, "http://localhost:8000").await
 }
 
 /// Router dengan antrian milik test (prefix unik), untuk test webhook.
 pub fn app_with_queue(pool: PgPool, queue: Queue) -> Router {
     let git = Arc::new(FakeGitFactory::default());
-    build_app(pool, "http://localhost:8080", git, queue)
+    build_app(pool, "http://localhost:8000", git, queue)
 }
 
 /// Router dengan `FakeGitFactory` yang bisa diatur dan diperiksa test.
 pub async fn app_and_git(pool: PgPool) -> (Router, Arc<FakeGitFactory>) {
     let git = Arc::new(FakeGitFactory::default());
     (
-        app_with_git(pool, "http://localhost:8080", git.clone()).await,
+        app_with_git(pool, "http://localhost:8000", git.clone()).await,
         git,
     )
 }

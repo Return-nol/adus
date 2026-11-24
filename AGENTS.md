@@ -52,8 +52,8 @@ cargo fmt --all
 pnpm -C web install
 pnpm -C web check                                           # must report 0 errors
 pnpm -C web build                                           # required before spa tests and release builds
-pnpm -C web dev                                             # http://localhost:5173, proxies /api and /webhooks to :8080
-ADUS_PUBLIC_URL=http://localhost:8080 cargo run -p adus     # http://localhost:8080
+pnpm -C web dev                                             # http://localhost:5173, proxies /api and /webhooks to :8000
+ADUS_PUBLIC_URL=http://localhost:8000 cargo run -p adus     # http://localhost:8000
 ```
 
 CI (`.github/workflows/ci.yml`): `rust` (`fmt`, `clippy`, `cargo test` with Postgres/Redis) and `web` (`check`, `fmt:check`). Release (`.github/workflows/release.yml`): pushes multi-arch image on `v*` tags. On Windows, if `cargo` is missing from `PATH`, check `%USERPROFILE%\.cargo\bin` (MSVC toolchain).
