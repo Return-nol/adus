@@ -327,7 +327,10 @@ pub(crate) fn expand_diff_block(file: &FileDiff, head_text: &str) -> String {
     if parsed.hunks.is_empty() {
         return diff_block(file);
     }
-    let head_lines: Vec<&str> = head_text.lines().collect();
+    // Redact the full head text once so multi-line secrets (e.g. PEM bodies) are masked while
+    // preserving line numbers, leaving raw diff hunk lines from `file.patch` unredacted.
+    let redacted_head = redact_secrets(head_text);
+    let head_lines: Vec<&str> = redacted_head.lines().collect();
     let Ok(total_u32) = u32::try_from(head_lines.len()) else {
         return diff_block(file);
     };
@@ -407,8 +410,7 @@ fn push_expanded_range(
         let Some(code) = head_lines.get((n - 1) as usize) else {
             continue;
         };
-        let redacted = redact_secrets(code);
-        out.push(format!("{n:>5} : {redacted}"));
+        out.push(format!("{n:>5} : {code}"));
         *expanded_count += 1;
     }
 }
@@ -1085,6 +1087,9 @@ mod tests {
         let gh_secret = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         // 1. 60-line modified file with two nearby hunks (at lines 20..=21 and 28..=29) + secret outside vs inside hunk.
         let mut lines: Vec<String> = (1..=60).map(|i| format!("line_{i}")).collect();
+        lines[5] = "-----BEGIN PRIVATE KEY-----".into(); // line 6: multiline PEM outside hunk
+        lines[6] = "MIIEvQIBADANBgkqhkiG9w0B".into(); // line 7: base64 PEM body
+        lines[7] = "-----END PRIVATE KEY-----".into(); // line 8
         lines[14] = format!("let outer = \"{gh_secret}\";"); // line 15: 5 lines before hunk 1 (line 20)
         lines[19] = format!("let inner = \"{gh_secret}\";"); // line 20: '+' line inside hunk 1
         let head_text = lines.join("\n");
@@ -1119,7 +1124,10 @@ mod tests {
             assert_eq!(count, 1, "line {n} appeared {count} times in:\n{expanded}");
         }
 
-        // 2. Secret outside hunk (line 15) is masked on ':' line; secret on '+' line (line 20) stays raw.
+        // 2. Secrets outside hunk (line 15 token + lines 6..=8 multiline PEM) are masked on ':' lines;
+        // secret on '+' line (line 20) stays raw.
+        assert!(expanded.contains("    7 : [REDACTED]\n"), "{expanded}");
+        assert!(!expanded.contains("MIIEvQIBADANBgkqhkiG9w0B"), "{expanded}");
         assert!(
             expanded.contains("   15 : let outer = \"[REDACTED]\";"),
             "{expanded}"
