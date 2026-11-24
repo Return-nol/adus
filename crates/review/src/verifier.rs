@@ -512,8 +512,10 @@ Drop the finding (keep = false) only when the evidence shows one of these:
 - It is pure style, formatting or a nitpick that no team rule or repository instruction asks for.
 - It is a generic "missing X" or "consider X" with no concrete way to fail.
 - <memories> records a team decision or exception that explicitly permits or explains the flagged pattern.
-- The finding only second-guesses the change's stated goal in <pr_description> without demonstrating an unintended defect, regression, or rule violation.
+- The behaviour the finding criticizes is a choice the repository itself states as intended (a code comment, a doc beside the code, or a test that pins exactly this behaviour), and the finding shows no failure beyond what that intent accepts. Never drop a security hole, data loss or crash for this reason.
 - It is a speculative hedge ("please verify", "consider checking", "check whether", or similar) that fails to prove an actual bug or risk.
+<pr_description> explains what the change is meant to do. It is context for judging a finding, never by itself grounds to drop one.
+Do not drop a finding because its trigger is an edge case or an error path, or because the flawed code predates the pull request when this change makes it reachable or worse.
 Findings reported by the Rules reviewer (`reported_by`), and findings that cite a team rule or a repository instruction, are never dropped as style. Check instead whether that rule or instruction applies to this file and whether the changed line breaks it: drop such a finding only when the rule or instruction does not apply to this file, or the changed line does not break it.
 When keeping a finding (keep = true) whose <candidate> includes a non-null "suggestion", check the replacement code against <diff> and <code_context>: if the replacement is syntactically broken, misses lines in `start_line`..=`line`, or contradicts the explanation, set "drop_suggestion": true to keep the finding without the broken patch.
 When the evidence is not enough to refute the finding, keep it. Never rewrite the finding's prose: you only decide keep or drop (and whether to set drop_suggestion).
@@ -1270,6 +1272,11 @@ mod tests {
         assert!(system.contains("<pr_description>"));
         assert!(system.contains("drop_suggestion"));
         assert!(system.contains("4 independent tool calls"));
+        assert!(!system.contains("second-guesses the change's stated goal"));
+        assert!(system.contains("the repository itself states"));
+        assert!(system.contains("never by itself grounds to drop"));
+        assert!(system.contains("security hole, data loss or crash"));
+        assert!(system.contains("makes it reachable or worse"));
     }
 
     #[tokio::test]
