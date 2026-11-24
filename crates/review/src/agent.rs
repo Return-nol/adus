@@ -237,9 +237,12 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             "agent step"
         );
         let ChatResponse {
-            text, tool_calls, ..
+            text,
+            tool_calls,
+            provider_meta,
+            ..
         } = response;
-        messages.push(assistant_message(&text, &tool_calls));
+        messages.push(assistant_message(&text, &tool_calls, provider_meta));
 
         if tool_calls.is_empty() {
             if let Ok(result) = submit.parse_prose(&text) {
@@ -486,8 +489,11 @@ fn user_message(text: String) -> Message {
     }
 }
 
-fn assistant_message(text: &str, calls: &[ToolCall]) -> Message {
-    let mut parts = Vec::with_capacity(calls.len() + 1);
+fn assistant_message(text: &str, calls: &[ToolCall], provider_meta: Option<String>) -> Message {
+    let mut parts = Vec::with_capacity(calls.len() + usize::from(provider_meta.is_some()) + 1);
+    if let Some(meta) = provider_meta {
+        parts.push(AssistantPart::ProviderMeta(meta));
+    }
     if !text.is_empty() {
         parts.push(AssistantPart::Text(text.to_owned()));
     }
@@ -564,7 +570,8 @@ fn message_char_len(message: &Message) -> usize {
             .map(|part| match part {
                 AssistantPart::Text(text) => text.chars().count(),
                 // `provider_meta` is replayed to the provider too (Anthropic thinking blocks,
-                // Gemini thought signatures), so it counts toward the context size.
+                // Gemini thought signatures, OpenAI-compatible reasoning), so it counts toward
+                // the context size.
                 AssistantPart::ToolCall(call) => {
                     call.name.chars().count()
                         + call.arguments.to_string().chars().count()
@@ -573,6 +580,7 @@ fn message_char_len(message: &Message) -> usize {
                             .as_ref()
                             .map_or(0, |meta| meta.chars().count())
                 }
+                AssistantPart::ProviderMeta(meta) => meta.chars().count(),
             })
             .sum::<usize>(),
         Message::Tool { results } => results
@@ -734,7 +742,7 @@ mod tests {
                 .iter()
                 .filter_map(|p| match p {
                     AssistantPart::ToolCall(c) => Some(c.id.as_str()),
-                    AssistantPart::Text(_) => None,
+                    AssistantPart::Text(_) | AssistantPart::ProviderMeta(_) => None,
                 })
                 .collect();
             if ids.is_empty() {
@@ -1393,5 +1401,32 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(fresh.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_meta_is_kept_and_resent() {
+        let tb = default_toolbox();
+        let mut first = tools_turn(vec![read("c1", "src/a.rs")]).unwrap();
+        first.provider_meta = Some(r#"{"reasoning_content":"t"}"#.into());
+        let chat = ScriptedChat::new(vec![Ok(first), tools_turn(vec![submit("c2", "done")])]);
+        let out = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(20))
+            .await
+            .unwrap();
+        assert_eq!(out.result, "done");
+        let reqs = chat.requests();
+        assert_eq!(
+            reqs[1].messages[1],
+            Message::Assistant {
+                parts: vec![
+                    AssistantPart::ProviderMeta(r#"{"reasoning_content":"t"}"#.into()),
+                    AssistantPart::ToolCall(read("c1", "src/a.rs")),
+                ],
+            }
+        );
+        assert_eq!(
+            message_char_len(&reqs[1].messages[1]),
+            message_char_len(&assistant_calls(&["c1"]))
+                + r#"{"reasoning_content":"t"}"#.chars().count()
+        );
     }
 }

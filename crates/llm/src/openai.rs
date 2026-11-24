@@ -54,8 +54,34 @@ struct WireMessage {
     content: Option<String>,
     reasoning: Option<String>,
     reasoning_content: Option<String>,
+    reasoning_details: Option<Value>,
     // Some compatible servers send `"tool_calls": null`, hence `Option`.
     tool_calls: Option<Vec<WireToolCall>>,
+}
+
+const REPLAY_REASONING_KEYS: [&str; 3] = ["reasoning_content", "reasoning_details", "reasoning"];
+
+fn capture_provider_meta(message: Option<&WireMessage>) -> Option<String> {
+    let m = message?;
+    let mut map = serde_json::Map::new();
+    if let Some(s) = m
+        .reasoning_content
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        map.insert("reasoning_content".into(), Value::String(s.to_owned()));
+    }
+    if let Some(v) = m
+        .reasoning_details
+        .as_ref()
+        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        map.insert("reasoning_details".into(), v.clone());
+    }
+    if let Some(s) = m.reasoning.as_deref().filter(|s| !s.trim().is_empty()) {
+        map.insert("reasoning".into(), Value::String(s.to_owned()));
+    }
+    (!map.is_empty()).then(|| Value::Object(map).to_string())
 }
 
 #[derive(Deserialize)]
@@ -151,12 +177,8 @@ impl OpenAiClient {
             .into_iter()
             .next()
             .map_or((None, None), |c| (Some(c.message), c.finish_reason));
-        let has_reasoning = message.as_ref().is_some_and(|m| {
-            [m.reasoning.as_deref(), m.reasoning_content.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|s| !s.trim().is_empty())
-        });
+        let provider_meta = capture_provider_meta(message.as_ref());
+        let has_reasoning = provider_meta.is_some();
         let (text, wire_calls) = message.map_or((None, None), |m| (m.content, m.tool_calls));
         // A missing id is made up; `prior` keeps it unique across the conversation (as Gemini).
         let prior = req.prior_tool_calls();
@@ -200,6 +222,7 @@ impl OpenAiClient {
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0),
             cache_write_tokens: 0,
+            provider_meta,
         })
     }
 }
@@ -251,6 +274,7 @@ fn wire_messages(req: &ChatRequest) -> Vec<Value> {
 fn assistant_message(parts: &[AssistantPart]) -> Value {
     let mut text = String::new();
     let mut calls = Vec::new();
+    let mut message = json!({"role": "assistant", "content": Value::Null});
     for part in parts {
         match part {
             AssistantPart::Text(t) => text.push_str(t),
@@ -259,14 +283,20 @@ fn assistant_message(parts: &[AssistantPart]) -> Value {
                 "type": "function",
                 "function": {"name": c.name, "arguments": c.arguments.to_string()},
             })),
+            AssistantPart::ProviderMeta(meta) => {
+                if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(meta) {
+                    for key in REPLAY_REASONING_KEYS {
+                        if let Some(val) = map.get(key) {
+                            message[key] = val.clone();
+                        }
+                    }
+                }
+            }
         }
     }
-    let content = if text.is_empty() {
-        Value::Null
-    } else {
-        text.into()
-    };
-    let mut message = json!({"role": "assistant", "content": content});
+    if !text.is_empty() {
+        message["content"] = text.into();
+    }
     if !calls.is_empty() {
         message["tool_calls"] = calls.into();
     }

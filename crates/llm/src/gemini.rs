@@ -208,6 +208,7 @@ impl GeminiClient {
             output_tokens: field(|u| u.candidates_token_count),
             cache_read_tokens: field(|u| u.cached_content_token_count),
             cache_write_tokens: 0,
+            provider_meta: None,
         })
     }
 }
@@ -291,18 +292,19 @@ fn wire_contents(messages: &[Message]) -> Vec<Value> {
 fn model_parts(parts: &[AssistantPart]) -> Vec<Value> {
     parts
         .iter()
-        // The API rejects empty text parts.
-        .filter(|p| !matches!(p, AssistantPart::Text(t) if t.is_empty()))
-        .map(|p| match p {
-            AssistantPart::Text(t) => json!({"text": t}),
+        // The API rejects empty text parts and ignores opaque per-turn provider metadata.
+        .filter_map(|p| match p {
+            AssistantPart::Text(t) if t.is_empty() => None,
+            AssistantPart::Text(t) => Some(json!({"text": t})),
             AssistantPart::ToolCall(c) => {
                 let mut part = json!({"functionCall": {"name": c.name, "args": c.arguments}});
                 // Thinking models reject a replayed call that lost its signature.
                 if let Some(signature) = &c.provider_meta {
                     part["thoughtSignature"] = signature.as_str().into();
                 }
-                part
+                Some(part)
             }
+            AssistantPart::ProviderMeta(_) => None,
         })
         .collect()
 }

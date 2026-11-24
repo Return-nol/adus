@@ -213,6 +213,7 @@ impl AnthropicClient {
             output_tokens: field(|u| u.output_tokens),
             cache_read_tokens: cache_read,
             cache_write_tokens: cache_write,
+            provider_meta: None,
         })
     }
 }
@@ -317,6 +318,7 @@ fn assistant_blocks(parts: &[AssistantPart]) -> Vec<Value> {
                 "name": c.name,
                 "input": c.arguments,
             })),
+            AssistantPart::ProviderMeta(_) => {}
         }
     }
     out

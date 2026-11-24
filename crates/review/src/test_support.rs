@@ -182,6 +182,7 @@ pub(crate) fn text_turn(text: &str) -> Result<ChatResponse, ChatError> {
         output_tokens: 10,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        provider_meta: None,
     })
 }
 
@@ -194,6 +195,7 @@ pub(crate) fn tools_turn(calls: Vec<ToolCall>) -> Result<ChatResponse, ChatError
         output_tokens: 10,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        provider_meta: None,
     })
 }
 

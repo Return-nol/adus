@@ -133,6 +133,8 @@ pub enum UserPart {
 pub enum AssistantPart {
     Text(String),
     ToolCall(ToolCall),
+    /// Opaque per-turn provider metadata (JSON object), replayed verbatim by the client that produced it.
+    ProviderMeta(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +182,8 @@ pub struct ChatResponse {
     pub output_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_write_tokens: u32,
+    /// Opaque per-turn provider metadata captured from the response, if any.
+    pub provider_meta: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
