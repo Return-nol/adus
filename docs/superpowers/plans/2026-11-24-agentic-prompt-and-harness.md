@@ -332,3 +332,244 @@ Expected: All pass with 0 warnings and 0 failures.
 git add docs/SPEC.md docs/superpowers/specs/2026-11-24-agentic-prompt-and-harness-design.md docs/superpowers/plans/2026-11-24-agentic-prompt-and-harness.md
 git commit -m "docs: sync SPEC.md for agentic prompt redesign and review harness improvements"
 ```
+
+---
+
+## Amendment §12: Finder Reports, Verifier Filters
+
+**Goal:** Turn the Finder from a second filter into a reporter (promote code-backed suspicions, dismiss only with a reason, log every dismissal) and narrow the Verifier's "intended behaviour" drop to intent the repository itself states.
+
+**Architecture:** Prompt text changes in `prompt.rs`, `specialists.rs` and `verifier.rs`, plus an optional `dismissed` list on `submit_findings` that `parse.rs` parses (capped, cut, redacted) and `SubmitFindings::parse_arguments` logs at debug level on the accepted call only. `SubmitSpec::Output` stays `Vec<Suggestion>`; no change to `agent.rs`, `engine.rs`, the DB, the API or `web/`.
+
+**Spec:** [docs/superpowers/specs/2026-11-24-agentic-prompt-and-harness-design.md](../specs/2026-11-24-agentic-prompt-and-harness-design.md) §12
+
+### Amendment Constraints
+
+- The **Clean-room and no-assumption rule** in Global Constraints applies unchanged to Tasks 7–10; every implementer and reviewer prompt carries it verbatim. Kodus files consulted for §12 are listed in spec §12.7.
+- Exact values: `MAX_DISMISSED = 30`, `DISMISSED_TEXT_CHARS = 300` (cut by `char`), log messages `"finder dismissed"` (one per entry) and `"finder dismissals"` (count field `dismissed`), Finder phase-3 heading `Promote or dismiss`.
+- The field is named in prompts only as `"dismissed"` (double quotes, matching `FINDER_FIELDS` style) and only in tool-enabled prompts. `GENERALIST_ROLE` and every diff-only prompt never contain `"dismissed"`.
+- Prefix-cache invariant (§4.1), specialist opening sentences, the `"call submit_findings."` / `"respond with the JSON array."` endings, and the Verifier invariants listed in Global Constraints stay intact.
+- **Precondition:** the live-trace work and the TEMP `rereview` command are in the user's stash (`wip: live agent TRACE debugging`) and are not part of these tasks; never pop, drop or stage them. `.cargo/config.toml` is the user's local edit and is never staged. Task 7's logs name the agent through fields on `SubmitFindings`, not through a tracing span.
+
+### Amendment Review Focus
+
+1. Model sends `dismissed` as an object, a string, or not at all → the submission is accepted with its findings unchanged and no dismissals (pinned in Task 7).
+2. A dismissal with a blank `why_safe` (`"   "`) or a negative `line` → the blank one is skipped; the negative line keeps the entry with `line: None` (pinned in Task 7).
+3. Multi-byte text (`"é"` × 400) in `suspicion` → cut to 300 chars without panicking (pinned in Task 7).
+4. A token (`ghp_…`) inside `why_safe` → returned as `[REDACTED]`, so it never reaches the logs (pinned in Task 7).
+5. Diff-only Finder prompts (all five roles) never mention `"dismissed"`, while tool prompts do (pinned in Task 8).
+
+---
+
+### Task 7: `dismissed` on `submit_findings` — schema, parser, logging
+
+**Files:**
+- Modify: `crates/review/src/parse.rs` (`submit_findings_tool_def` ~145-200; new items after `parse_submit_findings` ~209; test `submit_findings_tool_def_uses_portable_schema` ~486)
+- Modify: `crates/review/src/finder.rs` (`SubmitFindings::parse_arguments` ~276-287, imports ~27-30)
+- Modify: `crates/review/src/prompt.rs` (`build_finder_system_prompt` ~214-232, new const next to `FINDER_FIELDS`)
+
+**Interfaces:**
+- Produces (in `parse.rs`): `pub(crate) const MAX_DISMISSED: usize = 30;`, `pub(crate) const DISMISSED_TEXT_CHARS: usize = 300;`, `#[derive(Debug, Clone, PartialEq, Eq)] pub(crate) struct Dismissal { pub file: String, pub line: Option<u32>, pub suspicion: String, pub why_safe: String }`, `pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal>`.
+- Produces (in `prompt.rs`): `const FINDER_DISMISSED_TOOLS: &str`, appended to the tool-enabled `<Output>` only.
+
+- [ ] **Step 1: Write the failing tests** in `parse.rs`:
+
+```rust
+// Extend submit_findings_tool_def_uses_portable_schema:
+assert_eq!(params["required"], json!(["findings"])); // unchanged: dismissed is optional
+let dismissed = &params["properties"]["dismissed"];
+assert_eq!(dismissed["type"], json!("array"));
+assert_eq!(dismissed["items"]["required"], json!(["file", "suspicion", "why_safe"]));
+assert_eq!(dismissed["items"]["properties"]["line"]["type"], json!("integer"));
+
+#[test]
+fn parse_dismissed_skips_malformed_caps_cuts_and_redacts() {
+    let ok = |file: &str| json!({"file": file, "suspicion": "s", "why_safe": "w"});
+    let args = json!({"findings": [], "dismissed": [
+        {"file": "a.go", "line": 12, "suspicion": "nil deref", "why_safe": "guarded at a.go:10"},
+        ok("b.go"),
+        {"file": "c.go", "line": -3, "suspicion": "s", "why_safe": "w"},
+        {"file": "d.go", "suspicion": "s", "why_safe": "   "},
+        {"file": "e.go", "suspicion": "s"},
+        "not an object",
+        {"file": "f.go", "suspicion": "é".repeat(400), "why_safe": "token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa leaked"},
+    ]});
+    let got = parse_dismissed(&args);
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[0], Dismissal { file: "a.go".into(), line: Some(12), suspicion: "nil deref".into(), why_safe: "guarded at a.go:10".into() });
+    assert_eq!(got[1].line, None);
+    assert_eq!((got[2].file.as_str(), got[2].line), ("c.go", None));
+    assert_eq!(got[3].suspicion.chars().count(), DISMISSED_TEXT_CHARS);
+    assert!(got[3].why_safe.contains("[REDACTED]") && !got[3].why_safe.contains("ghp_"));
+
+    for absent in [
+        json!({"findings": []}),
+        json!({"findings": [], "dismissed": {"file": "x"}}),
+        json!({"findings": [], "dismissed": "x"}),
+    ] {
+        assert!(parse_dismissed(&absent).is_empty());
+    }
+    let many: Vec<Value> = (0..40).map(|i| ok(&format!("f{i}.go"))).collect();
+    assert_eq!(parse_dismissed(&json!({"dismissed": many})).len(), MAX_DISMISSED);
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p adus-review -j 2 --lib -- parse_dismissed submit_findings_tool_def`
+Expected: compile error (`parse_dismissed`, `Dismissal`, `MAX_DISMISSED` not defined).
+
+- [ ] **Step 3: Implement in `parse.rs`**
+
+- `submit_findings_tool_def`: add the optional `dismissed` array (items: `file` string, `line` integer, `suspicion` string, `why_safe` string; `required: ["file", "suspicion", "why_safe"]`; portable subset only) and extend the tool description to ask for every ruled-out suspicion with the reason it cannot fail.
+- `parse_dismissed`: read `args["dismissed"]` as an array (anything else → empty); for each object take trimmed `file`, `suspicion`, `why_safe` (skip the item when any is missing, non-string or blank); `line` via `as_u64` → `u32::try_from` (else `None`); cut `suspicion`/`why_safe` to `DISMISSED_TEXT_CHARS` chars, then `crate::redact::redact_secrets(..).into_owned()`; stop after `MAX_DISMISSED` kept entries.
+
+- [ ] **Step 4: Log on the accepted call in `finder.rs`**
+
+Add `specialist: &'static str` and `batch: usize` to `SubmitFindings` (set from `kind.label()` and `index` where `run_all` builds it per agent; the test construction in `finder_bounces_off_line_anchor_once_then_accepts_partial_on_second_or_last_step` uses `"Generalist"` and `0`). In `SubmitFindings::parse_arguments`, after the anchor check has passed (just before `Ok(suggestions)`), call `parse_dismissed(arguments)` and emit `tracing::debug!(specialist = self.specialist, batch = self.batch, file = %d.file, line = ?d.line, suspicion = %d.suspicion, why_safe = %d.why_safe, "finder dismissed")` per entry, then `tracing::debug!(specialist = self.specialist, batch = self.batch, dismissed = list.len(), "finder dismissals")`. The early `?` return on a bounced call must leave this code unreached.
+
+- [ ] **Step 5: Describe the field in the tool prompt (`prompt.rs`)**
+
+Add `FINDER_DISMISSED_TOOLS` (one short paragraph: optional top-level `"dismissed"` list of `{"file", "line" (optional), "suspicion", "why_safe"}` for every suspicion ruled out, with the reason it cannot fail; never posted) and use `format!("{FINDER_OUTPUT_TOOLS}\n{FINDER_FIELDS}\n{FINDER_DISMISSED_TOOLS}")` in the `with_tools` branch of `build_finder_system_prompt`. The diff-only branch is unchanged.
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `cargo test -p adus-review -j 2 --lib -- parse:: finder:: prompt::`
+Expected: PASS, including the existing `finder_bounces_off_line_anchor_once_then_accepts_partial_on_second_or_last_step` and `specialists_share_byte_identical_system_prefix`.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/review/src/parse.rs crates/review/src/finder.rs crates/review/src/prompt.rs
+git commit -m "feat(review): log Finder dismissals from an optional submit_findings field"
+```
+
+---
+
+### Task 8: Finder stance and specialist roles
+
+**Files:**
+- Modify: `crates/review/src/prompt.rs` (`FINDER_MINDSET`, `FINDER_WORKFLOW_TOOLS`, `FINDER_WORKFLOW_DIFF_ONLY`, `FINDER_SCOPE`, `FINDER_SEVERITY` ~150-200; test `specialists_share_byte_identical_system_prefix` ~822-871)
+- Modify: `crates/review/src/specialists.rs` (`GENERALIST_ROLE`, `BUG_ROLE`, `BUG_ROLE_DIFF_ONLY` ~18-58; test `active_specialists_omits_rules_when_none_match` ~160-180)
+
+**Interfaces:**
+- Consumes: `FINDER_DISMISSED_TOOLS` and the `"dismissed"` field name from Task 7.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// prompt.rs, end of specialists_share_byte_identical_system_prefix:
+for phrase in ["Promote or dismiss", "\"dismissed\"", "newly reachable", "not a test"] {
+    assert!(tools.contains(phrase), "{phrase}");
+}
+for gone in ["leave it out", "Second-guessing an intentional change", "Many pull requests have no defects"] {
+    assert!(!tools.contains(gone), "{gone}");
+}
+for kind in ALL_KINDS {
+    let plain = build_finder_system_prompt(kind, false);
+    assert!(plain.contains("Promote or dismiss"), "{kind:?}");
+    assert!(!plain.contains("\"dismissed\""), "{kind:?}");
+}
+
+// specialists.rs, in active_specialists_omits_rules_when_none_match:
+assert!(SpecialistKind::Generalist.role_block().contains("dismissed with a stated reason"));
+assert!(!SpecialistKind::Generalist.role_block().contains("submit []"));
+for with_tools in [true, false] {
+    assert!(SpecialistKind::Bug.role_block_for(with_tools).contains("promoting or dismissing"));
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p adus-review -j 2 --lib -- specialists_share active_specialists_omits`
+Expected: FAIL on `Promote or dismiss`.
+
+- [ ] **Step 3: Rewrite the Finder constants per spec §12.3**
+
+`FINDER_MINDSET` (a real team PR, "not a test" wording, surface every defect the change introduces or makes reachable, empty only when every suspicion was dismissed with a reason); phase 3 of both workflows headed `Promote or dismiss` (the tool version names `"dismissed"`, the diff-only version names neither the field nor any tool); `FINDER_SCOPE` items as listed in §12.3 (the `<pr_description>` goal-not-correctness rule, "newly reachable" older defects, failure-not-question wording, report-and-let-the-Verifier-filter instead of "leave it out"); `FINDER_SEVERITY` `info` line without "verified". Keep phase 4's "do not keep searching just because steps remain".
+
+- [ ] **Step 4: Update the roles per spec §12.4**
+
+`GENERALIST_ROLE` step 4: "Submit once every hunk is checked: each suspicion is either a finding or dismissed with a stated reason." `BUG_ROLE` and `BUG_ROLE_DIFF_ONLY` step 2 end with "…before promoting or dismissing it" (the diff-only one still names no tool). Opening sentences unchanged.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cargo test -p adus-review -j 2`
+Expected: PASS, including the role matchers in `crates/review/tests/engine.rs`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/review/src/prompt.rs crates/review/src/specialists.rs
+git commit -m "feat(review): Finder promotes code-backed suspicions and dismisses only with a reason"
+```
+
+---
+
+### Task 9: Verifier drops for repository-stated intent only
+
+**Files:**
+- Modify: `crates/review/src/verifier.rs` (`VERIFIER_DROP_RULES` ~507-520; test `user_prompt_puts_shared_sections_first_and_the_candidate_last` ~1234-1275)
+
+- [ ] **Step 1: Write the failing test** (extend `user_prompt_puts_shared_sections_first_and_the_candidate_last`, after `let system = build_system_prompt(true);`):
+
+```rust
+assert!(!system.contains("second-guesses the change's stated goal"));
+assert!(system.contains("the repository itself states"));
+assert!(system.contains("never by itself grounds to drop"));
+assert!(system.contains("security hole, data loss or crash"));
+assert!(system.contains("makes it reachable or worse"));
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test -p adus-review -j 2 --lib -- user_prompt_puts_shared_sections_first`
+Expected: FAIL on the first assertion.
+
+- [ ] **Step 3: Edit `VERIFIER_DROP_RULES` per spec §12.6**
+
+Remove the `<pr_description>` second-guess rule; add the repository-stated-intent rule (a code comment, a doc beside the code, or a test that pins it; "the repository itself states"; never for a "security hole, data loss or crash"); add "`<pr_description>` … is context, never by itself grounds to drop"; add the keep guidance for edge-case triggers and older code this change "makes it reachable or worse". Keep the `<memories>`, hedge, Rules-reviewer, `drop_suggestion` and keep-by-default lines, including the exact `Findings reported by the Rules reviewer (`reported_by`)` opening.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p adus-review -j 2 --lib -- verifier::`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/review/src/verifier.rs
+git commit -m "feat(review): Verifier drops for repository-stated intent only, not the PR description"
+```
+
+---
+
+### Task 10: Sync `docs/SPEC.md` and mark spec §12 implemented
+
+**Files:**
+- Modify: `docs/SPEC.md` (§8.4 stages 1 and 3, §10 entry)
+- Modify: `docs/superpowers/specs/2026-11-24-agentic-prompt-and-harness-design.md` (status line)
+
+- [ ] **Step 1: Readjust `docs/SPEC.md` per spec §12.8**
+
+§8.4 stage 1: replace "anti-CTF clean-PR stopping rule with `[]` early exit, … and do-not-report list" with the report-and-dismiss stance and the `dismissed` list (`MAX_DISMISSED = 30`, `DISMISSED_TEXT_CHARS = 300`, redacted, debug-logged on the accepted call, never posted or persisted). §8.4 stage 3: replace "`<pr_description>`-stated PR intent" with the repository-stated-intent rule (never for security, data loss or crash) and "`<pr_description>` alone is never grounds to drop". §10: replace "**§12 amendment pending** … until it lands" with "§12 amendment: Finder reports / Verifier filters, `dismissed` log".
+
+- [ ] **Step 2: Mark the spec implemented**
+
+Status line: `Status: implemented (consolidated into [docs/SPEC.md](../../SPEC.md) §8.3–§8.4, including the §12 amendment)`.
+
+- [ ] **Step 3: Run full workspace checks**
+
+Run: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace -j 2`
+Expected: all pass, 0 warnings.
+
+- [ ] **Step 4: Live check (manual, by the user)**
+
+Re-run the review of `manot40/better-booru#13` with `RUST_LOG=info,adus_review=debug,adus_review::trace=trace`. Expected (spec §12.1): each of the four defects appears as a candidate or as a `"finder dismissed"` line with a reason, and the Verifier keeps at least three.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add docs/SPEC.md docs/superpowers/specs/2026-11-24-agentic-prompt-and-harness-design.md docs/superpowers/plans/2026-11-24-agentic-prompt-and-harness.md
+git commit -m "docs: sync SPEC.md for the Finder-reports / Verifier-filters amendment"
+```

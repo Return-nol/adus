@@ -1,6 +1,6 @@
 # Agentic Prompt Redesign & Review Harness Improvements — Design Specification
 
-Date: 2026-11-24 · Status: implemented (consolidated into [docs/SPEC.md](../../SPEC.md) §8.3–§8.4)
+Date: 2026-11-24 · Status: §1–§11 implemented (consolidated into [docs/SPEC.md](../../SPEC.md) §8.3–§8.4); §12 amendment approved, pending implementation
 
 > **Binding scope & policy:** Extends [docs/SPEC.md](../../SPEC.md) §8.3–§8.4 and the agentic review engine spec ([2026-11-21-agentic-review-engine-design.md](2026-11-21-agentic-review-engine-design.md)). The clean-room and no-assumption rule in `AGENTS.md` applies: Kodus community code may be read as a behaviour reference only (cite it), Kodus enterprise code (`libs/ee/**`, `*.ee.*`) is never opened. All prompts, schemas, and code are written fresh for Adus.
 
@@ -226,3 +226,104 @@ When implemented, update [docs/SPEC.md](../../SPEC.md):
 - §8.3: note `load_expanded_diffs` secret redaction on `:` expanded lines while raw diffs remain unredacted.
 - §8.4: document `Rules` specialist activation on `repo_instructions`, Finder anchor bounce (`validate_batch_anchors`) + `filtered_dropped` stage metric, `DEFAULT_COMPACTION_CHAR_LIMIT = 320_000` / 400-char excerpt compaction, Verifier `<pr_title>`/`<pr_description>`/`<pr_manifest>` prefix + `<memories>`/PR-intent/hedge drop rules + `drop_suggestion`, and pre-seeded ±15-line hunk context.
 - §10: add an entry for `2026-11-24-agentic-prompt-and-harness-design.md` and mark its status `implemented`.
+
+When §12 is implemented, readjust [docs/SPEC.md](../../SPEC.md) again (see §12.8).
+
+---
+
+## 12. Amendment: Finder Reports, Verifier Filters (2026-11-24)
+
+### 12.1 Why
+
+A re-run on `better-booru#13` (the same change as `#12`) with §1–§11 implemented posted **no findings**. The trace shows the Finder saw most of the defects a Kodus review raises and argued itself out of each:
+
+| Defect | Finder's dismissal in the trace |
+|---|---|
+| `posts.go:165` — dropping `pi.orphaned = false` lets `PreviewDimExpr` read dimensions from orphaned rows | "Not a solid failure"; also skipped via the §4.2 "intentional change explained in `<pr_description>`" item |
+| `cache.go:124` — a transient `s3Storage.Exists` error is treated as a cache miss | "Fine." |
+| `cache.go:116-168` — `Loc == "CDN"` with S3 nil/disabled falls through to the local fallback with hard-coded `"webp"` | "pre-existing" |
+| `cache.go:126/144/155` — DB update errors swallowed with `_, _ =` | never considered |
+
+It still framed the review as a test ("Where's the planted bug?", "graders"), and settled on one weak finding because §4.2 told it to leave out anything not proven and to treat `[]` as the good outcome. The Verifier then dropped that finding (reasonably, from the PR description's root cause).
+
+§4.2 and §7.3 made **both** stages filter. Kodus community prompts split the work instead: the Finder promotes any code-backed suspicion and dismisses only what it can explain cannot fail; the Verifier filters, keeps by default, and drops for "intended" behaviour only when the repository itself states the intent (§12.7). This amendment adopts that split, written fresh for Adus, and makes the Finder's dismissals observable.
+
+**Success:** on a re-run of `better-booru#13`, each of the four defects above appears either as a Finder candidate or as a logged dismissal with a stated reason, and the Verifier keeps at least three of them.
+
+### 12.2 Approaches considered
+
+| Approach | Summary | Decision |
+|---|---|---|
+| 1 — Prompt-only split | Rewrite Finder stance/scope and Verifier drop rules. | Rejected: leaves Finder dismissals invisible without the full trace. |
+| 2 — Prompt split + `dismissed` log | Approach 1, plus an optional `dismissed` list on `submit_findings` that is logged, never posted. | **Selected** (user decision 2026-11-24). |
+| 3 — Two-pass Finder | A sweep pass lists suspicions per hunk, an investigation pass checks them. | Rejected: more time and cost; measure approach 2 first. |
+
+### 12.3 Finder stance (`prompt.rs`)
+
+Replaces the corresponding parts of §4.2. Prefix-cache invariants (§4.1), the `:` context rule, and the `+`-line anchoring rules stay.
+
+- **`FINDER_MINDSET`:** a senior engineer reviewing a real pull request from their own team, not a test or benchmark with planted bugs. The goal is to surface every defect the change introduces or makes reachable. Never invent findings; an empty result is right only when every changed hunk was checked and every suspicion was dismissed with a reason. Remove "many pull requests have no defects… `[]` is a normal, good outcome" and "a clean pass… is worth far more than speculative guesses".
+- **`FINDER_WORKFLOW_TOOLS`** phase 3 becomes **"Promote or dismiss"**: promote a suspicion to a finding when the changed code backs it, anchored to a `+` line; full proof is not required, because the Verifier checks every finding. Dismiss a suspicion only when you can state why it cannot fail (a guard, type, constraint or caller you read); "looks fine" is not a reason. List every dismissal in `dismissed` (§12.5). Phases 1, 2 and 4 stay; phase 4 keeps "do not keep searching just because steps remain" but drops the emphasis on `[]`.
+- **`FINDER_WORKFLOW_DIFF_ONLY`** phase 3 gets the same promote/dismiss rule, limited to what the diff shows, without naming `dismissed` or any tool (the diff-only answer stays a plain JSON array).
+- **`FINDER_SCOPE`:**
+  - Remove the do-not-report item "Second-guessing an intentional change explicitly explained in `<pr_description>`…". Add: `<pr_description>` states what the change is meant to do, not that it is correct; check that the change still holds wherever it reaches (callers, shared queries, invariants) and report side effects the description does not cover.
+  - Add: a problem in older code counts when this change makes it worse or newly reachable; anchor it to the `+` line that does so.
+  - Reword the hedge item: write each finding as a failure with its trigger, never as a question ("please verify…", "consider checking…").
+  - Keep the items for hypotheticals already prevented by types, constraints or guards (now: "that you read") and for unrequested style, naming, comments, logging and tests.
+  - Replace "If you are not sure concrete code evidence proves a problem, leave it out." with: "When a code-backed suspicion survives your checks but you cannot fully prove it, report it at the severity it deserves (`info` for low risk) and let the Verifier filter it."
+- **`FINDER_SEVERITY`:** `info` reads "low-risk defect worth fixing" (drop "verified").
+- **`FINDER_OUTPUT_TOOLS` / `FINDER_FIELDS`:** describe the optional `dismissed` list (§12.5) after the finding fields. Diff-only output text is unchanged.
+
+### 12.4 Specialist roles (`specialists.rs`)
+
+- `GENERALIST_ROLE` playbook step 4 becomes: "Submit once every hunk is checked: each suspicion is either a finding or dismissed with a stated reason." (replaces "Stop and submit [] as soon as all hunks pass…"). `GENERALIST_ROLE` is shared with diff-only runs, so it never names the `"dismissed"` field.
+- `BUG_ROLE` playbook step 2 ends with "…before promoting or dismissing it" instead of "…before keeping a finding". `BUG_ROLE_DIFF_ONLY` gets the same wording without tool names.
+- Opening sentences and the other roles stay unchanged (test role markers depend on them).
+
+### 12.5 `dismissed` on `submit_findings` (`parse.rs`, `finder.rs`)
+
+- **Schema** (`submit_findings_tool_def`): add an optional top-level `dismissed` array (not in `required`). Each item: `file` (string), optional `line` (integer), `suspicion` (string), `why_safe` (string); required `file`, `suspicion`, `why_safe`. Same portable schema subset as today (no `additionalProperties`, `$schema`, `oneOf`). The tool description says to list every suspicion you ruled out in `dismissed`, with the reason it cannot fail.
+- **Parsing:** `pub(crate) struct Dismissal { file: String, line: Option<u32>, suspicion: String, why_safe: String }` and `pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal>`. A missing or non-array `dismissed` yields an empty list; malformed items (not an object, missing or blank required string) are skipped, never an error. At most `MAX_DISMISSED = 30` entries are kept; `suspicion` and `why_safe` are cut to `DISMISSED_TEXT_CHARS = 300` chars (by `char`, never splitting UTF-8) and then passed through `redact_secrets`, so every returned text is safe to log. `parse_submit_findings` and its result are unchanged.
+- **Logging** (`SubmitFindings::parse_arguments`): only when the call is accepted (after the anchor bounce, if any, has passed), parse `dismissed` and emit one `tracing::debug!` per entry (`specialist`, `batch`, `file`, `line`, `suspicion`, `why_safe`) with message `"finder dismissed"`, plus one `tracing::debug!(specialist, batch, dismissed = n, "finder dismissals")`. A bounced (`Err`) call logs nothing. `SubmitFindings` (already built once per Finder agent) carries `specialist: &'static str` (`SpecialistKind::label`) and `batch: usize` for these fields.
+- **Not changed:** `SubmitSpec::Output` stays `Vec<Suggestion>`; dismissals are never posted, persisted, shown to the Verifier, or counted anywhere else. No change to `agent.rs`, `engine.rs`, `verifier.rs` plumbing, the DB, the API or `web/`.
+
+### 12.6 Verifier verdict rules (`verifier.rs`)
+
+Replaces the PR-intent rule of §7.3; PR context in the Verifier prompt (§7.2) and `drop_suggestion` stay.
+
+- Remove the drop rule "The finding only second-guesses the change's stated goal in `<pr_description>`…".
+- Add the drop rule: the behaviour the finding criticizes is a choice the repository itself states as intended (a code comment, a doc beside the code, or a test that pins exactly this behaviour) and the finding shows no failure beyond what that intent accepts. Never drop a security hole, data loss or crash for this reason.
+- Add after the drop list: `<pr_description>` explains what the change is meant to do; it is context for judging a finding, never by itself grounds to drop one.
+- Add to the keep guidance: do not drop a finding because its trigger is an edge case or error path, or because the flawed code predates the pull request when this change makes it reachable or worse.
+- The `<memories>` rule, the hedge rule ("please verify…" that names no failure), the Rules-reviewer clause and fail-closed behaviour stay.
+
+### 12.7 Kodus reference (community code, behaviour only)
+
+Read on 2026-11-24 at HEAD of `kodustech/kodus-ai`; nothing under `libs/ee/**` or `*.ee.*` was opened:
+
+- `libs/code-review/infrastructure/agents/prompts/prompt-builder.ts` — the Finder treats the change as unproven (an intentional change is not therefore correct), promotes code-backed suspicions without full proof and leaves filtering to the verifier, dismisses only with an explained reason ("looks correct" is not one), and counts pre-existing issues the PR makes worse or newly reachable; recorded decisions never suppress a concrete finding by calling it deliberate.
+- `libs/code-review/infrastructure/agents/prompts/verifier-prompt.ts` — keep by default, drop only on refutation; "intended behaviour" drops only when the repository states the intent (comment, doc, test), never for security, data loss or crash; edge-case triggers and cross-file causes are not grounds to drop.
+- `libs/code-review/infrastructure/agents/core/finder.agent.ts`, `verifier.agent.ts`, `prompts/review-prompt-blocks.ts`, `prompts/one-problem-rule.ts` — read for context; no behaviour taken beyond the above.
+
+Nothing is ported: the `dismissed` field, its caps and its logging are Adus decisions.
+
+### 12.8 `SPEC.md` readjustment
+
+When §12 is implemented, update [docs/SPEC.md](../../SPEC.md):
+- §8.4 stage 1: replace "anti-CTF clean-PR stopping rule with `[]` early exit … and do-not-report list" with the report-and-dismiss stance (promote code-backed suspicions, dismiss only with a reason, side effects beyond `<pr_description>` and newly reachable older defects in scope), and document the optional `dismissed` list on `submit_findings` (`MAX_DISMISSED = 30`, `DISMISSED_TEXT_CHARS = 300`, debug-logged with secrets redacted, never posted or persisted).
+- §8.4 stage 3: replace "`<pr_description>`-stated PR intent" with the repository-stated-intent drop rule (never for security, data loss or crash) and note that `<pr_description>` alone is never grounds to drop.
+- §10: amend the `2026-11-24-agentic-prompt-and-harness-design.md` entry to mention the §12 amendment; set this spec's status line to `implemented` for all sections.
+
+### 12.9 Testing
+
+- `prompt.rs` (`specialists_share_byte_identical_system_prefix`): tool prompt contains "Promote or dismiss" and `dismissed`, no longer contains "leave it out" or the `<pr_description>` do-not-report item; diff-only prompts still contain no tool names and no `dismissed`.
+- `specialists.rs`: Generalist role mentions `dismissed`; opening sentences unchanged.
+- `parse.rs`: extend `submit_findings_tool_def_uses_portable_schema` (`dismissed` present, not required, item `required` = `["file", "suspicion", "why_safe"]`); add one test for `parse_dismissed` covering a valid entry with and without `line`, skipped malformed items, the 30-entry cap, the 300-char cut on multi-byte text, and a secret in `why_safe` coming back `[REDACTED]`.
+- `verifier.rs`: system prompt no longer contains "second-guesses the change's stated goal" and does contain the repository-stated-intent rule.
+- Live check: the success criterion in §12.1 (manual, with `adus_review::trace=trace`).
+
+### 12.10 Assumptions
+
+- `MAX_DISMISSED = 30` and `DISMISSED_TEXT_CHARS = 300` are tuning values chosen for this change, not taken from Kodus.
+- Asking for dismissals costs a few hundred output tokens per Finder agent; no budget change is made for it.
+- Out of scope: the deadline wrap-up that fired after a single 105 s step on `#13` (a time-budget fix of its own), a second recall pass, and persisting or surfacing dismissals in the dashboard.
