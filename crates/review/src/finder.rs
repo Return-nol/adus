@@ -24,7 +24,7 @@ use crate::agent::run_react_loop;
 use crate::agent::{AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec};
 use crate::budget::TokenBudget;
 use crate::parse::{
-    CommentableRange, Suggestion, parse_submit_findings, parse_suggestions,
+    CommentableRange, Suggestion, parse_dismissed, parse_submit_findings, parse_suggestions,
     submit_findings_tool_def, validate_batch_anchors,
 };
 use crate::prompt::{DiffBatch, build_finder_system_prompt, build_finder_user_prompt};
@@ -186,6 +186,8 @@ async fn run_all(
                             def: submit_def.clone(),
                             allowed: allowed.clone(),
                             anchor_retried: AtomicBool::new(false),
+                            specialist: kind.label(),
+                            batch: index,
                         };
                         run_one(llm, index, kind, prompt.clone(), tools, submit, deadline)
                     })
@@ -265,6 +267,9 @@ struct SubmitFindings<'a> {
     def: ToolDef,
     allowed: HashMap<String, &'a CommentableRange>,
     anchor_retried: AtomicBool,
+    /// The agent's `SpecialistKind::label` and batch index, for the dismissal logs.
+    specialist: &'static str,
+    batch: usize,
 }
 
 impl SubmitSpec for SubmitFindings<'_> {
@@ -283,6 +288,25 @@ impl SubmitSpec for SubmitFindings<'_> {
         if can_retry && !self.anchor_retried.swap(true, Ordering::Relaxed) {
             validate_batch_anchors(&suggestions, &self.allowed)?;
         }
+        // Only the accepted call is logged: a bounced one returned above and is re-sent.
+        let dismissed = parse_dismissed(arguments);
+        for d in &dismissed {
+            tracing::debug!(
+                specialist = self.specialist,
+                batch = self.batch,
+                file = %d.file,
+                line = ?d.line,
+                suspicion = %d.suspicion,
+                why_safe = %d.why_safe,
+                "finder dismissed"
+            );
+        }
+        tracing::debug!(
+            specialist = self.specialist,
+            batch = self.batch,
+            dismissed = dismissed.len(),
+            "finder dismissals"
+        );
         Ok(suggestions)
     }
 
@@ -452,6 +476,8 @@ mod tests {
             def: submit_findings_tool_def(),
             allowed: batch_map,
             anchor_retried: AtomicBool::new(false),
+            specialist: "Generalist",
+            batch: 0,
         };
         let chat = ScriptedChat::new(vec![submit_turn(
             "s1",

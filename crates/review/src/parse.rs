@@ -146,8 +146,9 @@ pub(crate) fn submit_findings_tool_def() -> ToolDef {
     ToolDef {
         name: "submit_findings".into(),
         description: "Submit your final review findings and end the review. Call it exactly \
-            once, with every finding you confirmed, or with an empty list when nothing is worth \
-            reporting."
+            once, with every finding you promoted, or with an empty list when nothing is worth \
+            reporting. List in `dismissed` every suspicion you ruled out, with the reason it \
+            cannot fail."
             .into(),
         parameters: json!({
             "type": "object",
@@ -190,11 +191,91 @@ pub(crate) fn submit_findings_tool_def() -> ToolDef {
                         },
                         "required": ["file", "line", "severity", "title", "body"]
                     }
+                },
+                "dismissed": {
+                    "type": "array",
+                    "description": "Optional. Every suspicion you checked and ruled out. Never posted; kept only in Adus's logs.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "file": {
+                                "type": "string",
+                                "description": "Path of the changed file the suspicion was about."
+                            },
+                            "line": {
+                                "type": "integer",
+                                "description": "Optional new-file line number the suspicion was about."
+                            },
+                            "suspicion": {
+                                "type": "string",
+                                "description": "What could have gone wrong."
+                            },
+                            "why_safe": {
+                                "type": "string",
+                                "description": "Why it cannot fail: the guard, type, constraint or caller you read."
+                            }
+                        },
+                        "required": ["file", "suspicion", "why_safe"]
+                    }
                 }
             },
             "required": ["findings"]
         }),
     }
+}
+
+/// Most `dismissed` entries kept from one `submit_findings` call.
+pub(crate) const MAX_DISMISSED: usize = 30;
+/// Characters kept of a dismissal's `suspicion` and `why_safe`.
+pub(crate) const DISMISSED_TEXT_CHARS: usize = 300;
+
+/// A suspicion the Finder ruled out, from the optional `dismissed` list of `submit_findings`.
+/// Only logged: never posted, persisted or shown to another stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Dismissal {
+    pub file: String,
+    pub line: Option<u32>,
+    pub suspicion: String,
+    pub why_safe: String,
+}
+
+/// Reads the optional `dismissed` list. Never fails: a missing or non-array list yields nothing,
+/// and malformed entries are skipped. Texts are cut to [`DISMISSED_TEXT_CHARS`] and
+/// secret-redacted, so every returned value is safe to log.
+pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal> {
+    let Some(items) = args.get("dismissed").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    fn text<'a>(item: &'a Value, key: &str) -> Option<&'a str> {
+        item.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+    let clean = |s: &str| {
+        let cut: String = s.chars().take(DISMISSED_TEXT_CHARS).collect();
+        crate::redact::redact_secrets(&cut).into_owned()
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let (file, suspicion, why_safe) = (
+                text(item, "file")?,
+                text(item, "suspicion")?,
+                text(item, "why_safe")?,
+            );
+            Some(Dismissal {
+                file: file.to_owned(),
+                line: item
+                    .get("line")
+                    .and_then(Value::as_u64)
+                    .and_then(|line| u32::try_from(line).ok()),
+                suspicion: clean(suspicion),
+                why_safe: clean(why_safe),
+            })
+        })
+        .take(MAX_DISMISSED)
+        .collect()
 }
 
 /// Arguments of `submit_findings`. Elements stay untyped so one malformed finding is skipped
@@ -348,6 +429,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_dismissed_skips_malformed_caps_cuts_and_redacts() {
+        let ok = |file: &str| json!({"file": file, "suspicion": "s", "why_safe": "w"});
+        let args = json!({"findings": [], "dismissed": [
+            {"file": "a.go", "line": 12, "suspicion": "nil deref", "why_safe": "guarded at a.go:10"},
+            ok("b.go"),
+            {"file": "c.go", "line": -3, "suspicion": "s", "why_safe": "w"},
+            {"file": "d.go", "suspicion": "s", "why_safe": "   "},
+            {"file": "e.go", "suspicion": "s"},
+            "not an object",
+            {
+                "file": "f.go",
+                "suspicion": "é".repeat(400),
+                "why_safe": "token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa leaked"
+            },
+        ]});
+        let got = parse_dismissed(&args);
+        assert_eq!(got.len(), 4);
+        assert_eq!(
+            got[0],
+            Dismissal {
+                file: "a.go".into(),
+                line: Some(12),
+                suspicion: "nil deref".into(),
+                why_safe: "guarded at a.go:10".into(),
+            }
+        );
+        assert_eq!(got[1].line, None);
+        assert_eq!((got[2].file.as_str(), got[2].line), ("c.go", None));
+        assert_eq!(got[3].suspicion.chars().count(), DISMISSED_TEXT_CHARS);
+        assert!(got[3].why_safe.contains("[REDACTED]"));
+        assert!(!got[3].why_safe.contains("ghp_"));
+
+        for absent in [
+            json!({"findings": []}),
+            json!({"findings": [], "dismissed": {"file": "x"}}),
+            json!({"findings": [], "dismissed": "x"}),
+        ] {
+            assert!(parse_dismissed(&absent).is_empty());
+        }
+        let many: Vec<Value> = (0..40).map(|i| ok(&format!("f{i}.go"))).collect();
+        assert_eq!(
+            parse_dismissed(&json!({"dismissed": many})).len(),
+            MAX_DISMISSED
+        );
+    }
+
+    #[test]
     fn parses_suggestions_formats_and_errors() {
         let fenced = "```json\n[{\"file\":\"src/a.rs\",\"line\":3,\"severity\":\"critical\",\
                       \"title\":\"T\",\"body\":\"B\",\"suggestion\":\"let x = 1;\"}]\n```";
@@ -497,6 +625,17 @@ mod tests {
         assert_eq!(
             item["properties"]["severity"]["enum"],
             json!(["info", "warning", "critical"])
+        );
+        // `dismissed` is optional: `required` above stays `["findings"]`.
+        let dismissed = &params["properties"]["dismissed"];
+        assert_eq!(dismissed["type"], json!("array"));
+        assert_eq!(
+            dismissed["items"]["required"],
+            json!(["file", "suspicion", "why_safe"])
+        );
+        assert_eq!(
+            dismissed["items"]["properties"]["line"]["type"],
+            json!("integer")
         );
         let text = params.to_string();
         for banned in ["additionalProperties", "$schema", "oneOf"] {

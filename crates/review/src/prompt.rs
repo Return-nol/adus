@@ -200,6 +200,9 @@ const FINDER_FIELDS: &str = r#"- "file": the path exactly as shown in <diffs>.
 - "body": state the concrete failure trigger, the verified symbol and file path involved, and the fix (never vague advice or speculation).
 - "suggestion" (optional): the exact code that replaces the existing lines it covers, "line" alone or "start_line".."line" when "start_line" is set, keeping their indentation. Leave it out when you are not sure."#;
 
+/// Tool-enabled only: the optional `dismissed` list of `submit_findings`.
+const FINDER_DISMISSED_TOOLS: &str = r#"Also pass "dismissed": a list with one entry for every suspicion you checked and ruled out, each with "file", "line" (optional), "suspicion" (what could have gone wrong) and "why_safe" (why it cannot fail: the guard, type, constraint or caller you read). Dismissals are never posted; they only record your reasoning."#;
+
 /// Closes the diff-only output section: a model that has no repository tools may still be
 /// offered the submit tool.
 const FINDER_OUTPUT_DIFF_ONLY_TAIL: &str = r#"If a finding-submission tool is offered to you, you may call it with {"findings": [...]} instead."#;
@@ -215,7 +218,7 @@ pub(crate) fn build_finder_system_prompt(kind: SpecialistKind, with_tools: bool)
     let (workflow, output) = if with_tools {
         (
             FINDER_WORKFLOW_TOOLS,
-            format!("{FINDER_OUTPUT_TOOLS}\n{FINDER_FIELDS}"),
+            format!("{FINDER_OUTPUT_TOOLS}\n{FINDER_FIELDS}\n{FINDER_DISMISSED_TOOLS}"),
         )
     } else {
         (
