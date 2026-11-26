@@ -17,9 +17,7 @@ use std::time::{Duration, Instant};
 
 use adus_core::types::normalize_path;
 use adus_git::{FileDiff, FileStatus};
-#[cfg(test)]
-use adus_llm::ToolCall;
-use adus_llm::ToolDef;
+use adus_llm::{ToolCall, ToolDef};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
@@ -395,20 +393,24 @@ impl Toolbox {
 
     /// The `(path, start, end)` window a `read_file` call asks for, with `path` as
     /// [`RepoWorkspace`] resolves it. `None` for any other tool, unparsable arguments, a path
-    /// that is not an existing file in the workspace, or an inverted range.
-    // Gated until the Finder loop calls it.
-    #[cfg(test)]
-    pub(crate) fn read_file_range(&self, call: &ToolCall) -> Option<(String, u32, u32)> {
+    /// that is not an existing file in the workspace, or an inverted range. The path is
+    /// resolved off the async runtime (`spawn_blocking`).
+    pub(crate) async fn read_file_range(&self, call: &ToolCall) -> Option<(String, u32, u32)> {
         if call.name != "read_file" {
             return None;
         }
         let args: ReadFileArgs = ReadFileArgs::deserialize(&call.arguments).ok()?;
-        let path = self
-            .workspace
-            .resolve_existing_file(args.path.trim())
-            .ok()?;
         let (start, end) = read_window(args.start_line, args.end_line).ok()?;
-        Some((path.rel().to_owned(), start, end))
+        let ws = Arc::clone(&self.workspace);
+        let path = tokio::task::spawn_blocking(move || {
+            ws.resolve_existing_file(args.path.trim())
+                .ok()
+                .map(|path| path.rel().to_owned())
+        })
+        .await
+        .ok()
+        .flatten()?;
+        Some((path, start, end))
     }
 
     /// [`read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
@@ -429,8 +431,6 @@ impl Toolbox {
 
 /// The `(first, shown)` line range from the `[<path>: lines X-Y of Z]` header of a successful
 /// `read_file` result; `(0, 0)` for an empty file. `None` when the output has no such header.
-// Gated until the Finder loop calls it.
-#[cfg(test)]
 pub(crate) fn parse_read_header_range(output: &str) -> Option<(u32, u32)> {
     let header = output.lines().next()?.strip_suffix(']')?;
     let (head, _total) = header.rsplit_once(" of ")?;
@@ -1148,8 +1148,8 @@ mod tests {
         content.lines().filter(|l| *l == path).count()
     }
 
-    #[test]
-    fn read_file_range_resolves_dot_paths_and_header_ranges() {
+    #[tokio::test]
+    async fn read_file_range_resolves_dot_paths_and_header_ranges() {
         let tb = toolbox(&[("src/a.rs", b"fn a() {}\n")]);
         let call = |name: &str, path: &str| ToolCall {
             id: "c1".into(),
@@ -1158,11 +1158,14 @@ mod tests {
             provider_meta: None,
         };
         assert_eq!(
-            tb.read_file_range(&call("read_file", "./src/a.rs")),
+            tb.read_file_range(&call("read_file", "./src/a.rs")).await,
             Some(("src/a.rs".to_owned(), 3, 202))
         );
-        assert_eq!(tb.read_file_range(&call("grep", "src/a.rs")), None);
-        assert_eq!(tb.read_file_range(&call("read_file", "../src/a.rs")), None);
+        assert_eq!(tb.read_file_range(&call("grep", "src/a.rs")).await, None);
+        assert_eq!(
+            tb.read_file_range(&call("read_file", "../src/a.rs")).await,
+            None
+        );
         assert_eq!(
             parse_read_header_range("[src/a.rs: lines 10-45 of 100]\n10: x"),
             Some((10, 45))

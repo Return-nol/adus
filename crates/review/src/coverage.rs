@@ -3,7 +3,7 @@
 //! The ledger drives the coverage debt note and the one-shot completion gate: a file is only
 //! "read" once every right-side hunk of its diff lies inside lines the model actually saw.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use adus_core::types::normalize_path;
 use adus_git::diff::commentable_hunks;
@@ -16,8 +16,11 @@ const COVERAGE_DEBT_MAX_RANGES: usize = 3;
 /// Extensions of documentation files, which carry no read debt.
 const GATE_DOC_EXTENSIONS: [&str; 4] = ["md", "mdx", "rst", "txt"];
 
+/// Qualifying files with their unread hunk ranges, sorted by path.
+pub(crate) type PendingSignature = Vec<(String, Vec<(u32, u32)>)>;
+
 /// One changed file: its right-side hunks and the line windows read so far.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct Target {
     /// Inclusive right-side hunk ranges; never empty.
     hunks: Vec<(u32, u32)>,
@@ -70,10 +73,9 @@ impl Target {
 }
 
 /// Tracks, per changed file, which hunks have been read.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct CoverageLedger {
     targets: BTreeMap<String, Target>,
-    opened: HashSet<String>,
 }
 
 impl CoverageLedger {
@@ -100,27 +102,18 @@ impl CoverageLedger {
                 })
             })
             .collect();
-        Self {
-            targets,
-            opened: HashSet::new(),
-        }
+        Self { targets }
     }
 
     /// Records a successful `read_file` that showed lines `start..=end` (`0-0`: an empty file).
+    /// Files outside the batch are ignored.
     pub(crate) fn record_read(&mut self, rel_path: &str, start: u32, end: u32) {
         if end != 0 && end < start {
             return;
         }
-        let path = normalize_path(rel_path);
-        if let Some(target) = self.targets.get_mut(&path) {
+        if let Some(target) = self.targets.get_mut(&normalize_path(rel_path)) {
             target.add_read(start, end);
         }
-        self.opened.insert(path);
-    }
-
-    /// Every file with at least one successful read, tracked or not.
-    pub(crate) fn opened_files(&self) -> HashSet<String> {
-        self.opened.clone()
     }
 
     /// Sorted paths of qualifying files (not docs, not tests) with an unread hunk.
@@ -132,7 +125,7 @@ impl CoverageLedger {
 
     /// Qualifying files with all their pending ranges, sorted by path. A new debt note is due
     /// only when this differs from the signature of the last note sent.
-    pub(crate) fn pending_signature(&self) -> Vec<(String, Vec<(u32, u32)>)> {
+    pub(crate) fn pending_signature(&self) -> PendingSignature {
         self.pending_qualifying()
             .map(|(path, target)| (path.to_owned(), target.pending_ranges()))
             .collect()
@@ -326,7 +319,6 @@ mod tests {
         ledger.record_read("src/a.rs", 100, 120);
         ledger.record_read("src/other.rs", 1, 50);
         assert_eq!(ledger.pending_signature(), before);
-        assert!(ledger.opened_files().contains("src/other.rs"));
         ledger.record_read("src/a.rs", 1, 10);
         assert_ne!(ledger.pending_signature(), before);
     }

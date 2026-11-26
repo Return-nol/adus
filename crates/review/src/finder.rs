@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use adus_core::types::{ReviewMode, normalize_path};
 use adus_db::memories::Memory;
-use adus_git::PullRequest;
+use adus_git::{FileDiff, PullRequest};
 use adus_llm::ReasoningEffort;
 use adus_llm::ToolDef;
 use adus_llm::router::{ChatService, UsageContext};
@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::agent::run_react_loop;
 use crate::agent::{AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec};
 use crate::budget::TokenBudget;
+use crate::coverage::CoverageLedger;
 use crate::parse::{
     CommentableRange, Suggestion, parse_dismissed, parse_submit_findings, parse_suggestions,
     submit_findings_tool_def, validate_batch_anchors,
@@ -199,16 +200,13 @@ async fn run_all(
                             specialist: kind.label(),
                             batch: index,
                         };
-                        let max_steps = finder_max_steps(batch.files.len());
-                        run_one(
-                            llm,
+                        let job = FinderJob {
                             kind,
-                            prompt.clone(),
-                            tools,
-                            submit,
-                            max_steps,
-                            deadline,
-                        )
+                            prompt: prompt.clone(),
+                            files: &batch.files,
+                            max_steps: finder_max_steps(batch.files.len()),
+                        };
+                        run_one(llm, job, tools, submit, deadline)
                     })
                     .collect();
                 future::join_all(agents).await
@@ -223,16 +221,34 @@ async fn run_all(
     per_batch.into_iter().flatten().collect()
 }
 
-/// One specialist on one batch, cut at `deadline`.
-async fn run_one(
-    llm: FinderLlm<'_>,
+/// What one Finder agent works on.
+struct FinderJob<'a> {
     kind: SpecialistKind,
     prompt: String,
+    /// The batch's files: the hunks a gated run must read.
+    files: &'a [&'a FileDiff],
+    max_steps: usize,
+}
+
+/// One specialist on one batch, cut at `deadline`. Every Finder run gets the budget band
+/// notes; `Generalist` and `Bug` with the repository tools also get a coverage ledger (debt
+/// notes) and the completion gate. `Security` and `Performance` look through a narrow lens and
+/// may rightly skip a file, so they get neither.
+async fn run_one(
+    llm: FinderLlm<'_>,
+    job: FinderJob<'_>,
     tools: AgentTools<'_>,
     submit: SubmitFindings<'_>,
-    max_steps: usize,
     deadline: Instant,
 ) -> FinderTask {
+    let FinderJob {
+        kind,
+        prompt,
+        files,
+        max_steps,
+    } = job;
+    let gated = matches!(tools, AgentTools::Full(_))
+        && matches!(kind, SpecialistKind::Generalist | SpecialistKind::Bug);
     let system = build_finder_system_prompt(kind, matches!(tools, AgentTools::Full(_)));
     let agent = AgentLlm {
         chat: llm.chat,
@@ -247,6 +263,9 @@ async fn run_one(
         wrap_up_steps: FINDER_WRAP_UP_STEPS,
         deadline: Some(deadline),
         token_budget: llm.token_budget.cloned(),
+        coverage_ledger: gated.then(|| CoverageLedger::from_files(files)),
+        enforce_gate: gated,
+        budget_bands: true,
         ..AgentConfig::new(max_steps)
     };
     // Names the agent on every log line of its run (concurrent agents interleave).
@@ -259,6 +278,7 @@ async fn run_one(
                 steps_used = outcome.steps_used,
                 candidates = outcome.result.len(),
                 cut_short = outcome.cut_short,
+                gate_refused = outcome.gate_refused,
                 "finder agent finished"
             );
             Ok(outcome)
@@ -333,6 +353,18 @@ impl SubmitSpec for SubmitFindings<'_> {
 
     fn parse_prose(&self, text: &str) -> Result<Vec<Suggestion>, String> {
         parse_suggestions(text).map_err(|err| err.to_string())
+    }
+
+    fn has_findings(&self, output: &Vec<Suggestion>) -> bool {
+        !output.is_empty()
+    }
+
+    fn with_findings_of(
+        &self,
+        _accepted: Vec<Suggestion>,
+        earlier: Vec<Suggestion>,
+    ) -> Vec<Suggestion> {
+        earlier
     }
 }
 
@@ -424,9 +456,21 @@ mod tests {
         )])));
         let deadline = Instant::now() + Duration::from_secs(30);
 
+        // The changed lines are read in the first turn, so the completion gate stays open.
+        let first_turn = || {
+            tools_turn(vec![
+                call(
+                    "s1",
+                    "submit_findings",
+                    json!({ "findings": [finding_arg("src/a.rs", 1, "Off-line")] }),
+                ),
+                call("r1", "read_file", json!({ "path": "src/a.rs" })),
+            ])
+        };
+
         // 1. First submit on off-line anchor bounces with nearest '+' lines; second submit on valid line succeeds.
         let chat = ScriptedChat::new(vec![
-            submit_turn("s1", vec![finding_arg("src/a.rs", 1, "Off-line")]),
+            first_turn(),
             submit_turn("s2", vec![finding_arg("src/a.rs", 2, "Re-anchored")]),
         ]);
         let llm = FinderLlm {
@@ -464,7 +508,7 @@ mod tests {
 
         // 2. Second submit with mixed valid + invalid anchors succeeds without AgentError::Unparseable.
         let chat = ScriptedChat::new(vec![
-            submit_turn("s1", vec![finding_arg("src/a.rs", 1, "Off-line")]),
+            first_turn(),
             submit_turn(
                 "s2",
                 vec![
@@ -526,6 +570,90 @@ mod tests {
         .expect("final step must not fail Unparseable on invalid anchor");
         assert_eq!(outcome.steps_used, 1);
         assert_eq!(outcome.result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn finder_ledger_only_for_generalist_and_bug() {
+        let patch = "@@ -1,1 +1,3 @@
+ a
++b
++c
+";
+        let file = FileDiff {
+            path: "src/a.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            patch: Some(patch.into()),
+        };
+        let files = vec![&file];
+        let allowed =
+            HashMap::from([("src/a.rs".to_string(), CommentableRange::from_patch(patch))]);
+        let usage = UsageContext::default();
+        let toolbox = Toolbox::new(Arc::new(RepoWorkspace::from_files(&[(
+            "src/a.rs", b"a
+b
+c
+",
+        )])));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let is_debt = |m: &Message| {
+            crate::test_support::msg_text(m).is_some_and(|t| t.starts_with("Unread changed code."))
+        };
+
+        for (kind, gated) in [
+            (SpecialistKind::Generalist, true),
+            (SpecialistKind::Bug, true),
+            (SpecialistKind::Security, false),
+            (SpecialistKind::Performance, false),
+        ] {
+            let chat = ScriptedChat::new(vec![
+                tools_turn(vec![call("g1", "grep", json!({ "pattern": "b" }))]),
+                submit_turn("s1", vec![finding_arg("src/a.rs", 2, "Early")]),
+                submit_turn("s2", vec![finding_arg("src/a.rs", 3, "Again")]),
+            ]);
+            let llm = FinderLlm {
+                chat: &chat,
+                provider_id: Uuid::from_u128(1),
+                model: "m",
+                effort: ReasoningEffort::Medium,
+                usage: &usage,
+                token_budget: None,
+            };
+            let submit = SubmitFindings {
+                def: submit_findings_tool_def(),
+                allowed: batch_allowed(
+                    &DiffBatch {
+                        files: files.clone(),
+                        rules: Vec::new(),
+                    },
+                    &allowed,
+                ),
+                anchor_retried: AtomicBool::new(false),
+                specialist: kind.label(),
+                batch: 0,
+            };
+            let job = FinderJob {
+                kind,
+                prompt: "PROMPT".into(),
+                files: &files,
+                max_steps: finder_max_steps(files.len()),
+            };
+            let task = run_one(llm, job, AgentTools::Full(&toolbox), submit, deadline).await;
+            let outcome = task.result.expect("finder run succeeds");
+            let reqs = chat.requests();
+            assert_eq!(outcome.gate_refused, gated, "{kind:?}");
+            assert_eq!(outcome.steps_used, if gated { 3 } else { 2 }, "{kind:?}");
+            assert_eq!(
+                outcome.result[0].title,
+                if gated { "Again" } else { "Early" },
+                "{kind:?}"
+            );
+            assert_eq!(reqs[1].messages.iter().any(is_debt), gated, "{kind:?}");
+            assert!(
+                reqs.iter()
+                    .all(|r| r.messages.iter().filter(|m| is_debt(m)).count() <= 1)
+            );
+        }
     }
 
     #[test]

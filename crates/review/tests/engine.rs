@@ -1610,8 +1610,11 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
             "pub fn is_admin() -> bool {\n    false\n}\n",
         ),
     ]);
-    s.chat
-        .finder(Reply::tool("read_file", json!({"path": "src/helper.rs"})));
+    // Reading the changed file too keeps the completion gate open.
+    s.chat.finder(Reply::Tools(vec![
+        ("read_file".into(), json!({"path": "src/helper.rs"})),
+        ("read_file".into(), json!({"path": "src/login.rs"})),
+    ]));
     s.chat.finder(Reply::submit(json!([
         finding_json("src/login.rs", 2, "critical", "Real bug"),
         finding_json("src/login.rs", 3, "warning", "False alarm"),
@@ -1653,7 +1656,7 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
         "{}",
         finder[0].user
     );
-    assert_eq!(finder[1].tool_results.len(), 1);
+    assert_eq!(finder[1].tool_results.len(), 2);
     assert!(finder[1].tool_results[0].contains("pub fn is_admin() -> bool"));
 
     // Verifier: fast model at Low, with tools, one call per candidate.
@@ -2044,12 +2047,14 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
         ("a.rs", "a\nb\n"),
         ("AGENTS.md", "Always log with tracing, never println."),
     ]);
+    s.chat
+        .finder(Reply::tool("read_file", json!({"path": "a.rs"})));
     s.chat.finder(Reply::finding("a.rs", 2, "Bug"));
 
     run(&s, Trigger::Opened).await.unwrap();
 
     let finder = s.chat.finder_calls();
-    assert_eq!(finder.len(), 1);
+    assert_eq!(finder.len(), 2);
     assert!(finder[0].user.contains("<repository_instructions>"));
     assert!(
         finder[0]
@@ -2069,7 +2074,9 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
         .await
         .unwrap();
     let finder = &s.chat.finder_calls()[before..];
-    assert_eq!(finder.len(), 4);
+    // Bug, Security, Performance and Rules, plus Bug's second call: the completion gate
+    // refuses its first submission because `a.rs` is unread.
+    assert_eq!(finder.len(), 5);
     assert_eq!(
         finder
             .iter()
