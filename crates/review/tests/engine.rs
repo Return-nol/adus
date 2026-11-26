@@ -17,8 +17,8 @@ use common::{FakeGit, PAT, conn_status, pr};
 use serde_json::json;
 use sqlx::PgPool;
 use support::{
-    Reply, Setup, Stage, clone_spec, diff_header, file, finding_json, patch_repo, setup, setup_big,
-    setup_files, setup_one, update_settings,
+    Reply, Setup, Stage, captured_logs, clone_spec, diff_header, file, finding_json, patch_repo,
+    setup, setup_big, setup_files, setup_one, update_settings,
 };
 use uuid::Uuid;
 
@@ -26,7 +26,7 @@ mod support {
     use std::collections::HashMap;
     use std::ops::{Deref, DerefMut};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
     use adus_core::types::ProviderKind;
@@ -47,21 +47,35 @@ mod support {
     use crate::PATCH_2;
     use crate::common::{self, FakeGit, pr};
 
-    /// Which review stage sent a chat request, read from its system prompt.
+    /// Which review stage sent a chat request, read from its system prompt (and, for the
+    /// Finder's Pass 2, its first user message).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum Stage {
+        /// Finder Pass 1.
         Finder,
+        /// Finder Pass 2, the synthesis rescue.
+        Synthesis,
         Verifier,
         Dedup,
+        Severity,
+        Enrich,
     }
 
-    fn stage_of(system: &str) -> Stage {
+    fn stage_of(system: &str, user: &str) -> Stage {
         if system.contains("<ReviewInstructions>") {
-            Stage::Finder
+            if user.contains("<already_inspected_files>") {
+                Stage::Synthesis
+            } else {
+                Stage::Finder
+            }
         } else if system.contains("Adudu's verifier") {
             Stage::Verifier
         } else if system.contains("You merge duplicate findings") {
             Stage::Dedup
+        } else if system.contains("You rate how severe each finding") {
+            Stage::Severity
+        } else if system.contains("You write the headline of one verified finding") {
+            Stage::Enrich
         } else {
             panic!("unexpected chat system prompt: {system}");
         }
@@ -136,7 +150,8 @@ mod support {
     }
 
     /// Scripted fake LLM. Consumes the first matching scripted reply per stage; defaults to
-    /// Finder `[]`, Verifier `{"keep": true}`, Dedup invalid (keeps all).
+    /// Finder and Synthesis `[]`, Verifier `{"keep": true}`, Dedup, Severity and Enrich invalid
+    /// (keep all, `warning`, the body's first sentence as the title).
     #[derive(Default)]
     pub struct FakeChat {
         script: Mutex<Vec<Scripted>>,
@@ -222,6 +237,18 @@ mod support {
             self.calls_of(Stage::Dedup)
         }
 
+        pub fn synthesis_calls(&self) -> Vec<ChatCall> {
+            self.calls_of(Stage::Synthesis)
+        }
+
+        pub fn severity_calls(&self) -> Vec<ChatCall> {
+            self.calls_of(Stage::Severity)
+        }
+
+        pub fn enrich_calls(&self) -> Vec<ChatCall> {
+            self.calls_of(Stage::Enrich)
+        }
+
         /// Finder calls that contain `needle` answer after `delay`.
         pub fn delay(&self, needle: &str, delay: Duration) {
             self.delays
@@ -259,8 +286,8 @@ mod support {
                 None => {
                     let reply = match stage {
                         Stage::Verifier => Reply::text(r#"{"keep": true, "rationale": "fake"}"#),
-                        Stage::Dedup => Reply::text("no answer"),
-                        Stage::Finder => Reply::text("[]"),
+                        Stage::Dedup | Stage::Severity | Stage::Enrich => Reply::text("no answer"),
+                        Stage::Finder | Stage::Synthesis => Reply::text("[]"),
                     };
                     (reply, None)
                 }
@@ -276,7 +303,6 @@ mod support {
             req: ChatRequest,
             ctx: UsageContext,
         ) -> Result<ChatResponse, ChatError> {
-            let stage = stage_of(&req.system);
             let user = req
                 .messages
                 .iter()
@@ -285,6 +311,7 @@ mod support {
                     _ => None,
                 })
                 .unwrap_or_default();
+            let stage = stage_of(&req.system, &user);
             let tool_results = req
                 .messages
                 .iter()
@@ -298,7 +325,7 @@ mod support {
             let haystack = format!("{}\n{user}", req.system);
             let offered: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
             let sticky_delay = match stage {
-                Stage::Finder => self
+                Stage::Finder | Stage::Synthesis => self
                     .delays
                     .lock()
                     .unwrap()
@@ -554,6 +581,61 @@ mod support {
         format!("=== {path} (")
     }
 
+    /// Log output captured by [`captured_logs`].
+    #[derive(Clone, Default)]
+    pub struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        /// The first captured line that contains every one of `needles`.
+        pub fn line(&self, needles: &[&str]) -> Option<String> {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .find(|line| needles.iter().all(|needle| line.contains(needle)))
+                .map(str::to_string)
+        }
+    }
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    static LOGS: OnceLock<LogBuffer> = OnceLock::new();
+
+    /// Every `info` log of this test binary from now on, by one global subscriber installed on
+    /// first use. Tests run in parallel, so a caller picks its own lines (by review id). A
+    /// scoped subscriber is not enough: tracing caches a callsite's interest globally, so it
+    /// misses a log line another test reached first.
+    pub fn captured_logs() -> LogBuffer {
+        LOGS.get_or_init(|| {
+            let buffer = LogBuffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buffer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in this test binary");
+            buffer
+        })
+        .clone()
+    }
+
     /// One finding as a JSON object for `submit_findings`.
     pub fn finding_json(path: &str, line: u32, severity: &str, title: &str) -> serde_json::Value {
         json!({"file": path, "line": line, "severity": severity, "title": title, "body": "why"})
@@ -667,9 +749,14 @@ async fn full_review_posts_valid_comments_and_summary(pool: PgPool) {
     assert_eq!(verifier[0].effort, Some(ReasoningEffort::High));
     assert!(verifier[0].user.contains("\"title\": \"Bug\""));
     assert!(s.chat.dedup_calls().is_empty());
+    // The Finder named a severity, so only the title is left to the fast model.
+    assert!(s.chat.severity_calls().is_empty());
+    let enrich = s.chat.enrich_calls();
+    assert_eq!(enrich.len(), 1);
+    assert_eq!(enrich[0].model, "gpt-fast");
 
     let calls = s.chat.calls();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 3);
     for call in calls {
         assert_eq!(call.ctx.review_id, Some(id));
         assert_eq!(call.ctx.repository_id, Some(s.repository_id));
@@ -1250,9 +1337,9 @@ async fn repo_provider_override_wins(pool: PgPool) {
     run(&s, Trigger::Opened).await.unwrap();
 
     let calls = s.chat.calls();
-    assert_eq!(calls.len(), 2, "Finder and Verifier");
+    assert_eq!(calls.len(), 3, "Finder, Verifier and Enrich");
     assert!(calls.iter().all(|c| c.provider_id == other.id));
-    // The Finder and the Verifier both run on the primary model.
+    // Every stage runs on the primary model: this provider has no fast model.
     assert!(calls.iter().all(|c| c.model == "claude-test"));
 }
 
@@ -1635,7 +1722,9 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
 
     // Finder: primary model at High, repository tools, then the helper file's content; Pass 2
     // (the synthesis rescue, answering the default `[]`) follows with what Pass 1 opened.
-    let finder = s.chat.finder_calls();
+    let mut finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 2);
+    finder.extend(s.chat.synthesis_calls());
     assert_eq!(finder.len(), 3);
     for call in &finder {
         assert_eq!(call.model, "gpt-test");
@@ -1696,6 +1785,146 @@ src/login.rs
     assert!(!root.exists(), "the workspace is deleted after the review");
 }
 
+/// The whole Generalist pipeline on lean Finder output: Pass 1 (gated once), Pass 2, the
+/// Verifier with one Evidence Gate run, Semantic Dedup, Severity and Enrichment. The posted
+/// body is the Finder's (redacted); severity and title come from the post-verify funnel.
+#[sqlx::test(migrations = "../../migrations")]
+async fn generalist_pipeline_runs_post_verify_funnel_and_posts_finder_bodies(pool: PgPool) {
+    let s = setup_files(
+        &pool,
+        vec![file("src/a.rs", PATCH_234), file("src/b.rs", PATCH_234)],
+    )
+    .await;
+    s.enable_clone(&[
+        (
+            "src/a.rs", "a
+b
+c
+d
+",
+        ),
+        (
+            "src/b.rs", "a
+b
+c
+d
+",
+        ),
+    ]);
+    let token = format!("ghp_{}", "a1".repeat(18));
+    let secret_body = format!("Logs the token {token} in plain text. Anyone can reuse it.");
+    let lean = |file: &str, line: u32, body: &str| json!({"file": file, "line": line, "category": "bug", "body": body});
+    let pass1 = json!([
+        lean("src/a.rs", 2, &secret_body),
+        lean("src/b.rs", 3, "Off by one when the list is empty."),
+    ]);
+    // Pass 1 reads a.rs only: its first submission is refused once (b.rs is unread), the
+    // second is accepted. The b.rs finding therefore goes to the Evidence Gate.
+    s.chat
+        .finder(Reply::tool("read_file", json!({"path": "src/a.rs"})));
+    s.chat.finder(Reply::submit(pass1.clone()));
+    s.chat.finder(Reply::submit(pass1));
+    s.chat.push_stage(
+        Stage::Synthesis,
+        Reply::submit(json!([lean("src/a.rs", 4, "`d` is never freed!")])),
+    );
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1, 2]}"#));
+    s.chat.push_stage(
+        Stage::Severity,
+        Reply::text(
+            r#"{"severities": [{"index": 0, "severity": "critical"}, {"index": 1, "severity": "info"}]}"#,
+        ),
+    );
+    s.chat.push_for(
+        Stage::Enrich,
+        "Logs the token",
+        Reply::text(
+            r#"{"title": "Token written to the log", "suggestion": "log_redacted(b);", "body": "A rewritten, unchecked claim."}"#,
+        ),
+    );
+    let logs = captured_logs();
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.comments_posted, 3);
+    assert_eq!(s.chat.finder_calls().len(), 3);
+    assert_eq!(s.chat.synthesis_calls().len(), 1);
+    // Three light runs and one Evidence Gate run, all on the primary model at High.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 4);
+    assert!(
+        verifier
+            .iter()
+            .all(|c| c.model == "gpt-test" && c.effort == Some(ReasoningEffort::High))
+    );
+    // Dedup, Severity and Enrich run on the fast model at Medium.
+    let funnel = [
+        s.chat.dedup_calls(),
+        s.chat.severity_calls(),
+        s.chat.enrich_calls(),
+    ];
+    assert_eq!(funnel.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1, 3]);
+    for call in funnel.iter().flatten() {
+        assert_eq!(call.model, "gpt-fast");
+        assert_eq!(call.effort, Some(ReasoningEffort::Medium));
+    }
+
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    let bodies: Vec<&str> = posted.comments.iter().map(|c| c.body.as_str()).collect();
+    let redacted_body = secret_body.replace(&token, "[REDACTED]");
+    assert_eq!(
+        bodies,
+        vec![
+            format!(
+                "{ADUDU_MARKER}
+**🚨 Critical:** Token written to the log
+
+{redacted_body}
+
+```suggestion
+log_redacted(b);
+```"
+            ),
+            format!(
+                "{ADUDU_MARKER}
+**ℹ️ Info:** Off by one when the list is empty.
+
+Off by one when the list is empty."
+            ),
+            format!(
+                "{ADUDU_MARKER}
+**⚠️ Warning:** `d` is never freed!
+
+`d` is never freed!"
+            ),
+        ]
+    );
+    assert!(posted.summary.contains("Critical: 1"));
+
+    let review_id = format!("review_id={id}");
+    let line = logs
+        .line(&["review stages finished", &review_id])
+        .expect("stage log");
+    for field in [
+        "finder_steps=4",
+        "gate_refusals=1",
+        "synthesis_candidates=1",
+        "verify_candidates=3",
+        "dropped_unverified=0",
+        "evidence_gate_runs=1",
+        "kept_by_origin=pass1=2 synthesis_rescue=1 prose_recovery=0",
+        "budget_used=13",
+        "input_tokens=13",
+        "cache_read_tokens=0",
+        "cache_write_tokens=0",
+        "token_budget_reached=false",
+    ] {
+        assert!(line.contains(field), "{field} missing: {line}");
+    }
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(pool: PgPool) {
     let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
@@ -1751,7 +1980,7 @@ async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(poo
     let dedup = s.chat.dedup_calls();
     assert_eq!(dedup.len(), 1);
     assert_eq!(dedup[0].model, "gpt-fast");
-    assert_eq!(dedup[0].effort, Some(ReasoningEffort::Low));
+    assert_eq!(dedup[0].effort, Some(ReasoningEffort::Medium));
     assert!(dedup[0].user.contains("Missing null check"));
     assert!(dedup[0].user.contains("Unvalidated input"));
     assert!(dedup[0].user.contains("Bug reviewer"));
@@ -2066,7 +2295,8 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
 
     // Pass 1 (two calls), then the synthesis rescue.
     let finder = s.chat.finder_calls();
-    assert_eq!(finder.len(), 3);
+    assert_eq!(finder.len(), 2);
+    assert_eq!(s.chat.synthesis_calls().len(), 1);
     assert!(finder[0].user.contains("<repository_instructions>"));
     assert!(
         finder[0]
@@ -2087,8 +2317,9 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
         .unwrap();
     let finder = &s.chat.finder_calls()[before..];
     // Bug, Security, Performance and Rules, plus Bug's second call (the completion gate
-    // refuses its first submission because `a.rs` is unread) and Bug's synthesis rescue.
-    assert_eq!(finder.len(), 6);
+    // refuses its first submission because `a.rs` is unread); then Bug's synthesis rescue.
+    assert_eq!(finder.len(), 5);
+    assert_eq!(s.chat.synthesis_calls().len(), 2);
     assert_eq!(
         finder
             .iter()
@@ -2479,7 +2710,7 @@ async fn finder_wrap_up_for_token_budget_is_named_in_the_warning(pool: PgPool) {
     let summary = &git.reviews[0].summary;
     assert!(
         summary.contains(&budget_warning(
-            3,
+            4,
             1,
             "some reviewers stopped early, 1 finding verified from the diff only"
         )),

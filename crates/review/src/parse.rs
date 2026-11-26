@@ -47,12 +47,12 @@ pub(crate) struct Suggestion {
     /// means a single-line finding.
     pub start_line: Option<u32>,
     pub line: u32,
-    /// `None` until classified: the lean Finder output carries none. Readers that need one before
-    /// then use `Severity::Warning`.
+    /// `None` until classified: the lean Finder output carries none, and `classify_severity`
+    /// fills it after verification.
     pub severity: Option<Severity>,
     /// `None` when the model named no valid category and its Finder role implies none.
     pub category: Option<FindingCategory>,
-    /// Empty for lean Finder output until a title is derived after verification.
+    /// Empty for lean Finder output until `enrich_suggestions` sets it after verification.
     pub title: String,
     pub body: String,
     /// Kode pengganti untuk baris/rentang itu (opsional).
@@ -91,7 +91,7 @@ impl CommentableRange {
     }
 
     /// Whether `start_line < line` and both lie in one diff hunk.
-    fn spans_one_hunk(&self, start_line: u32, line: u32) -> bool {
+    pub(crate) fn spans_one_hunk(&self, start_line: u32, line: u32) -> bool {
         same_hunk(&self.hunks, start_line, line)
     }
 }
@@ -140,13 +140,23 @@ pub(crate) fn first_json_object<T: DeserializeOwned>(raw: &str) -> Option<T> {
     })
 }
 
-fn parse_u32_field(val: &Value) -> Option<u32> {
+pub(crate) fn parse_u32_field(val: &Value) -> Option<u32> {
     let n = match val {
         Value::Number(n) => n.as_u64()?,
         Value::String(s) => s.trim().parse().ok()?,
         _ => return None,
     };
     u32::try_from(n).ok()
+}
+
+/// `"critical"`, `"warning"` or `"info"`, ignoring case and surrounding whitespace.
+pub(crate) fn parse_severity(text: &str) -> Option<Severity> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "critical" => Some(Severity::Critical),
+        "warning" => Some(Severity::Warning),
+        "info" => Some(Severity::Info),
+        _ => None,
+    }
 }
 
 /// One finding object, lean (`file`, `line`, `body`, optional `start_line` and `category`) or
@@ -166,12 +176,7 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
             _ => (None, false),
         },
     };
-    let severity = text("severity").and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
-        "critical" => Some(Severity::Critical),
-        "warning" => Some(Severity::Warning),
-        "info" => Some(Severity::Info),
-        _ => None,
-    });
+    let severity = text("severity").and_then(|s| parse_severity(&s));
     let file = text("file").filter(|f| !f.trim().is_empty())?;
     Some(Suggestion {
         file,

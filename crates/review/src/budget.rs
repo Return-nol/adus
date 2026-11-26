@@ -1,5 +1,5 @@
 //! Per-review input-token ceiling (`settings.max_review_input_tokens`). One [`TokenBudget`] is
-//! shared by every Finder, Verifier and Dedup call of a review run. It is a soft cap: calls
+//! shared by every Finder, Verifier and post-verify call of a review run. It is a soft cap: calls
 //! already in flight finish, each running agent may send one more submit-only call, and the
 //! Verifier still checks the remaining candidates diff-only, so a review may pass the limit.
 //!
@@ -17,6 +17,8 @@ pub(crate) const CACHE_READ_DIVISOR: u32 = 4;
 pub(crate) struct TokenBudget {
     limit: u64,
     used: AtomicU64,
+    /// Input tokens sent, unweighted (cache reads in full), for the stage log.
+    raw_input: AtomicU64,
     /// Agent runs (Finder or Verifier) that wrapped up early because of the budget.
     wrap_ups: AtomicUsize,
     /// Verifier candidates checked diff-only instead of with the repository tools.
@@ -31,6 +33,7 @@ impl TokenBudget {
         Self {
             limit,
             used: AtomicU64::new(0),
+            raw_input: AtomicU64::new(0),
             wrap_ups: AtomicUsize::new(0),
             diff_only_verifications: AtomicUsize::new(0),
         }
@@ -43,6 +46,8 @@ impl TokenBudget {
         let uncached = input_tokens - cached;
         let charged = uncached.saturating_add(cached.div_ceil(CACHE_READ_DIVISOR));
         self.used.fetch_add(u64::from(charged), Ordering::Relaxed);
+        self.raw_input
+            .fetch_add(u64::from(input_tokens), Ordering::Relaxed);
     }
 
     /// The weighted budget left as a percentage of the limit; `100` when unlimited.
@@ -55,8 +60,14 @@ impl TokenBudget {
         u32::try_from(u128::from(left) * 100 / u128::from(self.limit)).unwrap_or(100)
     }
 
+    /// Weighted input tokens counted so far (what the limit is checked against).
     pub(crate) fn used(&self) -> u64 {
         self.used.load(Ordering::Relaxed)
+    }
+
+    /// Input tokens sent so far, cache reads counted in full.
+    pub(crate) fn raw_input(&self) -> u64 {
+        self.raw_input.load(Ordering::Relaxed)
     }
 
     /// True once a non-zero limit is reached.
@@ -154,6 +165,8 @@ mod tests {
         // 5 cached tokens round up to 2.
         budget.add(5, 5);
         assert_eq!(budget.used(), 1_427);
+        // The raw total counts every input token in full.
+        assert_eq!(budget.raw_input(), 2_105);
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub(crate) fn format_pr_description(description: &str, max_chars: usize) -> Stri
 
 /// Awali tiap baris `+` dan ` ` di hunk dengan nomor baris file baru, mis. `   42 + let x = 1;`,
 /// supaya model bisa menyebut nomor baris yang benar. Baris `-` diberi spasi sebagai ganti nomor.
-fn annotate_patch(patch: &str) -> String {
+pub(crate) fn annotate_patch(patch: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     // `None` until the first hunk header: lines before it (file headers) are kept as they are.
     let mut right: Option<u32> = None;
@@ -491,35 +491,36 @@ fn severity_label(severity: Severity) -> &'static str {
     }
 }
 
-/// Isi komentar inline untuk satu temuan.
-/// Most characters of a title derived from a finding's body.
+/// Most characters of a title derived from a finding's body, the ellipsis included.
 const FALLBACK_TITLE_CHARS: usize = 100;
 
-/// The first sentence of `body`'s first line (up to a `.`, `!` or `?` followed by whitespace or
-/// the line end), cut at [`FALLBACK_TITLE_CHARS`] characters.
-fn first_sentence_title(body: &str) -> String {
+/// The title of a finding that enrichment gave none: the first sentence of `body`'s first line
+/// (up to a `.`, `!` or `?` followed by whitespace or the line end), at most
+/// [`FALLBACK_TITLE_CHARS`] characters (a longer one is cut and ends with `…`).
+pub(crate) fn first_sentence_title(body: &str) -> String {
     let line = body.trim().lines().next().unwrap_or("");
     let end = line
         .match_indices(['.', '!', '?'])
         .map(|(at, _)| at + 1)
         .find(|&end| line[end..].is_empty() || line[end..].starts_with(char::is_whitespace))
         .unwrap_or(line.len());
-    truncate_with_marker(line[..end].trim(), FALLBACK_TITLE_CHARS, "…").into_owned()
+    let sentence = line[..end].trim();
+    if sentence.chars().count() <= FALLBACK_TITLE_CHARS {
+        return sentence.to_string();
+    }
+    truncate_with_marker(sentence, FALLBACK_TITLE_CHARS - 1, "…").into_owned()
 }
 
-/// A finding without a severity yet is labelled `Warning`; one without a title (the lean Finder
-/// output) uses the body's first sentence.
-pub(crate) fn format_inline(s: &Suggestion) -> String {
-    let title = if s.title.trim().is_empty() {
-        first_sentence_title(&s.body)
-    } else {
-        s.title.clone()
-    };
+/// Isi komentar inline untuk satu temuan, labelled with `severity`.
+pub(crate) fn format_inline(s: &Suggestion, severity: Severity) -> String {
     // Judul harus satu baris supaya tetap di dalam label tebal.
-    let title = title.lines().collect::<Vec<_>>().join(" ");
+    let title = s.title.lines().collect::<Vec<_>>().join(" ");
     let mut out = format!(
-        "{MARKER}\n**{}:** {title}\n\n{}",
-        severity_label(s.severity.unwrap_or(Severity::Warning)),
+        "{MARKER}
+**{}:** {title}
+
+{}",
+        severity_label(severity),
         s.body
     );
     if let Some(code) = &s.suggestion {
@@ -674,42 +675,39 @@ mod tests {
             body: "`unwrap` on user input.".into(),
             suggestion: Some("let x = y?;".into()),
         };
-        let inline = format_inline(&s);
+        let inline = format_inline(&s, Severity::Warning);
         assert!(inline.starts_with(MARKER));
         assert!(inline.contains("**⚠️ Warning:** Possible panic"));
         assert!(inline.contains("`unwrap` on user input."));
         assert!(inline.ends_with("```suggestion\nlet x = y?;\n```"));
 
-        let plain = format_inline(&Suggestion {
-            suggestion: None,
-            ..s.clone()
-        });
+        let plain = format_inline(
+            &Suggestion {
+                suggestion: None,
+                ..s.clone()
+            },
+            Severity::Warning,
+        );
         assert!(!plain.contains("```"));
 
-        let nested = format_inline(&Suggestion {
-            file: "a.md".into(),
-            severity: Some(Severity::Info),
-            title: "first\nsecond\r\nthird".into(),
-            body: "b".into(),
-            suggestion: Some("````rust\nx\n```\n\n".into()),
-            ..s.clone()
-        });
+        let nested = format_inline(
+            &Suggestion {
+                file: "a.md".into(),
+                title: "first\nsecond\r\nthird".into(),
+                body: "b".into(),
+                suggestion: Some("````rust\nx\n```\n\n".into()),
+                ..s.clone()
+            },
+            Severity::Info,
+        );
         assert!(nested.contains("**ℹ️ Info:** first second third\n"));
         assert!(nested.ends_with("`````suggestion\n````rust\nx\n```\n`````"));
 
-        // Lean Finder output (no severity, no title yet): `Warning` and the body's first sentence.
-        let lean = format_inline(&Suggestion {
-            severity: None,
-            title: String::new(),
-            body: "`cfg.timeout` is read as seconds. It is milliseconds.".into(),
-            suggestion: None,
-            ..s
-        });
-        assert!(
-            lean.contains("**⚠️ Warning:** `cfg.timeout` is read as seconds.\n\n`cfg.timeout`"),
-            "{lean}"
-        );
-        assert_eq!(first_sentence_title(&"x".repeat(150)).chars().count(), 101);
+        // The fallback title enrichment uses: at most 100 characters, the ellipsis included.
+        let long = first_sentence_title(&"x".repeat(150));
+        assert_eq!(long.chars().count(), 100);
+        assert!(long.ends_with('…'));
+        assert_eq!(first_sentence_title(&"x".repeat(100)), "x".repeat(100));
         assert_eq!(
             first_sentence_title("v1.2 breaks it\nmore"),
             "v1.2 breaks it"

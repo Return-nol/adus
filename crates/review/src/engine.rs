@@ -1,6 +1,7 @@
-//! Mesin review: ambil diff PR, jalankan Finder → Verifier → Dedup, posting temuan, catat di
-//! `reviews`. The Finder stage lives in `finder.rs`; this file keeps the review-row lifecycle,
-//! the clone and its fallback, the stage sequencing and the deadlines, and posting.
+//! Mesin review: ambil diff PR, jalankan Finder → Verifier → Dedup → Severity → Enrichment,
+//! posting temuan, catat di `reviews`. The Finder stage lives in `finder.rs`; this file keeps
+//! the review-row lifecycle, the clone and its fallback, the stage sequencing and the deadlines,
+//! and posting.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -33,6 +34,7 @@ use crate::agent::{AgentError, AgentOutcome};
 use crate::budget::TokenBudget;
 use crate::dedup::{DedupOutcome, deduplicate_findings};
 use crate::discussion::threads_for_dedup;
+use crate::enrich::enrich_suggestions;
 use crate::finder::{
     FinderFailure, FinderInput, FinderLlm, FinderPass, FinderTask, SynthesisSkipped, batch_allowed,
     run_finder,
@@ -44,6 +46,7 @@ use crate::prompt::{
 };
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
+use crate::severity::{classify_severity, fill_unclassified};
 use crate::small_pr::is_small_pr;
 use crate::tools::Toolbox;
 use crate::verifier::{CandidateFinding, VerifyContext, VerifyInput, verify_candidates};
@@ -151,7 +154,7 @@ struct Stages<'a> {
     provider_id: Uuid,
     /// Finder and Verifier model.
     primary_model: &'a str,
-    /// Dedup model (`effective_fast_model()`).
+    /// Post-verify funnel model (`effective_fast_model()`): Dedup, Severity and Enrichment.
     fast_model: &'a str,
     rules: &'a [Rule],
     memories: &'a [Memory],
@@ -163,7 +166,7 @@ struct Stages<'a> {
     /// `Generalist`).
     small: bool,
     /// Input tokens this run may send (`settings.max_review_input_tokens`), shared by every
-    /// Finder, Verifier and Dedup call.
+    /// Finder, Verifier and post-verify call.
     token_budget: Arc<TokenBudget>,
 }
 
@@ -494,9 +497,9 @@ impl Engine {
         }
     }
 
-    /// Clone, Finder, Verifier and Dedup for `targets`. Returns the findings to post; files of
-    /// a batch no Finder agent reviewed go to `skipped`, and every degradation adds a note to
-    /// `warnings`.
+    /// Clone, Finder, Verifier and the post-verify funnel for `targets`. Returns the findings to
+    /// post; files of a batch no Finder agent reviewed go to `skipped`, and every degradation
+    /// adds a note to `warnings`.
     async fn review_targets(
         &self,
         s: &Stages<'_>,
@@ -594,56 +597,64 @@ impl Engine {
         let synthesis_skipped = finder.synthesis_skipped.map(SynthesisSkipped::label);
         let synthesis_candidates = finder.synthesis_candidates;
         let (cache_read_tokens, cache_write_tokens) = finder_cache_tokens(&finder.tasks);
+        let (finder_steps, gate_refusals) = finder_steps_and_refusals(&finder.tasks);
         let (candidates, filtered_dropped) =
             collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
-        let candidate_count = candidates.len();
+        // Every candidate is queued for the Verifier (no count cap, spec §5).
+        let queued = candidates.len();
 
-        let (verified, verifier_dropped, evidence_gate_runs) = if candidates.is_empty() {
-            (Vec::new(), 0, 0)
-        } else {
-            let ctx = VerifyContext {
-                chat: self.chat.as_ref(),
-                provider_id: s.provider_id,
-                model: s.primary_model,
-                usage: s.usage,
-                token_budget: Some(&s.token_budget),
+        let (verified, dropped_refuted, dropped_unverified, evidence_gate_runs) =
+            if candidates.is_empty() {
+                (Vec::new(), 0, 0, 0)
+            } else {
+                let ctx = VerifyContext {
+                    chat: self.chat.as_ref(),
+                    provider_id: s.provider_id,
+                    model: s.primary_model,
+                    usage: s.usage,
+                    token_budget: Some(&s.token_budget),
+                };
+                let report = verify_candidates(
+                    ctx,
+                    VerifyInput {
+                        pr: s.pr,
+                        manifest,
+                        candidates,
+                        targets: &files,
+                        rules: s.rules,
+                        memories: s.memories,
+                        repo_instructions: repo_instructions.as_deref(),
+                        toolbox: verifier_toolbox,
+                        deadline: s.deadlines.verifier,
+                    },
+                )
+                .await;
+                if let Some(err) = report.all_retryable_error {
+                    return Err(chat_error(err));
+                }
+                if report.dropped_unverified > 0 {
+                    warnings.push(format!(
+                        "{} candidate finding(s) could not be verified and were omitted",
+                        report.dropped_unverified
+                    ));
+                }
+                (
+                    report.kept,
+                    report.dropped_refuted,
+                    report.dropped_unverified,
+                    report.evidence_gate_runs,
+                )
             };
-            let report = verify_candidates(
-                ctx,
-                VerifyInput {
-                    pr: s.pr,
-                    manifest,
-                    candidates,
-                    targets: &files,
-                    rules: s.rules,
-                    memories: s.memories,
-                    repo_instructions: repo_instructions.as_deref(),
-                    toolbox: verifier_toolbox,
-                    deadline: s.deadlines.verifier,
-                },
-            )
-            .await;
-            if let Some(err) = report.all_retryable_error {
-                return Err(chat_error(err));
-            }
-            if report.dropped_unverified > 0 {
-                warnings.push(format!(
-                    "{} candidate finding(s) could not be verified and were omitted",
-                    report.dropped_unverified
-                ));
-            }
-            let dropped = report.dropped_refuted + report.dropped_unverified;
-            (report.kept, dropped, report.evidence_gate_runs)
-        };
         let verified_kept = verified.len();
-        let kept_by_origin = count_by_origin(&verified);
 
+        // Post-verify funnel (spec §6), all by `deadlines.post_verify`: Semantic Dedup,
+        // severity, enrichment (which ends with `check_fix`).
         let finding_paths = verified
             .iter()
             .map(|c| normalize_path(&c.suggestion.file))
             .collect();
         let existing = threads_for_dedup(s.threads, &finding_paths);
-        let fallback: Vec<Suggestion> = verified.iter().map(|c| c.suggestion.clone()).collect();
+        let fallback = verified.clone();
         let dedup = deduplicate_findings(
             self.chat.as_ref(),
             s.provider_id,
@@ -654,7 +665,7 @@ impl Engine {
             &existing,
         );
         let DedupOutcome {
-            kept: found,
+            kept,
             already_raised,
         } = match tokio::time::timeout_at(s.deadlines.post_verify, dedup).await {
             Ok(outcome) => outcome,
@@ -671,6 +682,38 @@ impl Engine {
                 "{already_raised} finding(s) skipped: already raised in this PR's discussion."
             ));
         }
+        let kept_by_origin = count_by_origin(&kept);
+        let mut found: Vec<Suggestion> = kept.into_iter().map(|c| c.suggestion).collect();
+
+        let classify = classify_severity(
+            self.chat.as_ref(),
+            s.provider_id,
+            s.fast_model,
+            s.usage,
+            Some(s.token_budget.as_ref()),
+            &mut found,
+        );
+        if tokio::time::timeout_at(s.deadlines.post_verify, classify)
+            .await
+            .is_err()
+        {
+            tracing::warn!("severity classification cut by the deadline; using warning");
+            fill_unclassified(&mut found);
+        }
+        // Returns by the deadline on its own: no call starts in its last `ENRICH_RESERVE`.
+        enrich_suggestions(
+            self.chat.as_ref(),
+            s.provider_id,
+            s.fast_model,
+            s.usage,
+            Some(s.token_budget.as_ref()),
+            toolbox.as_ref(),
+            &files,
+            &allowed,
+            &mut found,
+            s.deadlines.post_verify,
+        )
+        .await;
 
         let budget = s.token_budget.as_ref();
         // Only when the ceiling changed something (spec decision 15).
@@ -678,23 +721,29 @@ impl Engine {
             warnings.push(warning);
         }
         tracing::info!(
+            review_id = s.usage.review_id.map(tracing::field::display),
             review_mode = ?mode,
             clone_ms,
             fallback_reason,
             finder_tasks,
+            finder_steps,
+            gate_refusals,
             filtered_dropped,
-            candidates = candidate_count,
             synthesis_candidates,
             synthesis_skipped,
+            verify_candidates = queued,
             verified_kept,
-            kept_by_origin = %kept_by_origin,
-            verifier_dropped,
+            dropped_refuted,
+            dropped_unverified,
             evidence_gate_runs,
             dedup_dropped = verified_kept.saturating_sub(found.len() + already_raised),
             already_raised,
+            posted = found.len(),
+            kept_by_origin = %kept_by_origin,
+            budget_used = budget.used(),
+            input_tokens = budget.raw_input(),
             cache_read_tokens,
             cache_write_tokens,
-            input_tokens = budget.used(),
             token_budget_reached = budget.exhausted(),
             "review stages finished"
         );
@@ -703,20 +752,20 @@ impl Engine {
             .map(|file| (normalize_path(&file.path), file.patch.as_deref()))
             .collect();
         let mut counts: BTreeMap<Severity, usize> = BTreeMap::new();
-        for suggestion in &found {
-            *counts
-                .entry(suggestion.severity.unwrap_or(Severity::Warning))
-                .or_default() += 1;
-        }
         let mut redacted_comments = 0;
         let comments = found
             .iter()
             .map(|s| {
+                // The one default left: `classify_severity`, or its deadline fallback, has
+                // already given every finding a severity; the field stays an `Option` because
+                // the Finder sends none.
+                let severity = s.severity.unwrap_or(Severity::Warning);
+                *counts.entry(severity).or_default() += 1;
                 let end_offset = s.start_line.and_then(|_| {
                     let patch = patches.get(s.file.as_str()).copied().flatten()?;
                     right_line_end_offset(patch, s.line)
                 });
-                let (body, redacted) = inline_body(s);
+                let (body, redacted) = inline_body(s, severity);
                 redacted_comments += usize::from(redacted);
                 InlineComment {
                     path: s.file.clone(),
@@ -826,18 +875,21 @@ impl Engine {
 /// value already masked as [`REDACTED`], is dropped (the comment keeps its span, and its body
 /// ends with [`SUGGESTION_OMITTED`]), so "Apply suggestion" never writes `[REDACTED]` into
 /// code. The flag: something was masked or dropped.
-fn inline_body(s: &Suggestion) -> (String, bool) {
+fn inline_body(s: &Suggestion, severity: Severity) -> (String, bool) {
     let leaks = s
         .suggestion
         .as_deref()
         .is_some_and(|code| contains_secret(code) || code.contains(REDACTED));
     let body = if leaks {
-        format_inline(&Suggestion {
-            suggestion: None,
-            ..s.clone()
-        })
+        format_inline(
+            &Suggestion {
+                suggestion: None,
+                ..s.clone()
+            },
+            severity,
+        )
     } else {
-        format_inline(s)
+        format_inline(s, severity)
     };
     let (mut body, masked) = redact_owned(body);
     if leaks {
@@ -855,7 +907,7 @@ fn redact_owned(text: String) -> (String, bool) {
     (text, false)
 }
 
-/// Candidates per Finder pass, as `pass1=N synthesis_rescue=N prose_recovery=N`.
+/// Findings per Finder pass, as `pass1=N synthesis_rescue=N prose_recovery=N`.
 fn count_by_origin(candidates: &[CandidateFinding]) -> String {
     [
         FinderPass::Pass1,
@@ -869,6 +921,20 @@ fn count_by_origin(candidates: &[CandidateFinding]) -> String {
     })
     .collect::<Vec<_>>()
     .join(" ")
+}
+
+/// LLM calls and completion-gate refusals summed over the Finder tasks that finished (both
+/// passes).
+fn finder_steps_and_refusals(tasks: &[FinderTask]) -> (usize, usize) {
+    tasks
+        .iter()
+        .filter_map(|task| task.result.as_ref().ok())
+        .fold((0, 0), |(steps, refusals), outcome| {
+            (
+                steps + outcome.steps_used,
+                refusals + usize::from(outcome.gate_refused),
+            )
+        })
 }
 
 /// Cache tokens summed over the Finder agents that finished.

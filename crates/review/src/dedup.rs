@@ -14,17 +14,19 @@ use uuid::Uuid;
 use crate::agent::{AgentLlm, chat_low_effort};
 use crate::budget::TokenBudget;
 use crate::discussion::format_threads;
-use crate::parse::{Suggestion, first_json_object};
+use crate::parse::first_json_object;
 use crate::prompt::wrap;
 use crate::verifier::{CandidateFinding, SerializedCandidate};
 
 /// Output cap of the answer (a short list of indices).
 const DEDUP_MAX_TOKENS: u32 = 1_024;
+/// Semantic Dedup runs on the fast model at this effort.
+const DEDUP_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 
 const DEDUP_SYSTEM: &str = r#"You merge duplicate findings of a pull request review and set aside findings the pull request's discussion has already covered.
 <findings> holds the findings of this review, each with an index; several reviewers produced them. <existing_comments>, when present, holds discussion threads already on the pull request (by Adus earlier, by human reviewers or by the author), each with an index.
 
-Task 1, duplicates: two findings are duplicates when they describe one root cause at the same or a related location, even if worded differently or reported by different reviewers. Findings about different problems are never duplicates, even on the same line. From each group of duplicates keep one finding, preferring in order: (1) higher severity, (2) concrete file/symbol evidence and a tighter line anchor, and (3) a finding that cites a team rule or repository instruction when applicable; keep every finding without a duplicate. List the kept findings in "keep_indices"; it is never empty.
+Task 1, duplicates: two findings are duplicates when they describe one root cause at the same or a related location, even if worded differently or reported by different reviewers. Findings about different problems are never duplicates, even on the same line. From each group of duplicates keep one finding, preferring in order: (1) higher severity, when findings carry one, (2) concrete file/symbol evidence and a tighter line anchor, and (3) a finding that cites a team rule or repository instruction when applicable; keep every finding without a duplicate. List the kept findings in "keep_indices"; it is never empty.
 
 Task 2, already raised: a finding is already raised only when one existing thread already points out the same problem at the same or a related location, whether that thread agreed with it, fixed it or rejected it. A thread about a different problem, or one that only touches the same code, does not count. For each such finding add {"finding": <finding index>, "comment": <thread index>} to "already_raised", citing that thread. When unsure, leave the finding out of "already_raised".
 
@@ -33,14 +35,16 @@ Respond with ONLY a JSON object, no prose and no markdown fences: {"keep_indices
 
 /// What Semantic Dedup left to post.
 pub(crate) struct DedupOutcome {
-    pub kept: Vec<Suggestion>,
+    /// The findings to post, unchanged (severity, category and origin included), in their
+    /// original order.
+    pub kept: Vec<CandidateFinding>,
     /// Findings dropped because an existing thread already raised them.
     pub already_raised: usize,
 }
 
 /// Merges semantic duplicates among `findings` and drops the ones an `existing` thread already
 /// raised, with one single-turn call. `existing` is already selected (`threads_for_dedup`).
-/// `model` is the provider's `effective_fast_model()`; the call uses `ReasoningEffort::Low`.
+/// `model` is the provider's `effective_fast_model()`; the call uses `ReasoningEffort::Medium`.
 ///
 /// No call is made without findings, or for one finding with no existing thread. An LLM error,
 /// an unparseable answer, an index out of range or an empty `keep_indices` keeps every finding
@@ -58,7 +62,7 @@ pub(crate) async fn deduplicate_findings(
     existing: &[&PrThread],
 ) -> DedupOutcome {
     let unchanged = |findings: Vec<CandidateFinding>| DedupOutcome {
-        kept: findings.into_iter().map(|f| f.suggestion).collect(),
+        kept: findings,
         already_raised: 0,
     };
     if findings.is_empty() || (findings.len() < 2 && existing.is_empty()) {
@@ -70,7 +74,7 @@ pub(crate) async fn deduplicate_findings(
         provider_id,
         model,
         system: DEDUP_SYSTEM,
-        effort: Some(ReasoningEffort::Low),
+        effort: Some(DEDUP_EFFORT),
         usage: usage_ctx,
     };
     let text = match chat_low_effort(
@@ -118,7 +122,7 @@ pub(crate) async fn deduplicate_findings(
             already_raised += usize::from(drop);
             !drop
         })
-        .map(|(_, finding)| finding.suggestion)
+        .map(|(_, finding)| finding)
         .collect();
     DedupOutcome {
         kept,
@@ -178,6 +182,7 @@ mod tests {
 
     use super::*;
     use crate::finder::FinderPass;
+    use crate::parse::Suggestion;
     use crate::redact::REDACTED;
     use crate::specialists::SpecialistKind;
     use crate::test_support::{ScriptedChat, text_turn, user_text};
@@ -209,10 +214,6 @@ mod tests {
             .collect()
     }
 
-    fn suggestions(findings: &[CandidateFinding]) -> Vec<Suggestion> {
-        findings.iter().map(|f| f.suggestion.clone()).collect()
-    }
-
     async fn dedup_with(
         chat: &ScriptedChat,
         findings: Vec<CandidateFinding>,
@@ -223,7 +224,7 @@ mod tests {
         deduplicate_findings(chat, id, FAST_MODEL, &usage, None, findings, existing).await
     }
 
-    async fn dedup(chat: &ScriptedChat, findings: Vec<CandidateFinding>) -> Vec<Suggestion> {
+    async fn dedup(chat: &ScriptedChat, findings: Vec<CandidateFinding>) -> Vec<CandidateFinding> {
         dedup_with(chat, findings, &[]).await.kept
     }
 
@@ -252,16 +253,13 @@ mod tests {
             "Duplicates found:\n```json\n{\"keep_indices\": [3, 0, 3]}\n```",
         )]);
         let kept = dedup(&chat, input.clone()).await;
-        assert_eq!(
-            kept,
-            vec![input[0].suggestion.clone(), input[3].suggestion.clone()]
-        );
+        assert_eq!(kept, vec![input[0].clone(), input[3].clone()]);
 
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 1);
         let req = &reqs[0];
         assert_eq!(req.model, FAST_MODEL);
-        assert_eq!(req.effort, Some(ReasoningEffort::Low));
+        assert_eq!(req.effort, Some(ReasoningEffort::Medium));
         assert!(req.tools.is_empty());
         assert_eq!(req.messages.len(), 1);
         let prompt = user_text(req);
@@ -288,7 +286,7 @@ mod tests {
             let input = findings(&["zero", "one", "two"]);
             let chat = ScriptedChat::new(vec![answer]);
             let kept = dedup(&chat, input.clone()).await;
-            assert_eq!(kept, suggestions(&input), "{label}");
+            assert_eq!(kept, input, "{label}");
             assert_eq!(chat.requests().len(), 1, "{label}");
         }
     }
@@ -312,7 +310,7 @@ mod tests {
         )]);
         let input = findings(&["only"]);
         let outcome = dedup_with(&chat, input.clone(), &[&thread]).await;
-        assert_eq!(outcome.kept, suggestions(&input));
+        assert_eq!(outcome.kept, input);
         assert_eq!(outcome.already_raised, 0);
     }
 
@@ -328,7 +326,7 @@ mod tests {
         );
         let one = findings(&["only"]);
         let outcome = dedup_with(&chat, one.clone(), &[]).await;
-        assert_eq!(outcome.kept, suggestions(&one));
+        assert_eq!(outcome.kept, one);
         assert_eq!(outcome.already_raised, 0);
         assert!(chat.requests().is_empty());
     }
@@ -341,7 +339,7 @@ mod tests {
         )]);
         let input = findings(&["zero", "one"]);
         let outcome = dedup_with(&chat, input.clone(), &[&thread]).await;
-        assert_eq!(outcome.kept, vec![input[0].suggestion.clone()]);
+        assert_eq!(outcome.kept, vec![input[0].clone()]);
         assert_eq!(outcome.already_raised, 1);
     }
 

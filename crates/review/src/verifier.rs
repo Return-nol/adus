@@ -3,7 +3,8 @@
 //! short ReAct loop with the read-only repository tools, and a finding on a file the Finder
 //! never opened is re-verified by a longer Evidence Gate run; without a checkout it is a single
 //! call against the file's diff. A reply whose verdict cannot be read keeps the finding; a
-//! candidate that never gets a reply (provider error, deadline) is dropped.
+//! candidate whose light (or diff-only) run never gets a reply (provider error, deadline) is
+//! dropped, while an Evidence Gate run that ends without a verdict keeps the light verdict.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -544,7 +545,7 @@ async fn verify_one(
 
 /// Centre and radius of `<code_context>`: [`SNIPPET_RADIUS`] lines around the whole span
 /// `start_line..=line` (just `line` for a single-line finding). `read_file` still caps it.
-fn snippet_window(s: &Suggestion) -> (u32, u32) {
+pub(crate) fn snippet_window(s: &Suggestion) -> (u32, u32) {
     let start = s
         .start_line
         .filter(|&start| start < s.line)
