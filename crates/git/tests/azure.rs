@@ -209,6 +209,29 @@ async fn get_pr_reads_is_draft() {
 }
 
 #[tokio::test]
+async fn decode_error_names_the_field() {
+    let server = MockServer::start().await;
+    let mut pull: Value = serde_json::from_str(&fixture("pr.json")).unwrap();
+    pull.as_object_mut()
+        .unwrap()
+        .remove("lastMergeSourceCommit");
+    Mock::given(method("GET"))
+        .and(path(format!("{REPO_BASE}/pullrequests/7")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pull))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server).get_pr(&repo(), 7).await.unwrap_err();
+    let GitError::Decode(detail) = err else {
+        panic!("expected a decode error, got {err:?}");
+    };
+    assert!(
+        detail.contains("missing field `lastMergeSourceCommit`"),
+        "{detail}"
+    );
+}
+
+#[tokio::test]
 async fn ensure_webhooks_creates_three_subscriptions() {
     let server = MockServer::start().await;
     let events = [

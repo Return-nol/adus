@@ -1,7 +1,7 @@
 {
   "changeEntries": [
     { "changeType": "add", "item": { "path": "/src/new.rs", "gitObjectType": "blob" } },
-    { "changeType": "delete", "item": { "path": "/src/gone.rs", "gitObjectType": "blob" } },
+    { "changeType": "delete", "originalPath": "/src/gone.rs", "item": { "originalObjectId": "DCC1FA23", "path": null } },
     { "changeType": "edit, rename", "item": { "path": "/src/moved.rs", "gitObjectType": "blob" }, "originalPath": "/src/orig.rs" },
     { "changeType": "edit", "item": { "path": "/img/logo.png", "gitObjectType": "blob" } }
   ],
