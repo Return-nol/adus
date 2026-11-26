@@ -1182,7 +1182,7 @@ mod tests {
     async fn exhausted_budget_verifies_candidates_diff_only() {
         let tb = toolbox();
         let budget = Arc::new(TokenBudget::new(1));
-        budget.add(1);
+        budget.add(1, 0);
         let chat = RoutedChat::new(vec![
             ("kept", vec![answer(text_turn(r#"{"keep": true}"#))]),
             ("refuted", vec![answer(text_turn(r#"{"keep": false}"#))]),
@@ -1221,7 +1221,7 @@ mod tests {
 
         // Already diff-only: exhaustion changes nothing.
         let budget = Arc::new(TokenBudget::new(1));
-        budget.add(1);
+        budget.add(1, 0);
         let chat = RoutedChat::keeping_everything();
         let report = verify(&chat, bugs(&["a", "b"]), None, later(30_000), Some(&budget)).await;
         assert_eq!(titles(&report.kept), ["a", "b"]);

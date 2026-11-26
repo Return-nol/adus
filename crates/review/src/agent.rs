@@ -163,7 +163,7 @@ pub(crate) async fn chat_low_effort(
         .chat(llm.provider_id, request, llm.usage.clone())
         .await?;
     if let Some(budget) = token_budget {
-        budget.add(response.input_tokens);
+        budget.add(response.input_tokens, response.cache_read_tokens);
     }
     Ok(response.text)
 }
@@ -237,7 +237,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
         let response = request(llm, &mut messages, offered, &mut overflow_retried).await?;
         tally.add(&response);
         if let Some(budget) = &config.token_budget {
-            budget.add(response.input_tokens);
+            budget.add(response.input_tokens, response.cache_read_tokens);
         }
         tracing::debug!(
             step = tally.steps_used,

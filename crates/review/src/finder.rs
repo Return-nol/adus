@@ -34,10 +34,19 @@ use crate::tools::Toolbox;
 
 /// Diff batches reviewed at the same time (spec 4.7).
 const BATCH_CONCURRENCY: usize = 2;
-/// LLM calls one Finder agent may make.
-pub const FINDER_MAX_STEPS: usize = 20;
+/// LLM calls a Finder agent may make on a batch of up to `FINDER_FREE_FILES` files.
+const FINDER_BASE_STEPS: usize = 20;
+/// Files per batch covered by `FINDER_BASE_STEPS`; each two files beyond add one step.
+const FINDER_FREE_FILES: usize = 8;
+/// Most LLM calls one Finder agent may make, however large the batch.
+const FINDER_STEP_CAP: usize = 30;
 /// The last Finder steps that offer only `submit_findings`.
 const FINDER_WRAP_UP_STEPS: usize = 2;
+
+/// LLM calls one Finder agent may make on a batch of `files` files.
+pub(crate) fn finder_max_steps(files: usize) -> usize {
+    (FINDER_BASE_STEPS + files.saturating_sub(FINDER_FREE_FILES).div_ceil(2)).min(FINDER_STEP_CAP)
+}
 
 /// Where the Finder talks to the model: the provider's `primary_model` at `finder_effort(mode)`.
 #[derive(Clone, Copy)]
@@ -190,7 +199,16 @@ async fn run_all(
                             specialist: kind.label(),
                             batch: index,
                         };
-                        run_one(llm, index, kind, prompt.clone(), tools, submit, deadline)
+                        let max_steps = finder_max_steps(batch.files.len());
+                        run_one(
+                            llm,
+                            kind,
+                            prompt.clone(),
+                            tools,
+                            submit,
+                            max_steps,
+                            deadline,
+                        )
                     })
                     .collect();
                 future::join_all(agents).await
@@ -208,11 +226,11 @@ async fn run_all(
 /// One specialist on one batch, cut at `deadline`.
 async fn run_one(
     llm: FinderLlm<'_>,
-    batch: usize,
     kind: SpecialistKind,
     prompt: String,
     tools: AgentTools<'_>,
     submit: SubmitFindings<'_>,
+    max_steps: usize,
     deadline: Instant,
 ) -> FinderTask {
     let system = build_finder_system_prompt(kind, matches!(tools, AgentTools::Full(_)));
@@ -229,10 +247,10 @@ async fn run_one(
         wrap_up_steps: FINDER_WRAP_UP_STEPS,
         deadline: Some(deadline),
         token_budget: llm.token_budget.cloned(),
-        ..AgentConfig::new(FINDER_MAX_STEPS)
+        ..AgentConfig::new(max_steps)
     };
     // Names the agent on every log line of its run (concurrent agents interleave).
-    let span = tracing::debug_span!("finder", specialist = kind.label(), batch);
+    let span = tracing::debug_span!("finder", specialist = kind.label(), batch = submit.batch);
     let run = run_react_loop(&agent, tools, &submit, &config, prompt).instrument(span);
     let result = match tokio::time::timeout_at(deadline, run).await {
         Ok(Ok(outcome)) => {
@@ -258,7 +276,7 @@ async fn run_one(
         }
     };
     FinderTask {
-        batch,
+        batch: submit.batch,
         kind,
         result,
     }
@@ -508,5 +526,20 @@ mod tests {
         .expect("final step must not fail Unparseable on invalid anchor");
         assert_eq!(outcome.steps_used, 1);
         assert_eq!(outcome.result.len(), 2);
+    }
+
+    #[test]
+    fn finder_max_steps_scales_with_batch_files() {
+        for (files, steps) in [
+            (0, 20),
+            (8, 20),
+            (9, 21),
+            (10, 21),
+            (11, 22),
+            (28, 30),
+            (100, 30),
+        ] {
+            assert_eq!(finder_max_steps(files), steps, "{files} files");
+        }
     }
 }

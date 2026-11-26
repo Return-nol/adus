@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-/// Backstop of one job. The engine already bounds a review by its budget (12 min Generalist,
+/// Backstop of one job. The engine already bounds a review by its budget (20 min Generalist,
 /// 30 min Specialists) so its `reviews` row is recorded as failed; this guards the rest. It is
 /// below the lock TTL and the queue's take-over limit (both 35 min), so a stuck job is never
 /// worked on by two workers at once.

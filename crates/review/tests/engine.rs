@@ -2184,7 +2184,7 @@ async fn clone_is_bounded_by_the_finder_deadline(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn review_timeout_matches_effective_mode(pool: PgPool) {
-    assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(12 * 60));
+    assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(20 * 60));
     assert_eq!(SPECIALISTS_REVIEW_TIMEOUT, Duration::from_secs(30 * 60));
 
     // Part 1: only the Specialists budget is non-zero.

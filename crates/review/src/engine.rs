@@ -47,7 +47,7 @@ use crate::verifier::{CandidateFinding, VerifyContext, VerifyInput, verify_candi
 use crate::workspace::{RepoCloner, WorkspaceError};
 
 /// Budget of one Generalist review (`Engine::review_timeout`), small PRs included.
-pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(12 * 60);
+pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// Budget of one Specialists review (`Engine::specialists_review_timeout`): up to four agents
 /// per batch at `High` effort need more time than one Generalist agent.
 pub const SPECIALISTS_REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -123,21 +123,21 @@ fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
 
 /// When each stage must be done, as fractions of the run's budget (`review_timeout` or
 /// `specialists_review_timeout`) from the run's start (spec 4.11): Finder (clone included)
-/// 60 %, Verifier 90 %, Dedup 97 %; the rest is for posting.
+/// 55 %, Verifier 80 %, post-verify funnel 93 %; the rest is for posting.
 #[derive(Debug, Clone, Copy)]
 struct Deadlines {
     finder: Instant,
     verifier: Instant,
-    dedup: Instant,
+    post_verify: Instant,
 }
 
 impl Deadlines {
     fn new(start: Instant, budget: Duration) -> Self {
         let at = |percent: u32| start + budget.saturating_mul(percent) / 100;
         Self {
-            finder: at(60),
-            verifier: at(90),
-            dedup: at(97),
+            finder: at(55),
+            verifier: at(80),
+            post_verify: at(93),
         }
     }
 }
@@ -663,7 +663,7 @@ impl Engine {
         let DedupOutcome {
             kept: found,
             already_raised,
-        } = match tokio::time::timeout_at(s.deadlines.dedup, dedup).await {
+        } = match tokio::time::timeout_at(s.deadlines.post_verify, dedup).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => {
                 tracing::warn!("semantic dedup cut by the deadline; keeping all findings");
@@ -1107,5 +1107,24 @@ pub(crate) fn chat_error(err: ChatError) -> EngineError {
         ChatError::Invalid(_) | ChatError::ToolsUnsupported(_) | ChatError::ContextOverflow(_) => {
             EngineError::Fatal(format!("LLM: {err}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_timeout_is_twenty_minutes() {
+        assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(20 * 60));
+    }
+
+    #[test]
+    fn deadlines_split_budget_55_80_93() {
+        let start = Instant::now();
+        let d = Deadlines::new(start, REVIEW_TIMEOUT);
+        assert_eq!(d.finder, start + Duration::from_secs(11 * 60));
+        assert_eq!(d.verifier, start + Duration::from_secs(16 * 60));
+        assert_eq!(d.post_verify, start + Duration::from_secs(18 * 60 + 36));
     }
 }
