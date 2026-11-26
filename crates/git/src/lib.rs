@@ -95,13 +95,24 @@ pub(crate) fn basic_auth_header(user: &str, password: &str) -> String {
     format!("Basic {encoded}")
 }
 
-/// Decode a JSON response body into `T`, mapping parse/transport failures to `GitError::Decode`.
+/// Longest serde message kept in a `GitError::Decode`.
+const DECODE_DETAIL_CHARS: usize = 200;
+
+/// Decode a JSON response body into `T`. A failed body read is `GitError::Http`; a body that
+/// does not match `T` is `GitError::Decode` carrying serde's message (field and position, e.g.
+/// "missing field `title` at line 1 column 42"), cut to `DECODE_DETAIL_CHARS`, so a provider
+/// shape change names the field in the logs.
 pub(crate) async fn decode<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
 ) -> Result<T, GitError> {
-    resp.json::<T>()
+    let body = resp
+        .bytes()
         .await
-        .map_err(|e| GitError::Decode(e.without_url().to_string()))
+        .map_err(|e| GitError::Http(e.without_url().to_string()))?;
+    serde_json::from_slice(&body).map_err(|e| {
+        let detail: String = e.to_string().chars().take(DECODE_DETAIL_CHARS).collect();
+        GitError::Decode(detail)
+    })
 }
 
 pub trait GitProviderFactory: Send + Sync {
