@@ -500,7 +500,7 @@ Sync every implemented constant and behaviour, following spec §12:
 - §7: `REVIEW_TIMEOUT = 20 min`; stage deadlines 55 / 80 / 93 % (`post_verify`), `ENRICH_RESERVE`.
 - §8.3: removal of `expand_diff_block` / `load_expanded_diffs`; Verifier auto-widen.
 - §8.4: model/effort matrix; raw diffs; 500-char PR description; `<changed_functions>`; per-hunk `CoverageLedger` with the append-only debt note and the one-shot gate (Generalist and Bug Pass 1 only); budget bands and their texts; required `reasoning`; Synthesis Rescue with its budget/time gates, `origin` and `synthesis_skipped`; Prose Recovery; `primary`/`High` Verifier with the verdict-due note, keep-on-unreadable verdicts and the Evidence Gate; no `MAX_VERIFY_CANDIDATES` cap and the `verify_order` queue (replace the §7 "Up to `MAX_VERIFY_CANDIDATES = 25` sorted `Critical > Warning > Info`" text); stringified-array parsing; the empty-resubmit fallback; Finder-only budget bands; post-verify Severity, title-and-suggestion Enrichment (body never rewritten) and `check_fix`; cache-weighted `TokenBudget`; the new stage-log fields.
-- §10: an entry for the overhaul spec noting the core loop is implemented and Sharded Rules arrives in the companion plan (the spec stays `Status: draft` until that plan's last task).
+- §10: an entry for the overhaul spec noting the core loop is implemented and Sharded Rules arrives in the companion plan (the spec stays `Status: approved`, not `implemented`, until that plan's last task).
 
 - [ ] **Step 2: Commit**
 
