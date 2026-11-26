@@ -1115,11 +1115,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_timeout_is_twenty_minutes() {
-        assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(20 * 60));
-    }
-
-    #[test]
     fn deadlines_split_budget_55_80_93() {
         let start = Instant::now();
         let d = Deadlines::new(start, REVIEW_TIMEOUT);

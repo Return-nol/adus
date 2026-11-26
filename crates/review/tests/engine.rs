@@ -2082,7 +2082,7 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn finder_deadline_cuts_slow_specialist_and_posts_survivors_with_note(pool: PgPool) {
     let mut s = setup_one(&pool).await;
-    // Finder deadline at 60 % = 900 ms; the Performance reviewer would answer after 30 s.
+    // Finder deadline at 55 % = 825 ms; the Performance reviewer would answer after 30 s.
     s.engine.specialists_review_timeout = Duration::from_millis(1500);
     s.chat.delay(PERFORMANCE_ROLE, Duration::from_secs(30));
     s.chat
@@ -2110,7 +2110,7 @@ async fn finder_deadline_cuts_slow_specialist_and_posts_survivors_with_note(pool
 #[sqlx::test(migrations = "../../migrations")]
 async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
     let mut s = setup_one(&pool).await;
-    // Finder deadline at 60 % = 270 ms, well before the 450 ms review timeout.
+    // Finder deadline at 55 % = 247.5 ms, well before the 450 ms review timeout.
     s.engine.review_timeout = Duration::from_millis(450);
     s.chat
         .delay("<ReviewInstructions>", Duration::from_secs(30));
@@ -2131,7 +2131,7 @@ async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn finder_deadline_lists_the_unfinished_batch_as_skipped(pool: PgPool) {
     let mut s = setup_big(&pool, &["a.rs", "b.rs"]).await;
-    // Finder deadline at 60 % = 900 ms; the b.rs batch would answer after 30 s.
+    // Finder deadline at 55 % = 825 ms; the b.rs batch would answer after 30 s.
     s.engine.review_timeout = Duration::from_millis(1500);
     s.chat.delay(&diff_header("b.rs"), Duration::from_secs(30));
     s.chat.finder_file("a.rs", Reply::finding("a.rs", 2, "Bug"));
@@ -2160,7 +2160,7 @@ async fn finder_deadline_lists_the_unfinished_batch_as_skipped(pool: PgPool) {
 async fn clone_is_bounded_by_the_finder_deadline(pool: PgPool) {
     let mut s = setup_one(&pool).await;
     s.enable_clone(&[]);
-    // Finder deadline at 60 % = 270 ms; the clone would take 30 s.
+    // Finder deadline at 55 % = 247.5 ms; the clone would take 30 s.
     s.engine.review_timeout = Duration::from_millis(450);
     s.cloner.delay(Duration::from_secs(30));
     let started = Instant::now();
@@ -2252,8 +2252,8 @@ async fn review_timeout_matches_effective_mode(pool: PgPool) {
 async fn slow_specialist_submits_before_the_finder_deadline(pool: PgPool) {
     let mut s = setup_one(&pool).await;
     s.enable_clone(&[("a.rs", "a\nb\n")]);
-    // Finder deadline at 60 % = 540 ms. Turn 1 takes 250 ms; with <= 290 ms left
-    // (< 2 * 250 ms), turn 2 offers only `submit_findings` and finishes well before 540 ms.
+    // Finder deadline at 55 % = 495 ms. Turn 1 takes 250 ms; with <= 245 ms left
+    // (< 2 * 250 ms), turn 2 offers only `submit_findings` and finishes well before 495 ms.
     s.engine.specialists_review_timeout = Duration::from_millis(900);
     s.chat.finder_role_delayed(
         BUG_ROLE,
