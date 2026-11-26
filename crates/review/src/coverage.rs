@@ -19,19 +19,16 @@ const GATE_DOC_EXTENSIONS: [&str; 4] = ["md", "mdx", "rst", "txt"];
 /// One changed file: its right-side hunks and the line windows read so far.
 #[derive(Debug, Default)]
 struct Target {
-    /// Inclusive right-side hunk ranges. Empty for a file without commentable hunks.
+    /// Inclusive right-side hunk ranges; never empty.
     hunks: Vec<(u32, u32)>,
     /// Sorted, merged, inclusive windows the model has seen.
     reads: Vec<(u32, u32)>,
-    /// Set by any successful read; covers a file without hunks.
-    read: bool,
     /// Set by a read of an empty file (`0-0`), which covers every hunk.
     whole: bool,
 }
 
 impl Target {
     fn add_read(&mut self, start: u32, end: u32) {
-        self.read = true;
         if end == 0 {
             self.whole = true;
             return;
@@ -68,11 +65,7 @@ impl Target {
     }
 
     fn is_pending(&self) -> bool {
-        if self.hunks.is_empty() {
-            !self.read
-        } else {
-            !self.pending_ranges().is_empty()
-        }
+        !self.pending_ranges().is_empty()
     }
 }
 
@@ -84,28 +77,27 @@ pub(crate) struct CoverageLedger {
 }
 
 impl CoverageLedger {
-    /// One target per readable file of the batch. A deleted file has no head version to open,
-    /// so it carries no debt.
+    /// One target per file of the batch with something to read. A deleted file has no head
+    /// version to open, and a file without commentable hunks (binary, rename-only, mode-only)
+    /// has no changed lines to read, so neither carries debt.
     pub(crate) fn from_files(files: &[&FileDiff]) -> Self {
         let targets = files
             .iter()
             .filter(|file| file.status != FileStatus::Deleted)
-            .map(|file| {
-                let hunks = file
-                    .patch
-                    .as_deref()
-                    .map(commentable_hunks)
-                    .unwrap_or_default()
+            .filter_map(|file| {
+                let hunks: Vec<(u32, u32)> = commentable_hunks(file.patch.as_deref()?)
                     .into_iter()
                     .map(|range| (*range.start(), *range.end()))
                     .collect();
-                (
-                    normalize_path(&file.path),
-                    Target {
-                        hunks,
-                        ..Target::default()
-                    },
-                )
+                (!hunks.is_empty()).then(|| {
+                    (
+                        normalize_path(&file.path),
+                        Target {
+                            hunks,
+                            ..Target::default()
+                        },
+                    )
+                })
             })
             .collect();
         Self {
@@ -174,11 +166,8 @@ impl CoverageLedger {
 }
 
 /// `path: lines a-b, c-d`; a lone one-line range reads `line a`; more than the cap ends with
-/// `, …`. A file without commentable hunks is named alone.
+/// `, …`.
 fn file_debt(path: &str, ranges: &[(u32, u32)]) -> String {
-    let Some(&(first_start, first_end)) = ranges.first() else {
-        return path.to_owned();
-    };
     let shown: Vec<String> = ranges
         .iter()
         .take(COVERAGE_DEBT_MAX_RANGES)
@@ -190,7 +179,7 @@ fn file_debt(path: &str, ranges: &[(u32, u32)]) -> String {
             }
         })
         .collect();
-    let label = if ranges.len() == 1 && first_start == first_end {
+    let label = if matches!(ranges, [(start, end)] if start == end) {
         "line"
     } else {
         "lines"
@@ -316,7 +305,8 @@ mod tests {
     }
 
     #[test]
-    fn coverage_ledger_names_single_lines_and_hunkless_files_and_signature_tracks_covered_ranges() {
+    fn coverage_ledger_names_single_lines_skips_hunkless_files_and_signature_tracks_covered_ranges()
+    {
         let mut ledger = ledger(&[
             diff("src/a.rs", &[(1, 10), (50, 60)]),
             diff("src/c.rs", &[(7, 7)]),
@@ -328,7 +318,8 @@ mod tests {
             },
         ]);
         let note = ledger.debt_note("submit_findings").unwrap();
-        assert!(note.contains("- assets/logo.bin\n"), "{note}");
+        assert!(!note.contains("logo.bin"), "{note}");
+        assert_eq!(ledger.pending_qualifying_files(), ["src/a.rs", "src/c.rs"]);
         assert!(note.contains("- src/c.rs: line 7\n"), "{note}");
 
         let before = ledger.pending_signature();

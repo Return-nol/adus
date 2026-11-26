@@ -273,13 +273,7 @@ impl ReadOnlyCall {
         match self {
             Self::ReadFile(args) => {
                 let path = ws.resolve(args.path.trim())?;
-                let start = args.start_line.unwrap_or(1).max(1);
-                let last_allowed = start.saturating_add(READ_MAX_LINES - 1);
-                let end = match args.end_line {
-                    Some(end) if end < start => return Err(ToolError::BadRange),
-                    Some(end) => end.min(last_allowed),
-                    None => last_allowed,
-                };
+                let (start, end) = read_window(args.start_line, args.end_line)?;
                 let key = CacheKey::ReadFile {
                     path: path.rel().to_owned(),
                     start,
@@ -322,6 +316,20 @@ impl ReadOnlyCall {
             }
         }
     }
+}
+
+/// The inclusive line window a `read_file` call covers: `start_line` defaults to 1, the window
+/// holds at most [`READ_MAX_LINES`] lines, and an `end_line` before `start_line` is
+/// [`ToolError::BadRange`].
+fn read_window(start_line: Option<u32>, end_line: Option<u32>) -> Result<(u32, u32), ToolError> {
+    let start = start_line.unwrap_or(1).max(1);
+    let last_allowed = start.saturating_add(READ_MAX_LINES - 1);
+    let end = match end_line {
+        Some(end) if end < start => return Err(ToolError::BadRange),
+        Some(end) => end.min(last_allowed),
+        None => last_allowed,
+    };
+    Ok((start, end))
 }
 
 fn parse_args<T: DeserializeOwned>(tool: &'static str, args: &Value) -> Result<T, ToolError> {
@@ -399,13 +407,7 @@ impl Toolbox {
             .workspace
             .resolve_existing_file(args.path.trim())
             .ok()?;
-        let start = args.start_line.unwrap_or(1).max(1);
-        let last_allowed = start.saturating_add(READ_MAX_LINES - 1);
-        let end = match args.end_line {
-            Some(end) if end < start => return None,
-            Some(end) => end.min(last_allowed),
-            None => last_allowed,
-        };
+        let (start, end) = read_window(args.start_line, args.end_line).ok()?;
         Some((path.rel().to_owned(), start, end))
     }
 
