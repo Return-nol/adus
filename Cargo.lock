@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adus"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adus-core",
  "adus-db",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "adus-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "adus-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adus-core",
  "chrono",
@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "adus-git"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adus-core",
  "async-trait",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "adus-llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adus-core",
  "adus-db",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "adus-queue"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adus-core",
  "chrono",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "adus-review"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adus-core",
  "adus-db",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "adus-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adus-core",
  "adus-db",
