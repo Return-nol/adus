@@ -15,8 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use adus_core::types::normalize_path;
-use adus_git::{FileDiff, FileStatus};
 use adus_llm::{ToolCall, ToolDef};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
@@ -25,7 +23,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::prompt::{MAX_EXPAND_FILE_CHARS, diff_block, expand_diff_block, truncate_with_marker};
+use crate::prompt::truncate_with_marker;
 use crate::redact::redact_secrets;
 use crate::workspace::{PathError, RepoPath, RepoWorkspace, is_secret_path};
 
@@ -456,53 +454,6 @@ fn read_file_snippet_sync(
         .saturating_add(radius)
         .min(start.saturating_add(READ_MAX_LINES - 1));
     read_file(&target, start, end).ok()
-}
-
-/// Pre-seeds up to [`crate::prompt::EXPANDED_HUNK_CONTEXT`] surrounding head-file lines around
-/// each hunk for modified/renamed files whose raw diff is under [`MAX_EXPAND_FILE_CHARS`].
-/// Runs in `spawn_blocking` and silently skips added, secret, binary, oversized (>2 MB), missing,
-/// or path-escaping files.
-pub(crate) async fn load_expanded_diffs(
-    ws: Arc<RepoWorkspace>,
-    files: &[FileDiff],
-) -> HashMap<String, String> {
-    let candidates: Vec<FileDiff> = files
-        .iter()
-        .filter(|file| {
-            file.status != FileStatus::Added
-                && !file.patch.as_deref().unwrap_or("").is_empty()
-                && diff_block(file).chars().count() < MAX_EXPAND_FILE_CHARS
-        })
-        .cloned()
-        .collect();
-    if candidates.is_empty() {
-        return HashMap::new();
-    }
-    match tokio::task::spawn_blocking(move || load_expanded_diffs_sync(&ws, &candidates)).await {
-        Ok(map) => map,
-        Err(err) => {
-            tracing::warn!(error = %err, "loading expanded diffs failed");
-            HashMap::new()
-        }
-    }
-}
-
-fn load_expanded_diffs_sync(ws: &RepoWorkspace, files: &[FileDiff]) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for file in files {
-        let key = normalize_path(&file.path);
-        let Ok(resolved) = ws.resolve(&key) else {
-            continue;
-        };
-        if !resolved.abs().is_file() {
-            continue;
-        }
-        let Ok(text) = read_text(resolved.abs()) else {
-            continue;
-        };
-        out.insert(key, expand_diff_block(file, &text));
-    }
-    out
 }
 
 /// Runs `call` through the cache. Fresh content is redacted before it is cached, so cached
@@ -1864,52 +1815,5 @@ mod tests {
             assert!(!def.description.is_empty());
             assert_portable_schema(&def.parameters);
         }
-    }
-
-    #[tokio::test]
-    async fn load_expanded_diffs_skips_added_oversized_and_secret_files() {
-        use adus_git::{FileDiff, FileStatus};
-
-        let big_patch = format!("@@ -1,1 +1,2 @@\n a\n+{}\n", "x".repeat(20_500));
-        let a_body: String = (1..=30).map(|i| format!("line_{i}\n")).collect();
-        let ws = workspace(&[
-            ("src/a.rs", a_body.as_bytes()),
-            ("src/new.rs", b"fn new_fn() {}\n"),
-            (".env", b"SECRET=12345678\n"),
-            ("src/big.rs", b"a\n"),
-        ]);
-        let files = vec![
-            FileDiff {
-                path: "src/a.rs".into(),
-                old_path: None,
-                status: FileStatus::Modified,
-                patch: Some("@@ -20,1 +20,2 @@\n line_20\n+added\n".into()),
-            },
-            FileDiff {
-                path: "src/new.rs".into(),
-                old_path: None,
-                status: FileStatus::Added,
-                patch: Some("@@ -0,0 +1,1 @@\n+fn new_fn() {}\n".into()),
-            },
-            FileDiff {
-                path: ".env".into(),
-                old_path: None,
-                status: FileStatus::Modified,
-                patch: Some("@@ -1,1 +1,1 @@\n-OLD=1\n+NEW=2\n".into()),
-            },
-            FileDiff {
-                path: "src/big.rs".into(),
-                old_path: None,
-                status: FileStatus::Modified,
-                patch: Some(big_patch),
-            },
-        ];
-
-        let expanded = load_expanded_diffs(ws, &files).await;
-        assert!(expanded.contains_key("src/a.rs"));
-        assert!(expanded["src/a.rs"].contains("    5 : line_5"));
-        assert!(!expanded.contains_key("src/new.rs"));
-        assert!(!expanded.contains_key(".env"));
-        assert!(!expanded.contains_key("src/big.rs"));
     }
 }

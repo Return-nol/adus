@@ -42,7 +42,7 @@ use crate::prompt::{
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
 use crate::small_pr::is_small_pr;
-use crate::tools::{Toolbox, load_expanded_diffs};
+use crate::tools::Toolbox;
 use crate::verifier::{CandidateFinding, VerifyContext, VerifyInput, verify_candidates};
 use crate::workspace::{RepoCloner, WorkspaceError};
 
@@ -546,14 +546,11 @@ impl Engine {
             }
         };
         let clone_ms = clone_started.elapsed().as_millis();
-        let (repo_instructions, expanded) = match &workspace {
-            Some(workspace) => tokio::join!(
-                load_repo_instructions(Arc::clone(workspace)),
-                load_expanded_diffs(Arc::clone(workspace), &files),
-            ),
-            None => (None, HashMap::new()),
+        let repo_instructions = match &workspace {
+            Some(workspace) => load_repo_instructions(Arc::clone(workspace)).await,
+            None => None,
         };
-        let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS, &expanded);
+        let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS);
         // One cache for every agent of this review, Finder and Verifier alike.
         let toolbox = workspace.map(Toolbox::new);
 
@@ -562,7 +559,6 @@ impl Engine {
             manifest,
             batches: &batches,
             allowed: &allowed,
-            expanded: &expanded,
             memories: s.memories,
             repo_instructions: repo_instructions.as_deref(),
             mode,
@@ -707,7 +703,9 @@ impl Engine {
             .collect();
         let mut counts: BTreeMap<Severity, usize> = BTreeMap::new();
         for suggestion in &found {
-            *counts.entry(suggestion.severity).or_default() += 1;
+            *counts
+                .entry(suggestion.severity.unwrap_or(Severity::Warning))
+                .or_default() += 1;
         }
         let mut redacted_comments = 0;
         let comments = found

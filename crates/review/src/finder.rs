@@ -26,8 +26,8 @@ use crate::agent::{AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, 
 use crate::budget::TokenBudget;
 use crate::coverage::CoverageLedger;
 use crate::parse::{
-    CommentableRange, Suggestion, parse_dismissed, parse_submit_findings, parse_suggestions,
-    submit_findings_tool_def, validate_batch_anchors,
+    CommentableRange, Suggestion, parse_dismissed, parse_reasoning, parse_submit_findings,
+    parse_suggestions, submit_findings_tool_def, validate_batch_anchors,
 };
 use crate::prompt::{DiffBatch, build_finder_system_prompt, build_finder_user_prompt};
 use crate::specialists::{SpecialistKind, active_specialists};
@@ -67,7 +67,6 @@ pub(crate) struct FinderInput<'a> {
     pub manifest: &'a str,
     pub batches: &'a [DiffBatch<'a>],
     pub allowed: &'a HashMap<String, CommentableRange>,
-    pub expanded: &'a HashMap<String, String>,
     pub memories: &'a [Memory],
     pub repo_instructions: Option<&'a str>,
     pub mode: ReviewMode,
@@ -154,7 +153,6 @@ async fn run_all(
     deadline: Instant,
 ) -> Vec<FinderTask> {
     let with_tools = matches!(tools, AgentTools::Full(_));
-    let submit_def = submit_findings_tool_def();
     // Futures are built up front: a closure inside the stream would make the future lose
     // `Send` (higher-ranked lifetime inference), as in `agent.rs`.
     let batches: Vec<_> = input
@@ -168,7 +166,6 @@ async fn run_all(
                 batch,
                 input.memories,
                 input.repo_instructions,
-                input.expanded,
                 with_tools,
             );
             let kinds = active_specialists(
@@ -176,7 +173,6 @@ async fn run_all(
                 !batch.rules.is_empty() || input.repo_instructions.is_some(),
             );
             let allowed = batch_allowed(batch, input.allowed);
-            let submit_def = &submit_def;
             async move {
                 // Checked when the batch starts (the stream polls it), not when it is built.
                 if llm.token_budget.is_some_and(|budget| budget.exhausted()) {
@@ -194,10 +190,10 @@ async fn run_all(
                     .into_iter()
                     .map(|kind| {
                         let submit = SubmitFindings {
-                            def: submit_def.clone(),
+                            def: submit_findings_tool_def(kind == SpecialistKind::Generalist),
                             allowed: allowed.clone(),
                             anchor_retried: AtomicBool::new(false),
-                            specialist: kind.label(),
+                            kind,
                             batch: index,
                         };
                         let job = FinderJob {
@@ -303,14 +299,24 @@ async fn run_one(
 }
 
 /// The Finder's terminal tool, `submit_findings`. A reply without a tool call is read as the
-/// JSON array of the diff-only output format.
+/// JSON array of the diff-only output format. Findings without a valid `category` get the
+/// specialist's own (none for the generalist).
 struct SubmitFindings<'a> {
     def: ToolDef,
     allowed: HashMap<String, &'a CommentableRange>,
     anchor_retried: AtomicBool,
-    /// The agent's `SpecialistKind::label` and batch index, for the dismissal logs.
-    specialist: &'static str,
+    /// The agent's specialist and batch index, for the category default and the logs.
+    kind: SpecialistKind,
     batch: usize,
+}
+
+impl SubmitFindings<'_> {
+    fn with_default_category(&self, mut suggestions: Vec<Suggestion>) -> Vec<Suggestion> {
+        for s in &mut suggestions {
+            s.category = s.category.or(self.kind.category());
+        }
+        suggestions
+    }
 }
 
 impl SubmitSpec for SubmitFindings<'_> {
@@ -330,10 +336,20 @@ impl SubmitSpec for SubmitFindings<'_> {
             validate_batch_anchors(&suggestions, &self.allowed)?;
         }
         // Only the accepted call is logged: a bounced one returned above and is re-sent.
+        let specialist = self.kind.label();
+        match parse_reasoning(arguments) {
+            Some(reasoning) => tracing::debug!(
+                specialist,
+                batch = self.batch,
+                reasoning = %reasoning,
+                "finder reasoning"
+            ),
+            None => tracing::debug!(specialist, batch = self.batch, "finder reasoning missing"),
+        }
         let dismissed = parse_dismissed(arguments);
         for d in &dismissed {
             tracing::debug!(
-                specialist = self.specialist,
+                specialist,
                 batch = self.batch,
                 file = %d.file,
                 line = ?d.line,
@@ -343,16 +359,18 @@ impl SubmitSpec for SubmitFindings<'_> {
             );
         }
         tracing::debug!(
-            specialist = self.specialist,
+            specialist,
             batch = self.batch,
             dismissed = dismissed.len(),
             "finder dismissals"
         );
-        Ok(suggestions)
+        Ok(self.with_default_category(suggestions))
     }
 
     fn parse_prose(&self, text: &str) -> Result<Vec<Suggestion>, String> {
-        parse_suggestions(text).map_err(|err| err.to_string())
+        parse_suggestions(text)
+            .map(|suggestions| self.with_default_category(suggestions))
+            .map_err(|err| err.to_string())
     }
 
     fn has_findings(&self, output: &Vec<Suggestion>) -> bool {
@@ -439,13 +457,11 @@ mod tests {
             review_id: Some(Uuid::from_u128(1)),
             repository_id: Some(Uuid::from_u128(2)),
         };
-        let expanded = HashMap::new();
         let input = FinderInput {
             pr: &pr,
             manifest: "src/a.rs",
             batches: &batches,
             allowed: &allowed,
-            expanded: &expanded,
             memories: &[],
             repo_instructions: None,
             mode: ReviewMode::Generalist,
@@ -533,16 +549,16 @@ mod tests {
             .expect("second submit with partial invalid keeps findings");
         assert_eq!(outcome.steps_used, 2);
         assert_eq!(outcome.result.len(), 2);
-        assert_eq!(outcome.result[0].severity, Severity::Warning);
+        assert_eq!(outcome.result[0].severity, Some(Severity::Warning));
 
         // 3. On the final step (can_retry == false), SubmitFindings accepts mixed findings immediately.
         let mut batch_map = HashMap::new();
         batch_map.insert("src/a.rs".to_string(), &allowed["src/a.rs"]);
         let submit = SubmitFindings {
-            def: submit_findings_tool_def(),
+            def: submit_findings_tool_def(true),
             allowed: batch_map,
             anchor_retried: AtomicBool::new(false),
-            specialist: "Generalist",
+            kind: SpecialistKind::Generalist,
             batch: 0,
         };
         let chat = ScriptedChat::new(vec![submit_turn(
@@ -621,7 +637,7 @@ c
                 token_budget: None,
             };
             let submit = SubmitFindings {
-                def: submit_findings_tool_def(),
+                def: submit_findings_tool_def(kind == SpecialistKind::Generalist),
                 allowed: batch_allowed(
                     &DiffBatch {
                         files: files.clone(),
@@ -630,7 +646,7 @@ c
                     &allowed,
                 ),
                 anchor_retried: AtomicBool::new(false),
-                specialist: kind.label(),
+                kind,
                 batch: 0,
             };
             let job = FinderJob {
@@ -649,6 +665,8 @@ c
                 if gated { "Again" } else { "Early" },
                 "{kind:?}"
             );
+            // No `category` was sent: a specialist's own fills in, the generalist's stays unset.
+            assert_eq!(outcome.result[0].category, kind.category(), "{kind:?}");
             assert_eq!(reqs[1].messages.iter().any(is_debt), gated, "{kind:?}");
             assert!(
                 reqs.iter()

@@ -25,9 +25,10 @@ use crate::agent::{
 };
 use crate::budget::TokenBudget;
 use crate::engine::is_retryable;
-use crate::parse::{Suggestion, first_json_object};
+use crate::parse::{FindingCategory, Suggestion, first_json_object};
 use crate::prompt::{
-    diff_block, format_memories, format_pr_description, format_rules, or_none, wrap,
+    MAX_DESCRIPTION_CHARS_DIFF_ONLY, diff_block, format_memories, format_pr_description,
+    format_rules, or_none, wrap,
 };
 use crate::specialists::SpecialistKind;
 use crate::tools::Toolbox;
@@ -65,7 +66,11 @@ pub(crate) struct SerializedCandidate<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     start_line: Option<u32>,
     line: u32,
-    severity: Severity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    severity: Option<Severity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<FindingCategory>,
+    #[serde(skip_serializing_if = "str::is_empty")]
     title: &'a str,
     body: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,6 +91,7 @@ impl<'a> SerializedCandidate<'a> {
             start_line: s.start_line,
             line: s.line,
             severity: s.severity,
+            category: s.category,
             title: &s.title,
             body: &s.body,
             suggestion: include_suggestion.then_some(&s.suggestion),
@@ -596,7 +602,7 @@ fn build_user_prompt(
         wrap("pr_title", &evidence.pr.title),
         wrap(
             "pr_description",
-            &format_pr_description(&evidence.pr.description),
+            &format_pr_description(&evidence.pr.description, MAX_DESCRIPTION_CHARS_DIFF_ONLY),
         ),
         wrap("pr_manifest", evidence.manifest),
         wrap("rules", &or_none(format_rules(&rules))),
@@ -679,7 +685,8 @@ mod tests {
                 file: "src/a.rs".into(),
                 start_line: None,
                 line: 2,
-                severity,
+                severity: Some(severity),
+                category: None,
                 title: title.into(),
                 body: format!("body of {title}"),
                 suggestion: None,

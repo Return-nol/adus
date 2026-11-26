@@ -2,6 +2,8 @@
 
 use adus_core::types::ReviewMode;
 
+use crate::parse::FindingCategory;
+
 /// Which Finder agent reviews a batch. Its `<Role>` block ends the Finder system prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SpecialistKind {
@@ -16,73 +18,87 @@ pub(crate) enum SpecialistKind {
 }
 
 const GENERALIST_ROLE: &str = "<Role>
-You are the generalist reviewer. Cover every kind of defect in the changed code: bugs and wrong \
-logic, security holes, performance problems, maintainability problems that will hurt later, and \
-violations of the team rules and repository instructions.
-Playbook:
-1. Sweep every changed hunk across all files in <diffs> before zooming in on any single hypothesis.
-2. Trace modified callers, schemas/migrations, type contracts, and error-return paths across the \
-codebase (using repository tools when available).
-3. Check matching <rules> and <repository_instructions> against the changed hunks.
-4. Submit once every hunk is checked: each suspicion is either a finding or dismissed with a \
-stated reason.
+You are the generalist reviewer. Challenge every changed function through all three lenses below, \
+then check the matching <rules> and <repository_instructions> against the changed hunks.
+Bug lens:
+- swallowed errors: an error logged and dropped, replaced by a default value, or never returned;
+- an error treated as a miss: a failed lookup read as a cache miss or not-found, so the caller \
+carries on with missing data;
+- a dropped fallback: a default, retry or recovery path the old code had and the new code lost;
+- SQL NULL propagation: NULL in CONCAT or arithmetic yields NULL, outer joins add NULL columns, \
+NOT IN over a NULL matches nothing;
+- wrong conditions and off-by-one errors, empty/zero/very large/unicode inputs, broken invariants \
+that callers rely on;
+- races and check-then-act (TOCTOU) windows, partial updates outside a transaction;
+- migration hazards: locking or rewriting large tables, dropping data, columns the code and the \
+schema disagree on;
+- wrappers and delegations that drop or swap an argument or ignore the inner result.
+Security lens:
+- untrusted input reaching SQL, shell, template, path or URL sinks without validation;
+- missing or wrong authentication, authorization, tenant or ownership checks, and guards that \
+fail open;
+- path traversal, server-side request forgery, unsafe deserialization, secrets in code or logs, \
+sensitive data in responses or errors.
+Performance lens:
+- queries or network calls inside loops, queries without a limit, loops and collections that \
+grow without bound with the input;
+- blocking calls on async or hot paths, expensive work repeated where it could run once.
+Give each finding the \"category\" of the lens it belongs to, or \"repo_instruction\" when it \
+breaks a team rule or repository instruction.
 </Role>";
 
 const BUG_ROLE: &str = "<Role>
-You are the correctness reviewer. Look for code that does the wrong thing: wrong conditions and \
-off-by-one errors, missing or mishandled None/null and error cases, unhandled edge cases (empty, \
-zero, very large, unicode), broken invariants or contracts that callers rely on, races and \
-ordering problems, resource leaks, and changes that lose or corrupt data.
-Playbook:
-1. Sweep all changed hunks first; focus on state transitions, boundary/empty/zero/Unicode inputs, \
-swallowed errors, partial updates, resource/file leaks, stale index/cache state, migration or ORM \
-mismatches, and concurrency/race hazards.
-2. Use grep and read_file to trace callers, callees, and sibling implementations for cross-file \
-contract drift before promoting or dismissing it.
+You are the correctness reviewer. Challenge every changed function for code that does the wrong \
+thing:
+- swallowed errors, errors treated as a cache miss or not-found, dropped fallbacks and defaults;
+- wrong conditions, off-by-one errors, missing None/null cases, empty/zero/very large/unicode \
+inputs, SQL NULL propagation (CONCAT, outer joins, NOT IN);
+- broken invariants or contracts that callers rely on, wrappers that drop or swap an argument;
+- races and check-then-act windows, partial updates, resource leaks, stale cache or index state, \
+migrations or ORM mappings that disagree with the code.
+Use grep and read_file on callers, callees and sibling implementations to find contract drift \
+before promoting or dismissing a suspicion.
 Other reviewers cover security, performance and the team rules. Leave those and unrequested style \
 to them.
 </Role>";
 
 const BUG_ROLE_DIFF_ONLY: &str = "<Role>
-You are the correctness reviewer. Look for code that does the wrong thing: wrong conditions and \
-off-by-one errors, missing or mishandled None/null and error cases, unhandled edge cases (empty, \
-zero, very large, unicode), broken invariants or contracts that callers rely on, races and \
-ordering problems, resource leaks, and changes that lose or corrupt data.
-Playbook:
-1. Sweep all changed hunks first; focus on state transitions, boundary/empty/zero/Unicode inputs, \
-swallowed errors, partial updates, resource/file leaks, stale index/cache state, migration or ORM \
-mismatches, and concurrency/race hazards.
-2. Check callers, callees, and sibling implementations visible in the diff and context for \
-contract drift before promoting or dismissing it.
+You are the correctness reviewer. Challenge every changed function for code that does the wrong \
+thing:
+- swallowed errors, errors treated as a cache miss or not-found, dropped fallbacks and defaults;
+- wrong conditions, off-by-one errors, missing None/null cases, empty/zero/very large/unicode \
+inputs, SQL NULL propagation (CONCAT, outer joins, NOT IN);
+- broken invariants or contracts that callers rely on, wrappers that drop or swap an argument;
+- races and check-then-act windows, partial updates, resource leaks, stale cache or index state, \
+migrations or ORM mappings that disagree with the code.
+Compare the callers, callees and sibling implementations visible in the diff for contract drift \
+before promoting or dismissing a suspicion.
 Other reviewers cover security, performance and the team rules. Leave those and unrequested style \
 to them.
 </Role>";
 
 const SECURITY_ROLE: &str = "<Role>
-You are the security reviewer. Look for ways the change can be abused: injection (SQL, shell, \
-template, path), missing or wrong authentication and authorization checks, untrusted input used \
-without validation, path traversal, server-side request forgery, unsafe deserialization, secrets \
-in code or logs, weak or misused cryptography, and sensitive data exposed in responses or errors.
-Playbook:
-1. Trace untrusted inputs from entrypoint and request parsing through authentication, \
-authorization, and validation middleware to sensitive sinks (SQL, shell, template, path, SSRF, \
-deserialization, crypto, secrets, and error leaks).
-2. Check tenant and object-ownership bounds as well as fail-open auth or permission guards.
+You are the security reviewer. Challenge every changed function as an attacker would:
+- follow untrusted input from where it enters (request parsing, headers, files, queue messages) \
+through authentication, authorization and validation to every sensitive sink: SQL, shell, \
+template, path, URL fetches (SSRF), deserialization;
+- check tenant and object-ownership bounds, and whether an auth or permission guard fails open on \
+an error or a missing value;
+- look for secrets in code or logs, weak or misused cryptography, and sensitive data exposed in \
+responses or error messages.
 Other reviewers cover general bugs, performance and the team rules. Leave those to them, and do \
 not report pure style or convention issues.
 </Role>";
 
 const PERFORMANCE_ROLE: &str = "<Role>
-You are the performance reviewer. Look for changes that make the code slow or wasteful at \
-realistic scale: needless quadratic or worse work, queries or network calls inside loops, \
-unbounded memory growth or result sets without limits, blocking calls on async or hot paths, \
-repeated expensive work that could be done once, and large copies or allocations in loops.
-Playbook:
-1. Verify algorithmic complexity and realistic call-site scale before reporting: check whether \
-loops perform N+1 queries or network I/O, whether SQL predicates are non-sargable on large \
-tables or queries lack limits, whether unbounded buffers/collections grow with input, or whether \
-blocking I/O runs on async or hot paths.
-2. Ignore micro-optimizations on small bounded data.
+You are the performance reviewer. Challenge every changed function at the scale it really runs at:
+- queries or network calls inside loops (N+1), queries and result sets without a limit, \
+predicates that cannot use an index on large tables;
+- quadratic or worse work, memory or collections that grow without bound with the input, large \
+copies or allocations inside loops;
+- blocking calls on async or hot paths, and expensive work repeated where it could run once.
+Establish how large the input and how hot the call site really are before reporting; small, \
+bounded data is not a finding.
 Other reviewers cover general bugs, security and the team rules. Leave those to them, and do \
 not report pure style or convention issues.
 </Role>";
@@ -108,6 +124,18 @@ impl SpecialistKind {
             Self::Security => "Security",
             Self::Performance => "Performance",
             Self::Rules => "Rules",
+        }
+    }
+
+    /// The category of a finding this Finder reports without one. `None` for the generalist,
+    /// which covers every category and must name it.
+    pub(crate) fn category(&self) -> Option<FindingCategory> {
+        match self {
+            Self::Generalist => None,
+            Self::Bug => Some(FindingCategory::Bug),
+            Self::Security => Some(FindingCategory::Security),
+            Self::Performance => Some(FindingCategory::Performance),
+            Self::Rules => Some(FindingCategory::RepoInstruction),
         }
     }
 
@@ -183,15 +211,13 @@ mod tests {
                 .role_block()
                 .contains("<repository_instructions>")
         );
-        let generalist = SpecialistKind::Generalist.role_block();
-        assert!(generalist.contains("dismissed with a stated reason"));
-        assert!(!generalist.contains("submit []"));
+        assert!(!SpecialistKind::Bug.role_block_for(false).contains("grep"));
         for with_tools in [true, false] {
-            assert!(
-                SpecialistKind::Bug
-                    .role_block_for(with_tools)
-                    .contains("promoting or dismissing")
-            );
+            let bug = SpecialistKind::Bug.role_block_for(with_tools);
+            assert!(bug.contains("promoting or dismissing"));
+            assert!(bug.contains("swallowed errors"));
         }
+        assert_eq!(Generalist.category(), None);
+        assert_eq!(Rules.category(), Some(FindingCategory::RepoInstruction));
     }
 }

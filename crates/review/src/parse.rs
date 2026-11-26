@@ -1,26 +1,58 @@
 //! Parsing dan validasi jawaban LLM menjadi daftar temuan review.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 
 use adus_core::types::{Severity, normalize_path};
 use adus_git::diff::{commentable_hunks, commentable_lines, same_hunk};
 use adus_llm::ToolDef;
-use serde::Deserialize;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use thiserror::Error;
+
+/// Which lens a finding belongs to. The generalist names it; a specialist's findings default to
+/// its own (`SpecialistKind::category`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FindingCategory {
+    Bug,
+    Security,
+    Performance,
+    /// Breaks a team rule or a repository instruction.
+    RepoInstruction,
+}
+
+impl FindingCategory {
+    /// `"bug"`, `"security"`, `"performance"` or `"repo_instruction"`, ignoring case and
+    /// surrounding whitespace.
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "bug" => Some(Self::Bug),
+            "security" => Some(Self::Security),
+            "performance" => Some(Self::Performance),
+            "repo_instruction" => Some(Self::RepoInstruction),
+            _ => None,
+        }
+    }
+}
 
 /// Satu temuan dari LLM untuk satu baris (atau rentang baris) di file baru.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Suggestion {
     pub file: String,
-    /// First line of the span `start_line..=line` of existing new-file lines that `suggestion`
-    /// replaces. `None`, or a value equal to `line` (which parsing turns into `None`), means a
-    /// single-line finding.
+    /// First line of the span `start_line..=line` of existing new-file lines the finding (and its
+    /// `suggestion`) covers. `None`, or a value equal to `line` (which parsing turns into `None`),
+    /// means a single-line finding.
     pub start_line: Option<u32>,
     pub line: u32,
-    pub severity: Severity,
+    /// `None` until classified: the lean Finder output carries none. Readers that need one before
+    /// then use `Severity::Warning`.
+    pub severity: Option<Severity>,
+    /// `None` when the model named no valid category and its Finder role implies none.
+    pub category: Option<FindingCategory>,
+    /// Empty for lean Finder output until a title is derived after verification.
     pub title: String,
     pub body: String,
     /// Kode pengganti untuk baris/rentang itu (opsional).
@@ -57,7 +89,7 @@ impl CommentableRange {
 pub(crate) struct ParseError;
 
 /// Ambil array JSON pertama dari jawaban model (boleh dibungkus ```json atau diapit prosa).
-/// Objek yang kurang field wajib (`file`, `line`, `title`, `body`) dilewati, bukan menggagalkan parse.
+/// Objek yang kurang field wajib (`file`, `line`, `body`) dilewati, bukan menggagalkan parse.
 pub(crate) fn parse_suggestions(raw: &str) -> Result<Vec<Suggestion>, ParseError> {
     let items = first_json_array(raw).ok_or(ParseError)?;
     Ok(items.iter().filter_map(to_suggestion).collect())
@@ -105,6 +137,9 @@ fn parse_u32_field(val: &Value) -> Option<u32> {
     u32::try_from(n).ok()
 }
 
+/// One finding object, lean (`file`, `line`, `body`, optional `start_line` and `category`) or
+/// legacy (with `title`, `severity` and `suggestion`). `None` without a non-blank `file`, a valid
+/// `line`, or a `body`.
 fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
     let text = |key: &str| item.get(key)?.as_str().map(str::to_string);
     let line = parse_u32_field(item.get("line")?)?;
@@ -119,22 +154,20 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
             _ => (None, false),
         },
     };
-    let severity = match text("severity")
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "critical" => Severity::Critical,
-        "warning" => Severity::Warning,
-        _ => Severity::Info,
-    };
+    let severity = text("severity").and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+        "critical" => Some(Severity::Critical),
+        "warning" => Some(Severity::Warning),
+        "info" => Some(Severity::Info),
+        _ => None,
+    });
     let file = text("file").filter(|f| !f.trim().is_empty())?;
     Some(Suggestion {
         file,
         start_line,
         line,
         severity,
-        title: text("title")?,
+        category: text("category").and_then(|c| FindingCategory::parse(&c)),
+        title: text("title").unwrap_or_default(),
         body: text("body")?,
         suggestion: text("suggestion").filter(|_| range_ok),
     })
@@ -142,20 +175,32 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
 
 /// The Finder's terminal tool. Uses only `type`, `properties`, `required`, `description`,
 /// `items` and `enum`, the JSON-schema subset every provider (Gemini included) accepts.
-pub(crate) fn submit_findings_tool_def() -> ToolDef {
+/// `reasoning` is listed (and required) before `findings` so the model accounts for its
+/// investigation first. `category` is required from the generalist only; a specialist's
+/// findings default to its own category.
+pub(crate) fn submit_findings_tool_def(is_generalist: bool) -> ToolDef {
+    let finding_required = if is_generalist {
+        json!(["file", "line", "category", "body"])
+    } else {
+        json!(["file", "line", "body"])
+    };
     ToolDef {
         name: "submit_findings".into(),
-        description: "Submit your final review findings and end the review. Call it exactly \
-            once, with every finding you promoted, or with an empty list when nothing is worth \
-            reporting. List in `dismissed` every suspicion you ruled out, with the reason it \
-            cannot fail."
+        description: "Submit your final review and end it. Call it exactly once, after your \
+            reasoning accounts for every changed function and every lens, with every finding \
+            you promoted, or with an empty list when nothing is worth reporting. List in \
+            `dismissed` every suspicion you ruled out, with the reason it cannot fail."
             .into(),
         parameters: json!({
             "type": "object",
             "properties": {
+                "reasoning": {
+                    "type": "string",
+                    "description": "Write this first. For each changed function or hunk: what you challenged, which callers or callees you read, and why each suspicion was reported or dismissed. Never posted."
+                },
                 "findings": {
                     "type": "array",
-                    "description": "The confirmed findings; empty when there is nothing to report.",
+                    "description": "The findings you promoted; empty when there is nothing to report.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -165,36 +210,28 @@ pub(crate) fn submit_findings_tool_def() -> ToolDef {
                             },
                             "start_line": {
                                 "type": "integer",
-                                "description": "Optional. Set it only when `suggestion` replaces more than one EXISTING line of the new file: the first of those lines (a \"+\" or \" \" line in the same diff hunk, strictly less than `line`). The suggestion then replaces exactly lines start_line..line, so it must hold the full new text for all of them. Leave it out when the suggestion replaces only `line` (even if the new code has several lines), when it only inserts code, and when there is no suggestion."
+                                "description": "Optional. When the problem spans several lines, the first of them: a \"+\" or \" \" line in the same diff hunk, strictly less than `line`."
                             },
                             "line": {
                                 "type": "integer",
-                                "description": "New-file line number of a \"+\" line in that file's diff (the end line when `start_line` is set)."
+                                "description": "New-file line number of a \"+\" line in that file's diff (the last line of the span when `start_line` is set)."
                             },
-                            "severity": {
+                            "category": {
                                 "type": "string",
-                                "enum": ["info", "warning", "critical"],
-                                "description": "critical: will break, lose data or open a security hole; warning: likely bug or real performance or maintainability problem; info: worth knowing, low risk."
-                            },
-                            "title": {
-                                "type": "string",
-                                "description": "One-line summary of the problem."
+                                "enum": ["bug", "security", "performance", "repo_instruction"],
+                                "description": "The lens the finding belongs to; repo_instruction when it breaks a team rule or repository instruction."
                             },
                             "body": {
                                 "type": "string",
-                                "description": "Why it is a problem and how to fix it."
-                            },
-                            "suggestion": {
-                                "type": "string",
-                                "description": "Optional exact replacement for the existing lines it covers: `line` alone, or start_line..line when `start_line` is set. Keep their indentation; it may span several lines. Leave it out when unsure."
+                                "description": "The concrete trigger, the impact, and the code path (symbols and file paths) through which it fails, then the fix. Posted as written."
                             }
                         },
-                        "required": ["file", "line", "severity", "title", "body"]
+                        "required": finding_required
                     }
                 },
                 "dismissed": {
                     "type": "array",
-                    "description": "Optional. Every suspicion you checked and ruled out. Never posted; kept only in Adus's logs.",
+                    "description": "Optional. Every suspicion you tested, under every lens, and ruled out. Never posted; kept only in Adus's logs.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -219,8 +256,22 @@ pub(crate) fn submit_findings_tool_def() -> ToolDef {
                     }
                 }
             },
-            "required": ["findings"]
+            "required": ["reasoning", "findings"]
         }),
+    }
+}
+
+/// `args[key]` as an array. Claude models often send an array argument as a JSON-encoded string
+/// inside an otherwise valid tool call, so a string that parses to a JSON array is accepted too;
+/// any other value (or string) yields `None`.
+fn array_arg<'a>(args: &'a Value, key: &str) -> Option<Cow<'a, [Value]>> {
+    match args.get(key)? {
+        Value::Array(items) => Some(Cow::Borrowed(items.as_slice())),
+        Value::String(text) => match serde_json::from_str(text) {
+            Ok(Value::Array(items)) => Some(Cow::Owned(items)),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -239,12 +290,13 @@ pub(crate) struct Dismissal {
     pub why_safe: String,
 }
 
-/// Reads the optional `dismissed` list. Never fails: a missing or non-array list yields nothing,
-/// and malformed entries are skipped. Every text (`file` included) is secret-redacted and then
-/// cut to [`DISMISSED_TEXT_CHARS`], so every returned value is safe to log. Redacting first
-/// keeps a cut from splitting a secret into an unrecognisable, partly logged prefix.
+/// Reads the optional `dismissed` list (an array, or a string holding one). Never fails: a
+/// missing or non-array list yields nothing, and malformed entries are skipped. Every text
+/// (`file` included) is secret-redacted and then cut to [`DISMISSED_TEXT_CHARS`], so every
+/// returned value is safe to log. Redacting first keeps a cut from splitting a secret into an
+/// unrecognisable, partly logged prefix.
 pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal> {
-    let Some(items) = args.get("dismissed").and_then(Value::as_array) else {
+    let Some(items) = array_arg(args, "dismissed") else {
         return Vec::new();
     };
     fn text<'a>(item: &'a Value, key: &str) -> Option<&'a str> {
@@ -281,21 +333,24 @@ pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal> {
         .collect()
 }
 
-/// Arguments of `submit_findings`. Elements stay untyped so one malformed finding is skipped
-/// instead of rejecting the whole submission.
-#[derive(Deserialize)]
-struct SubmitFindingsArgs {
-    findings: Vec<Value>,
+/// The `reasoning` of a `submit_findings` call, trimmed and secret-redacted so it is safe to
+/// log; `None` when missing or blank. Never posted, and its absence never refuses a submission.
+pub(crate) fn parse_reasoning(args: &Value) -> Option<String> {
+    args.get("reasoning")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| crate::redact::redact_secrets(text).into_owned())
 }
 
-/// Reads the `submit_findings` arguments. Elements that are not objects or lack a required
-/// field are skipped, as in [`parse_suggestions`]. The error text is shown to the model.
+/// Reads the `submit_findings` findings (an array, or a string holding one; `reasoning` is not
+/// needed). Elements that are not objects or lack a required field are skipped, as in
+/// [`parse_suggestions`]. The error text is shown to the model.
 pub(crate) fn parse_submit_findings(args: &Value) -> Result<Vec<Suggestion>, String> {
-    let parsed = SubmitFindingsArgs::deserialize(args).map_err(|err| {
-        format!("{err}; expected an object with a `findings` array of finding objects")
+    let items = array_arg(args, "findings").ok_or_else(|| {
+        "expected an object with a `findings` array of finding objects".to_string()
     })?;
-    Ok(parsed
-        .findings
+    Ok(items
         .iter()
         .filter_map(Value::as_object)
         .filter_map(to_suggestion)
@@ -380,7 +435,9 @@ pub(crate) fn keep_valid_batch(
     dedup_exact(valid, |s| s)
 }
 
-/// Drops exact `(file, line, title)` duplicates of `items`, keeping the first position. When
+/// Drops exact `(file, line, title)` duplicates of `items` (the body stands in for an empty
+/// title, so two untitled lean findings on one line merge only when they say the same thing),
+/// keeping the first position. When
 /// the kept entry has no `start_line` and a later duplicate has one, the later entry takes that
 /// position: its suggestion was written for the span it replaces.
 pub(crate) fn dedup_exact<T>(
@@ -391,7 +448,12 @@ pub(crate) fn dedup_exact<T>(
     let mut positions: HashMap<(String, u32, String), usize> = HashMap::new();
     for item in items {
         let s = finding(&item);
-        let key = (s.file.clone(), s.line, s.title.clone());
+        let text = if s.title.is_empty() {
+            &s.body
+        } else {
+            &s.title
+        };
+        let key = (s.file.clone(), s.line, text.clone());
         let has_range = s.start_line.is_some();
         match positions.get(&key).and_then(|&at| kept.get_mut(at)) {
             Some(slot) => {
@@ -417,7 +479,8 @@ mod tests {
             file: file.into(),
             start_line: None,
             line,
-            severity: Severity::Warning,
+            severity: Some(Severity::Warning),
+            category: None,
             title: title.into(),
             body: "body".into(),
             suggestion: None,
@@ -504,7 +567,8 @@ mod tests {
                 file: "src/a.rs".into(),
                 start_line: None,
                 line: 3,
-                severity: Severity::Critical,
+                severity: Some(Severity::Critical),
+                category: None,
                 title: "T".into(),
                 body: "B".into(),
                 suggestion: Some("let x = 1;".into()),
@@ -517,7 +581,7 @@ mod tests {
         let got = parse_suggestions(prose).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].line, 7);
-        assert_eq!(got[0].severity, Severity::Warning);
+        assert_eq!(got[0].severity, Some(Severity::Warning));
         assert_eq!(got[0].suggestion, None);
 
         // Empty brackets in prose do not mask a real finding array; empty arrays still parse.
@@ -533,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_incomplete_items_defaults_severity_and_sanitizes_start_line() {
+    fn skips_incomplete_items_leaves_unknown_severity_unset_and_sanitizes_start_line() {
         let raw = r#"[{"file":"a.rs","line":1,"severity":"blocker","title":"T","body":"B"},
                       {"file":"a.rs","line":2,"title":"T","body":"B"},
                       {"file":"a.rs","line":3,"severity":"CRITICAL","title":"T","body":"B"}]"#;
@@ -542,16 +606,12 @@ mod tests {
             .into_iter()
             .map(|s| s.severity)
             .collect();
-        assert_eq!(
-            severities,
-            vec![Severity::Info, Severity::Info, Severity::Critical]
-        );
+        assert_eq!(severities, vec![None, None, Some(Severity::Critical)]);
 
         let incomplete = r#"[{"line":1,"title":"no file","body":"B"},
                              {"file":"a.rs","title":"no line","body":"B"},
                              {"file":"a.rs","line":-1,"title":"bad line","body":"B"},
                              {"file":"a.rs","line":"x","title":"bad line","body":"B"},
-                             {"file":"a.rs","line":1,"body":"no title"},
                              {"file":"a.rs","line":1,"title":"no body"},
                              {"file":"a.rs","line":9,"title":"ok","body":"B"}]"#;
         let got = parse_suggestions(incomplete).unwrap();
@@ -603,7 +663,8 @@ mod tests {
                     file: "src/a.rs".into(),
                     start_line: Some(2),
                     line: 3,
-                    severity: Severity::Critical,
+                    severity: Some(Severity::Critical),
+                    category: None,
                     title: "T".into(),
                     body: "B".into(),
                     suggestion: Some("let x = 1;".into()),
@@ -612,7 +673,8 @@ mod tests {
                     file: "src/b.rs".into(),
                     start_line: None,
                     line: 4,
-                    severity: Severity::Info,
+                    severity: None,
+                    category: None,
                     title: "T2".into(),
                     body: "B2".into(),
                     suggestion: None,
@@ -623,29 +685,46 @@ mod tests {
             parse_submit_findings(&json!({"findings": []})).unwrap(),
             vec![]
         );
-        for bad in [json!({}), json!({"findings": "none"})] {
-            let err = parse_submit_findings(&bad).unwrap_err();
-            assert!(err.contains("findings"), "{err}");
-        }
     }
 
     #[test]
     fn submit_findings_tool_def_uses_portable_schema() {
-        let def = submit_findings_tool_def();
+        let def = submit_findings_tool_def(true);
         assert_eq!(def.name, "submit_findings");
         let params = &def.parameters;
-        assert_eq!(params["required"], json!(["findings"]));
+        assert_eq!(params["required"], json!(["reasoning", "findings"]));
+        let keys: Vec<&str> = params["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["reasoning", "findings", "dismissed"]);
+        assert_eq!(params["properties"]["reasoning"]["type"], json!("string"));
         let item = &params["properties"]["findings"]["items"];
         assert_eq!(
             item["required"],
-            json!(["file", "line", "severity", "title", "body"])
+            json!(["file", "line", "category", "body"])
         );
+        let fields: Vec<&str> = item["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(fields, ["file", "start_line", "line", "category", "body"]);
         assert_eq!(item["properties"]["start_line"]["type"], json!("integer"));
         assert_eq!(
-            item["properties"]["severity"]["enum"],
-            json!(["info", "warning", "critical"])
+            item["properties"]["category"]["enum"],
+            json!(["bug", "security", "performance", "repo_instruction"])
         );
-        // `dismissed` is optional: `required` above stays `["findings"]`.
+        // A specialist's findings default to its own category.
+        let specialist = submit_findings_tool_def(false).parameters;
+        assert_eq!(
+            specialist["properties"]["findings"]["items"]["required"],
+            json!(["file", "line", "body"])
+        );
+        // `dismissed` is optional: `required` above does not list it.
         let dismissed = &params["properties"]["dismissed"];
         assert_eq!(dismissed["type"], json!("array"));
         assert_eq!(
@@ -659,6 +738,75 @@ mod tests {
         let text = params.to_string();
         for banned in ["additionalProperties", "$schema", "oneOf"] {
             assert!(!text.contains(banned), "schema uses {banned}");
+        }
+    }
+
+    #[test]
+    fn parses_lean_finder_findings_and_back_compat_full_findings() {
+        let lean = json!({
+            "reasoning": "GetCache: read both callers; the nil error path is reported.",
+            "findings": [{"file": "src/a.rs", "line": 4, "category": "bug", "body": "why"}]
+        });
+        let expected = vec![Suggestion {
+            file: "src/a.rs".into(),
+            start_line: None,
+            line: 4,
+            severity: None,
+            category: Some(FindingCategory::Bug),
+            title: String::new(),
+            body: "why".into(),
+            suggestion: None,
+        }];
+        assert_eq!(parse_submit_findings(&lean).unwrap(), expected);
+        assert_eq!(
+            parse_reasoning(&lean).as_deref(),
+            Some("GetCache: read both callers; the nil error path is reported.")
+        );
+
+        // A missing or blank `reasoning` never refuses the submission.
+        let mut without = lean.clone();
+        without.as_object_mut().unwrap().remove("reasoning");
+        assert_eq!(parse_submit_findings(&without).unwrap(), expected);
+        assert_eq!(parse_reasoning(&without), None);
+        assert_eq!(parse_reasoning(&json!({"reasoning": "  "})), None);
+
+        // Legacy full objects keep title, severity and suggestion; an unknown category is unset.
+        let legacy = json!({"findings": [{
+            "file": "src/a.rs", "line": 4, "severity": "critical", "title": "T",
+            "body": "B", "suggestion": "x", "category": "style"
+        }]});
+        let got = parse_submit_findings(&legacy).unwrap();
+        assert_eq!(
+            (
+                got[0].severity,
+                got[0].category,
+                got[0].title.as_str(),
+                got[0].suggestion.as_deref()
+            ),
+            (Some(Severity::Critical), None, "T", Some("x"))
+        );
+    }
+
+    #[test]
+    fn parses_stringified_findings_and_dismissed_arrays() {
+        let args = json!({
+            "reasoning": "r",
+            "findings": "[{\"file\": \"src/a.rs\", \"line\": 4, \"category\": \"bug\", \"body\": \"why\"}]",
+            "dismissed": "[{\"file\": \"src/a.rs\", \"suspicion\": \"s\", \"why_safe\": \"w\"}]"
+        });
+        let got = parse_submit_findings(&args).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].line, got[0].body.as_str()), (4, "why"));
+        assert_eq!(parse_dismissed(&args).len(), 1);
+
+        for bad in [
+            json!({}),
+            json!({"findings": "not json"}),
+            json!({"findings": "{\"file\": \"src/a.rs\"}"}),
+            json!({"findings": {"file": "src/a.rs"}}),
+        ] {
+            let err = parse_submit_findings(&bad).unwrap_err();
+            assert!(err.contains("findings"), "{err}");
         }
     }
 
