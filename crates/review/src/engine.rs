@@ -149,9 +149,9 @@ struct Stages<'a> {
     pr: &'a PullRequest,
     mode: ReviewMode,
     provider_id: Uuid,
-    /// Finder model.
+    /// Finder and Verifier model.
     primary_model: &'a str,
-    /// Verifier and Dedup model (`effective_fast_model()`).
+    /// Dedup model (`effective_fast_model()`).
     fast_model: &'a str,
     rules: &'a [Rule],
     memories: &'a [Memory],
@@ -598,13 +598,13 @@ impl Engine {
             collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
         let candidate_count = candidates.len();
 
-        let (verified, verifier_dropped) = if candidates.is_empty() {
-            (Vec::new(), 0)
+        let (verified, verifier_dropped, evidence_gate_runs) = if candidates.is_empty() {
+            (Vec::new(), 0, 0)
         } else {
             let ctx = VerifyContext {
                 chat: self.chat.as_ref(),
                 provider_id: s.provider_id,
-                model: s.fast_model,
+                model: s.primary_model,
                 usage: s.usage,
                 token_budget: Some(&s.token_budget),
             };
@@ -632,14 +632,8 @@ impl Engine {
                     report.dropped_unverified
                 ));
             }
-            if report.truncated_by_cap > 0 {
-                warnings.push(format!(
-                    "{} lower-priority findings exceeded the verification cap and were omitted",
-                    report.truncated_by_cap
-                ));
-            }
             let dropped = report.dropped_refuted + report.dropped_unverified;
-            (report.kept, dropped)
+            (report.kept, dropped, report.evidence_gate_runs)
         };
         let verified_kept = verified.len();
         let kept_by_origin = count_by_origin(&verified);
@@ -695,6 +689,7 @@ impl Engine {
             verified_kept,
             kept_by_origin = %kept_by_origin,
             verifier_dropped,
+            evidence_gate_runs,
             dedup_dropped = verified_kept.saturating_sub(found.len() + already_raised),
             already_raised,
             cache_read_tokens,

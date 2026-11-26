@@ -1,7 +1,9 @@
 //! Second pass of the review: every candidate finding is checked by a skeptical Verifier
 //! (refute-to-drop, keep-by-default) before it can be posted. With a checkout the Verifier is a
-//! short ReAct loop with the read-only repository tools; without one it is a single call
-//! against the file's diff. Fail-closed: a candidate without a verdict is dropped.
+//! short ReAct loop with the read-only repository tools, and a finding on a file the Finder
+//! never opened is re-verified by a longer Evidence Gate run; without a checkout it is a single
+//! call against the file's diff. A reply whose verdict cannot be read keeps the finding; a
+//! candidate that never gets a reply (provider error, deadline) is dropped.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +15,7 @@ use adus_git::{FileDiff, PullRequest};
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use adus_llm::{ReasoningEffort, ToolDef};
 use futures::{StreamExt, stream};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -26,7 +28,7 @@ use crate::agent::{
 use crate::budget::TokenBudget;
 use crate::engine::is_retryable;
 use crate::finder::FinderPass;
-use crate::parse::{FindingCategory, Suggestion, first_json_object};
+use crate::parse::{FindingCategory, Suggestion};
 use crate::prompt::{
     MAX_DESCRIPTION_CHARS_DIFF_ONLY, diff_block, format_memories, format_pr_description,
     format_rules, or_none, wrap,
@@ -36,10 +38,11 @@ use crate::tools::Toolbox;
 
 /// Verifier tasks that run at the same time.
 const VERIFY_CONCURRENCY: usize = 4;
-/// LLM calls one tool-enabled Verifier may make.
-const VERIFY_MAX_STEPS: usize = 6;
-/// Most candidates verified in one review; the rest are omitted, lowest severity first.
-const MAX_VERIFY_CANDIDATES: usize = 25;
+/// LLM calls of the light tool-enabled Verifier run every candidate gets.
+const VERIFY_LIGHT_MAX_STEPS: usize = 7;
+/// LLM calls of the Evidence Gate run: the re-verify of a kept finding on a file the Finder
+/// never opened.
+const VERIFY_FULL_MAX_STEPS: usize = 10;
 
 /// Lines shown on each side of the finding's line (or span) in `<code_context>`.
 const SNIPPET_RADIUS: u32 = 40;
@@ -47,8 +50,8 @@ const SNIPPET_RADIUS: u32 = 40;
 const VERDICT_MAX_TOKENS: u32 = 2_048;
 /// Name of the Verifier's terminal tool.
 const SUBMIT_VERDICT: &str = "submit_verdict";
-/// Every Verifier call uses the fast model at this effort (spec decision 10).
-const VERIFY_EFFORT: ReasoningEffort = ReasoningEffort::Low;
+/// Every Verifier call uses the primary model at this effort, the Finder's own.
+const VERIFY_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
 /// A finding from a Finder agent, waiting for verification.
 #[derive(Debug, Clone, PartialEq)]
@@ -124,16 +127,16 @@ pub(crate) struct VerificationReport {
     pub kept: Vec<CandidateFinding>,
     /// Findings the Verifier refuted.
     pub dropped_refuted: usize,
-    /// Findings without a verdict (error, unparseable answer or deadline); fail-closed.
+    /// Findings that never got a reply to read (provider error or deadline).
     pub dropped_unverified: usize,
-    /// Findings beyond [`MAX_VERIFY_CANDIDATES`] that were never verified.
-    pub truncated_by_cap: usize,
+    /// Evidence Gate re-verifies started (kept findings on files the Finder never opened).
+    pub evidence_gate_runs: usize,
     /// Set when no candidate got a verdict and every failure was a retryable chat error
     /// (`AllKeysFailed`, `NoKeys`, `Internal`): the review should be retried, not posted.
     pub all_retryable_error: Option<ChatError>,
 }
 
-/// Where the Verifier talks to the model. `model` is the provider's `effective_fast_model()`.
+/// Where the Verifier talks to the model. `model` is the provider's primary model.
 #[derive(Clone, Copy)]
 pub(crate) struct VerifyContext<'a> {
     pub chat: &'a dyn ChatService,
@@ -160,17 +163,18 @@ pub(crate) struct VerifyInput<'a> {
 
 /// Verifies `input.candidates` and returns the confirmed ones in their original order.
 ///
-/// Candidates are sorted by severity (stable, `Critical` first) and cut at
-/// [`MAX_VERIFY_CANDIDATES`]; up to [`VERIFY_CONCURRENCY`] are verified at a time. With a
-/// `toolbox` each one runs a tool-enabled loop of at most [`VERIFY_MAX_STEPS`] steps; without
-/// one (or once the model rejected tool calling, or for a candidate that starts once the
-/// review's token budget is exhausted) each one is a single diff-only call. Work still running
-/// at `deadline` is dropped as unverified, never as retryable.
+/// Every candidate is queued in [`verify_order`] (nothing is cut); up to [`VERIFY_CONCURRENCY`]
+/// are verified at a time. With a `toolbox` each one runs a light tool-enabled loop of at most
+/// [`VERIFY_LIGHT_MAX_STEPS`] steps, and every finding it keeps whose file the Finder never
+/// opened is re-verified by an Evidence Gate loop of at most [`VERIFY_FULL_MAX_STEPS`] steps,
+/// whose verdict replaces the light one. Without a `toolbox` (or once the model rejected tool
+/// calling, or for a candidate that starts once the review's token budget is exhausted) each run
+/// is a single diff-only call. Work still running at `deadline`, and work that starts after it,
+/// is dropped as unverified, never as retryable.
 pub(crate) async fn verify_candidates(
     ctx: VerifyContext<'_>,
     input: VerifyInput<'_>,
 ) -> VerificationReport {
-    let (selected, truncated_by_cap) = prioritize(input.candidates);
     let evidence = Evidence {
         pr: input.pr,
         manifest: input.manifest,
@@ -182,58 +186,127 @@ pub(crate) async fn verify_candidates(
         deadline: input.deadline,
     };
     let submit = SubmitVerdict(submit_verdict_tool_def());
-    // Set once the fast model rejects tool calling; candidates that start later skip the tools.
+    // Set once the model rejects tool calling; candidates that start later skip the tools.
     let diff_only = AtomicBool::new(input.toolbox.is_none());
+    let pass = Pass {
+        ctx,
+        evidence: &evidence,
+        submit: &submit,
+        diff_only: &diff_only,
+    };
 
-    // Futures are built up front: a closure inside the stream would make the future lose
-    // `Send` (higher-ranked lifetime inference), as in `agent.rs`.
-    let pending: Vec<_> = selected
-        .into_iter()
-        .map(|(index, candidate)| {
-            let evidence = &evidence;
-            let diff_only = &diff_only;
-            let submit = &submit;
-            async move {
+    let mut results = pass
+        .run(verify_order(input.candidates), VERIFY_LIGHT_MAX_STEPS)
+        .await;
+    let mut evidence_gate_runs = 0;
+    if evidence.toolbox.is_some() {
+        let (mut gate, settled): (Vec<_>, Vec<_>) =
+            results.into_iter().partition(|(_, candidate, outcome)| {
+                matches!(outcome, Outcome::Kept { .. }) && !candidate.investigated_by_finder
+            });
+        gate.sort_by_key(|(index, candidate, _)| queue_key(*index, candidate));
+        evidence_gate_runs = gate.len();
+        if evidence_gate_runs > 0 {
+            tracing::debug!(
+                findings = evidence_gate_runs,
+                "evidence gate: re-verifying findings on files the Finder never opened"
+            );
+        }
+        let queue = gate
+            .into_iter()
+            .map(|(index, candidate, _)| (index, candidate))
+            .collect();
+        results = settled;
+        results.extend(pass.run(queue, VERIFY_FULL_MAX_STEPS).await);
+    }
+    // `buffer_unordered` finishes in any order; the report keeps the original one.
+    results.sort_by_key(|(index, _, _)| *index);
+    let mut report = summarize(results);
+    report.evidence_gate_runs = evidence_gate_runs;
+    report
+}
+
+/// One Verifier pass over a queue of candidates; shared by the light pass and the Evidence Gate.
+#[derive(Clone, Copy)]
+struct Pass<'p, 'a> {
+    ctx: VerifyContext<'a>,
+    evidence: &'p Evidence<'a>,
+    submit: &'p SubmitVerdict,
+    diff_only: &'p AtomicBool,
+}
+
+impl Pass<'_, '_> {
+    /// Verifies `queue` (`(original index, candidate)`, started in this order) with tool loops of
+    /// at most `max_steps` steps; results come back in completion order.
+    async fn run(
+        &self,
+        queue: Vec<(usize, CandidateFinding)>,
+        max_steps: usize,
+    ) -> Vec<(usize, CandidateFinding, Outcome)> {
+        // Futures are built up front: a closure inside the stream would make the future lose
+        // `Send` (higher-ranked lifetime inference), as in `agent.rs`.
+        let pending: Vec<_> = queue
+            .into_iter()
+            .map(|(index, candidate)| async move {
                 // Checked when the candidate starts (the stream polls it), not when it is built.
-                let outcome = if Instant::now() >= evidence.deadline {
+                let outcome = if Instant::now() >= self.evidence.deadline {
                     Outcome::Unverified(Failure::Deadline)
                 } else {
                     // Names the candidate on every log line of its run (verdicts run concurrently).
                     let span = tracing::debug_span!(
                         "verify",
                         candidate = index,
+                        max_steps,
                         file = %candidate.suggestion.file,
                         line = candidate.suggestion.line,
                     );
                     tokio::time::timeout_at(
-                        evidence.deadline,
-                        verify_one(ctx, &candidate, evidence, submit, diff_only).instrument(span),
+                        self.evidence.deadline,
+                        verify_one(self, &candidate, max_steps).instrument(span),
                     )
                     .await
                     .unwrap_or(Outcome::Unverified(Failure::Deadline))
                 };
                 (index, candidate, outcome)
-            }
-        })
-        .collect();
-    let mut results: Vec<_> = stream::iter(pending)
-        .buffer_unordered(VERIFY_CONCURRENCY)
-        .collect()
-        .await;
-    // `buffer_unordered` finishes in any order; the report keeps the original one.
-    results.sort_by_key(|(index, _, _)| *index);
-    summarize(results, truncated_by_cap)
+            })
+            .collect();
+        stream::iter(pending)
+            .buffer_unordered(VERIFY_CONCURRENCY)
+            .collect()
+            .await
+    }
 }
 
-/// Tags every candidate with its original index, keeps the [`MAX_VERIFY_CANDIDATES`] most
-/// severe (ties keep their order) and returns them with the number left out.
-fn prioritize(candidates: Vec<CandidateFinding>) -> (Vec<(usize, CandidateFinding)>, usize) {
+/// Tags every candidate with its original index and orders the queue so the least important
+/// candidates are the ones a deadline or an exhausted budget cuts: by category (security, bug,
+/// performance, repository instruction), then by the Finder pass that produced it (Pass 1,
+/// prose recovery, synthesis rescue), then by original position. Nothing is cut.
+fn verify_order(candidates: Vec<CandidateFinding>) -> Vec<(usize, CandidateFinding)> {
     let mut tagged: Vec<(usize, CandidateFinding)> = candidates.into_iter().enumerate().collect();
-    // `sort_by_key` is stable, so equal severities keep their original order.
-    tagged.sort_by_key(|(_, c)| std::cmp::Reverse(c.suggestion.severity));
-    let truncated = tagged.len().saturating_sub(MAX_VERIFY_CANDIDATES);
-    tagged.truncate(MAX_VERIFY_CANDIDATES);
-    (tagged, truncated)
+    tagged.sort_by_key(|(index, candidate)| queue_key(*index, candidate));
+    tagged
+}
+
+/// Sort key of [`verify_order`]: category rank, origin rank, original index.
+fn queue_key(index: usize, candidate: &CandidateFinding) -> (u8, u8, usize) {
+    // A finding without a category takes its Finder's; the generalist's counts as a bug.
+    let category = candidate
+        .suggestion
+        .category
+        .or_else(|| candidate.specialist.category())
+        .unwrap_or(FindingCategory::Bug);
+    let category_rank = match category {
+        FindingCategory::Security => 0,
+        FindingCategory::Bug => 1,
+        FindingCategory::Performance => 2,
+        FindingCategory::RepoInstruction => 3,
+    };
+    let origin_rank = match candidate.origin {
+        FinderPass::Pass1 => 0,
+        FinderPass::ProseRecovery => 1,
+        FinderPass::SynthesisRescue => 2,
+    };
+    (category_rank, origin_rank, index)
 }
 
 /// Parsed verdict from `submit_verdict` or diff-only JSON.
@@ -276,20 +349,14 @@ impl Outcome {
 enum Failure {
     /// The chat call failed in a way a later retry of the whole job may fix.
     Retryable(ChatError),
-    /// Any other error, an unparseable answer or a cut-short loop.
+    /// Any other error.
     Other,
     /// The Verifier deadline passed first.
     Deadline,
 }
 
-fn summarize(
-    results: Vec<(usize, CandidateFinding, Outcome)>,
-    truncated_by_cap: usize,
-) -> VerificationReport {
-    let mut report = VerificationReport {
-        truncated_by_cap,
-        ..VerificationReport::default()
-    };
+fn summarize(results: Vec<(usize, CandidateFinding, Outcome)>) -> VerificationReport {
+    let mut report = VerificationReport::default();
     let mut first_retryable = None;
     let mut only_retryable_failures = true;
     for (_, mut candidate, outcome) in results {
@@ -341,16 +408,20 @@ struct Evidence<'a> {
     deadline: Instant,
 }
 
-/// Verifies one candidate: tool-enabled while the model supports tools and the review's token
-/// budget lasts, diff-only otherwise. A `ToolsUnsupported` switches every later candidate to
-/// diff-only and re-runs this one there.
+/// Verifies one candidate: tool-enabled (at most `max_steps` steps) while the model supports
+/// tools and the review's token budget lasts, diff-only otherwise. A `ToolsUnsupported`
+/// switches every later candidate to diff-only and re-runs this one there.
 async fn verify_one(
-    ctx: VerifyContext<'_>,
+    pass: &Pass<'_, '_>,
     candidate: &CandidateFinding,
-    evidence: &Evidence<'_>,
-    submit: &SubmitVerdict,
-    diff_only: &AtomicBool,
+    max_steps: usize,
 ) -> Outcome {
+    let Pass {
+        ctx,
+        evidence,
+        submit,
+        diff_only,
+    } = *pass;
     let snippet = match evidence.toolbox {
         Some(toolbox) => {
             let s = &candidate.suggestion;
@@ -368,7 +439,8 @@ async fn verify_one(
             budget.note_diff_only();
         } else {
             let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), true);
-            match verify_with_tools(ctx, toolbox, submit, prompt, evidence.deadline).await {
+            let config = verifier_config(max_steps, evidence.deadline, ctx.token_budget);
+            match verify_with_tools(ctx, toolbox, submit, prompt, &config).await {
                 Err(AgentError::ToolsUnsupported(_)) => {
                     tracing::warn!(
                         "verifier model rejected tool calling; verifying the rest diff-only"
@@ -394,12 +466,28 @@ fn snippet_window(s: &Suggestion) -> (u32, u32) {
     (s.line - half, SNIPPET_RADIUS.saturating_add(half))
 }
 
+/// The Verifier's loop policy: the final step offers no tools and asks for the JSON verdict,
+/// short reads are widened so enclosing guards show, and no Finder budget bands or gate.
+fn verifier_config(
+    max_steps: usize,
+    deadline: Instant,
+    token_budget: Option<&Arc<TokenBudget>>,
+) -> AgentConfig {
+    AgentConfig {
+        deadline: Some(deadline),
+        token_budget: token_budget.cloned(),
+        no_tools_on_last_step: true,
+        widen_short_reads: true,
+        ..AgentConfig::new(max_steps)
+    }
+}
+
 async fn verify_with_tools(
     ctx: VerifyContext<'_>,
     toolbox: &Toolbox,
     submit: &SubmitVerdict,
     prompt: String,
-    deadline: Instant,
+    config: &AgentConfig,
 ) -> Result<AgentOutcome<Verdict>, AgentError> {
     let system = build_system_prompt(true);
     let llm = AgentLlm {
@@ -410,29 +498,16 @@ async fn verify_with_tools(
         effort: Some(VERIFY_EFFORT),
         usage: ctx.usage,
     };
-    run_react_loop(
-        &llm,
-        AgentTools::Full(toolbox),
-        submit,
-        &AgentConfig {
-            deadline: Some(deadline),
-            token_budget: ctx.token_budget.cloned(),
-            ..AgentConfig::new(VERIFY_MAX_STEPS)
-        },
-        prompt,
-    )
-    .await
+    run_react_loop(&llm, AgentTools::Full(toolbox), submit, config, prompt).await
 }
 
-/// A verdict recovered from prose after the step budget ran out (`cut_short`) does not count:
-/// the spec treats an aborted wrap-up as a Verifier error.
+/// A verdict recovered from the final reply's text counts like a submitted one (`cut_short`
+/// included). A run that replied but whose verdict cannot be read keeps the finding: failing
+/// to state a refutation is not one.
 fn agent_outcome(result: Result<AgentOutcome<Verdict>, AgentError>) -> Outcome {
     match result {
-        Ok(outcome) if outcome.cut_short => {
-            tracing::debug!("verifier ran out of steps; dropping the candidate as unverified");
-            Outcome::Unverified(Failure::Other)
-        }
         Ok(outcome) => Outcome::from_verdict(outcome.result),
+        Err(AgentError::Unparseable(_)) => unreadable(),
         Err(AgentError::Chat(err)) => chat_failure(err),
         Err(err) => {
             tracing::debug!(error = %err, "verifier failed; dropping the candidate");
@@ -459,12 +534,17 @@ async fn verify_diff_only(
     match chat_low_effort(&llm, budget, prompt, VERDICT_MAX_TOKENS).await {
         Ok(text) => match submit.parse_prose(&text) {
             Ok(verdict) => Outcome::from_verdict(verdict),
-            Err(_) => {
-                tracing::debug!("diff-only verifier answer has no verdict; dropping the candidate");
-                Outcome::Unverified(Failure::Other)
-            }
+            Err(_) => unreadable(),
         },
         Err(err) => chat_failure(err),
+    }
+}
+
+/// The Verifier replied but no verdict could be read from it: the finding is kept.
+fn unreadable() -> Outcome {
+    tracing::debug!("verifier verdict unreadable, kept");
+    Outcome::Kept {
+        drop_suggestion: false,
     }
 }
 
@@ -478,22 +558,58 @@ fn chat_failure(err: ChatError) -> Outcome {
     }
 }
 
-/// Arguments of `submit_verdict`, and the JSON a diff-only Verifier answers with. `rationale`
-/// is asked for so the model states its evidence; it is not used (or logged) afterwards.
-#[derive(Debug, Deserialize)]
-struct SubmitVerdictArgs {
-    keep: bool,
-    #[serde(default)]
-    drop_suggestion: bool,
+/// Reads a verdict from `submit_verdict` arguments or a JSON object in reply text, loosely:
+/// `keep` (required) and `drop_suggestion` (default false) may be booleans or the strings
+/// `"true"` / `"false"`. `rationale` is asked for so the model states its evidence; it is not
+/// used (or logged) afterwards.
+fn loose_verdict(value: &Value) -> Option<Verdict> {
+    let flag = |key: &str| match value.get(key)? {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => parse_bool(text),
+        _ => None,
+    };
+    Some(Verdict {
+        keep: flag("keep")?,
+        drop_suggestion: flag("drop_suggestion").unwrap_or(false),
+    })
 }
 
-impl From<SubmitVerdictArgs> for Verdict {
-    fn from(args: SubmitVerdictArgs) -> Self {
-        Self {
-            keep: args.keep,
-            drop_suggestion: args.drop_suggestion,
-        }
+/// `true` / `false`, ignoring case and surrounding whitespace.
+fn parse_bool(text: &str) -> Option<bool> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
+}
+
+/// The verdict in reply text: the first JSON object [`loose_verdict`] reads, else a bare
+/// `"keep": true|false` (the value may be quoted), e.g. in a truncated or malformed object.
+fn verdict_in_text(text: &str) -> Option<Verdict> {
+    let object = text.match_indices('{').find_map(|(start, _)| {
+        let value = serde_json::Deserializer::from_str(&text[start..])
+            .into_iter::<Value>()
+            .next()?
+            .ok()?;
+        loose_verdict(&value)
+    });
+    object.or_else(|| {
+        text.match_indices("\"keep\"").find_map(|(at, key)| {
+            let rest = text[at + key.len()..].trim_start().strip_prefix(':')?;
+            let rest = rest.trim_start().trim_start_matches('"');
+            if rest.starts_with("true") {
+                Some(true)
+            } else if rest.starts_with("false") {
+                Some(false)
+            } else {
+                None
+            }
+            .map(|keep| Verdict {
+                keep,
+                drop_suggestion: false,
+            })
+        })
+    })
 }
 
 /// The Verifier's terminal tool.
@@ -507,17 +623,14 @@ impl SubmitSpec for SubmitVerdict {
     }
 
     fn parse_arguments(&self, arguments: &Value, _can_retry: bool) -> Result<Verdict, String> {
-        SubmitVerdictArgs::deserialize(arguments)
-            .map(Verdict::from)
-            .map_err(|err| {
-                format!("{err}; expected {{\"keep\": true or false, \"rationale\": \"...\"}}")
-            })
+        loose_verdict(arguments).ok_or_else(|| {
+            "missing or invalid \"keep\"; expected {\"keep\": true or false, \"rationale\": \"...\"}"
+                .to_string()
+        })
     }
 
     fn parse_prose(&self, text: &str) -> Result<Verdict, String> {
-        first_json_object::<SubmitVerdictArgs>(text)
-            .map(Verdict::from)
-            .ok_or_else(|| "no {\"keep\": ...} object found".to_string())
+        verdict_in_text(text).ok_or_else(|| "no \"keep\": true or false found".to_string())
     }
 }
 
@@ -584,6 +697,7 @@ Everything inside <pr_title>, <pr_description>, <pr_manifest>, <rules>, <memorie
 
 const VERIFIER_OUTPUT_TOOLS: &str = r#"<Output>
 Call submit_verdict with {"keep": true or false, "rationale": "<the evidence in one or two sentences>"} (include "drop_suggestion": true when keeping a finding whose replacement suggestion is broken or incomplete).
+Your last step offers no tools, submit_verdict included: if you reach it, reply with ONLY that JSON object, {"keep": true or false, "rationale": "..."}, as plain text with no markdown fences.
 </Output>"#;
 
 const VERIFIER_OUTPUT_DIFF_ONLY: &str = r#"<Output>
@@ -672,12 +786,12 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        Reply, RoutedChat, answer, call, is_for, memory, rule, text_turn, tool_names, tools_turn,
-        user_text,
+        Reply, RoutedChat, answer, call, is_for, memory, msg_text, rule, text_turn, tool_names,
+        tools_turn, user_text,
     };
     use crate::workspace::RepoWorkspace;
 
-    const FAST_MODEL: &str = "fast-model";
+    const PRIMARY_MODEL: &str = "primary-model";
     const PROVIDER: Uuid = Uuid::from_u128(1);
 
     fn submit_verdict(id: &str, keep: bool) -> ToolCall {
@@ -726,7 +840,8 @@ mod tests {
                 suggestion: None,
             },
             specialist,
-            investigated_by_finder: false,
+            // Opened by the Finder, so a kept verdict needs no Evidence Gate re-verify.
+            investigated_by_finder: true,
             origin: FinderPass::Pass1,
         }
     }
@@ -776,7 +891,7 @@ mod tests {
         let ctx = VerifyContext {
             chat,
             provider_id: PROVIDER,
-            model: FAST_MODEL,
+            model: PRIMARY_MODEL,
             usage: &usage,
             token_budget,
         };
@@ -798,11 +913,11 @@ mod tests {
         .await
     }
 
-    fn assert_fast_and_low(reqs: &[ChatRequest]) {
+    fn assert_primary_and_high(reqs: &[ChatRequest]) {
         assert!(!reqs.is_empty());
         for req in reqs {
-            assert_eq!(req.model, FAST_MODEL);
-            assert_eq!(req.effort, Some(ReasoningEffort::Low));
+            assert_eq!(req.model, PRIMARY_MODEL);
+            assert_eq!(req.effort, Some(ReasoningEffort::High));
         }
     }
 
@@ -841,7 +956,7 @@ mod tests {
         );
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 3);
-        assert_fast_and_low(&reqs);
+        assert_primary_and_high(&reqs);
         for req in &reqs {
             assert_eq!(
                 tool_names(req),
@@ -882,79 +997,177 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn caps_at_25_prioritizing_critical_over_info() {
-        let mut candidates: Vec<CandidateFinding> = (0..10)
-            .map(|i| candidate(&format!("info-{i:02}"), Severity::Info, SpecialistKind::Bug))
-            .collect();
-        for i in 10..30 {
-            let (name, severity) = if i % 2 == 0 {
-                ("crit", Severity::Critical)
-            } else {
-                ("warn", Severity::Warning)
-            };
-            candidates.push(candidate(
-                &format!("{name}-{i:02}"),
-                severity,
-                SpecialistKind::Bug,
-            ));
-        }
-        let chat = RoutedChat::keeping_everything();
-        let report = verify(&chat, candidates.clone(), None, later(30_000), None).await;
-
-        assert_eq!(report.truncated_by_cap, 5);
-        assert_eq!(report.dropped_unverified, 0);
-        let mut expected: Vec<CandidateFinding> = candidates[..5].to_vec();
-        expected.extend_from_slice(&candidates[10..]);
-        assert_eq!(titles(&report.kept), titles(&expected));
-        assert_eq!(chat.requests().len(), MAX_VERIFY_CANDIDATES);
-        for i in 5..10 {
-            assert!(chat.requests_for(&format!("info-{i:02}")).is_empty());
-        }
+    /// Every user text the model was shown in `req`, joined.
+    fn conversation(req: &ChatRequest) -> String {
+        req.messages
+            .iter()
+            .filter(|msg| matches!(msg, Message::User { .. }))
+            .filter_map(msg_text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[tokio::test]
-    async fn fail_closed_drops_unparseable_and_invalid_verifier_outputs() {
-        let tb = toolbox();
-        let mut cut_short: Vec<Reply> = (0..VERIFY_MAX_STEPS - 1)
-            .map(|i| answer(tools_turn(vec![read_a(&format!("s{i}"))])))
+    async fn verifies_every_candidate_without_a_cap() {
+        let names: Vec<String> = (0..30).map(|i| format!("finding-{i:02}")).collect();
+        let candidates: Vec<CandidateFinding> = names.iter().map(|name| bug(name)).collect();
+        let chat = RoutedChat::keeping_everything();
+        let report = verify(&chat, candidates.clone(), None, later(30_000), None).await;
+
+        assert_eq!(chat.requests().len(), 30);
+        assert_eq!(report.kept, candidates);
+        assert_eq!(report.dropped_unverified, 0);
+    }
+
+    #[test]
+    fn verify_order_ranks_category_then_origin_then_position() {
+        let queued = |category: Option<FindingCategory>, specialist, origin| {
+            let mut c = candidate("queued", Severity::Warning, specialist);
+            c.suggestion.category = category;
+            c.origin = origin;
+            c
+        };
+        let input = vec![
+            queued(
+                Some(FindingCategory::Performance),
+                SpecialistKind::Bug,
+                FinderPass::Pass1,
+            ),
+            queued(
+                Some(FindingCategory::Bug),
+                SpecialistKind::Bug,
+                FinderPass::SynthesisRescue,
+            ),
+            queued(None, SpecialistKind::Security, FinderPass::Pass1),
+            queued(
+                Some(FindingCategory::Bug),
+                SpecialistKind::Bug,
+                FinderPass::Pass1,
+            ),
+            queued(
+                Some(FindingCategory::RepoInstruction),
+                SpecialistKind::Bug,
+                FinderPass::Pass1,
+            ),
+            queued(
+                Some(FindingCategory::Bug),
+                SpecialistKind::Bug,
+                FinderPass::ProseRecovery,
+            ),
+            queued(
+                Some(FindingCategory::Bug),
+                SpecialistKind::Bug,
+                FinderPass::Pass1,
+            ),
+        ];
+        let order: Vec<usize> = verify_order(input)
+            .into_iter()
+            .map(|(index, _)| index)
             .collect();
-        let mut last = tools_turn(vec![read_a("s-last")]).unwrap();
-        last.text = r#"{"keep": true, "rationale": "out of steps"}"#.into();
-        cut_short.push(answer(Ok(last)));
+        assert_eq!(order, [2, 3, 6, 5, 1, 0, 4]);
+    }
+
+    #[tokio::test]
+    async fn evidence_gate_re_verifies_uninvestigated_findings_at_full_steps() {
+        let tb = toolbox();
+        let mut uninvestigated = bug("uninvestigated");
+        uninvestigated.investigated_by_finder = false;
+        // Light verdict, then the Evidence Gate run: a short read (widened), six more reads,
+        // and a refutation on its 8th step, which a 7-step run would answer without tools.
+        let mut replies = vec![
+            answer(tools_turn(vec![submit_verdict("l1", true)])),
+            answer(tools_turn(vec![call(
+                "g0",
+                "read_file",
+                json!({"path": "src/a.rs", "start_line": 2, "end_line": 3}),
+            )])),
+        ];
+        replies.extend((1..7).map(|i| answer(tools_turn(vec![read_a(&format!("g{i}"))]))));
+        replies.push(answer(tools_turn(vec![submit_verdict("g7", false)])));
         let chat = RoutedChat::new(vec![
             (
-                "invalid-one",
+                "investigated",
+                vec![answer(tools_turn(vec![submit_verdict("i1", true)]))],
+            ),
+            ("uninvestigated", replies),
+        ]);
+        let report = verify(
+            &chat,
+            vec![bug("investigated"), uninvestigated],
+            Some(&tb),
+            later(30_000),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            VerificationReport {
+                kept: vec![bug("investigated")],
+                dropped_refuted: 1,
+                evidence_gate_runs: 1,
+                ..VerificationReport::default()
+            }
+        );
+        assert_primary_and_high(&chat.requests());
+        assert_eq!(chat.requests_for("investigated").len(), 1);
+        let reqs = chat.requests_for("uninvestigated");
+        assert_eq!(
+            reqs.len(),
+            1 + 8,
+            "light verdict, then 8 Evidence Gate steps"
+        );
+        assert!(tool_names(&reqs[8]).contains(&"read_file"));
+        // The gate's 2-line read was widened to the enclosing lines.
+        let Some(Message::Tool { results }) = reqs[2].messages.get(2) else {
+            panic!("expected the read_file result");
+        };
+        assert!(results[0].content.contains("[src/a.rs: lines 1-5 of 5]"));
+
+        let config = verifier_config(VERIFY_FULL_MAX_STEPS, later(1_000), None);
+        assert_eq!(config.max_steps, 10);
+        assert!(config.no_tools_on_last_step);
+        assert!(config.widen_short_reads);
+        assert!(!config.budget_bands);
+        assert!(config.coverage_ledger.is_none());
+        assert!(!config.enforce_gate);
+    }
+
+    #[tokio::test]
+    async fn verifier_keeps_unreadable_verdict_and_drops_on_error_or_deadline() {
+        let tb = toolbox();
+        let mut unreadable: Vec<Reply> = (0..VERIFY_LIGHT_MAX_STEPS - 1)
+            .map(|i| answer(tools_turn(vec![read_a(&format!("u{i}"))])))
+            .collect();
+        unreadable.push(answer(text_turn("I think this is fine")));
+        let chat = RoutedChat::new(vec![
+            ("unreadable", unreadable),
+            (
+                "prose-verdict",
+                vec![answer(text_turn(
+                    r#"Checked the caller. {"keep": false, "rationale": "guard at a.rs:3"} is my verdict."#,
+                ))],
+            ),
+            (
+                "string-keep",
+                vec![answer(tools_turn(vec![call(
+                    "s1",
+                    SUBMIT_VERDICT,
+                    json!({"keep": "false", "rationale": "guarded"}),
+                )]))],
+            ),
+            (
+                "provider-error",
                 vec![answer(Err(ChatError::Invalid("bad request".into())))],
-            ),
-            (
-                "prose-one",
-                vec![
-                    answer(text_turn("I am not sure.")),
-                    answer(text_turn("Still thinking.")),
-                ],
-            ),
-            (
-                "overflow-one",
-                vec![
-                    answer(Err(ChatError::ContextOverflow("too long".into()))),
-                    answer(Err(ChatError::ContextOverflow("still too long".into()))),
-                ],
-            ),
-            ("cut-short-one", cut_short),
-            (
-                "kept-one",
-                vec![answer(tools_turn(vec![submit_verdict("k1", true)]))],
             ),
         ]);
         let report = verify(
             &chat,
             bugs(&[
-                "invalid-one",
-                "prose-one",
-                "overflow-one",
-                "cut-short-one",
-                "kept-one",
+                "unreadable",
+                "prose-verdict",
+                "string-keep",
+                "provider-error",
             ]),
             Some(&tb),
             later(30_000),
@@ -964,25 +1177,53 @@ mod tests {
         assert_eq!(
             report,
             VerificationReport {
-                kept: vec![bug("kept-one")],
-                dropped_unverified: 4,
+                kept: vec![bug("unreadable")],
+                dropped_refuted: 2,
+                dropped_unverified: 1,
                 ..VerificationReport::default()
             }
         );
-        assert_eq!(chat.requests_for("cut-short-one").len(), VERIFY_MAX_STEPS);
+        // The light run's last step offers no tools and asks for the JSON verdict; the step
+        // before it carries the verdict-due note.
+        let reqs = chat.requests_for("unreadable");
+        assert_eq!(reqs.len(), VERIFY_LIGHT_MAX_STEPS);
+        let last = &reqs[VERIFY_LIGHT_MAX_STEPS - 1];
+        assert!(last.tools.is_empty());
+        assert!(conversation(last).contains("This is your last step"));
+        assert!(
+            last.system
+                .contains(r#"reply with ONLY that JSON object, {"keep": true or false"#)
+        );
+        let before = &reqs[VERIFY_LIGHT_MAX_STEPS - 2];
+        assert!(!before.tools.is_empty());
+        assert!(conversation(before).contains("One step left for reading"));
 
+        // A deadline cut drops the candidate, not as retryable.
+        let chat = RoutedChat::new(vec![("slow", vec![Reply::Hang])]);
+        let report = verify(&chat, bugs(&["slow"]), Some(&tb), later(200), None).await;
+        assert_eq!(
+            report,
+            VerificationReport {
+                dropped_unverified: 1,
+                ..VerificationReport::default()
+            }
+        );
+
+        // Diff-only: no readable verdict keeps the finding; a bare `"keep": false` in a broken
+        // object refutes it.
         let chat = RoutedChat::new(vec![
             ("garbage", vec![answer(text_turn("Looks fine to me."))]),
-            (
-                "invalid",
-                vec![answer(Err(ChatError::Invalid("bad request".into())))],
-            ),
             ("wrong-type", vec![answer(text_turn(r#"{"keep": "yes"}"#))]),
-            ("ok", vec![answer(text_turn(r#"{"keep": true}"#))]),
+            (
+                "bare-keep",
+                vec![answer(text_turn(
+                    r#"{"keep": false, "rationale": "cut off"#,
+                ))],
+            ),
         ]);
         let report = verify(
             &chat,
-            bugs(&["garbage", "invalid", "wrong-type", "ok"]),
+            bugs(&["garbage", "wrong-type", "bare-keep"]),
             None,
             later(30_000),
             None,
@@ -991,8 +1232,8 @@ mod tests {
         assert_eq!(
             report,
             VerificationReport {
-                kept: vec![bug("ok")],
-                dropped_unverified: 3,
+                kept: bugs(&["garbage", "wrong-type"]),
+                dropped_refuted: 1,
                 ..VerificationReport::default()
             }
         );
@@ -1114,7 +1355,7 @@ mod tests {
         let ctx = VerifyContext {
             chat: &chat,
             provider_id: PROVIDER,
-            model: FAST_MODEL,
+            model: PRIMARY_MODEL,
             usage: &usage,
             token_budget: None,
         };
@@ -1152,7 +1393,7 @@ mod tests {
 
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 2);
-        assert_fast_and_low(&reqs);
+        assert_primary_and_high(&reqs);
         for req in &reqs {
             assert!(req.tools.is_empty());
             assert_eq!(req.max_tokens, VERDICT_MAX_TOKENS);
@@ -1242,15 +1483,14 @@ mod tests {
         assert_eq!(
             report,
             VerificationReport {
-                kept: vec![bug("kept")],
+                kept: bugs(&["kept", "garbage"]),
                 dropped_refuted: 1,
-                dropped_unverified: 1,
                 ..VerificationReport::default()
             }
         );
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 3);
-        assert_fast_and_low(&reqs);
+        assert_primary_and_high(&reqs);
         for req in &reqs {
             assert!(req.tools.is_empty());
             assert!(user_text(req).contains("<code_context>"));

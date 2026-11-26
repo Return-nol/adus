@@ -659,12 +659,12 @@ async fn full_review_posts_valid_comments_and_summary(pool: PgPool) {
     assert_eq!(finder[0].model, "gpt-test");
     assert_eq!(finder[0].max_tokens, 8192);
     assert!(finder[0].user.contains("No unwrap"));
-    // The one valid finding is verified with the fast model; one finding needs no dedup.
+    // The one valid finding is verified with the primary model; one finding needs no dedup.
     let verifier = s.chat.verifier_calls();
     assert_eq!(verifier.len(), 1);
     assert_eq!(verifier[0].provider_id, s.provider_id);
-    assert_eq!(verifier[0].model, "gpt-fast");
-    assert_eq!(verifier[0].effort, Some(ReasoningEffort::Low));
+    assert_eq!(verifier[0].model, "gpt-test");
+    assert_eq!(verifier[0].effort, Some(ReasoningEffort::High));
     assert!(verifier[0].user.contains("\"title\": \"Bug\""));
     assert!(s.chat.dedup_calls().is_empty());
 
@@ -1252,7 +1252,7 @@ async fn repo_provider_override_wins(pool: PgPool) {
     let calls = s.chat.calls();
     assert_eq!(calls.len(), 2, "Finder and Verifier");
     assert!(calls.iter().all(|c| c.provider_id == other.id));
-    // No fast model: the Verifier falls back to the primary model.
+    // The Finder and the Verifier both run on the primary model.
     assert!(calls.iter().all(|c| c.model == "claude-test"));
 }
 
@@ -1670,12 +1670,12 @@ src/login.rs
         finder[2].user
     );
 
-    // Verifier: fast model at Low, with tools, one call per candidate.
+    // Verifier: primary model at High, with tools, one call per candidate.
     let verifier = s.chat.verifier_calls();
     assert_eq!(verifier.len(), 2);
     for call in &verifier {
-        assert_eq!(call.model, "gpt-fast");
-        assert_eq!(call.effort, Some(ReasoningEffort::Low));
+        assert_eq!(call.model, "gpt-test");
+        assert_eq!(call.effort, Some(ReasoningEffort::High));
         assert!(call.tools.contains(&"read_file".to_string()));
         assert!(call.tools.contains(&"submit_verdict".to_string()));
     }
@@ -1747,7 +1747,7 @@ async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(poo
     // The Verifier keeps both findings; dedup merges them into one.
     let verifier = s.chat.verifier_calls();
     assert_eq!(verifier.len(), 2);
-    assert!(verifier.iter().all(|c| c.model == "gpt-fast"));
+    assert!(verifier.iter().all(|c| c.model == "gpt-test"));
     let dedup = s.chat.dedup_calls();
     assert_eq!(dedup.len(), 1);
     assert_eq!(dedup[0].model, "gpt-fast");

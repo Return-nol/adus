@@ -77,7 +77,7 @@ const TOOL_CALL_ARGS_CHARS: usize = 150;
 /// Limits and policies of one agent run.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentConfig {
-    /// LLM calls allowed in one run (Finder 20 to 30, Verifier 6).
+    /// LLM calls allowed in one run (Finder 20 to 30, Verifier 7, Evidence Gate 10).
     pub max_steps: usize,
     /// Old tool outputs are compacted while the conversation is longer than this (chars).
     pub compaction_char_limit: usize,
