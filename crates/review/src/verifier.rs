@@ -5,6 +5,7 @@
 //! call against the file's diff. A reply whose verdict cannot be read keeps the finding; a
 //! candidate that never gets a reply (provider error, deadline) is dropped.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -129,7 +130,7 @@ pub(crate) struct VerificationReport {
     pub dropped_refuted: usize,
     /// Findings that never got a reply to read (provider error or deadline).
     pub dropped_unverified: usize,
-    /// Evidence Gate re-verifies started (kept findings on files the Finder never opened).
+    /// Evidence Gate tool runs that finished before the deadline, with or without a verdict.
     pub evidence_gate_runs: usize,
     /// Set when no candidate got a verdict and every failure was a retryable chat error
     /// (`AllKeysFailed`, `NoKeys`, `Internal`): the review should be retried, not posted.
@@ -165,12 +166,12 @@ pub(crate) struct VerifyInput<'a> {
 ///
 /// Every candidate is queued in [`verify_order`] (nothing is cut); up to [`VERIFY_CONCURRENCY`]
 /// are verified at a time. With a `toolbox` each one runs a light tool-enabled loop of at most
-/// [`VERIFY_LIGHT_MAX_STEPS`] steps, and every finding it keeps whose file the Finder never
-/// opened is re-verified by an Evidence Gate loop of at most [`VERIFY_FULL_MAX_STEPS`] steps,
-/// whose verdict replaces the light one. Without a `toolbox` (or once the model rejected tool
-/// calling, or for a candidate that starts once the review's token budget is exhausted) each run
-/// is a single diff-only call. Work still running at `deadline`, and work that starts after it,
-/// is dropped as unverified, never as retryable.
+/// [`VERIFY_LIGHT_MAX_STEPS`] steps, and every finding a light tool run keeps whose file the
+/// Finder never opened is re-verified by an Evidence Gate loop of at most
+/// [`VERIFY_FULL_MAX_STEPS`] steps (see [`Mode::Gate`]). Without a `toolbox` (or once the model
+/// rejected tool calling, or for a candidate that starts once the review's token budget is
+/// exhausted) a light run is a single diff-only call. A light run still going at `deadline`, or
+/// starting after it, is dropped as unverified, never as retryable.
 pub(crate) async fn verify_candidates(
     ctx: VerifyContext<'_>,
     input: VerifyInput<'_>,
@@ -195,35 +196,105 @@ pub(crate) async fn verify_candidates(
         diff_only: &diff_only,
     };
 
-    let mut results = pass
-        .run(verify_order(input.candidates), VERIFY_LIGHT_MAX_STEPS)
-        .await;
+    let light = pass.run(verify_order(input.candidates), Mode::Light).await;
+    let GateSplit {
+        queue,
+        mut light_outcomes,
+        mut results,
+    } = gate_split(light);
+    if !queue.is_empty() {
+        tracing::debug!(
+            findings = queue.len(),
+            "evidence gate: re-verifying findings on files the Finder never opened"
+        );
+    }
     let mut evidence_gate_runs = 0;
-    if evidence.toolbox.is_some() {
-        let (mut gate, settled): (Vec<_>, Vec<_>) =
-            results.into_iter().partition(|(_, candidate, outcome)| {
-                matches!(outcome, Outcome::Kept { .. }) && !candidate.investigated_by_finder
-            });
-        gate.sort_by_key(|(index, candidate, _)| queue_key(*index, candidate));
-        evidence_gate_runs = gate.len();
-        if evidence_gate_runs > 0 {
-            tracing::debug!(
-                findings = evidence_gate_runs,
-                "evidence gate: re-verifying findings on files the Finder never opened"
-            );
+    for mut verified in pass.run(queue, Mode::Gate).await {
+        let light = light_outcomes.remove(&verified.index);
+        if verified.with_tools {
+            evidence_gate_runs += 1;
         }
-        let queue = gate
-            .into_iter()
-            .map(|(index, candidate, _)| (index, candidate))
-            .collect();
-        results = settled;
-        results.extend(pass.run(queue, VERIFY_FULL_MAX_STEPS).await);
+        // A gate run without a verdict keeps the light one (always `Kept`).
+        if let (Outcome::Unverified(_), Some(light)) = (&verified.outcome, light) {
+            tracing::debug!(
+                candidate = verified.index,
+                "evidence gate gave no verdict; keeping the light verdict"
+            );
+            verified.outcome = light;
+        }
+        results.push(verified);
     }
     // `buffer_unordered` finishes in any order; the report keeps the original one.
-    results.sort_by_key(|(index, _, _)| *index);
+    results.sort_by_key(|verified| verified.index);
     let mut report = summarize(results);
     report.evidence_gate_runs = evidence_gate_runs;
     report
+}
+
+/// Which Verifier run a candidate gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The first verdict of every candidate: a [`VERIFY_LIGHT_MAX_STEPS`]-step tool loop, or one
+    /// diff-only call.
+    Light,
+    /// The Evidence Gate re-verify of a kept finding the Finder never opened: a
+    /// [`VERIFY_FULL_MAX_STEPS`]-step tool loop only. Never started once the tools are off or
+    /// the token budget is exhausted (it could only repeat the diff-only call); every run
+    /// without a verdict leaves the light one in place.
+    Gate,
+}
+
+impl Mode {
+    fn max_steps(self) -> usize {
+        match self {
+            Self::Light => VERIFY_LIGHT_MAX_STEPS,
+            Self::Gate => VERIFY_FULL_MAX_STEPS,
+        }
+    }
+}
+
+/// One candidate's result from a [`Pass`].
+#[derive(Debug)]
+struct Verified {
+    /// Position in `VerifyInput::candidates`.
+    index: usize,
+    candidate: CandidateFinding,
+    outcome: Outcome,
+    /// The outcome came from a tool-enabled loop (not a diff-only call or a skipped run).
+    with_tools: bool,
+}
+
+/// The light results split for the Evidence Gate.
+struct GateSplit {
+    /// Kept findings of light tool runs whose file the Finder never opened, in
+    /// [`verify_order`].
+    queue: Vec<(usize, CandidateFinding)>,
+    /// The light outcome of every queued finding, by index.
+    light_outcomes: HashMap<usize, Outcome>,
+    /// Every other light result, final.
+    results: Vec<Verified>,
+}
+
+fn gate_split(light: Vec<Verified>) -> GateSplit {
+    let (mut gated, results): (Vec<_>, Vec<_>) = light.into_iter().partition(|verified| {
+        verified.with_tools
+            && matches!(verified.outcome, Outcome::Kept { .. })
+            && !verified.candidate.investigated_by_finder
+    });
+    gated.sort_by_key(|verified| queue_key(verified.index, &verified.candidate));
+    let mut light_outcomes = HashMap::with_capacity(gated.len());
+    let queue = gated
+        .into_iter()
+        .map(|verified| {
+            light_outcomes.insert(verified.index, verified.outcome);
+            (verified.index, verified.candidate)
+        })
+        .collect();
+    GateSplit {
+        queue,
+        light_outcomes,
+        results,
+    }
 }
 
 /// One Verifier pass over a queue of candidates; shared by the light pass and the Evidence Gate.
@@ -236,38 +307,39 @@ struct Pass<'p, 'a> {
 }
 
 impl Pass<'_, '_> {
-    /// Verifies `queue` (`(original index, candidate)`, started in this order) with tool loops of
-    /// at most `max_steps` steps; results come back in completion order.
-    async fn run(
-        &self,
-        queue: Vec<(usize, CandidateFinding)>,
-        max_steps: usize,
-    ) -> Vec<(usize, CandidateFinding, Outcome)> {
+    /// Verifies `queue` (`(original index, candidate)`, started in this order) in `mode`;
+    /// results come back in completion order.
+    async fn run(&self, queue: Vec<(usize, CandidateFinding)>, mode: Mode) -> Vec<Verified> {
         // Futures are built up front: a closure inside the stream would make the future lose
         // `Send` (higher-ranked lifetime inference), as in `agent.rs`.
         let pending: Vec<_> = queue
             .into_iter()
             .map(|(index, candidate)| async move {
                 // Checked when the candidate starts (the stream polls it), not when it is built.
-                let outcome = if Instant::now() >= self.evidence.deadline {
-                    Outcome::Unverified(Failure::Deadline)
+                let (outcome, with_tools) = if Instant::now() >= self.evidence.deadline {
+                    (Outcome::Unverified(Failure::Deadline), false)
                 } else {
                     // Names the candidate on every log line of its run (verdicts run concurrently).
                     let span = tracing::debug_span!(
                         "verify",
                         candidate = index,
-                        max_steps,
+                        mode = ?mode,
                         file = %candidate.suggestion.file,
                         line = candidate.suggestion.line,
                     );
                     tokio::time::timeout_at(
                         self.evidence.deadline,
-                        verify_one(self, &candidate, max_steps).instrument(span),
+                        verify_one(self, &candidate, mode).instrument(span),
                     )
                     .await
-                    .unwrap_or(Outcome::Unverified(Failure::Deadline))
+                    .unwrap_or((Outcome::Unverified(Failure::Deadline), false))
                 };
-                (index, candidate, outcome)
+                Verified {
+                    index,
+                    candidate,
+                    outcome,
+                    with_tools,
+                }
             })
             .collect();
         stream::iter(pending)
@@ -355,11 +427,16 @@ enum Failure {
     Deadline,
 }
 
-fn summarize(results: Vec<(usize, CandidateFinding, Outcome)>) -> VerificationReport {
+fn summarize(results: Vec<Verified>) -> VerificationReport {
     let mut report = VerificationReport::default();
     let mut first_retryable = None;
     let mut only_retryable_failures = true;
-    for (_, mut candidate, outcome) in results {
+    for Verified {
+        mut candidate,
+        outcome,
+        ..
+    } in results
+    {
         tracing::debug!(
             file = %candidate.suggestion.file,
             line = candidate.suggestion.line,
@@ -408,20 +485,27 @@ struct Evidence<'a> {
     deadline: Instant,
 }
 
-/// Verifies one candidate: tool-enabled (at most `max_steps` steps) while the model supports
-/// tools and the review's token budget lasts, diff-only otherwise. A `ToolsUnsupported`
-/// switches every later candidate to diff-only and re-runs this one there.
+/// Verifies one candidate in `mode` and says whether the outcome came from a tool loop. A light
+/// run is tool-enabled while the model supports tools and the review's token budget lasts,
+/// diff-only otherwise; a `ToolsUnsupported` switches every later candidate to diff-only and
+/// re-runs this one there. A gate run is the tool loop only: without it the outcome is
+/// `Unverified` and the caller keeps the light verdict.
 async fn verify_one(
     pass: &Pass<'_, '_>,
     candidate: &CandidateFinding,
-    max_steps: usize,
-) -> Outcome {
+    mode: Mode,
+) -> (Outcome, bool) {
     let Pass {
         ctx,
         evidence,
         submit,
         diff_only,
     } = *pass;
+    let budget_exhausted = ctx.token_budget.filter(|budget| budget.exhausted());
+    if mode == Mode::Gate && (diff_only.load(Ordering::Relaxed) || budget_exhausted.is_some()) {
+        tracing::debug!("tools off or token budget exhausted; keeping the light verdict");
+        return (Outcome::Unverified(Failure::Other), false);
+    }
     let snippet = match evidence.toolbox {
         Some(toolbox) => {
             let s = &candidate.suggestion;
@@ -434,12 +518,12 @@ async fn verify_one(
     if let (Some(toolbox), false) = (evidence.toolbox, diff_only.load(Ordering::Relaxed)) {
         // Checked when the candidate starts: once the budget is exhausted, one small diff-only
         // call replaces the tool loop, so the finding is still verified (and counted).
-        if let Some(budget) = ctx.token_budget.filter(|budget| budget.exhausted()) {
+        if let Some(budget) = budget_exhausted {
             tracing::debug!("token budget exhausted; verifying the candidate diff-only");
             budget.note_diff_only();
         } else {
             let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), true);
-            let config = verifier_config(max_steps, evidence.deadline, ctx.token_budget);
+            let config = verifier_config(mode.max_steps(), evidence.deadline, ctx.token_budget);
             match verify_with_tools(ctx, toolbox, submit, prompt, &config).await {
                 Err(AgentError::ToolsUnsupported(_)) => {
                     tracing::warn!(
@@ -447,12 +531,15 @@ async fn verify_one(
                     );
                     diff_only.store(true, Ordering::Relaxed);
                 }
-                result => return agent_outcome(result),
+                result => return (agent_outcome(result), true),
             }
         }
     }
+    if mode == Mode::Gate {
+        return (Outcome::Unverified(Failure::Other), false);
+    }
     let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), false);
-    verify_diff_only(ctx, submit, prompt).await
+    (verify_diff_only(ctx, submit, prompt).await, false)
 }
 
 /// Centre and radius of `<code_context>`: [`SNIPPET_RADIUS`] lines around the whole span
@@ -854,6 +941,17 @@ mod tests {
         titles.iter().map(|title| bug(title)).collect()
     }
 
+    /// Bug findings on files the Finder never opened (Evidence Gate candidates when kept).
+    fn unopened(titles: &[&str]) -> Vec<CandidateFinding> {
+        bugs(titles)
+            .into_iter()
+            .map(|mut c| {
+                c.investigated_by_finder = false;
+                c
+            })
+            .collect()
+    }
+
     fn titles(findings: &[CandidateFinding]) -> Vec<&str> {
         findings
             .iter()
@@ -1070,8 +1168,9 @@ mod tests {
     #[tokio::test]
     async fn evidence_gate_re_verifies_uninvestigated_findings_at_full_steps() {
         let tb = toolbox();
-        let mut uninvestigated = bug("uninvestigated");
-        uninvestigated.investigated_by_finder = false;
+        let [uninvestigated, mut gate_error] =
+            <[CandidateFinding; 2]>::try_from(unopened(&["uninvestigated", "gate-error"])).unwrap();
+        gate_error.suggestion.category = Some(FindingCategory::Security);
         // Light verdict, then the Evidence Gate run: a short read (widened), six more reads,
         // and a refutation on its 8th step, which a 7-step run would answer without tools.
         let mut replies = vec![
@@ -1090,10 +1189,18 @@ mod tests {
                 vec![answer(tools_turn(vec![submit_verdict("i1", true)]))],
             ),
             ("uninvestigated", replies),
+            // A gate run without a verdict (provider error) keeps the light verdict.
+            (
+                "gate-error",
+                vec![
+                    answer(tools_turn(vec![submit_verdict("e1", true)])),
+                    answer(Err(ChatError::Invalid("bad request".into()))),
+                ],
+            ),
         ]);
         let report = verify(
             &chat,
-            vec![bug("investigated"), uninvestigated],
+            vec![bug("investigated"), uninvestigated, gate_error.clone()],
             Some(&tb),
             later(30_000),
             None,
@@ -1103,12 +1210,13 @@ mod tests {
         assert_eq!(
             report,
             VerificationReport {
-                kept: vec![bug("investigated")],
+                kept: vec![bug("investigated"), gate_error.clone()],
                 dropped_refuted: 1,
-                evidence_gate_runs: 1,
+                evidence_gate_runs: 2,
                 ..VerificationReport::default()
             }
         );
+        assert_eq!(chat.requests_for("gate-error").len(), 2);
         assert_primary_and_high(&chat.requests());
         assert_eq!(chat.requests_for("investigated").len(), 1);
         let reqs = chat.requests_for("uninvestigated");
@@ -1123,6 +1231,49 @@ mod tests {
             panic!("expected the read_file result");
         };
         assert!(results[0].content.contains("[src/a.rs: lines 1-5 of 5]"));
+
+        // The gate queue follows `verify_order` (security first); diff-only light verdicts and
+        // findings the Finder opened stay final.
+        let light = |index: usize, candidate: CandidateFinding, with_tools: bool| Verified {
+            index,
+            candidate,
+            outcome: Outcome::Kept {
+                drop_suggestion: false,
+            },
+            with_tools,
+        };
+        let [first, diff_only] =
+            <[CandidateFinding; 2]>::try_from(unopened(&["first", "diff-only"])).unwrap();
+        let split = gate_split(vec![
+            light(0, first, true),
+            light(1, bug("opened"), true),
+            light(2, diff_only, false),
+            light(3, gate_error, true),
+        ]);
+        let queued: Vec<usize> = split.queue.iter().map(|(index, _)| *index).collect();
+        assert_eq!(queued, [3, 0]);
+        let mut settled: Vec<usize> = split.results.iter().map(|v| v.index).collect();
+        settled.sort_unstable();
+        assert_eq!(settled, [1, 2]);
+
+        // A gate run never starts once the token budget is exhausted (here by the light run).
+        let budget = Arc::new(TokenBudget::new(100));
+        let chat = RoutedChat::new(vec![(
+            "late",
+            vec![answer(tools_turn(vec![submit_verdict("t1", true)]))],
+        )]);
+        let report = verify(
+            &chat,
+            unopened(&["late"]),
+            Some(&tb),
+            later(30_000),
+            Some(&budget),
+        )
+        .await;
+        assert_eq!(report.kept, unopened(&["late"]));
+        assert_eq!(report.evidence_gate_runs, 0);
+        assert_eq!(chat.requests().len(), 1);
+        assert_eq!(budget.warning(0, 0), None, "no diff-only verification");
 
         let config = verifier_config(VERIFY_FULL_MAX_STEPS, later(1_000), None);
         assert_eq!(config.max_steps, 10);
@@ -1445,7 +1596,8 @@ mod tests {
             ("e", vec![answer(text_turn(r#"{"keep": true}"#))]),
         ]);
         let names = ["first", "b", "c", "d", "e"];
-        let report = verify(&chat, bugs(&names), Some(&tb), later(30_000), None).await;
+        // Unopened files: the diff-only verdicts are final (no Evidence Gate calls).
+        let report = verify(&chat, unopened(&names), Some(&tb), later(30_000), None).await;
         assert_eq!(titles(&report.kept), names);
         assert_eq!(report.dropped_unverified, 0);
 
@@ -1472,9 +1624,10 @@ mod tests {
             ("refuted", vec![answer(text_turn(r#"{"keep": false}"#))]),
             ("garbage", vec![answer(text_turn("not sure"))]),
         ]);
+        // Unopened files: a diff-only light verdict is final, so no Evidence Gate call follows.
         let report = verify(
             &chat,
-            bugs(&["kept", "refuted", "garbage"]),
+            unopened(&["kept", "refuted", "garbage"]),
             Some(&tb),
             later(30_000),
             Some(&budget),
@@ -1483,7 +1636,7 @@ mod tests {
         assert_eq!(
             report,
             VerificationReport {
-                kept: bugs(&["kept", "garbage"]),
+                kept: unopened(&["kept", "garbage"]),
                 dropped_refuted: 1,
                 ..VerificationReport::default()
             }
