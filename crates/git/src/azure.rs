@@ -195,7 +195,14 @@ impl AzureProvider {
                 continue;
             }
             let status = c.status();
-            let path = normalize_path(&c.item.path);
+            // A deleted file has `item.path: null` and its path in `originalPath`.
+            let Some(raw_path) = c.item.path.as_deref().or(match status {
+                FileStatus::Deleted => c.original_path.as_deref(),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let path = normalize_path(raw_path);
             let old_path = match status {
                 FileStatus::Renamed => c.original_path.as_deref().map(normalize_path),
                 _ => None,
@@ -421,7 +428,8 @@ struct AzChange {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzItem {
-    path: String,
+    /// `null` for a deleted file in iteration changes; its path is then the change's `originalPath`.
+    path: Option<String>,
     #[serde(default)]
     is_folder: bool,
     git_object_type: Option<String>,
