@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use adus_core::types::normalize_path;
 use adus_git::{FileDiff, FileStatus};
+#[cfg(test)]
+use adus_llm::ToolCall;
 use adus_llm::ToolDef;
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
@@ -383,6 +385,30 @@ impl Toolbox {
         }
     }
 
+    /// The `(path, start, end)` window a `read_file` call asks for, with `path` as
+    /// [`RepoWorkspace`] resolves it. `None` for any other tool, unparsable arguments, a path
+    /// that is not an existing file in the workspace, or an inverted range.
+    // Gated until the Finder loop calls it.
+    #[cfg(test)]
+    pub(crate) fn read_file_range(&self, call: &ToolCall) -> Option<(String, u32, u32)> {
+        if call.name != "read_file" {
+            return None;
+        }
+        let args: ReadFileArgs = ReadFileArgs::deserialize(&call.arguments).ok()?;
+        let path = self
+            .workspace
+            .resolve_existing_file(args.path.trim())
+            .ok()?;
+        let start = args.start_line.unwrap_or(1).max(1);
+        let last_allowed = start.saturating_add(READ_MAX_LINES - 1);
+        let end = match args.end_line {
+            Some(end) if end < start => return None,
+            Some(end) => end.min(last_allowed),
+            None => last_allowed,
+        };
+        Some((path.rel().to_owned(), start, end))
+    }
+
     /// [`read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
     pub(crate) async fn read_file_snippet(
         &self,
@@ -397,6 +423,18 @@ impl Toolbox {
             .ok()
             .flatten()
     }
+}
+
+/// The `(first, shown)` line range from the `[<path>: lines X-Y of Z]` header of a successful
+/// `read_file` result; `(0, 0)` for an empty file. `None` when the output has no such header.
+// Gated until the Finder loop calls it.
+#[cfg(test)]
+pub(crate) fn parse_read_header_range(output: &str) -> Option<(u32, u32)> {
+    let header = output.lines().next()?.strip_suffix(']')?;
+    let (head, _total) = header.rsplit_once(" of ")?;
+    let (_, range) = head.rsplit_once(": lines ")?;
+    let (first, shown) = range.split_once('-')?;
+    Some((first.parse().ok()?, shown.parse().ok()?))
 }
 
 /// Lines `center_line ± radius` of `path` in the `read_file` format, or `None` on any
@@ -1106,6 +1144,27 @@ mod tests {
 
     fn headers(content: &str, path: &str) -> usize {
         content.lines().filter(|l| *l == path).count()
+    }
+
+    #[test]
+    fn read_file_range_resolves_dot_paths_and_header_ranges() {
+        let tb = toolbox(&[("src/a.rs", b"fn a() {}\n")]);
+        let call = |name: &str, path: &str| ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: json!({"path": path, "start_line": 3}),
+            provider_meta: None,
+        };
+        assert_eq!(
+            tb.read_file_range(&call("read_file", "./src/a.rs")),
+            Some(("src/a.rs".to_owned(), 3, 202))
+        );
+        assert_eq!(tb.read_file_range(&call("grep", "src/a.rs")), None);
+        assert_eq!(tb.read_file_range(&call("read_file", "../src/a.rs")), None);
+        assert_eq!(
+            parse_read_header_range("[src/a.rs: lines 10-45 of 100]\n10: x"),
+            Some((10, 45))
+        );
     }
 
     #[tokio::test]

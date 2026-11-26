@@ -1,6 +1,8 @@
 mod agent;
 mod budget;
 pub mod command;
+#[cfg(test)]
+mod coverage;
 mod dedup;
 mod discussion;
 pub mod engine;
