@@ -16,6 +16,7 @@ use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::agent::{
@@ -174,9 +175,16 @@ pub(crate) async fn verify_candidates(
                 let outcome = if Instant::now() >= evidence.deadline {
                     Outcome::Unverified(Failure::Deadline)
                 } else {
+                    // Names the candidate on every log line of its run (verdicts run concurrently).
+                    let span = tracing::debug_span!(
+                        "verify",
+                        candidate = index,
+                        file = %candidate.suggestion.file,
+                        line = candidate.suggestion.line,
+                    );
                     tokio::time::timeout_at(
                         evidence.deadline,
-                        verify_one(ctx, &candidate, evidence, submit, diff_only),
+                        verify_one(ctx, &candidate, evidence, submit, diff_only).instrument(span),
                     )
                     .await
                     .unwrap_or(Outcome::Unverified(Failure::Deadline))

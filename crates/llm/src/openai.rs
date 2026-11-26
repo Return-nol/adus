@@ -17,6 +17,8 @@ pub struct OpenAiClient {
     base_url: String,
     /// Nama field batas token: OpenAI asli `max_completion_tokens`, server kompatibel `max_tokens`.
     max_tokens_field: &'static str,
+    /// `base_url` points at OpenRouter, which takes `reasoning` instead of `reasoning_effort`.
+    openrouter: bool,
 }
 
 impl OpenAiClient {
@@ -25,8 +27,28 @@ impl OpenAiClient {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             max_tokens_field,
+            openrouter: is_openrouter_host(base_url),
         }
     }
+
+    /// Whether this client talks to OpenRouter (host `openrouter.ai` or a subdomain).
+    fn is_openrouter(&self) -> bool {
+        self.openrouter
+    }
+}
+
+/// `true` when `base_url` parses with host `openrouter.ai` or `*.openrouter.ai` (case-insensitive).
+fn is_openrouter_host(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+}
+
+/// OpenRouter answers 404 with this text when `provider.require_parameters` leaves it no
+/// upstream (the model does not support the reasoning parameter).
+fn is_no_endpoints(err: &LlmError) -> bool {
+    matches!(err, LlmError::Invalid(m) if m.to_lowercase().contains("no endpoints found"))
 }
 
 #[derive(Deserialize)]
@@ -129,6 +151,7 @@ impl OpenAiClient {
         api_key: &str,
         req: &ChatRequest,
         effort: Option<ReasoningEffort>,
+        require_params: bool,
     ) -> Result<ChatResponse, LlmError> {
         let mut body = json!({
             "model": req.model,
@@ -138,7 +161,16 @@ impl OpenAiClient {
         let reserve = effort.map_or(0, ReasoningEffort::output_reserve);
         body[self.max_tokens_field] = req.max_tokens.saturating_add(reserve).into();
         if let Some(e) = effort {
-            body["reasoning_effort"] = e.as_str().into();
+            if self.is_openrouter() {
+                body["reasoning"] = json!({"effort": e.as_str()});
+                if require_params {
+                    // Route only to upstreams that honour every parameter, so reasoning is not
+                    // silently dropped.
+                    body["provider"] = json!({"require_parameters": true});
+                }
+            } else {
+                body["reasoning_effort"] = e.as_str().into();
+            }
         }
         if !req.tools.is_empty() {
             let tools: Vec<Value> = req
@@ -225,12 +257,30 @@ impl OpenAiClient {
             provider_meta,
         })
     }
+
+    /// One attempt at `effort`. On OpenRouter a reasoning request first requires every parameter
+    /// to be honoured; a model with no such endpoint gets one retry without that requirement.
+    async fn chat_attempt(
+        &self,
+        api_key: &str,
+        req: &ChatRequest,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<ChatResponse, LlmError> {
+        let strict = self.is_openrouter() && effort.is_some();
+        match self.chat_once(api_key, req, effort, strict).await {
+            Err(ref err) if strict && is_no_endpoints(err) => {
+                self.chat_once(api_key, req, effort, false).await
+            }
+            other => other,
+        }
+    }
 }
 
 #[async_trait]
 impl LlmClient for OpenAiClient {
     async fn chat(&self, api_key: &str, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        chat_with_effort_fallback(req.effort, |effort| self.chat_once(api_key, req, effort)).await
+        chat_with_effort_fallback(req.effort, |effort| self.chat_attempt(api_key, req, effort))
+            .await
     }
 
     async fn list_models(&self, api_key: &str) -> Result<Vec<String>, LlmError> {
@@ -346,5 +396,103 @@ fn wire_error(err: WireError) -> LlmError {
         }
         Some(c) => LlmError::Invalid(format!("provider status {c}{suffix}")),
         None => LlmError::Invalid(format!("provider error{suffix}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[test]
+    fn openrouter_host_is_matched_exactly_or_as_subdomain() {
+        for (url, expected) in [
+            ("https://openrouter.ai/api/v1", true),
+            ("https://OPENROUTER.AI/v1", true),
+            ("https://eu.openrouter.ai/api/v1", true),
+            ("https://api.openai.com/v1", false),
+            ("https://notopenrouter.ai/v1", false),
+            ("not a url", false),
+        ] {
+            assert_eq!(is_openrouter_host(url), expected, "{url}");
+        }
+    }
+
+    fn ok_body() -> Value {
+        json!({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+    }
+
+    async fn bodies(server: &MockServer) -> Vec<Value> {
+        let requests = server.received_requests().await.unwrap_or_default();
+        requests
+            .iter()
+            .map(|r| r.body_json().unwrap_or(Value::Null))
+            .collect()
+    }
+
+    fn request() -> ChatRequest {
+        let mut req = ChatRequest::text("m-1", "be brief", "hello", 100);
+        req.effort = Some(ReasoningEffort::High);
+        req
+    }
+
+    #[tokio::test]
+    async fn openrouter_sends_reasoning_and_falls_back_when_no_endpoints() {
+        let server = MockServer::start().await;
+        let mut client = OpenAiClient::new(Client::new(), &server.uri(), "max_tokens");
+        // The mock listens on 127.0.0.1; flag it as OpenRouter.
+        client.openrouter = true;
+        assert!(client.is_openrouter());
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(|req: &wiremock::Request| {
+                let body: Value = req.body_json().unwrap_or(Value::Null);
+                if body["provider"]["require_parameters"] == json!(true) {
+                    ResponseTemplate::new(404).set_body_json(json!({"error": {
+                        "message": "No endpoints found that can handle the requested parameters",
+                        "code": 404,
+                    }}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(ok_body())
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let got = client.chat("key", &request()).await.unwrap();
+
+        assert_eq!(got.text, "ok");
+        let sent = bodies(&server).await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["reasoning"]["effort"], "high");
+        assert_eq!(sent[0]["provider"]["require_parameters"], true);
+        assert_eq!(sent[1]["reasoning"]["effort"], "high");
+        assert!(sent[1].get("provider").is_none());
+        assert!(sent.iter().all(|b| b.get("reasoning_effort").is_none()));
+    }
+
+    #[tokio::test]
+    async fn non_openrouter_keeps_bare_reasoning_effort() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .mount(&server)
+            .await;
+        let client = OpenAiClient::new(Client::new(), &server.uri(), "max_tokens");
+        assert!(!client.is_openrouter());
+
+        client.chat("key", &request()).await.unwrap();
+
+        let sent = bodies(&server).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["reasoning_effort"], "high");
+        assert!(sent[0].get("reasoning").is_none());
+        assert!(sent[0].get("provider").is_none());
     }
 }

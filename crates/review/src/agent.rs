@@ -18,7 +18,15 @@ use uuid::Uuid;
 
 use crate::budget::TokenBudget;
 use crate::prompt::truncate_with_marker;
+use crate::redact::redact_secrets;
 use crate::tools::{ToolOutput, Toolbox};
+
+/// Target of the live agent trace, enabled with `RUST_LOG=...,adus_review::trace=trace`: each
+/// run's prompt, and per step the model's reasoning, reply text, tool calls and tool results
+/// (secrets redacted).
+const TRACE_TARGET: &str = "adus_review::trace";
+/// Most characters of one tool result shown in the trace.
+const TRACE_RESULT_CHARS: usize = 2_000;
 
 /// Default `AgentConfig::compaction_char_limit`.
 const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 320_000;
@@ -191,6 +199,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
     let mut nudged_last_step = false;
     let mut last_text = String::new();
     let mut wrap_up = WrapUp::default();
+    trace_prompt(llm.system, &messages);
 
     while tally.steps_used < config.max_steps {
         let starts_wrap_up = wrap_up.check(tally.steps_used, config);
@@ -237,6 +246,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             wrap_up = wrap_up.reason,
             "agent step"
         );
+        trace_response(tally.steps_used, &response);
         let ChatResponse {
             text,
             tool_calls,
@@ -282,6 +292,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             config.max_concurrent_tools,
         )
         .await;
+        trace_results(tally.steps_used, &results);
         messages.push(Message::Tool { results });
         last_text = text;
         wrap_up.record(step_started.elapsed());
@@ -482,6 +493,73 @@ async fn answer_call(
         tool_name: call.name.clone(),
         content: output.content,
         is_error: output.is_error,
+    }
+}
+
+fn trace_enabled() -> bool {
+    tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE)
+}
+
+/// Traces the system prompt and the run's first user message.
+fn trace_prompt(system: &str, messages: &[Message]) {
+    if !trace_enabled() {
+        return;
+    }
+    let prompt = messages
+        .iter()
+        .find_map(|m| match m {
+            Message::User { parts } => parts.iter().map(|UserPart::Text(t)| t.as_str()).next(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    tracing::trace!(
+        target: TRACE_TARGET,
+        system = %redact_secrets(system),
+        prompt = %redact_secrets(prompt),
+        "agent prompt"
+    );
+}
+
+/// Traces what the model produced in one step: reasoning, reply text and every tool call.
+fn trace_response(step: usize, response: &ChatResponse) {
+    if !trace_enabled() {
+        return;
+    }
+    if let Some(reasoning) = response.reasoning() {
+        tracing::trace!(target: TRACE_TARGET, step, reasoning = %redact_secrets(&reasoning), "agent reasoning");
+    }
+    if !response.text.trim().is_empty() {
+        tracing::trace!(target: TRACE_TARGET, step, text = %redact_secrets(&response.text), "agent text");
+    }
+    for call in &response.tool_calls {
+        let args = call.arguments.to_string();
+        tracing::trace!(
+            target: TRACE_TARGET,
+            step,
+            tool = %call.name,
+            id = %call.id,
+            args = %redact_secrets(&args),
+            "agent tool call"
+        );
+    }
+}
+
+/// Traces the result of every tool call of one step, each cut to [`TRACE_RESULT_CHARS`].
+fn trace_results(step: usize, results: &[ToolResult]) {
+    if !trace_enabled() {
+        return;
+    }
+    for result in results {
+        let content = truncate_with_marker(&result.content, TRACE_RESULT_CHARS, TRUNCATED_MARKER);
+        tracing::trace!(
+            target: TRACE_TARGET,
+            step,
+            tool = %result.tool_name,
+            id = %result.call_id,
+            is_error = result.is_error,
+            content = %redact_secrets(&content),
+            "agent tool result"
+        );
     }
 }
 

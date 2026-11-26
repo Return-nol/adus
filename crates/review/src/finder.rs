@@ -18,6 +18,7 @@ use adus_llm::router::{ChatService, UsageContext};
 use futures::{StreamExt, future, stream};
 use serde_json::Value;
 use tokio::time::Instant;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::agent::run_react_loop;
@@ -230,7 +231,9 @@ async fn run_one(
         token_budget: llm.token_budget.cloned(),
         ..AgentConfig::new(FINDER_MAX_STEPS)
     };
-    let run = run_react_loop(&agent, tools, &submit, &config, prompt);
+    // Names the agent on every log line of its run (concurrent agents interleave).
+    let span = tracing::debug_span!("finder", specialist = kind.label(), batch);
+    let run = run_react_loop(&agent, tools, &submit, &config, prompt).instrument(span);
     let result = match tokio::time::timeout_at(deadline, run).await {
         Ok(Ok(outcome)) => {
             tracing::debug!(

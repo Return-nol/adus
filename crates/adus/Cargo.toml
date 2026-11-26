@@ -28,6 +28,8 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Used by the hidden `rereview` debug command.
+uuid.workspace = true
 
 [dev-dependencies]
 redis.workspace = true

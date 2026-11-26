@@ -1449,7 +1449,10 @@ async fn anthropic_current_model_sends_adaptive_thinking_and_effort() {
     assert_eq!(resp.text, "ok");
 
     let body = sent_body(&server).await;
-    assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "adaptive", "display": "summarized"})
+    );
     assert_eq!(body["output_config"], json!({"effort": "high"}));
     assert_eq!(body["max_tokens"], 8192 + 23_000);
     assert!(!body.to_string().contains("budget_tokens"));

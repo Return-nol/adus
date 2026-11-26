@@ -126,7 +126,8 @@ impl AnthropicClient {
         });
         if let Some(e) = effort {
             if adaptive_thinking(&req.model) {
-                body["thinking"] = json!({"type": "adaptive"});
+                // "summarized": Claude 4.7+ / 5.x return empty thinking blocks by default; this changes only what the response shows, not cost or behaviour, and lets the trace show reasoning.
+                body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
                 body["output_config"] = json!({"effort": e.as_str()});
             } else {
                 body["thinking"] = json!({"type": "enabled", "budget_tokens": e.output_reserve()});

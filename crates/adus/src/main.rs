@@ -4,6 +4,7 @@ use adus::{JOB_TIMEOUT, STALE_SWEEP_EVERY, run_scheduler, run_worker};
 use adus_core::{
     config::{self, Config, Level},
     crypto::{Cipher, generate_secret_key},
+    job::{Job, Trigger},
 };
 use adus_git::{GitProviderFactory, HttpGitProviderFactory};
 use adus_llm::router::{ChatService, LlmRouter};
@@ -48,6 +49,14 @@ enum Command {
     Doctor,
     /// Probe /healthz on this machine; exit 0 if it answers (for Docker HEALTHCHECK)
     Healthcheck,
+    /// Debug only (hidden): queue a full review of a PR as if it had just been opened; a running `adus serve` picks it up.
+    #[command(hide = true)]
+    Rereview {
+        /// Repository id (`repository_id` in the review logs)
+        repository_id: uuid::Uuid,
+        /// Pull request number
+        pr_number: i64,
+    },
 }
 
 #[tokio::main]
@@ -64,6 +73,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::CheckConfig => Ok(check_config()),
         Command::Doctor => Ok(doctor().await),
         Command::Healthcheck => Ok(healthcheck().await),
+        Command::Rereview {
+            repository_id,
+            pr_number,
+        } => rereview(repository_id, pr_number).await,
     }
 }
 
@@ -219,6 +232,26 @@ async fn doctor() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Queues `Job::ReviewPr` with `Trigger::Opened`, so the review runs in full (no
+/// incremental diff against the last reviewed head). Findings Adus already posted on the PR are
+/// still filtered out by Semantic Dedup (`already_raised`).
+async fn rereview(
+    repository_id: uuid::Uuid,
+    pr_number: i64,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let config = Config::from_env()?;
+    let queue = Queue::connect(&config.redis_url, "adus").await?;
+    let job = Job::ReviewPr {
+        repository_id,
+        pr_number,
+        trigger: Trigger::Opened,
+        mode_override: None,
+    };
+    queue.enqueue(&job).await?;
+    println!("queued review of PR #{pr_number} (repository {repository_id}) as opened");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Hanya membaca `ADUS_BIND_ADDR` (bawaan `0.0.0.0:8000`) dan memeriksa port itu di 127.0.0.1.
