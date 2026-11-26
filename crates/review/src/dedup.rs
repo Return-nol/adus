@@ -177,6 +177,7 @@ mod tests {
     use adus_llm::router::ChatError;
 
     use super::*;
+    use crate::finder::FinderPass;
     use crate::redact::REDACTED;
     use crate::specialists::SpecialistKind;
     use crate::test_support::{ScriptedChat, text_turn, user_text};
@@ -196,6 +197,8 @@ mod tests {
                 suggestion: None,
             },
             specialist,
+            investigated_by_finder: false,
+            origin: FinderPass::Pass1,
         }
     }
 

@@ -45,7 +45,6 @@ impl TokenBudget {
         self.used.fetch_add(u64::from(charged), Ordering::Relaxed);
     }
 
-    #[cfg(test)]
     /// The weighted budget left as a percentage of the limit; `100` when unlimited.
     pub(crate) fn remaining_share_percent(&self) -> u32 {
         if self.limit == 0 {

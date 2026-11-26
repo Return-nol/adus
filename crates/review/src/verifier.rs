@@ -25,6 +25,7 @@ use crate::agent::{
 };
 use crate::budget::TokenBudget;
 use crate::engine::is_retryable;
+use crate::finder::FinderPass;
 use crate::parse::{FindingCategory, Suggestion, first_json_object};
 use crate::prompt::{
     MAX_DESCRIPTION_CHARS_DIFF_ONLY, diff_block, format_memories, format_pr_description,
@@ -55,6 +56,22 @@ pub(crate) struct CandidateFinding {
     pub suggestion: Suggestion,
     /// The Finder role that reported it.
     pub specialist: SpecialistKind,
+    /// The Finder opened its file with `read_file` (in Pass 1 or Pass 2).
+    pub investigated_by_finder: bool,
+    /// The Finder pass that produced it.
+    pub origin: FinderPass,
+}
+
+impl AsRef<Suggestion> for CandidateFinding {
+    fn as_ref(&self) -> &Suggestion {
+        &self.suggestion
+    }
+}
+
+impl AsMut<Suggestion> for CandidateFinding {
+    fn as_mut(&mut self) -> &mut Suggestion {
+        &mut self.suggestion
+    }
 }
 
 /// JSON shape shared by the Verifier (`<candidate>`) and Dedup (`<findings>`).
@@ -235,6 +252,15 @@ enum Outcome {
 }
 
 impl Outcome {
+    /// `"kept"`, `"refuted"` or `"unverified"`, for the per-candidate log line.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Kept { .. } => "kept",
+            Self::Refuted => "refuted",
+            Self::Unverified(_) => "unverified",
+        }
+    }
+
     fn from_verdict(verdict: Verdict) -> Self {
         if verdict.keep {
             Self::Kept {
@@ -267,6 +293,14 @@ fn summarize(
     let mut first_retryable = None;
     let mut only_retryable_failures = true;
     for (_, mut candidate, outcome) in results {
+        tracing::debug!(
+            file = %candidate.suggestion.file,
+            line = candidate.suggestion.line,
+            origin = candidate.origin.label(),
+            investigated_by_finder = candidate.investigated_by_finder,
+            verdict = outcome.label(),
+            "verifier verdict"
+        );
         match outcome {
             Outcome::Kept { drop_suggestion } => {
                 if drop_suggestion {
@@ -692,6 +726,8 @@ mod tests {
                 suggestion: None,
             },
             specialist,
+            investigated_by_finder: false,
+            origin: FinderPass::Pass1,
         }
     }
 

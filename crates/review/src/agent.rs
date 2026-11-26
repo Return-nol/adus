@@ -9,7 +9,7 @@
 //! prompt-cache prefix stays valid and providers that check preserved thinking accept it.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,6 +69,10 @@ const VERIFY_WIDEN_AFTER: u64 = 10;
 const OVERFLOW_TOOL_CHARS: usize = 500;
 /// Appended to a tool output cut after a context overflow.
 const TRUNCATED_MARKER: &str = "\n[output truncated]";
+/// Tool calls kept in [`AgentOutcome::recent_tool_calls`].
+const RECENT_TOOL_CALLS: usize = 20;
+/// Most characters of a call's arguments kept in its summary.
+const TOOL_CALL_ARGS_CHARS: usize = 150;
 
 /// Limits and policies of one agent run.
 #[derive(Debug, Clone)]
@@ -142,6 +146,27 @@ pub(crate) struct AgentOutcome<T> {
     pub opened_files: HashSet<String>,
     /// Mean wall time of the run's LLM calls; `None` when none completed.
     pub mean_step: Option<Duration>,
+    /// The last [`RECENT_TOOL_CALLS`] executed calls other than the terminal tool, oldest
+    /// first, each as `tool(arguments)` with secrets redacted and the arguments cut to
+    /// [`TOOL_CALL_ARGS_CHARS`] characters.
+    pub recent_tool_calls: Vec<String>,
+}
+
+impl<T> AgentOutcome<T> {
+    /// The same outcome with `result` replaced by `f(result)`.
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> AgentOutcome<U> {
+        AgentOutcome {
+            result: f(self.result),
+            steps_used: self.steps_used,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            cut_short: self.cut_short,
+            gate_refused: self.gate_refused,
+            opened_files: self.opened_files,
+            mean_step: self.mean_step,
+            recent_tool_calls: self.recent_tool_calls,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -412,6 +437,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             )
             .await;
         }
+        tally.record_calls(&executed, submit_name);
         trace_results(tally.steps_used, &results);
         messages.push(Message::Tool { results });
         last_text = text;
@@ -633,7 +659,7 @@ impl WrapUp {
     }
 }
 
-/// Steps, cache tokens, LLM time and opened files of one run.
+/// Steps, cache tokens, LLM time, opened files and recent tool calls of one run.
 #[derive(Default)]
 struct Tally {
     steps_used: usize,
@@ -642,6 +668,7 @@ struct Tally {
     /// Summed wall time of the LLM calls.
     llm_time: Duration,
     opened_files: HashSet<String>,
+    recent_calls: VecDeque<String>,
 }
 
 impl Tally {
@@ -654,6 +681,16 @@ impl Tally {
         self.cache_write_tokens = self
             .cache_write_tokens
             .saturating_add(response.cache_write_tokens);
+    }
+
+    /// Keeps a summary of every executed call of a turn except `submit_name`.
+    fn record_calls(&mut self, calls: &[ToolCall], submit_name: &str) {
+        for call in calls.iter().filter(|call| call.name != submit_name) {
+            if self.recent_calls.len() == RECENT_TOOL_CALLS {
+                self.recent_calls.pop_front();
+            }
+            self.recent_calls.push_back(tool_call_summary(call));
+        }
     }
 
     fn finish<T>(&mut self, result: T, cut_short: bool, gate_refused: bool) -> AgentOutcome<T> {
@@ -670,8 +707,22 @@ impl Tally {
             gate_refused,
             opened_files: std::mem::take(&mut self.opened_files),
             mean_step,
+            recent_tool_calls: std::mem::take(&mut self.recent_calls).into(),
         }
     }
+}
+
+/// `tool(arguments)`, secrets redacted before the arguments are cut to
+/// [`TOOL_CALL_ARGS_CHARS`] characters (a cut keeps `...` as its last three).
+fn tool_call_summary(call: &ToolCall) -> String {
+    let args = call.arguments.to_string();
+    let args = redact_secrets(&args);
+    let excerpt = if args.chars().count() > TOOL_CALL_ARGS_CHARS {
+        truncate_with_marker(&args, TOOL_CALL_ARGS_CHARS - 3, "...")
+    } else {
+        Cow::Borrowed(args.as_ref())
+    };
+    format!("{}({excerpt})", call.name)
 }
 
 /// The one-shot completion gate and the submissions it refused, oldest first.

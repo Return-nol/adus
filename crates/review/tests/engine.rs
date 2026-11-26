@@ -1313,12 +1313,14 @@ async fn review_mode_precedence_command_overrides_repo_overrides_settings(pool: 
         .unwrap();
     assert_eq!(roles_since(7), vec![GENERALIST_ROLE]);
 
-    let efforts: Vec<_> = s.chat.finder_calls().iter().map(|c| c.effort).collect();
-    let (medium, high) = (Some(ReasoningEffort::Medium), Some(ReasoningEffort::High));
-    let mut expected = vec![medium];
-    expected.extend([high; 6]);
-    expected.push(medium);
-    assert_eq!(efforts, expected);
+    // Both modes run the Finder at High.
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 8);
+    assert!(
+        finder
+            .iter()
+            .all(|c| c.effort == Some(ReasoningEffort::High))
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1631,12 +1633,13 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
     assert_eq!(row.status, ReviewStatus::Done);
     assert_eq!(row.comments_posted, 1);
 
-    // Finder: primary model at Medium, repository tools, then the helper file's content.
+    // Finder: primary model at High, repository tools, then the helper file's content; Pass 2
+    // (the synthesis rescue, answering the default `[]`) follows with what Pass 1 opened.
     let finder = s.chat.finder_calls();
-    assert_eq!(finder.len(), 2);
+    assert_eq!(finder.len(), 3);
     for call in &finder {
         assert_eq!(call.model, "gpt-test");
-        assert_eq!(call.effort, Some(ReasoningEffort::Medium));
+        assert_eq!(call.effort, Some(ReasoningEffort::High));
         assert!(call.system.contains(GENERALIST_ROLE));
         assert!(call.system.contains("You can read the repository"));
     }
@@ -1655,6 +1658,17 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
     assert!(!finder[0].user.contains("after_hunk"), "{}", finder[0].user);
     assert_eq!(finder[1].tool_results.len(), 2);
     assert!(finder[1].tool_results[0].contains("pub fn is_admin() -> bool"));
+    assert!(
+        finder[2].user.starts_with(&finder[0].user)
+            && finder[2].user.contains(
+                "<already_inspected_files>
+src/helper.rs
+src/login.rs
+"
+            ),
+        "{}",
+        finder[2].user
+    );
 
     // Verifier: fast model at Low, with tools, one call per candidate.
     let verifier = s.chat.verifier_calls();
@@ -2050,8 +2064,9 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
 
     run(&s, Trigger::Opened).await.unwrap();
 
+    // Pass 1 (two calls), then the synthesis rescue.
     let finder = s.chat.finder_calls();
-    assert_eq!(finder.len(), 2);
+    assert_eq!(finder.len(), 3);
     assert!(finder[0].user.contains("<repository_instructions>"));
     assert!(
         finder[0]
@@ -2071,9 +2086,9 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
         .await
         .unwrap();
     let finder = &s.chat.finder_calls()[before..];
-    // Bug, Security, Performance and Rules, plus Bug's second call: the completion gate
-    // refuses its first submission because `a.rs` is unread.
-    assert_eq!(finder.len(), 5);
+    // Bug, Security, Performance and Rules, plus Bug's second call (the completion gate
+    // refuses its first submission because `a.rs` is unread) and Bug's synthesis rescue.
+    assert_eq!(finder.len(), 6);
     assert_eq!(
         finder
             .iter()
@@ -2230,7 +2245,7 @@ async fn review_timeout_matches_effective_mode(pool: PgPool) {
         .unwrap();
     assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
 
-    // Small PR under Specialists default is forced to Generalist (effort and budget included).
+    // Small PR under Specialists default is forced to Generalist (budget included).
     enable_small_pr(&pool).await;
     let before = s.chat.finder_calls().len();
     let before_v = s.chat.verifier_calls().len();
@@ -2240,7 +2255,7 @@ async fn review_timeout_matches_effective_mode(pool: PgPool) {
     let finder = s.chat.finder_calls();
     assert_eq!(finder.len() - before, 1, "one Generalist pass");
     assert!(finder[before].system.contains(GENERALIST_ROLE));
-    assert_eq!(finder[before].effort, Some(ReasoningEffort::Medium));
+    assert_eq!(finder[before].effort, Some(ReasoningEffort::High));
     assert_eq!(s.chat.verifier_calls().len() - before_v, 1);
 
     let err = run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
@@ -2590,8 +2605,8 @@ async fn finder_still_sees_the_raw_diff(pool: PgPool) {
         "{}",
         finder[0].system
     );
-    // Tool output is masked.
-    let last = finder.last().unwrap();
+    // Tool output is masked (Pass 1's second call; Pass 2 follows it).
+    let last = &finder[1];
     assert!(
         last.tool_results
             .iter()

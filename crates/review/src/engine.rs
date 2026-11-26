@@ -29,11 +29,14 @@ use sqlx::PgPool;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::agent::AgentError;
+use crate::agent::{AgentError, AgentOutcome};
 use crate::budget::TokenBudget;
 use crate::dedup::{DedupOutcome, deduplicate_findings};
 use crate::discussion::threads_for_dedup;
-use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, batch_allowed, run_finder};
+use crate::finder::{
+    FinderFailure, FinderInput, FinderLlm, FinderPass, FinderTask, SynthesisSkipped, batch_allowed,
+    run_finder,
+};
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
     DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, batch_targets, build_manifest, format_inline,
@@ -114,12 +117,8 @@ struct ReviewOutput {
     redacted_comments: usize,
 }
 
-fn finder_effort(mode: ReviewMode) -> ReasoningEffort {
-    match mode {
-        ReviewMode::Generalist => ReasoningEffort::Medium,
-        ReviewMode::Specialists => ReasoningEffort::High,
-    }
-}
+/// Both Finder passes, in either review mode, run the primary model at this effort (spec §2).
+const FINDER_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
 /// When each stage must be done, as fractions of the run's budget (`review_timeout` or
 /// `specialists_review_timeout`) from the run's start (spec 4.11): Finder (clone included)
@@ -567,7 +566,8 @@ impl Engine {
             chat: self.chat.as_ref(),
             provider_id: s.provider_id,
             model: s.primary_model,
-            effort: finder_effort(mode),
+            fast_model: s.fast_model,
+            effort: FINDER_EFFORT,
             usage: s.usage,
             token_budget: Some(&s.token_budget),
         };
@@ -591,6 +591,8 @@ impl Engine {
             toolbox.as_ref()
         };
         let finder_tasks = finder.tasks.len();
+        let synthesis_skipped = finder.synthesis_skipped.map(SynthesisSkipped::label);
+        let synthesis_candidates = finder.synthesis_candidates;
         let (cache_read_tokens, cache_write_tokens) = finder_cache_tokens(&finder.tasks);
         let (candidates, filtered_dropped) =
             collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
@@ -640,6 +642,7 @@ impl Engine {
             (report.kept, dropped)
         };
         let verified_kept = verified.len();
+        let kept_by_origin = count_by_origin(&verified);
 
         let finding_paths = verified
             .iter()
@@ -687,7 +690,10 @@ impl Engine {
             finder_tasks,
             filtered_dropped,
             candidates = candidate_count,
+            synthesis_candidates,
+            synthesis_skipped,
             verified_kept,
+            kept_by_origin = %kept_by_origin,
             verifier_dropped,
             dedup_dropped = verified_kept.saturating_sub(found.len() + already_raised),
             already_raised,
@@ -854,6 +860,22 @@ fn redact_owned(text: String) -> (String, bool) {
     (text, false)
 }
 
+/// Candidates per Finder pass, as `pass1=N synthesis_rescue=N prose_recovery=N`.
+fn count_by_origin(candidates: &[CandidateFinding]) -> String {
+    [
+        FinderPass::Pass1,
+        FinderPass::SynthesisRescue,
+        FinderPass::ProseRecovery,
+    ]
+    .iter()
+    .map(|&pass| {
+        let count = candidates.iter().filter(|c| c.origin == pass).count();
+        format!("{}={count}", pass.label())
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
 /// Cache tokens summed over the Finder agents that finished.
 fn finder_cache_tokens(tasks: &[FinderTask]) -> (u32, u32) {
     tasks
@@ -915,13 +937,25 @@ fn collect_candidates(
                 let Some(range) = batch_ranges.get(task.batch) else {
                     continue;
                 };
-                let raw_count = outcome.result.len();
-                let valid = keep_valid_batch(outcome.result, range);
+                let AgentOutcome {
+                    result,
+                    opened_files,
+                    ..
+                } = outcome;
+                let raw_count = result.len();
+                let found = result
+                    .into_iter()
+                    .map(|finding| CandidateFinding {
+                        investigated_by_finder: opened_files
+                            .contains(&normalize_path(&finding.suggestion.file)),
+                        origin: finding.origin,
+                        suggestion: finding.suggestion,
+                        specialist: task.kind,
+                    })
+                    .collect();
+                let valid = keep_valid_batch(found, range);
                 filtered_dropped += raw_count.saturating_sub(valid.len());
-                candidates.extend(valid.into_iter().map(|suggestion| CandidateFinding {
-                    suggestion,
-                    specialist: task.kind,
-                }));
+                candidates.extend(valid);
                 continue;
             }
             Err(FinderFailure::TimedOut) => {

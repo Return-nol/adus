@@ -59,6 +59,18 @@ pub(crate) struct Suggestion {
     pub suggestion: Option<String>,
 }
 
+impl AsRef<Suggestion> for Suggestion {
+    fn as_ref(&self) -> &Suggestion {
+        self
+    }
+}
+
+impl AsMut<Suggestion> for Suggestion {
+    fn as_mut(&mut self) -> &mut Suggestion {
+        self
+    }
+}
+
 /// Baris dan rentang hunk sisi kanan pada satu file yang valid untuk dikomentari.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CommentableRange {
@@ -409,30 +421,31 @@ pub(crate) fn validate_batch_anchors(
 /// `start_line` survives only when `start_line..=line` lies in one diff hunk; when a requested
 /// range is dropped, the `suggestion` goes too, because a multi-line replacement anchored to
 /// `line` alone duplicates code on "Apply suggestion". Exact duplicates are then merged (see
-/// `dedup_exact`). `file` in the result is the normalized path.
-pub(crate) fn keep_valid_batch(
-    suggestions: Vec<Suggestion>,
+/// `dedup_exact`). `file` in the result is the normalized path. `T` is a finding or a value
+/// carrying one (a Verifier candidate keeps its other fields).
+pub(crate) fn keep_valid_batch<T: AsRef<Suggestion> + AsMut<Suggestion>>(
+    items: Vec<T>,
     allowed_by_file: &HashMap<String, &CommentableRange>,
-) -> Vec<Suggestion> {
-    let valid = suggestions.into_iter().filter_map(|s| {
+) -> Vec<T> {
+    let valid = items.into_iter().filter_map(|mut item| {
+        let s = item.as_mut();
         let file = normalize_path(&s.file);
         let allowed = allowed_by_file.get(&file)?;
         if !allowed.lines.contains(&s.line) {
             return None;
         }
-        let (start_line, suggestion) = match s.start_line {
-            Some(start) if start == s.line => (None, s.suggestion),
-            Some(start) if !allowed.spans_one_hunk(start, s.line) => (None, None),
-            start_line => (start_line, s.suggestion),
-        };
-        Some(Suggestion {
-            file,
-            start_line,
-            suggestion,
-            ..s
-        })
+        match s.start_line {
+            Some(start) if start == s.line => s.start_line = None,
+            Some(start) if !allowed.spans_one_hunk(start, s.line) => {
+                s.start_line = None;
+                s.suggestion = None;
+            }
+            _ => {}
+        }
+        s.file = file;
+        Some(item)
     });
-    dedup_exact(valid, |s| s)
+    dedup_exact(valid, AsRef::as_ref)
 }
 
 /// Drops exact `(file, line, title)` duplicates of `items` (the body stands in for an empty
