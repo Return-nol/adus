@@ -2259,12 +2259,12 @@ async fn review_timeout_matches_effective_mode(pool: PgPool) {
 async fn slow_specialist_submits_before_the_finder_deadline(pool: PgPool) {
     let mut s = setup_one(&pool).await;
     s.enable_clone(&[("a.rs", "a\nb\n")]);
-    // Finder deadline at 55 % = 495 ms. Turn 1 takes 250 ms; with <= 245 ms left
-    // (< 2 * 250 ms), turn 2 offers only `submit_findings` and finishes well before 495 ms.
-    s.engine.specialists_review_timeout = Duration::from_millis(900);
+    // Finder deadline at 55 % = 1650 ms. Turn 1 takes 830 ms; with <= 820 ms left
+    // (< 2 * 830 ms), turn 2 offers only `submit_findings` and finishes well before 1650 ms.
+    s.engine.specialists_review_timeout = Duration::from_secs(3);
     s.chat.finder_role_delayed(
         BUG_ROLE,
-        Duration::from_millis(250),
+        Duration::from_millis(830),
         Reply::tool("read_file", json!({"path": "a.rs"})),
     );
     s.chat.finder_role(
