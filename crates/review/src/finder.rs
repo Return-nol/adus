@@ -456,7 +456,8 @@ mod tests {
         )])));
         let deadline = Instant::now() + Duration::from_secs(30);
 
-        // The changed lines are read in the first turn, so the completion gate stays open.
+        // The changed lines are read in the first turn, so the completion gate does not refuse
+        // the second submit.
         let first_turn = || {
             tools_turn(vec![
                 call(

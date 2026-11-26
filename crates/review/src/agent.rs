@@ -461,8 +461,8 @@ fn widen_short_read(call: &ToolCall) -> Option<ToolCall> {
     Some(widened)
 }
 
-/// Records every successful `read_file` of a turn: the lines its output header shows go into
-/// `ledger`, and its file into `opened`. Path resolution runs off the async runtime.
+/// Records every successful `read_file` of a turn whose output has a `[path: lines X-Y of Z]`
+/// header: the lines shown go into `ledger`, and its file into `opened`. Path resolution runs off the async runtime.
 async fn record_reads(
     toolbox: &Toolbox,
     calls: &[ToolCall],
@@ -474,10 +474,14 @@ async fn record_reads(
         if result.is_error {
             continue;
         }
-        let Some((path, start, end)) = toolbox.read_file_range(call).await else {
+        // Only the lines the output header says were shown count; without a header nothing
+        // is credited.
+        let Some((start, end)) = parse_read_header_range(&result.content) else {
             continue;
         };
-        let (start, end) = parse_read_header_range(&result.content).unwrap_or((start, end));
+        let Some((path, _, _)) = toolbox.read_file_range(call).await else {
+            continue;
+        };
         if let Some(ledger) = ledger.as_deref_mut() {
             ledger.record_read(&path, start, end);
         }
