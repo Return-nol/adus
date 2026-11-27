@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::ops::ControlFlow;
@@ -496,9 +497,7 @@ fn read_head_file_capped_sync(
 
 /// Appends `line` as a `{n}: {line}` row of `read_file` output, without a newline.
 fn push_numbered_row(out: &mut String, n: usize, line: &str) {
-    out.push_str(&n.to_string());
-    out.push_str(": ");
-    out.push_str(line);
+    let _ = write!(out, "{n}: {line}");
 }
 
 /// Runs `call` through the cache. Fresh content is redacted before it is cached, so cached
@@ -621,13 +620,13 @@ fn read_file(path: &RepoPath, start: u32, end: u32) -> Result<String, ToolError>
     let mut body = String::new();
     let mut shown = first - 1;
     for (n, line) in (first..=last).zip(&lines[first - 1..last]) {
-        let prefix = format!("{n}: ");
-        let needed = prefix.chars().count() + line.chars().count() + 1;
+        let prefix_chars = n.checked_ilog10().unwrap_or(0) as usize + 3;
+        let needed = prefix_chars + line.chars().count() + 1;
         if needed > budget {
             if body.is_empty() {
                 // A single huge line (minified code): show its start rather than nothing.
-                let room = budget.saturating_sub(prefix.chars().count() + LINE_TRUNCATED.len() + 1);
-                body.push_str(&prefix);
+                let room = budget.saturating_sub(prefix_chars + LINE_TRUNCATED.len() + 1);
+                let _ = write!(body, "{n}: ");
                 body.extend(line.chars().take(room));
                 body.push_str(LINE_TRUNCATED);
                 body.push('\n');
@@ -814,20 +813,22 @@ fn grep(
         result = format!("No matches for `{pattern}` in {place}.\n");
     }
     if search.skipped > 0 {
-        result.push_str(&format!(
-            "[{} file(s) skipped: binary, unreadable or larger than 2 MB]\n",
+        let _ = writeln!(
+            result,
+            "[{} file(s) skipped: binary, unreadable or larger than 2 MB]",
             search.skipped
-        ));
+        );
     }
     if search.long_lines > 0 {
         let kib = limits.line_window / 1024;
-        result.push_str(&format!(
-            "[search truncated: {} line(s) longer than {kib} KiB were only searched in their first {kib} KiB]\n",
+        let _ = writeln!(
+            result,
+            "[search truncated: {} line(s) longer than {kib} KiB were only searched in their first {kib} KiB]",
             search.long_lines
-        ));
+        );
     }
     if let Some(reason) = search.truncated {
-        result.push_str(&format!("[search truncated: {reason}]\n"));
+        let _ = writeln!(result, "[search truncated: {reason}]");
     }
     result.pop();
     Ok(ToolText {
@@ -964,9 +965,10 @@ fn list_dir(dir: &RepoPath) -> Result<String, ToolError> {
     }
     let mut result = out.text;
     if shown < total {
-        result.push_str(&format!(
-            "[listing truncated: showing {shown} of {total} entries]\n"
-        ));
+        let _ = writeln!(
+            result,
+            "[listing truncated: showing {shown} of {total} entries]"
+        );
     }
     result.pop();
     Ok(result)
@@ -1009,9 +1011,10 @@ fn find_files(
     }
     let mut result = out.text;
     if more || shown < found.len() {
-        result.push_str(&format!(
-            "[results truncated: showing {shown} matches; narrow the pattern or path]\n"
-        ));
+        let _ = writeln!(
+            result,
+            "[results truncated: showing {shown} matches; narrow the pattern or path]"
+        );
     }
     if timed_out {
         result.push_str("[results truncated: time limit reached; narrow the pattern or path]\n");

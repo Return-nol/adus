@@ -4,6 +4,7 @@
 //! next to the Finder when the repository tools are available.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -427,7 +428,7 @@ fn rule_finding(
         rule.title, violation.claim
     );
     if let Some(cited) = violation.cited_line {
-        body.push_str(&format!(" (line {cited}, outside the changed lines)"));
+        let _ = write!(body, " (line {cited}, outside the changed lines)");
     }
     CandidateFinding {
         suggestion: Suggestion {

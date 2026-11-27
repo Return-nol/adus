@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 
 use adus_core::types::Severity;
 use adus_db::memories::Memory;
@@ -612,7 +613,7 @@ pub(crate) fn format_inline(s: &Suggestion, severity: Severity) -> String {
         // Fence satu backtick lebih panjang dari deretan backtick terpanjang di kode (minimal 3).
         let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
         let fence = "`".repeat((longest + 1).max(3));
-        out.push_str(&format!("\n\n{fence}suggestion\n{code}\n{fence}"));
+        let _ = write!(out, "\n\n{fence}suggestion\n{code}\n{fence}");
     }
     out
 }
@@ -642,7 +643,9 @@ pub(crate) fn format_summary(
     match ignored {
         0 => {}
         1 => out.push_str("\n\n1 file ignored"),
-        n => out.push_str(&format!("\n\n{n} files ignored")),
+        n => {
+            let _ = write!(out, "\n\n{n} files ignored");
+        }
     }
     if !skipped.is_empty() {
         out.push_str("\n\n**Skipped files**\n");
@@ -766,7 +769,7 @@ mod tests {
                 title: "first\nsecond\r\nthird".into(),
                 body: "b".into(),
                 suggestion: Some("````rust\nx\n```\n\n".into()),
-                ..s.clone()
+                ..s
             },
             Severity::Info,
         );

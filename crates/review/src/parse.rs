@@ -833,7 +833,7 @@ mod tests {
         );
 
         // A missing or blank `review_log` never refuses the submission.
-        let mut without = lean.clone();
+        let mut without = lean;
         without.as_object_mut().unwrap().remove("review_log");
         assert_eq!(parse_submit_findings(&without).unwrap(), expected);
         assert_eq!(parse_review_log(&without), None);
