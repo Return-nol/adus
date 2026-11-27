@@ -2,11 +2,8 @@
 //! This module holds the prompt builder and the lenient parser of the reply; the model call and
 //! the evidence loop live elsewhere.
 
-use std::ops::RangeInclusive;
-
 use adus_db::rules::Rule;
 use adus_git::FileDiff;
-use adus_git::diff::same_hunk;
 use serde_json::Value;
 
 use crate::parse::{CommentableRange, array_arg, parse_u32_field};
@@ -87,18 +84,16 @@ pub(crate) fn build_shard_prompts(
 /// A `line` that is a `+` line is kept, with its `start_line` only when both lie in one hunk. A
 /// `line` on another line of a hunk (a context line) moves to the nearest `+` line of that hunk,
 /// the earlier one on a tie, losing its `start_line` and recording the cited line. A `line`
-/// outside every hunk, or in a hunk without a `+` line, drops the entry. `hunks` are the file's
-/// right-side hunk ranges, context included.
+/// outside every hunk of `range`, or in a hunk without a `+` line, drops the entry.
 pub(crate) fn parse_shard_response(
     raw: &str,
     rule_count: usize,
     range: &CommentableRange,
-    hunks: &[RangeInclusive<u32>],
 ) -> Vec<RawShardViolation> {
     shard_items(raw)
         .unwrap_or_default()
         .iter()
-        .filter_map(|item| to_violation(item, rule_count, range, hunks))
+        .filter_map(|item| to_violation(item, rule_count, range))
         .collect()
 }
 
@@ -136,7 +131,6 @@ fn to_violation(
     item: &Value,
     rule_count: usize,
     range: &CommentableRange,
-    hunks: &[RangeInclusive<u32>],
 ) -> Option<RawShardViolation> {
     let rule_id = usize::try_from(parse_u32_field(item.get("rule_id")?)?).ok()?;
     if rule_id == 0 || rule_id > rule_count {
@@ -148,7 +142,7 @@ fn to_violation(
     }
     let cited = parse_u32_field(item.get("line")?)?;
     let start_line = item.get("start_line").and_then(parse_u32_field);
-    let (line, start_line, cited_line) = anchor(cited, start_line, range, hunks)?;
+    let (line, start_line, cited_line) = anchor(cited, start_line, range)?;
     Some(RawShardViolation {
         rule_index: rule_id - 1,
         line,
@@ -163,13 +157,12 @@ fn anchor(
     cited: u32,
     start_line: Option<u32>,
     range: &CommentableRange,
-    hunks: &[RangeInclusive<u32>],
 ) -> Option<(u32, Option<u32>, Option<u32>)> {
     if range.lines.contains(&cited) {
-        let start = start_line.filter(|&start| same_hunk(hunks, start, cited));
+        let start = start_line.filter(|&start| range.spans_one_hunk(start, cited));
         return Some((cited, start, None));
     }
-    let hunk = hunks.iter().find(|hunk| hunk.contains(&cited))?;
+    let hunk = range.hunks.iter().find(|hunk| hunk.contains(&cited))?;
     let nearest = range
         .lines
         .range(hunk.clone())
@@ -208,7 +201,7 @@ mod tests {
     #[test]
     fn lenient_shard_parser_handles_bare_array_string_lines_and_invalid_anchors() {
         let range = CommentableRange::from_patch(PATCH);
-        let parse = |raw: &str| parse_shard_response(raw, 3, &range, &range.hunks);
+        let parse = |raw: &str| parse_shard_response(raw, 3, &range);
 
         // Accepted envelopes: `violations`, `findings`, a bare array, a string holding the list,
         // all with prose or a code fence around them.
