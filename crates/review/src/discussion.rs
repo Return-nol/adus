@@ -13,9 +13,9 @@ use crate::redact::redact_secrets;
 /// Most threads sent to Semantic Dedup.
 const MAX_DEDUP_THREADS: usize = 60;
 /// Longest comment body sent to the model, in chars.
-const MAX_BODY_CHARS: usize = 1_000;
+pub(crate) const MAX_BODY_CHARS: usize = 1_000;
 /// Longest formatted threads section (`format_threads`) sent to the model, in chars.
-const MAX_THREADS_CHARS: usize = 40_000;
+pub(crate) const MAX_THREADS_CHARS: usize = 40_000;
 
 /// Threads on a file in `paths`, then general threads (no path), each group newest first, at
 /// most `MAX_DEDUP_THREADS`, cut by [`within_budget`]. Threads carry no timestamp, so "newest"
@@ -32,8 +32,9 @@ pub(crate) fn threads_for_dedup<'a>(
     within_budget(same_file.chain(general).take(MAX_DEDUP_THREADS))
 }
 
-/// The leading `threads` (already in priority order) whose `format_threads` output stays within
-/// `MAX_THREADS_CHARS`; the first thread that would exceed it and every later one are dropped.
+/// The `threads` (already in priority order) whose `format_threads` output stays within
+/// `MAX_THREADS_CHARS`; any thread that would push the output over the budget is skipped so
+/// smaller subsequent threads can still fit.
 // ponytail: re-formats the list per thread (quadratic), fine for at most 60 threads.
 pub(crate) fn within_budget<'a>(
     threads: impl IntoIterator<Item = &'a PrThread>,
@@ -43,7 +44,7 @@ pub(crate) fn within_budget<'a>(
         fitted.push(thread);
         if format_threads(&fitted).chars().count() > MAX_THREADS_CHARS {
             fitted.pop();
-            break;
+            continue;
         }
     }
     fitted
@@ -91,11 +92,14 @@ mod tests {
 
     fn thread(path: Option<&str>, body: &str) -> PrThread {
         PrThread {
+            id: None,
+            resolved: false,
             path: path.map(str::to_string),
             line: path.map(|_| 2),
             status: None,
             url: None,
             comments: vec![PrThreadComment {
+                id: String::new(),
                 author: "alice".into(),
                 by_adus: false,
                 body: body.into(),
@@ -138,6 +142,7 @@ mod tests {
     fn format_threads_marks_adus_and_cuts() {
         let mut long = thread(Some("src/a.rs"), &"x".repeat(1_500));
         long.comments.push(PrThreadComment {
+            id: String::new(),
             author: "pat-user".into(),
             by_adus: true,
             body: "earlier finding".into(),
@@ -147,5 +152,24 @@ mod tests {
         assert!(out.contains("\"author\": \"alice\""));
         assert!(out.contains(&format!("{} …", "x".repeat(1_000))));
         assert!(!out.contains(&"x".repeat(1_001)));
+    }
+
+    #[test]
+    fn within_budget_skips_oversized_thread() {
+        let small1 = thread(Some("src/a.rs"), "first small");
+        let mut oversized = thread(Some("src/a.rs"), &"z".repeat(MAX_BODY_CHARS));
+        oversized.comments = (0..45)
+            .map(|_| PrThreadComment {
+                id: String::new(),
+                author: "alice".into(),
+                by_adus: false,
+                body: "z".repeat(MAX_BODY_CHARS),
+            })
+            .collect();
+        let small2 = thread(Some("src/b.rs"), "second small");
+
+        let picked = within_budget([&small1, &oversized, &small2]);
+        let bodies: Vec<&str> = picked.iter().map(|t| t.comments[0].body.as_str()).collect();
+        assert_eq!(bodies, ["first small", "second small"]);
     }
 }

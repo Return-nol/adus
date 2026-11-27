@@ -347,13 +347,7 @@ async fn same_pr_jobs_never_run_concurrently() {
 
 #[tokio::test]
 async fn lock_busy_requeues_without_consuming_attempt() {
-    let (queue, prefix) = new_queue().await;
     let repository_id = Uuid::new_v4();
-    let held = queue
-        .try_lock(&format!("pr:{repository_id}:4"), Duration::from_secs(60))
-        .await
-        .unwrap();
-    assert!(held.is_some());
     let comment = Job::PrComment {
         repository_id,
         pr_number: 4,
@@ -364,23 +358,49 @@ async fn lock_busy_requeues_without_consuming_attempt() {
         },
         body: "@adudu review".into(),
     };
-    let delivery = deliver(&queue, &comment, 3).await;
-    let runner = FakeRunner::new(Ok(()), Duration::ZERO);
+    let reply = Job::ThreadReply {
+        repository_id,
+        pr_number: 4,
+        thread_id: "5".into(),
+        comment_id: "2".into(),
+    };
+    for job in [comment, reply] {
+        let (queue, prefix) = new_queue().await;
+        let held = queue
+            .try_lock(&format!("pr:{repository_id}:4"), Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(held.is_some());
+        let delivery = deliver(&queue, &job, 3).await;
+        let runner = FakeRunner::new(Ok(()), Duration::ZERO);
 
-    handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
-        .await
-        .unwrap();
+        handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
+            .await
+            .unwrap();
 
-    assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
-    let retries = delayed(&prefix).await;
-    assert_eq!(retries.len(), 1);
-    let (attempt, due_in) = retries[0];
-    assert_eq!(attempt, 3);
-    assert!((29.0..=30.5).contains(&due_in), "due in {due_in}s");
-    assert_eq!(stream_len(&format!("{prefix}:jobs")).await, 0);
-    // Lock milik pihak lain tidak disentuh.
-    assert!(lock_exists(&prefix, repository_id, 4).await);
-    cleanup(&prefix).await;
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0, "{job:?}");
+        let retries = delayed(&prefix).await;
+        assert_eq!(retries.len(), 1);
+        let (attempt, due_in) = retries[0];
+        assert_eq!(attempt, 3);
+        assert!((29.0..=30.5).contains(&due_in), "due in {due_in}s");
+        assert_eq!(stream_len(&format!("{prefix}:jobs")).await, 0);
+        // Lock milik pihak lain tidak disentuh.
+        assert!(lock_exists(&prefix, repository_id, 4).await);
+
+        // Once the PR is free the job reaches the runner and is acked.
+        queue
+            .unlock(&format!("pr:{repository_id}:4"), &held.unwrap())
+            .await
+            .unwrap();
+        let delivery = deliver(&queue, &job, 1).await;
+        handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1, "{job:?}");
+        assert!(!lock_exists(&prefix, repository_id, 4).await);
+        cleanup(&prefix).await;
+    }
 }
 
 #[tokio::test]

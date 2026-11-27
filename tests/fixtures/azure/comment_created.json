@@ -1,0 +1,15 @@
+{
+  "id": 3,
+  "parentCommentId": 1,
+  "author": {
+    "displayName": "Adus Bot",
+    "id": "d6245f20-2af8-44f4-9451-8107cb2767db",
+    "uniqueName": "adus@acme.com"
+  },
+  "content": "<!-- adudu -->\n🤖 **Adudu**\n\nThanks, confirmed fixed.",
+  "publishedDate": "2026-11-27T09:05:00.000Z",
+  "lastUpdatedDate": "2026-11-27T09:05:00.000Z",
+  "lastContentUpdatedDate": "2026-11-27T09:05:00.000Z",
+  "commentType": "text",
+  "usersLiked": []
+}

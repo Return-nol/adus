@@ -14,14 +14,15 @@ use adus_db::connections::{self, Connection, ConnectionStatus};
 use adus_db::ignore::{IgnoreMatcher, default_ignore_paths, effective_ignore_paths, title_matches};
 use adus_db::memories::Memory;
 use adus_db::repositories::{self, Repository};
+use adus_db::review_threads::{self, NewReviewThread};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::rules::Rule;
 use adus_db::settings::Settings;
 use adus_db::{ai, memories, rules, settings};
 use adus_git::diff::{added_line_count, intersect_hunks, right_line_end_offset};
 use adus_git::{
-    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PrThread,
-    PullRequest, RepoRef,
+    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PostedComment,
+    PrThread, PullRequest, RepoRef,
 };
 use adus_llm::ReasoningEffort;
 use adus_llm::router::{ChatError, ChatService, UsageContext};
@@ -36,8 +37,8 @@ use crate::discussion::threads_for_dedup;
 use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
-    DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, batch_targets, build_manifest, format_inline,
-    format_summary,
+    DiffBatch, MAX_BATCH_CHARS, ManifestFile, REPLY_LABEL, adus_body, apply_precedent,
+    batch_targets, build_manifest, format_inline, format_summary,
 };
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
@@ -51,6 +52,8 @@ pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(12 * 60);
 /// Budget of one Specialists review (`Engine::specialists_review_timeout`): up to four agents
 /// per batch at `High` effort need more time than one Generalist agent.
 pub const SPECIALISTS_REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Hard cap on push-validation before starting the review itself.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Summary note when the clone failed (not for auth) and the review saw only the diff.
 const CODEBASE_UNAVAILABLE: &str = "Codebase context unavailable — reviewed diff only";
@@ -91,8 +94,11 @@ pub enum EngineError {
 
 /// Hasil review yang tidak gagal.
 enum Outcome {
+    /// On the PR. Its finding threads are recorded once the review deadlines are past.
     Done {
-        posted: usize,
+        head_sha: String,
+        output: ReviewOutput,
+        posted: Vec<PostedComment>,
     },
     /// Alasan snake_case, disimpan di `reviews.skip_reason`.
     Skipped(&'static str),
@@ -108,6 +114,8 @@ struct Target {
 struct ReviewOutput {
     counts: BTreeMap<Severity, usize>,
     comments: Vec<InlineComment>,
+    /// The finding behind each of `comments`, same order.
+    findings: Vec<Suggestion>,
     /// Tool results that had a secret masked.
     redacted_tool_outputs: u64,
     /// Inline comments that had a secret masked or their suggestion dropped.
@@ -204,7 +212,24 @@ impl Engine {
             Err(_elapsed) => Err(timed_out()),
         };
         let (status, posted, skip_reason) = match outcome {
-            Ok(Outcome::Done { posted }) => (ReviewStatus::Done, posted, None),
+            Ok(Outcome::Done {
+                head_sha,
+                output,
+                posted,
+            }) => {
+                // After every review deadline (still under the job timeout): the review is on
+                // the PR, so a slow insert must not turn it into a timed-out failure.
+                self.record_threads(
+                    repository_id,
+                    review_id,
+                    pr_number,
+                    &head_sha,
+                    &output,
+                    &posted,
+                )
+                .await;
+                (ReviewStatus::Done, posted.len(), None)
+            }
             Ok(Outcome::Skipped(reason)) => (ReviewStatus::Skipped, 0, Some(reason)),
             Err(err) => {
                 let recorded = match &err {
@@ -260,27 +285,77 @@ impl Engine {
         reviews::set_running(&self.db, review_id, &pr.base_sha, &pr.head_sha)
             .await
             .map_err(db_error)?;
-        if pr.is_draft && trigger != Trigger::Command {
+        let settings = settings::get(&self.db).await.map_err(db_error)?;
+        let is_draft_skip = pr.is_draft && trigger != Trigger::Command;
+        let is_title_skip = trigger != Trigger::Command
+            && title_matches(&pr.title, &settings.ignored_title_keywords);
+        let models = if matches!(trigger, Trigger::Updated | Trigger::Command) {
+            match self.models(repo, &settings).await {
+                Ok(models) => models,
+                Err(err) if is_draft_skip || is_title_skip => {
+                    tracing::warn!(
+                        %review_id,
+                        error = %err,
+                        "skipping push validation on skipped PR: could not load models"
+                    );
+                    None
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            None
+        };
+        let validation_started = Instant::now();
+        let confirmed_fixed = if matches!(trigger, Trigger::Updated | Trigger::Command)
+            && let Some((provider_id, _, fast_model)) = &models
+        {
+            match tokio::time::timeout(
+                VALIDATE_TIMEOUT,
+                self.validate_open_threads(
+                    git.as_ref(),
+                    &repo_ref,
+                    repo,
+                    &pr,
+                    (*provider_id, fast_model.as_str()),
+                    &settings,
+                ),
+            )
+            .await
+            {
+                Ok(count) => count,
+                Err(_) => {
+                    tracing::warn!(%review_id, "push validation timed out");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        let validation_elapsed = validation_started.elapsed();
+        let start = start + validation_elapsed;
+        if is_draft_skip {
             return Ok(Outcome::Skipped("draft"));
         }
 
-        let settings = settings::get(&self.db).await.map_err(db_error)?;
         // Sebelum cek model dan diff: PR yang dilewati tidak memicu komentar atau fetch diff.
-        if trigger != Trigger::Command && title_matches(&pr.title, &settings.ignored_title_keywords)
-        {
+        if is_title_skip {
             return Ok(Outcome::Skipped("ignored_title"));
         }
-        let Some((provider_id, primary_model, fast_model)) = self.models(repo, &settings).await?
-        else {
+        let models = match trigger {
+            Trigger::Updated | Trigger::Command => models,
+            Trigger::Opened => self.models(repo, &settings).await?,
+        };
+        let Some((provider_id, primary_model, fast_model)) = models else {
             // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
             // atau diminta lewat `@adudu review`, supaya tidak spam.
             // Bukan kegagalan: tanpa baris failed atau dead letter untuk setiap push.
             if trigger == Trigger::Updated {
                 return Ok(Outcome::Skipped("no_model"));
             }
-            let body = format!(
-                "{MARKER}\nAdudu can't review yet: no AI model is configured. \
-                 An admin can pick a provider under Settings and its model under AI Providers."
+            let body = adus_body(
+                REPLY_LABEL,
+                "Adudu can't review yet: no AI model is configured. \
+                 An admin can pick a provider under Settings and its model under AI Providers.",
             );
             // Gagal posting tidak mengubah hasilnya: review tetap tidak bisa jalan.
             match git.post_comment(&repo_ref, pr_number, &body).await {
@@ -461,7 +536,13 @@ impl Engine {
                     )
                     .await?
                 };
-                let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
+                let summary = format_summary(
+                    &output.counts,
+                    &skipped,
+                    ignored,
+                    &warnings,
+                    confirmed_fixed,
+                );
                 let (summary, summary_redacted) = redact_owned(summary);
                 tracing::debug!(
                     redacted_tool_outputs = output.redacted_tool_outputs,
@@ -472,7 +553,11 @@ impl Engine {
                     .post_review(&repo_ref, &pr, &output.comments, &summary)
                     .await
                 {
-                    Ok(posted) => Ok(Outcome::Done { posted }),
+                    Ok(posted) => Ok(Outcome::Done {
+                        head_sha: pr.head_sha.clone(),
+                        output,
+                        posted,
+                    }),
                     Err(err) => Err(self.post_error(&conn, err).await),
                 }
             };
@@ -484,6 +569,49 @@ impl Engine {
         match tokio::time::timeout_at(cut, rest).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => Err(timed_out()),
+        }
+    }
+
+    /// One `review_threads` row per posted finding the provider identified. The review is
+    /// already posted: a DB error is only logged.
+    async fn record_threads(
+        &self,
+        repository_id: Uuid,
+        review_id: Uuid,
+        pr_number: i64,
+        head_sha: &str,
+        output: &ReviewOutput,
+        posted: &[PostedComment],
+    ) {
+        // The body is already redacted; the title is stored on its own.
+        let titles: Vec<Cow<'_, str>> = output
+            .findings
+            .iter()
+            .map(|f| redact_secrets(&f.title))
+            .collect();
+        let rows: Vec<NewReviewThread<'_>> = posted
+            .iter()
+            .filter(|p| !p.comment_id.is_empty())
+            .filter_map(|p| {
+                let comment = output.comments.get(p.index)?;
+                let finding = output.findings.get(p.index)?;
+                Some(NewReviewThread {
+                    repository_id,
+                    review_id: Some(review_id),
+                    pr_number,
+                    provider_thread_id: p.thread_id.as_deref().unwrap_or(&p.comment_id),
+                    root_comment_id: &p.comment_id,
+                    path: &comment.path,
+                    line: i32::try_from(finding.line).ok(),
+                    severity: finding.severity,
+                    title: titles.get(p.index)?,
+                    body: &comment.body,
+                    posted_head_sha: head_sha,
+                })
+            })
+            .collect();
+        if let Err(err) = review_threads::insert_many(&self.db, &rows).await {
+            tracing::warn!(%review_id, error = %err, "could not record finding threads");
         }
     }
 
@@ -654,7 +782,7 @@ impl Engine {
             &existing,
         );
         let DedupOutcome {
-            kept: found,
+            kept: mut found,
             already_raised,
         } = match tokio::time::timeout_at(s.deadlines.dedup, dedup).await {
             Ok(outcome) => outcome,
@@ -670,6 +798,9 @@ impl Engine {
             warnings.push(format!(
                 "{already_raised} finding(s) skipped: already raised in this PR's discussion."
             ));
+        }
+        for item in &mut found {
+            apply_precedent(item, s.memories);
         }
 
         let budget = s.token_budget.as_ref();
@@ -723,6 +854,7 @@ impl Engine {
         Ok(ReviewOutput {
             counts,
             comments,
+            findings: found,
             redacted_tool_outputs: toolbox.as_ref().map_or(0, Toolbox::redacted_outputs),
             redacted_comments,
         })

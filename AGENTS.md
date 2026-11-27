@@ -36,7 +36,7 @@ crates/queue    Redis Streams job queue, delivery dedup, per-PR lock, worker hea
 crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, specialists, finder, verifier, dedup, budget, small_pr, prompt, parse, command, engine
 crates/server   axum: router(), state.rs, error.rs, auth.rs, spa.rs, webhooks.rs, doctor.rs, api/*
 crates/adus     binary (serve, gen-secret, check-config, doctor, healthcheck), worker loop & scheduler
-migrations/     sqlx migrations (0001..0008), embedded by crates/db
+migrations/     sqlx migrations (0001..0010), embedded by crates/db
 web/            SvelteKit SPA (adapter-static) + shadcn-svelte; web/build is embedded into the binary
 ```
 

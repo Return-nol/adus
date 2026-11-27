@@ -21,11 +21,20 @@ pub struct Settings {
     pub small_pr_max_lines: i32,
     /// Input tokens (cached included) one review may send to the model. 0 = no limit.
     pub max_review_input_tokens: i32,
+    /// Replies Adus may post in one finding thread. 0 = never replies.
+    pub max_thread_replies: i32,
+    /// Open threads checked against a new push. 0 = no validation.
+    pub max_validate_threads: i32,
+    /// Memories one closed PR may teach (≥ 1).
+    pub max_learned_per_pr: i32,
+    /// Reasoning effort of the learning curator: `low`, `medium` or `high`.
+    pub curator_effort: String,
 }
 
 const COLUMNS: &str = "default_provider_id, max_files_per_review, \
      max_patch_lines_per_file, ignore_paths, ignored_title_keywords, review_mode, \
-     small_pr_max_lines, max_review_input_tokens";
+     small_pr_max_lines, max_review_input_tokens, max_thread_replies, max_validate_threads, \
+     max_learned_per_pr, curator_effort";
 
 pub async fn get(pool: &PgPool) -> Result<Settings> {
     sqlx::query_as(&format!("SELECT {COLUMNS} FROM settings WHERE id = 1"))
@@ -39,7 +48,8 @@ pub async fn update(pool: &PgPool, new: &Settings) -> Result<Settings> {
         "UPDATE settings SET default_provider_id = $1, \
          max_files_per_review = $2, max_patch_lines_per_file = $3, \
          ignore_paths = $4, ignored_title_keywords = $5, review_mode = $6, small_pr_max_lines = $7, \
-         max_review_input_tokens = $8 WHERE id = 1 \
+         max_review_input_tokens = $8, max_thread_replies = $9, max_validate_threads = $10, \
+         max_learned_per_pr = $11, curator_effort = $12 WHERE id = 1 \
          RETURNING {COLUMNS}"
     ))
     .bind(new.default_provider_id)
@@ -50,6 +60,10 @@ pub async fn update(pool: &PgPool, new: &Settings) -> Result<Settings> {
     .bind(new.review_mode)
     .bind(new.small_pr_max_lines)
     .bind(new.max_review_input_tokens)
+    .bind(new.max_thread_replies)
+    .bind(new.max_validate_threads)
+    .bind(new.max_learned_per_pr)
+    .bind(&new.curator_effort)
     .fetch_one(pool)
     .await
 }

@@ -2,9 +2,9 @@
 //! `remember: <isi>` (simpan memory repo). Hanya user Adus terdaftar yang boleh memerintah.
 
 use adus_core::job::{CommentAuthor, Job, Trigger};
-use adus_core::types::{ConnectionKind, ReviewMode};
+use adus_core::types::{ConnectionKind, ReviewMode, is_adus_comment};
 use adus_db::connections::Connection;
-use adus_db::memories::{self, MemorySource, MemoryStatus, NewMemory};
+use adus_db::memories::{self, MemoryKind, MemorySource, MemoryStatus, NewMemory};
 use adus_db::repositories;
 use adus_db::rules::KnowledgeScope;
 use adus_db::users::{self, User};
@@ -13,12 +13,12 @@ use adus_queue::Queue;
 use sqlx::PgPool;
 
 use crate::engine::{Engine, EngineError, db_error};
-use crate::prompt::MARKER;
+use crate::prompt::{REPLY_LABEL, adus_body};
 
 const MENTION: &str = "@adudu";
 /// Batas panjang isi `remember`, dalam karakter.
 pub(crate) const MAX_MEMORY_CHARS: usize = 2000;
-const HELP: &str = "I didn't understand that. I know these commands:\n\n\
+pub(crate) const HELP: &str = "I didn't understand that. I know these commands:\n\n\
                     - `@adudu review` — run a full review of this pull request\n\
                     - `@adudu review deep` — run a multi-specialist deep review (Bug, Security, Performance, Rules)\n\
                     - `@adudu remember: <text>` — save a convention for this repository";
@@ -33,10 +33,10 @@ pub enum Command {
     Unknown,
 }
 
-/// `None` jika tidak ada mention `@adudu` atau komentar itu buatan Adus sendiri (memuat MARKER).
+/// `None` jika tidak ada mention `@adudu` atau komentar itu buatan Adus sendiri (diawali MARKER).
 /// Hanya teks setelah mention pertama yang dibaca; kata pertamanya adalah perintah.
 pub(crate) fn parse_command(body: &str) -> Option<Command> {
-    if body.contains(MARKER) {
+    if is_adus_comment(body) {
         return None;
     }
     let rest = after_mention(body)?.trim_start();
@@ -54,6 +54,15 @@ pub(crate) fn parse_command(body: &str) -> Option<Command> {
         return Some(Command::Unknown);
     }
     Some(Command::Remember(text.to_string()))
+}
+
+/// Whether `body` holds a known `@adudu` command (`review`, `remember`). A reply that only
+/// mentions `@adudu` is conversation, not a command.
+pub fn has_command(body: &str) -> bool {
+    matches!(
+        parse_command(body),
+        Some(Command::Review { .. } | Command::Remember(_))
+    )
 }
 
 /// Mode named right after `review`; anything else (`please`, `deeper`, nothing) is `None`.
@@ -189,6 +198,12 @@ impl Engine {
                     source_url,
                     created_by: Some(user.id),
                     status: MemoryStatus::Active,
+                    kind: MemoryKind::Convention,
+                    context: None,
+                    reason: None,
+                    resolution: None,
+                    evidence: &[],
+                    supersedes: None,
                 };
                 memories::insert(&self.db, new).await.map_err(db_error)?;
                 let quoted: Vec<String> = text.lines().map(|line| format!("> {line}")).collect();
@@ -201,7 +216,7 @@ impl Engine {
             Command::Unknown => (HELP.to_string(), false),
         };
 
-        let body = format!("{MARKER}\n{reply}");
+        let body = adus_body(REPLY_LABEL, &reply);
         let Err(err) = git.post_comment(&repo_ref, *pr_number, &body).await else {
             return Ok(());
         };
@@ -214,7 +229,7 @@ impl Engine {
     }
 
     /// Token ditolak → connection `invalid` dan fatal; rate limit / HTTP → boleh diulang.
-    async fn reply_error(&self, conn: &Connection, err: GitError) -> EngineError {
+    pub(crate) async fn reply_error(&self, conn: &Connection, err: GitError) -> EngineError {
         let message = format!("posting the reply failed: {err}");
         match err {
             GitError::Unauthorized => self.unauthorized(conn).await,
@@ -306,7 +321,7 @@ mod tests {
 
     #[test]
     fn non_mentions_and_marker_return_none() {
-        let marker_body = format!("{MARKER}\n@adudu review");
+        let marker_body = adus_body(REPLY_LABEL, "@adudu review");
         for body in [
             "please review this",
             "adudu review",

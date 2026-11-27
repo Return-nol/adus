@@ -1,5 +1,6 @@
 use adus_git::{
-    AzureProvider, FileStatus, GitError, GitProvider, InlineComment, PullRequest, RepoRef,
+    AzureProvider, FileStatus, GitError, GitProvider, InlineComment, PostedComment, PullRequest,
+    RepoRef, ThreadRef, ThreadStatus,
 };
 use serde_json::{Value, json};
 use wiremock::matchers::{
@@ -597,7 +598,7 @@ async fn post_review_thread_context_has_leading_slash() {
         .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
         .and(query_param("api-version", "7.1"))
         .and(header_exists("authorization"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 1 })))
+        .respond_with(json_body("thread_created.json"))
         .expect(2)
         .mount(&server)
         .await;
@@ -613,7 +614,7 @@ async fn post_review_thread_context_has_leading_slash() {
         .post_review(&repo(), &pr(), &comments, "summary")
         .await
         .unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(n.len(), 1);
 
     let threads = captured_threads(&server).await;
     assert_eq!(
@@ -642,7 +643,7 @@ async fn post_review_posts_multiline_thread_context() {
         .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
         .and(query_param("api-version", "7.1"))
         .and(header_exists("authorization"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 1 })))
+        .respond_with(json_body("thread_created.json"))
         .expect(4)
         .mount(&server)
         .await;
@@ -674,7 +675,7 @@ async fn post_review_posts_multiline_thread_context() {
         .post_review(&repo(), &pr(), &comments, "summary")
         .await
         .unwrap();
-    assert_eq!(n, 3);
+    assert_eq!(n.len(), 3);
 
     let threads = captured_threads(&server).await;
     assert_eq!(
@@ -1006,6 +1007,10 @@ async fn list_pr_threads_maps_context_status_and_comments() {
     assert_eq!(file.line, Some(5));
     assert_eq!(file.status.as_deref(), Some("byDesign"));
     assert_eq!(file.url, None);
+    assert_eq!(file.id.as_deref(), Some("11"));
+    assert!(file.resolved);
+    let ids: Vec<&str> = file.comments.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["1", "2"]);
     let authors: Vec<&str> = file.comments.iter().map(|c| c.author.as_str()).collect();
     assert_eq!(authors, ["adus@acme.com", "dev@acme.com"]);
     assert!(file.comments[0].by_adus);
@@ -1018,6 +1023,7 @@ async fn list_pr_threads_maps_context_status_and_comments() {
     assert_eq!(general.path, None);
     assert_eq!(general.line, None);
     assert_eq!(general.comments[0].author, "lead@acme.com");
+    assert!(!general.resolved);
 }
 
 #[tokio::test]
@@ -1034,4 +1040,145 @@ async fn list_pr_threads_203_is_unauthorized() {
         .await
         .unwrap_err();
     assert_eq!(err, GitError::Unauthorized);
+}
+
+fn thread_ref() -> ThreadRef {
+    ThreadRef {
+        thread_id: "148".into(),
+        root_comment_id: "1".into(),
+    }
+}
+
+#[tokio::test]
+async fn post_review_returns_thread_ids() {
+    let server = MockServer::start().await;
+    // First inline thread: response without comments, so only the thread id is known.
+    Mock::given(method("POST"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 5 })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
+        .respond_with(json_body("thread_created.json"))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let comment = InlineComment {
+        path: "src/a.rs".into(),
+        start_line: None,
+        line: 12,
+        end_offset: None,
+        body: "careful".into(),
+    };
+    let posted = provider(&server)
+        .post_review(&repo(), &pr(), &[comment.clone(), comment], "summary")
+        .await
+        .unwrap();
+    assert_eq!(
+        posted,
+        [
+            PostedComment {
+                index: 0,
+                thread_id: Some("5".into()),
+                comment_id: String::new(),
+            },
+            PostedComment {
+                index: 1,
+                thread_id: Some("148".into()),
+                comment_id: "1".into(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn reply_in_thread_sets_parent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "{REPO_BASE}/pullRequests/7/threads/148/comments"
+        )))
+        .and(query_param("api-version", "7.1"))
+        .and(header_exists("authorization"))
+        .and(body_json(
+            json!({ "content": "thanks", "parentCommentId": 1, "commentType": 1 }),
+        ))
+        .respond_with(json_body("comment_created.json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let id = provider(&server)
+        .reply_in_thread(&repo(), 7, &thread_ref(), "thanks")
+        .await
+        .unwrap();
+    assert_eq!(id, "3");
+}
+
+#[tokio::test]
+async fn set_thread_status_patches_status() {
+    for (status, wire) in [
+        (ThreadStatus::Active, "active"),
+        (ThreadStatus::Fixed, "fixed"),
+        (ThreadStatus::WontFix, "wontFix"),
+        (ThreadStatus::ByDesign, "byDesign"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path(format!("{REPO_BASE}/pullRequests/7/threads/148")))
+            .and(query_param("api-version", "7.1"))
+            .and(header_exists("authorization"))
+            .and(body_json(json!({ "status": wire })))
+            .respond_with(json_body("thread.json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        provider(&server)
+            .set_thread_status(&repo(), 7, &thread_ref(), status)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn get_thread_maps_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/threads/148")))
+        .and(query_param("api-version", "7.1"))
+        .respond_with(json_body("thread.json"))
+        .mount(&server)
+        .await;
+
+    let thread = provider(&server)
+        .get_thread(&repo(), 7, &thread_ref())
+        .await
+        .unwrap();
+    assert_eq!(thread.id.as_deref(), Some("148"));
+    assert!(thread.resolved);
+    assert_eq!(thread.status.as_deref(), Some("fixed"));
+    assert_eq!(thread.path.as_deref(), Some("src/a.rs"));
+    assert_eq!(thread.line, Some(12));
+    let ids: Vec<&str> = thread.comments.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["1", "2"]);
+    assert!(thread.comments[0].by_adus);
+    assert!(!thread.comments[1].by_adus);
+
+    let err = provider(&server)
+        .get_thread(
+            &repo(),
+            7,
+            &ThreadRef {
+                thread_id: "../148".into(),
+                root_comment_id: "1".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, GitError::NotFound);
 }

@@ -1,7 +1,7 @@
 use adus_core::types::ConnectionKind;
 use adus_db::{
     connections,
-    memories::{self, Memory, MemorySource, MemoryStatus, NewMemory},
+    memories::{self, Evidence, Memory, MemoryKind, MemorySource, MemoryStatus, NewMemory},
     repositories::{self, NewRepository},
     rules::KnowledgeScope,
 };
@@ -40,6 +40,17 @@ async fn add_repo(pool: &PgPool) -> Uuid {
 }
 
 async fn add(pool: &PgPool, repo: Uuid, content: &str, status: MemoryStatus) -> Memory {
+    add_superseding(pool, repo, content, status, None, &[]).await
+}
+
+async fn add_superseding(
+    pool: &PgPool,
+    repo: Uuid,
+    content: &str,
+    status: MemoryStatus,
+    supersedes: Option<Uuid>,
+    evidence: &[Evidence],
+) -> Memory {
     memories::insert(
         pool,
         NewMemory {
@@ -50,6 +61,12 @@ async fn add(pool: &PgPool, repo: Uuid, content: &str, status: MemoryStatus) -> 
             source_url: None,
             created_by: None,
             status,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence,
+            supersedes,
         },
     )
     .await
@@ -109,16 +126,62 @@ async fn list_hides_rejected_unless_asked(pool: PgPool) {
     add(&pool, repo, "pending", MemoryStatus::Pending).await;
     add(&pool, repo, "rejected", MemoryStatus::Rejected).await;
 
-    let got = memories::list(&pool, Some(repo), None).await.unwrap();
+    let got = memories::list(&pool, Some(repo), None, None).await.unwrap();
     assert_eq!(contents(&got), ["active", "pending"]);
-    let got = memories::list(&pool, Some(repo), Some(MemoryStatus::Rejected))
+    let got = memories::list(&pool, Some(repo), Some(MemoryStatus::Rejected), None)
         .await
         .unwrap();
     assert_eq!(contents(&got), ["rejected"]);
-    let got = memories::list_all(&pool, None).await.unwrap();
+    let got = memories::list_all(&pool, None, None).await.unwrap();
     assert_eq!(contents(&got), ["active", "pending"]);
-    let got = memories::list_all(&pool, Some(MemoryStatus::Pending))
+    let got = memories::list_all(&pool, Some(MemoryStatus::Pending), None)
         .await
         .unwrap();
     assert_eq!(contents(&got), ["pending"]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn superseded_memory_leaves_prompts(pool: PgPool) {
+    let repo = add_repo(&pool).await;
+    let a = add(&pool, repo, "A", MemoryStatus::Active).await;
+    let evidence = [Evidence {
+        url: "https://example.com/pr/7".into(),
+        pr_number: Some(7),
+    }];
+    let b = add_superseding(
+        &pool,
+        repo,
+        "B",
+        MemoryStatus::Pending,
+        Some(a.id),
+        &evidence,
+    )
+    .await;
+    assert_eq!(b.supersedes, Some(a.id));
+    let stored = memories::get(&pool, b.id).await.unwrap().unwrap();
+    assert_eq!(stored.evidence, evidence);
+    let got = memories::applicable(&pool, repo).await.unwrap();
+    assert_eq!(contents(&got), ["A"]);
+
+    memories::approve(&pool, b.id, None).await.unwrap().unwrap();
+    let got = memories::applicable(&pool, repo).await.unwrap();
+    assert_eq!(contents(&got), ["B"]);
+    let a = memories::get(&pool, a.id).await.unwrap().unwrap();
+    assert_eq!(a.superseded_by, Some(b.id));
+
+    // Rejecting a replacement leaves the memory it targets in use.
+    let c = add_superseding(&pool, repo, "C", MemoryStatus::Pending, Some(b.id), &[]).await;
+    memories::reject(&pool, c.id).await.unwrap().unwrap();
+    let got = memories::applicable(&pool, repo).await.unwrap();
+    assert_eq!(contents(&got), ["B"]);
+
+    // Auto mode: inserting the replacement active retires its target in the same statement.
+    let d = add_superseding(&pool, repo, "D", MemoryStatus::Active, Some(b.id), &[]).await;
+    let got = memories::applicable(&pool, repo).await.unwrap();
+    assert_eq!(contents(&got), ["D"]);
+
+    // An already-superseded target keeps its first replacement.
+    add_superseding(&pool, repo, "E", MemoryStatus::Active, Some(b.id), &[]).await;
+    let b = memories::get(&pool, b.id).await.unwrap().unwrap();
+    assert_eq!(b.superseded_by, Some(d.id));
 }

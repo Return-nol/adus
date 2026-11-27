@@ -9,7 +9,7 @@ use std::{
 use adus_core::{config::Config, crypto::Cipher};
 use adus_git::{
     ConnectionKind, FileDiff, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
-    PrThread, PullRequest, RemoteRepo, RepoRef,
+    PostedComment, PrThread, PullRequest, RemoteRepo, RepoRef, ThreadRef, ThreadStatus,
 };
 use adus_llm::router::LlmRouter;
 use adus_queue::Queue;
@@ -338,10 +338,43 @@ impl GitProvider for FakeGit {
         _pr: &PullRequest,
         _comments: &[InlineComment],
         _summary: &str,
-    ) -> Result<usize, GitError> {
+    ) -> Result<Vec<PostedComment>, GitError> {
         Err(GitError::Http(
             "FakeGit: post_review not implemented".into(),
         ))
+    }
+
+    async fn reply_in_thread(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        _thread: &ThreadRef,
+        _body: &str,
+    ) -> Result<String, GitError> {
+        Err(GitError::Http(
+            "FakeGit: reply_in_thread not implemented".into(),
+        ))
+    }
+
+    async fn set_thread_status(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        _thread: &ThreadRef,
+        _status: ThreadStatus,
+    ) -> Result<(), GitError> {
+        Err(GitError::Http(
+            "FakeGit: set_thread_status not implemented".into(),
+        ))
+    }
+
+    async fn get_thread(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        _thread: &ThreadRef,
+    ) -> Result<PrThread, GitError> {
+        Err(GitError::Http("FakeGit: get_thread not implemented".into()))
     }
 
     async fn post_comment(

@@ -12,6 +12,7 @@ mod redact;
 mod repo_instructions;
 mod small_pr;
 mod specialists;
+mod threads;
 mod tools;
 mod verifier;
 pub mod workspace;

@@ -63,6 +63,15 @@ impl JobRunner for Engine {
                 repository_id,
                 pr_number,
             } => self.learn_pr(*repository_id, *pr_number).await,
+            Job::ThreadReply {
+                repository_id,
+                pr_number,
+                thread_id,
+                comment_id,
+            } => {
+                self.thread_reply(*repository_id, *pr_number, thread_id, comment_id)
+                    .await
+            }
         }
     }
 
@@ -183,6 +192,11 @@ pub async fn handle_delivery(
             repository_id,
             pr_number,
         } => ("learn_pr", repository_id, pr_number),
+        Job::ThreadReply {
+            repository_id,
+            pr_number,
+            ..
+        } => ("thread_reply", repository_id, pr_number),
     };
     let span =
         tracing::info_span!("job", kind, %repository_id, pr_number, attempt = delivery.attempt);
