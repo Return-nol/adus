@@ -37,8 +37,8 @@ use crate::discussion::threads_for_dedup;
 use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
-    DiffBatch, MAX_BATCH_CHARS, ManifestFile, REPLY_LABEL, adus_body, batch_targets,
-    build_manifest, format_inline, format_summary,
+    DiffBatch, MAX_BATCH_CHARS, ManifestFile, REPLY_LABEL, adus_body, apply_precedent,
+    batch_targets, build_manifest, format_inline, format_summary,
 };
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
@@ -746,7 +746,7 @@ impl Engine {
             &existing,
         );
         let DedupOutcome {
-            kept: found,
+            kept: mut found,
             already_raised,
         } = match tokio::time::timeout_at(s.deadlines.dedup, dedup).await {
             Ok(outcome) => outcome,
@@ -762,6 +762,9 @@ impl Engine {
             warnings.push(format!(
                 "{already_raised} finding(s) skipped: already raised in this PR's discussion."
             ));
+        }
+        for item in &mut found {
+            apply_precedent(item, s.memories);
         }
 
         let budget = s.token_budget.as_ref();

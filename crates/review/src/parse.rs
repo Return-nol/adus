@@ -25,6 +25,8 @@ pub(crate) struct Suggestion {
     pub body: String,
     /// Kode pengganti untuk baris/rentang itu (opsional).
     pub suggestion: Option<String>,
+    /// Optional 0-based index into `<memories>` when this finding matches an exception or fix pattern.
+    pub precedent: Option<usize>,
 }
 
 /// Baris dan rentang hunk sisi kanan pada satu file yang valid untuk dikomentari.
@@ -129,6 +131,10 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
         _ => Severity::Info,
     };
     let file = text("file").filter(|f| !f.trim().is_empty())?;
+    let precedent = item
+        .get("precedent")
+        .and_then(parse_u32_field)
+        .and_then(|n| usize::try_from(n).ok());
     Some(Suggestion {
         file,
         start_line,
@@ -137,6 +143,7 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
         title: text("title")?,
         body: text("body")?,
         suggestion: text("suggestion").filter(|_| range_ok),
+        precedent,
     })
 }
 
@@ -186,6 +193,10 @@ pub(crate) fn submit_findings_tool_def() -> ToolDef {
                             "suggestion": {
                                 "type": "string",
                                 "description": "Optional exact replacement for the existing lines it covers: `line` alone, or start_line..line when `start_line` is set. Keep their indentation; it may span several lines. Leave it out when unsure."
+                            },
+                            "precedent": {
+                                "type": "integer",
+                                "description": "Optional 0-based index from <memories> when this finding matches a recorded Exception or Fix pattern."
                             }
                         },
                         "required": ["file", "line", "severity", "title", "body"]
@@ -290,6 +301,7 @@ mod tests {
             title: title.into(),
             body: "body".into(),
             suggestion: None,
+            precedent: None,
         }
     }
 
@@ -314,6 +326,7 @@ mod tests {
                 title: "T".into(),
                 body: "B".into(),
                 suggestion: Some("let x = 1;".into()),
+                precedent: None,
             }]
         );
 
@@ -413,6 +426,7 @@ mod tests {
                     title: "T".into(),
                     body: "B".into(),
                     suggestion: Some("let x = 1;".into()),
+                    precedent: None,
                 },
                 Suggestion {
                     file: "src/b.rs".into(),
@@ -422,6 +436,7 @@ mod tests {
                     title: "T2".into(),
                     body: "B2".into(),
                     suggestion: None,
+                    precedent: None,
                 },
             ]
         );
@@ -539,6 +554,35 @@ mod tests {
                 sugg_span("src/a.rs", Some(2), 3, "T"),
                 sugg("src/a.rs", 4, "other"),
             ]
+        );
+    }
+
+    #[test]
+    fn parse_reads_precedent() {
+        let raw = r#"[
+            {"file":"a.rs","line":1,"severity":"warning","title":"T1","body":"B","precedent":2},
+            {"file":"a.rs","line":2,"severity":"warning","title":"T2","body":"B","precedent":"0"},
+            {"file":"a.rs","line":3,"severity":"warning","title":"T3","body":"B","precedent":-1},
+            {"file":"a.rs","line":4,"severity":"warning","title":"T4","body":"B","precedent":null}
+        ]"#;
+        let precedents: Vec<Option<usize>> = parse_suggestions(raw)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.precedent)
+            .collect();
+        assert_eq!(precedents, vec![Some(2), Some(0), None, None]);
+
+        let tool_args = json!({"findings": [
+            {"file":"a.rs","line":5,"severity":"critical","title":"T5","body":"B","precedent":3}
+        ]});
+        let from_tool = parse_submit_findings(&tool_args).unwrap();
+        assert_eq!(from_tool.len(), 1);
+        assert_eq!(from_tool[0].precedent, Some(3));
+
+        let def = submit_findings_tool_def();
+        assert_eq!(
+            def.parameters["properties"]["findings"]["items"]["properties"]["precedent"]["type"],
+            json!("integer")
         );
     }
 }

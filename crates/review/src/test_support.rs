@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use adus_core::types::Severity;
-use adus_db::memories::{Memory, MemoryKind, MemorySource, MemoryStatus};
+use adus_db::memories::{Evidence, Memory, MemoryKind, MemorySource, MemoryStatus};
 use adus_db::rules::{KnowledgeScope, Rule};
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use adus_llm::{ChatRequest, ChatResponse, Message, StopReason, ToolCall, UserPart};
@@ -258,5 +258,51 @@ pub(crate) fn memory(content: &str) -> Memory {
         supersedes: None,
         superseded_by: None,
         created_at: Utc::now(),
+    }
+}
+
+pub(crate) fn exception_memory(
+    content: &str,
+    context: Option<&str>,
+    reason: Option<&str>,
+    pr_number: Option<i64>,
+    url: Option<&str>,
+) -> Memory {
+    Memory {
+        kind: MemoryKind::Exception,
+        source: MemorySource::PrLearning,
+        context: context.map(str::to_string),
+        reason: reason.map(str::to_string),
+        evidence: url
+            .map(|u| {
+                vec![Evidence {
+                    url: u.to_string(),
+                    pr_number,
+                }]
+            })
+            .unwrap_or_default(),
+        ..memory(content)
+    }
+}
+
+pub(crate) fn fix_pattern_memory(
+    content: &str,
+    resolution: Option<&str>,
+    pr_number: Option<i64>,
+    url: Option<&str>,
+) -> Memory {
+    Memory {
+        kind: MemoryKind::FixPattern,
+        source: MemorySource::PrLearning,
+        resolution: resolution.map(str::to_string),
+        evidence: url
+            .map(|u| {
+                vec![Evidence {
+                    url: u.to_string(),
+                    pr_number,
+                }]
+            })
+            .unwrap_or_default(),
+        ..memory(content)
     }
 }

@@ -193,6 +193,7 @@ mod tests {
                 title: title.into(),
                 body: format!("body of {title}"),
                 suggestion: None,
+                precedent: None,
             },
             specialist,
         }

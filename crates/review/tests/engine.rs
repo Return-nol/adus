@@ -2635,3 +2635,107 @@ async fn review_records_finding_threads(pool: PgPool) {
         assert_eq!((t.severity, t.title.as_str()), expected);
     }
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_applies_precedents_to_comments_counts_and_threads(pool: PgPool) {
+    use adus_db::memories::{self, Evidence, MemoryKind, MemorySource, MemoryStatus, NewMemory};
+
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    let ev0 = [Evidence {
+        url: "https://github.com/org/repo/pull/5#discussion_r1".into(),
+        pr_number: Some(5),
+    }];
+    memories::insert(
+        &pool,
+        NewMemory {
+            scope: KnowledgeScope::Repo,
+            repository_id: Some(s.repository_id),
+            content: "skip auth on healthcheck".into(),
+            source: MemorySource::PrLearning,
+            source_url: None,
+            created_by: None,
+            status: MemoryStatus::Active,
+            kind: MemoryKind::Exception,
+            context: Some("By design: public probe"),
+            reason: Some("Liveness probe must be unauthenticated"),
+            resolution: None,
+            evidence: &ev0,
+            supersedes: None,
+        },
+    )
+    .await
+    .unwrap();
+    let ev1 = [Evidence {
+        url: "https://github.com/org/repo/pull/6#discussion_r2".into(),
+        pr_number: Some(6),
+    }];
+    memories::insert(
+        &pool,
+        NewMemory {
+            scope: KnowledgeScope::Repo,
+            repository_id: Some(s.repository_id),
+            content: "integer overflow on counter".into(),
+            source: MemorySource::PrLearning,
+            source_url: None,
+            created_by: None,
+            status: MemoryStatus::Active,
+            kind: MemoryKind::FixPattern,
+            context: None,
+            reason: None,
+            resolution: Some("Use saturating_add"),
+            evidence: &ev1,
+            supersedes: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let findings = json!([
+        {
+            "file": "src/a.rs",
+            "line": 2,
+            "severity": "critical",
+            "title": "Unauthenticated route",
+            "body": "Missing auth check.",
+            "precedent": 0
+        },
+        {
+            "file": "src/a.rs",
+            "line": 4,
+            "severity": "warning",
+            "title": "Possible overflow",
+            "body": "Counter can wrap.",
+            "precedent": 1
+        }
+    ]);
+    s.chat.push(Ok(&findings.to_string()));
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1]}"#));
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    let git = s.git.state();
+    let review = &git.reviews[0];
+    // Summary counts reflect post-precedent severities (Critical -> Info, Warning stays Warning).
+    assert!(review.summary.contains("Warning: 1"), "{}", review.summary);
+    assert!(review.summary.contains("Info: 1"), "{}", review.summary);
+    assert!(!review.summary.contains("Critical"), "{}", review.summary);
+
+    let c0 = review.comments.iter().find(|c| c.line == 2).unwrap();
+    assert!(c0.body.contains("**ℹ️ Info:** Unauthenticated route"));
+    assert!(c0.body.contains("**Precedent:** A similar case was declared by design in PR #5: Liveness probe must be unauthenticated"));
+
+    let c1 = review.comments.iter().find(|c| c.line == 4).unwrap();
+    assert!(c1.body.contains("**⚠️ Warning:** Possible overflow"));
+    assert!(
+        c1.body
+            .contains("**Precedent:** A similar case was fixed in PR #6: Use saturating_add")
+    );
+
+    let threads = review_threads::for_pr(&pool, s.repository_id, 7)
+        .await
+        .unwrap();
+    let t0 = threads.iter().find(|t| t.line == Some(2)).unwrap();
+    assert_eq!(t0.severity, Severity::Info);
+    assert!(t0.body.contains("**Precedent:**"));
+}
