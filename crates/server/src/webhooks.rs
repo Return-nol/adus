@@ -15,6 +15,7 @@ use adus_db::{
     repositories::{self, Repository},
 };
 use adus_queue::QueueError;
+use adus_review::command::has_command;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
@@ -264,9 +265,21 @@ fn github_comment(body: &Value, number: &Value, repo_id: Uuid) -> Option<Job> {
     if is_adus_comment(text) {
         return None;
     }
+    let pr_number = pr_number(number)?;
+    // GitHub flattens replies: `in_reply_to_id` is always the thread's root comment.
+    if let Some(root) = comment["in_reply_to_id"].as_i64()
+        && !has_command(text)
+    {
+        return Some(Job::ThreadReply {
+            repository_id: repo_id,
+            pr_number,
+            thread_id: root.to_string(),
+            comment_id: comment["id"].as_i64()?.to_string(),
+        });
+    }
     Some(Job::PrComment {
         repository_id: repo_id,
-        pr_number: pr_number(number)?,
+        pr_number,
         comment_url: http_url(&comment["html_url"]).map(str::to_string),
         author: CommentAuthor {
             login: Some(comment["user"]["login"].as_str()?.to_string()),
@@ -313,6 +326,18 @@ fn azure_comment(resource: &Value, repo_id: Uuid) -> Option<Job> {
     }
     let pr = &resource["pullRequest"];
     let pr_number = pr_number(&pr["pullRequestId"])?;
+    if comment["parentCommentId"]
+        .as_i64()
+        .is_some_and(|parent| parent > 0)
+        && !has_command(text)
+    {
+        return Some(Job::ThreadReply {
+            repository_id: repo_id,
+            pr_number,
+            thread_id: azure_thread_id(comment)?.to_string(),
+            comment_id: comment["id"].as_i64()?.to_string(),
+        });
+    }
     let unique_name = comment["author"]["uniqueName"].as_str()?.to_string();
     let comment_url = http_url(&pr["repository"]["webUrl"])
         .map(|web_url| format!("{}/pullrequest/{pr_number}", web_url.trim_end_matches('/')));
@@ -326,6 +351,18 @@ fn azure_comment(resource: &Value, repo_id: Uuid) -> Option<Job> {
         },
         body: text.to_string(),
     })
+}
+
+/// The payload has no thread id field; it is the last segment of the comment's
+/// `_links.threads.href` (`…/pullRequests/{pr}/threads/{id}`).
+fn azure_thread_id(comment: &Value) -> Option<u64> {
+    comment["_links"]["threads"]["href"]
+        .as_str()?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
+        .filter(|id| *id > 0)
 }
 
 /// Nomor PR harus bilangan bulat positif.
@@ -360,6 +397,8 @@ mod tests {
         include_str!("../../../tests/fixtures/webhooks/azure/pull_request_updated.json");
     const AZ_PR_COMMENT: &str =
         include_str!("../../../tests/fixtures/webhooks/azure/pull_request_comment.json");
+    const AZ_PR_COMMENT_REPLY: &str =
+        include_str!("../../../tests/fixtures/webhooks/azure/pull_request_comment_reply.json");
 
     fn fixture(text: &str) -> Value {
         serde_json::from_str(text).unwrap()
@@ -559,6 +598,45 @@ mod tests {
     }
 
     #[test]
+    fn github_reply_in_thread() {
+        let id = Uuid::nil();
+        let mut body = fixture(GH_REVIEW_COMMENT);
+        body["comment"]["in_reply_to_id"] = json!(284312600);
+        body["comment"]["body"] = json!("Fixed in the latest push, thanks.");
+        assert_eq!(
+            parse_github("pull_request_review_comment", &body, id),
+            Some(Job::ThreadReply {
+                repository_id: id,
+                pr_number: 2,
+                thread_id: "284312600".into(),
+                comment_id: "284312630".into(),
+            })
+        );
+
+        // Only mentioning Adus is conversation, not a command.
+        body["comment"]["body"] = json!("@adudu why is this a bug?");
+        assert!(matches!(
+            parse_github("pull_request_review_comment", &body, id),
+            Some(Job::ThreadReply { .. })
+        ));
+
+        // A command in a reply still runs as a command.
+        body["comment"]["body"] = json!("@adudu review");
+        assert!(matches!(
+            parse_github("pull_request_review_comment", &body, id),
+            Some(Job::PrComment { .. })
+        ));
+
+        // Adus's own replies come back as webhooks and are dropped.
+        body["comment"]["body"] = json!(
+            "<!-- adudu -->
+🤖 **Adudu**
+Thanks!"
+        );
+        assert_eq!(parse_github("pull_request_review_comment", &body, id), None);
+    }
+
+    #[test]
     fn azure_pull_request_events() {
         let id = Uuid::nil();
         assert_eq!(
@@ -611,6 +689,34 @@ mod tests {
             panic!("expected a comment job");
         };
         assert_eq!(comment_url, None);
+    }
+
+    #[test]
+    fn azure_reply_in_thread() {
+        let id = Uuid::nil();
+        let body = fixture(AZ_PR_COMMENT_REPLY);
+        assert_eq!(
+            parse_azure(&body, id),
+            Some(Job::ThreadReply {
+                repository_id: id,
+                pr_number: 1,
+                thread_id: "5".into(),
+                comment_id: "2".into(),
+            })
+        );
+
+        // The first comment of a thread is not a reply.
+        let mut root = body.clone();
+        root["resource"]["comment"]["parentCommentId"] = json!(0);
+        assert!(matches!(
+            parse_azure(&root, id),
+            Some(Job::PrComment { .. })
+        ));
+
+        // Without a readable thread id there is nothing to reply to.
+        let mut no_thread = body;
+        no_thread["resource"]["comment"]["_links"]["threads"]["href"] = json!("https://x/threads/");
+        assert_eq!(parse_azure(&no_thread, id), None);
     }
 
     #[test]

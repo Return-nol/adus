@@ -26,6 +26,15 @@ pub enum Job {
     },
     /// Learn by-design exceptions from the discussion of a closed PR.
     LearnPr { repository_id: Uuid, pr_number: i64 },
+    /// A human reply in a review thread. Carries no body: the engine re-reads the thread and
+    /// decides whether it is an Adus thread.
+    ThreadReply {
+        repository_id: Uuid,
+        pr_number: i64,
+        /// Provider thread id: GitHub root review comment id, Azure thread id.
+        thread_id: String,
+        comment_id: String,
+    },
 }
 
 /// Apa yang memicu review PR. Juga disimpan di `reviews.trigger`.
@@ -98,6 +107,25 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<Job>(json).unwrap(), learn);
+
+        let reply = Job::ThreadReply {
+            repository_id: Uuid::nil(),
+            pr_number: 3,
+            thread_id: "284312630".to_string(),
+            comment_id: "284312631".to_string(),
+        };
+        let json = serde_json::to_value(&reply).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "thread_reply",
+                "repository_id": "00000000-0000-0000-0000-000000000000",
+                "pr_number": 3,
+                "thread_id": "284312630",
+                "comment_id": "284312631",
+            })
+        );
+        assert_eq!(serde_json::from_value::<Job>(json).unwrap(), reply);
     }
 
     #[test]

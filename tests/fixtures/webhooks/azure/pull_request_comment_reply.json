@@ -1,0 +1,79 @@
+{
+  "subscriptionId": "00000000-0000-0000-0000-000000000000",
+  "notificationId": 4,
+  "id": "5d2e8a7c-41b3-4f0e-9c6a-2b8f1e7d9a30",
+  "eventType": "ms.vss-code.git-pullrequest-comment-event",
+  "publisherId": "tfs",
+  "message": {
+    "text": "Jamal Hartnett has commented on a pull request",
+    "markdown": "Jamal Hartnett has [commented on](https://dev.azure.com/fabrikam/DefaultCollection/_git/Fabrikam/pullrequest/1?discussionId=5) a pull request"
+  },
+  "resource": {
+    "comment": {
+      "id": 2,
+      "parentCommentId": 1,
+      "author": {
+        "id": "54d125f7-69f7-4191-904f-c5b96b6261c8",
+        "displayName": "Jamal Hartnett",
+        "uniqueName": "fabrikamfiber4@hotmail.com",
+        "imageUrl": "https://dev.azure.com/fabrikam/DefaultCollection/_api/_common/identityImage?id=54d125f7-69f7-4191-904f-c5b96b6261c8"
+      },
+      "content": "Fixed: the null check is in place now.",
+      "publishedDate": "2014-06-17T16:55:46.589889Z",
+      "lastUpdatedDate": "2014-06-17T16:55:46.589889Z",
+      "lastContentUpdatedDate": "2014-06-17T16:55:46.589889Z",
+      "commentType": "text",
+      "_links": {
+        "self": {
+          "href": "https://dev.azure.com/fabrikam/DefaultCollection/_apis/git/repositories/4bc14d40-c903-45e2-872e-0462c7748079/pullRequests/1/threads/5/comments/2"
+        },
+        "repository": {
+          "href": "https://dev.azure.com/fabrikam/DefaultCollection/_apis/git/repositories/4bc14d40-c903-45e2-872e-0462c7748079"
+        },
+        "threads": {
+          "href": "https://dev.azure.com/fabrikam/DefaultCollection/_apis/git/repositories/4bc14d40-c903-45e2-872e-0462c7748079/pullRequests/1/threads/5"
+        }
+      }
+    },
+    "pullRequest": {
+      "repository": {
+        "id": "4bc14d40-c903-45e2-872e-0462c7748079",
+        "name": "Fabrikam",
+        "url": "https://dev.azure.com/fabrikam/DefaultCollection/_apis/repos/git/repositories/4bc14d40-c903-45e2-872e-0462c7748079",
+        "project": {
+          "id": "6ce954b1-ce1f-45d1-b94d-e6bf2464ba2c",
+          "name": "Fabrikam-Fiber-Git",
+          "state": "wellFormed"
+        },
+        "defaultBranch": "refs/heads/master",
+        "remoteUrl": "https://dev.azure.com/fabrikam/DefaultCollection/_git/Fabrikam",
+        "webUrl": "https://dev.azure.com/fabrikam/DefaultCollection/_git/Fabrikam"
+      },
+      "pullRequestId": 1,
+      "status": "active",
+      "createdBy": {
+        "id": "54d125f7-69f7-4191-904f-c5b96b6261c8",
+        "displayName": "Jamal Hartnett",
+        "uniqueName": "fabrikamfiber4@hotmail.com"
+      },
+      "title": "my first pull request",
+      "sourceRefName": "refs/heads/mytopic",
+      "targetRefName": "refs/heads/master",
+      "isDraft": false,
+      "url": "https://dev.azure.com/fabrikam/DefaultCollection/_apis/repos/git/repositories/4bc14d40-c903-45e2-872e-0462c7748079/pullRequests/1"
+    }
+  },
+  "resourceVersion": "2.0",
+  "resourceContainers": {
+    "collection": {
+      "id": "c12d0eb8-e382-443b-9f9c-c52cba5014c2"
+    },
+    "account": {
+      "id": "f844ec47-a9db-4511-8281-8b63f4eaf94e"
+    },
+    "project": {
+      "id": "be9b3917-87e6-42a4-a549-2bc06a7a878f"
+    }
+  },
+  "createdDate": "2026-11-19T10:30:12.401Z"
+}

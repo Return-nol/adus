@@ -56,6 +56,15 @@ pub(crate) fn parse_command(body: &str) -> Option<Command> {
     Some(Command::Remember(text.to_string()))
 }
 
+/// Whether `body` holds a known `@adudu` command (`review`, `remember`). A reply that only
+/// mentions `@adudu` is conversation, not a command.
+pub fn has_command(body: &str) -> bool {
+    matches!(
+        parse_command(body),
+        Some(Command::Review { .. } | Command::Remember(_))
+    )
+}
+
 /// Mode named right after `review`; anything else (`please`, `deeper`, nothing) is `None`.
 fn review_mode(text: &str) -> Option<ReviewMode> {
     if word(text, "deep").is_some() || word(text, "specialists").is_some() {
