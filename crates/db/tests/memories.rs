@@ -1,7 +1,7 @@
 use adus_core::types::ConnectionKind;
 use adus_db::{
     connections,
-    memories::{self, Memory, MemoryKind, MemorySource, MemoryStatus, NewMemory},
+    memories::{self, Evidence, Memory, MemoryKind, MemorySource, MemoryStatus, NewMemory},
     repositories::{self, NewRepository},
     rules::KnowledgeScope,
 };
@@ -40,7 +40,7 @@ async fn add_repo(pool: &PgPool) -> Uuid {
 }
 
 async fn add(pool: &PgPool, repo: Uuid, content: &str, status: MemoryStatus) -> Memory {
-    add_superseding(pool, repo, content, status, None).await
+    add_superseding(pool, repo, content, status, None, &[]).await
 }
 
 async fn add_superseding(
@@ -49,6 +49,7 @@ async fn add_superseding(
     content: &str,
     status: MemoryStatus,
     supersedes: Option<Uuid>,
+    evidence: &[Evidence],
 ) -> Memory {
     memories::insert(
         pool,
@@ -64,7 +65,7 @@ async fn add_superseding(
             context: None,
             reason: None,
             resolution: None,
-            evidence: &[],
+            evidence,
             supersedes,
         },
     )
@@ -143,8 +144,22 @@ async fn list_hides_rejected_unless_asked(pool: PgPool) {
 async fn superseded_memory_leaves_prompts(pool: PgPool) {
     let repo = add_repo(&pool).await;
     let a = add(&pool, repo, "A", MemoryStatus::Active).await;
-    let b = add_superseding(&pool, repo, "B", MemoryStatus::Pending, Some(a.id)).await;
+    let evidence = [Evidence {
+        url: "https://example.com/pr/7".into(),
+        pr_number: Some(7),
+    }];
+    let b = add_superseding(
+        &pool,
+        repo,
+        "B",
+        MemoryStatus::Pending,
+        Some(a.id),
+        &evidence,
+    )
+    .await;
     assert_eq!(b.supersedes, Some(a.id));
+    let stored = memories::get(&pool, b.id).await.unwrap().unwrap();
+    assert_eq!(stored.evidence, evidence);
     let got = memories::applicable(&pool, repo).await.unwrap();
     assert_eq!(contents(&got), ["A"]);
 
@@ -155,14 +170,18 @@ async fn superseded_memory_leaves_prompts(pool: PgPool) {
     assert_eq!(a.superseded_by, Some(b.id));
 
     // Rejecting a replacement leaves the memory it targets in use.
-    let c = add_superseding(&pool, repo, "C", MemoryStatus::Pending, Some(b.id)).await;
+    let c = add_superseding(&pool, repo, "C", MemoryStatus::Pending, Some(b.id), &[]).await;
     memories::reject(&pool, c.id).await.unwrap().unwrap();
     let got = memories::applicable(&pool, repo).await.unwrap();
     assert_eq!(contents(&got), ["B"]);
 
-    // Auto mode inserts the replacement active, then activates it.
-    let d = add_superseding(&pool, repo, "D", MemoryStatus::Active, Some(b.id)).await;
-    memories::activate_superseding(&pool, d.id).await.unwrap();
+    // Auto mode: inserting the replacement active retires its target in the same statement.
+    let d = add_superseding(&pool, repo, "D", MemoryStatus::Active, Some(b.id), &[]).await;
     let got = memories::applicable(&pool, repo).await.unwrap();
     assert_eq!(contents(&got), ["D"]);
+
+    // An already-superseded target keeps its first replacement.
+    add_superseding(&pool, repo, "E", MemoryStatus::Active, Some(b.id), &[]).await;
+    let b = memories::get(&pool, b.id).await.unwrap().unwrap();
+    assert_eq!(b.superseded_by, Some(d.id));
 }

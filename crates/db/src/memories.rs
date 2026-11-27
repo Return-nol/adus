@@ -115,11 +115,18 @@ fn status_filter(param: &str) -> String {
     format!("(status = {param} OR ({param}::memory_status IS NULL AND status <> 'rejected'))")
 }
 
+/// An `active` memory that `supersedes` another retires it in the same statement.
 pub async fn insert(pool: &PgPool, new: NewMemory<'_>) -> Result<Memory> {
     sqlx::query_as(&format!(
-        "INSERT INTO memories (scope, repository_id, content, source, source_url, created_by, \
-         status, kind, context, reason, resolution, evidence, supersedes) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING {COLUMNS}"
+        "WITH inserted AS ( \
+           INSERT INTO memories (scope, repository_id, content, source, source_url, created_by, \
+           status, kind, context, reason, resolution, evidence, supersedes) \
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING {COLUMNS}), \
+         replaced AS ( \
+           UPDATE memories SET superseded_by = inserted.id FROM inserted \
+           WHERE inserted.status = 'active' AND memories.id = inserted.supersedes \
+             AND memories.superseded_by IS NULL) \
+         SELECT * FROM inserted"
     ))
     .bind(new.scope)
     .bind(new.repository_id)
@@ -207,7 +214,7 @@ pub async fn approve(pool: &PgPool, id: Uuid, content: Option<&str>) -> Result<O
            WHERE id = $1 AND status = 'pending' RETURNING {COLUMNS}), \
          replaced AS ( \
            UPDATE memories SET superseded_by = approved.id FROM approved \
-           WHERE memories.id = approved.supersedes) \
+           WHERE memories.id = approved.supersedes AND memories.superseded_by IS NULL) \
          SELECT * FROM approved"
     ))
     .bind(id)
@@ -225,19 +232,6 @@ pub async fn reject(pool: &PgPool, id: Uuid) -> Result<Option<Memory>> {
     .bind(id)
     .fetch_optional(pool)
     .await
-}
-
-/// For a memory inserted `active` (auto mode): marks the memory it `supersedes` as superseded.
-/// Does nothing when `new_id` is not active or supersedes nothing.
-pub async fn activate_superseding(pool: &PgPool, new_id: Uuid) -> Result<()> {
-    sqlx::query(
-        "UPDATE memories SET superseded_by = r.id FROM memories r \
-         WHERE r.id = $1 AND r.status = 'active' AND memories.id = r.supersedes",
-    )
-    .bind(new_id)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 /// `false` jika memory tidak ada.
