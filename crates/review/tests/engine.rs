@@ -2609,19 +2609,22 @@ async fn review_records_finding_threads(pool: PgPool) {
 
     let posted = s.git.state().reviews[0].comments.clone();
     assert_eq!(posted.len(), 2);
-    let mut threads = review_threads::for_pr(&pool, s.repository_id, 7)
+    let threads = review_threads::for_pr(&pool, s.repository_id, 7)
         .await
         .unwrap();
-    threads.sort_by(|a, b| a.root_comment_id.cmp(&b.root_comment_id));
     assert_eq!(threads.len(), 2);
-    for (i, t) in threads.iter().enumerate() {
+    for t in &threads {
+        // The fake gives the comment at index `i` the ids `t{i}` / `c{i}`.
+        let i = posted
+            .iter()
+            .position(|c| Some(i32::try_from(c.line).unwrap()) == t.line)
+            .expect("a posted comment on the thread's line");
         assert_eq!(t.outcome, ThreadOutcome::Open);
         assert_eq!(t.provider_thread_id, format!("t{i}"));
         assert_eq!(t.root_comment_id, format!("c{i}"));
         assert_eq!(t.posted_head_sha, "h1");
         assert_eq!(t.review_id, Some(id));
         assert_eq!(t.path, "src/a.rs");
-        assert_eq!(t.line, Some(i32::try_from(posted[i].line).unwrap()));
         assert_eq!(t.body, posted[i].body);
         let expected = match t.line {
             Some(2) => (Severity::Critical, "First"),

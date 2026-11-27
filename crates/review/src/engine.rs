@@ -92,8 +92,11 @@ pub enum EngineError {
 
 /// Hasil review yang tidak gagal.
 enum Outcome {
+    /// On the PR. Its finding threads are recorded once the review deadlines are past.
     Done {
-        posted: usize,
+        head_sha: String,
+        output: ReviewOutput,
+        posted: Vec<PostedComment>,
     },
     /// Alasan snake_case, disimpan di `reviews.skip_reason`.
     Skipped(&'static str),
@@ -207,7 +210,24 @@ impl Engine {
             Err(_elapsed) => Err(timed_out()),
         };
         let (status, posted, skip_reason) = match outcome {
-            Ok(Outcome::Done { posted }) => (ReviewStatus::Done, posted, None),
+            Ok(Outcome::Done {
+                head_sha,
+                output,
+                posted,
+            }) => {
+                // After every review deadline (still under the job timeout): the review is on
+                // the PR, so a slow insert must not turn it into a timed-out failure.
+                self.record_threads(
+                    repository_id,
+                    review_id,
+                    pr_number,
+                    &head_sha,
+                    &output,
+                    &posted,
+                )
+                .await;
+                (ReviewStatus::Done, posted.len(), None)
+            }
             Ok(Outcome::Skipped(reason)) => (ReviewStatus::Skipped, 0, Some(reason)),
             Err(err) => {
                 let recorded = match &err {
@@ -476,13 +496,11 @@ impl Engine {
                     .post_review(&repo_ref, &pr, &output.comments, &summary)
                     .await
                 {
-                    Ok(posted) => {
-                        self.record_threads(repo.id, review_id, &pr, &output, &posted)
-                            .await;
-                        Ok(Outcome::Done {
-                            posted: posted.len(),
-                        })
-                    }
+                    Ok(posted) => Ok(Outcome::Done {
+                        head_sha: pr.head_sha.clone(),
+                        output,
+                        posted,
+                    }),
                     Err(err) => Err(self.post_error(&conn, err).await),
                 }
             };
@@ -503,7 +521,8 @@ impl Engine {
         &self,
         repository_id: Uuid,
         review_id: Uuid,
-        pr: &PullRequest,
+        pr_number: i64,
+        head_sha: &str,
         output: &ReviewOutput,
         posted: &[PostedComment],
     ) {
@@ -522,7 +541,7 @@ impl Engine {
                 Some(NewReviewThread {
                     repository_id,
                     review_id: Some(review_id),
-                    pr_number: pr.number,
+                    pr_number,
                     provider_thread_id: p.thread_id.as_deref().unwrap_or(&p.comment_id),
                     root_comment_id: &p.comment_id,
                     path: &comment.path,
@@ -530,7 +549,7 @@ impl Engine {
                     severity: finding.severity,
                     title: titles.get(p.index)?,
                     body: &comment.body,
-                    posted_head_sha: &pr.head_sha,
+                    posted_head_sha: head_sha,
                 })
             })
             .collect();
