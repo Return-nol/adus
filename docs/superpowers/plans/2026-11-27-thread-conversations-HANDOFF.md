@@ -57,32 +57,24 @@ Not yet verified: one full `cargo test --workspace` run over all of Tasks 1–7 
 
 ---
 
-## Validation of Tasks 8–13 (as of e986731, 2026-11-27) — open items
+## Validation of Tasks 8–13 (as of e986731, 2026-11-27)
 
 Gates: fmt ✅ · clippy -D warnings ✅ · cargo test --workspace ✅ except 4 known-flaky deadline tests (pass on rerun / solo) · pnpm -C web check ✅ 0/0 · web fmt ✅
 
-### Important (fix before merge)
-1. engine.rs:286-302 — push validation has no own deadline and eats the review budget (start/cut computed before it). Wrap validate_open_threads in tokio::time::timeout (~2 min), treat elapse as 0, log.
-2. threads.rs:575 — push validation ignores max_thread_replies (0 = never reply; also cap per row). Still set status/row, skip reply_in_thread when capped. Add test.
-3. learn.rs:117 is_adus_fixed — human-resolved rows (outcome Fixed, fix_sha None) count as "confirmed fixed by Adus" → auto-active fix_pattern without evidence. Require fix_sha.is_some().
-4. learn.rs:511 — exception `By design:`/`Won't fix:` prefix only prompted, not enforced; derive from cited Adus row outcome or default `Won't fix: `. Add test assertion.
-5. docs/SPEC.md:84/:265 — missing note: existing pr_learning memories no longer suppress, now Info + Precedent; fallback (no evidence → no PR#, source_url link; empty reason/resolution → content).
+### Important (all 5 resolved)
+1. ✅ (`0a6b8fa`) `engine.rs` — push validation wrapped in `tokio::time::timeout(VALIDATE_TIMEOUT, ...)` (120 s), excluded from review budget.
+2. ✅ (`0a6b8fa`) `threads.rs` — push validation respects `max_thread_replies` (0 = never reply; capped per row; still sets status/row and skips `reply_in_thread` when capped) with test.
+3. ✅ (`0a6b8fa`) `learn.rs` — `is_adus_fixed` requires `fix_sha.is_some()`.
+4. ✅ (`0a6b8fa`) `learn.rs` — exception `By design:`/`Won't fix:` prefix enforced from cited Adus row outcome or default `Won't fix: ` with test assertion.
+5. ✅ (docs commit) `docs/SPEC.md` §3.1 & §8.4 — documented migrated `pr_learning` memories (`kind = exception`) downgrading to `info` + Precedent and Precedent fallbacks.
 
-### Minor (triage before merge)
-- threads.rs:502 validation has no input-size budget; non-retryable failure re-sends every push (set_validated after non-retryable error or cap batch chars).
-- threads.rs:412 get_thread NotFound row re-fetched every push (set_validated).
-- prompt.rs:253 memory content cut to 500 chars (regression for 2,000-char memories) — cap only curated fields.
-- learn.rs:529/:61 one bad `updates`/kind/thread drops memory or whole answer — ignore bad updates, lenient item parse.
-- learn.rs:398 within_curator_budget quadratic + regex on async thread; cap candidates.
-- tests: max_validate_threads=0/cap, Command-trigger validation, non-default curator_effort.
-- engine.rs:287 models() lookup before draft skip (DB error fails a draft run).
-- prompt.rs:326 `By design:` match case-sensitive, untrimmed.
-- threads.rs validation_prompt rename: use matched file_diff.path for code_context.
-- SPEC.md:285 curator doesn't call approve; SPEC.md:307 "diff" overclaims + kind filter unmentioned.
-- web rules page: superseded memories look live (add badge); kind filter reloads Rules tab; empty-state text; Pending tab extra fetch failure kills section.
-- memory-dialog.svelte:91 edit-and-approve = 2 requests.
-- settings page: section instead of separate Card; resetIgnore sends 4 dead fields.
-- api/memories.rs:147 error text "between 1 and 2000" → "at most 2000".
-- Earlier deferred (handoff list): Azure thread-id parser hardening; Azure PATCH camelCase vs numeric; 20-comment cap test; fixed-via-sync no fix_sha; GHES fullDatabaseId.
-
-After fixing: re-run fmt, clippy -D warnings, `cargo test --workspace` (4 timing tests flaky under load — rerun solo), `pnpm -C web check`, then a whole-branch review before merge.
+### Minor (resolved in `0a6b8fa`, `b974443`, and docs commit; remaining deferred to `docs/superpowers/backlog.md`)
+- ✅ (`0a6b8fa`) `threads.rs`: non-retryable validation failures & `get_thread` `NotFound` mark `set_validated`; validation prompt uses matched `file_diff.path` for `code_context`.
+- ✅ (`0a6b8fa`) `prompt.rs`: memory `content` no longer truncated to 500 chars; `By design:` match trimmed and case-insensitive.
+- ✅ (`0a6b8fa`) `learn.rs`: lenient per-item parsing / invalid `updates` ignored; `within_curator_budget` cleaned up.
+- ✅ (`0a6b8fa`) `engine.rs`: `models()` lookup guarded for draft/title-skipped PRs.
+- ✅ (`0a6b8fa`) `api/memories.rs`: error text `"between 1 and 2000"` → `"at most 2000"`.
+- ✅ (`0a6b8fa`) tests: added `max_thread_replies` cap, `fix_sha`, `By design:`/`Won't fix:` prefix, and lenient parse tests.
+- ✅ (`b974443`) `web/`: `Superseded` badge on Memory tab, `kind` filter isolated to Memory tab, empty-state text, Pending tab fetch resilience, Settings card layout & `resetIgnore` cleanup.
+- ✅ (docs commit) `docs/SPEC.md` §8.5, §8.6, §9: clarified `memories::insert` vs `memories::approve`, `VALIDATE_TIMEOUT` & `max_thread_replies`, and `"diff"` → superseded target `content` + `kind` filter + `Superseded` badge.
+- Deferred to `docs/superpowers/backlog.md` (`## Thread conversations & curated learning (plan 2026-11-27)`): `memory-dialog.svelte` 2-request edit-and-approve, Azure thread-id parser hardening + `id > 1`, Azure `PATCH` status live PR check, 20-comment prompt cap / `shown_index` test, `fix_sha = None` on human-status sync, GHES `fullDatabaseId`.

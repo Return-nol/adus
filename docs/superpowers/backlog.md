@@ -80,3 +80,12 @@ Task numbers below are this plan's tasks. Sources: the per-task reviews, final r
 - Learned-memory inserts and the `pr_learning_runs` row are not one transaction: a DB failure between them can duplicate up to 5 memories on retry
 - Semantic Dedup's `already_raised` citation is not checked against the finding's file (only the prompt-level data guard stops an injected thread from suppressing an unrelated finding)
 - Memory prompt injection has no cap or relevance selection, so prompts grow with the number of active memories
+
+## Thread conversations & curated learning (plan 2026-11-27)
+
+- `web/src/lib/components/memory-dialog.svelte`: edit-and-approve makes 2 sequential requests (`PATCH` then `POST /approve`)
+- Azure thread-id parser (`webhooks.rs`, `_links.threads.href`) trailing-slash/query hardening + reply detection `id > 1`
+- Azure `PATCH` status camelCase vs numeric `CommentThreadStatus` verification against a live Azure PR
+- `crates/review/tests/threads.rs`: missing test for 20-comment prompt cap / `shown_index`
+- `review_threads` fixed via human-status sync have `fix_sha = None`
+- GitHub `fullDatabaseId` may be absent on older GitHub Enterprise Server
