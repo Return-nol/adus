@@ -97,7 +97,7 @@ CREATE TABLE review_threads (
     repository_id      uuid NOT NULL REFERENCES repositories (id) ON DELETE CASCADE,
     review_id          uuid REFERENCES reviews (id) ON DELETE SET NULL,
     pr_number          bigint NOT NULL,
-    provider_thread_id text NOT NULL,   -- Azure thread id / GitHub review-thread node id (may be filled lazily)
+    provider_thread_id text NOT NULL,   -- Azure thread id / GitHub root review comment id (GraphQL node id is looked up, never stored)
     root_comment_id    text NOT NULL,   -- Azure comment id within the thread / GitHub review comment id
     path               text NOT NULL,
     line               integer,
@@ -113,7 +113,7 @@ CREATE TABLE review_threads (
     validated_head_sha text,            -- last head push validation checked this thread at
     created_at         timestamptz NOT NULL DEFAULT now(),
     updated_at         timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (repository_id, pr_number, root_comment_id)
+    UNIQUE (repository_id, pr_number, provider_thread_id)
 );
 CREATE INDEX review_threads_open_idx ON review_threads (repository_id, pr_number) WHERE outcome = 'open';
 
