@@ -129,6 +129,22 @@ fn first_json_array(raw: &str) -> Option<Vec<Map<String, Value>>> {
     saw_empty.then(Vec::new)
 }
 
+/// The first JSON object in `raw` (fenced or surrounded by prose) that `read` accepts.
+/// Text after the object is ignored.
+// ponytail: O(n²) on text with many `{` that are not JSON; model replies are small.
+pub(crate) fn first_json_value<T>(
+    raw: &str,
+    mut read: impl FnMut(Value) -> Option<T>,
+) -> Option<T> {
+    raw.match_indices('{').find_map(|(start, _)| {
+        let value = serde_json::Deserializer::from_str(&raw[start..])
+            .into_iter::<Value>()
+            .next()?
+            .ok()?;
+        read(value)
+    })
+}
+
 /// The first JSON object in `raw` (fenced or surrounded by prose) that deserializes into `T`.
 /// Objects that do not fit `T` (for example a quoted finding) are skipped; text after the
 /// object is ignored.
@@ -140,6 +156,24 @@ pub(crate) fn first_json_object<T: DeserializeOwned>(raw: &str) -> Option<T> {
             .next()?
             .ok()
     })
+}
+
+/// Parses a JSON boolean or a `"true"` / `"false"` string (case- and whitespace-insensitive).
+pub(crate) fn parse_bool_field(val: &Value) -> Option<bool> {
+    match val {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if trimmed.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn parse_u32_field(val: &Value) -> Option<u32> {
@@ -947,5 +981,26 @@ mod tests {
 
         let normalized_ok = vec![sugg("/src/a.rs", 12, "Valid")];
         assert_eq!(validate_batch_anchors(&normalized_ok, &allowed), Ok(()));
+    }
+
+    #[test]
+    fn first_json_value_skips_non_matching_and_handles_prose_and_fences() {
+        let raw = "Note: `if { x }` and {\"other\": 1} then\n```json\n{\"keep\": true, \"n\": 2}\n```\ntrailing";
+        let got = first_json_value(raw, |v| v.get("keep").and_then(Value::as_bool));
+        assert_eq!(got, Some(true));
+
+        let none = first_json_value("no objects {\"a\": 1}", |v| v.get("b").cloned());
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn parse_bool_field_accepts_bool_and_trimmed_ascii_strings() {
+        assert_eq!(parse_bool_field(&json!(true)), Some(true));
+        assert_eq!(parse_bool_field(&json!(false)), Some(false));
+        assert_eq!(parse_bool_field(&json!("  true \n")), Some(true));
+        assert_eq!(parse_bool_field(&json!("\tFALSE ")), Some(false));
+        for invalid in [json!("yes"), json!("1"), json!(""), json!(1), json!(null)] {
+            assert_eq!(parse_bool_field(&invalid), None, "{invalid}");
+        }
     }
 }

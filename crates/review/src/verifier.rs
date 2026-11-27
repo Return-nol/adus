@@ -30,7 +30,7 @@ use crate::agent::{
 use crate::budget::TokenBudget;
 use crate::engine::is_retryable;
 use crate::finder::FinderPass;
-use crate::parse::{FindingCategory, Suggestion};
+use crate::parse::{FindingCategory, Suggestion, first_json_value, parse_bool_field};
 use crate::prompt::{
     MAX_DESCRIPTION_CHARS_DIFF_ONLY, diff_block, format_memories, format_pr_description,
     format_rules, or_none, wrap,
@@ -672,11 +672,7 @@ fn chat_failure(err: ChatError) -> Outcome {
 /// `keep` (required) may be a boolean or the string `"true"` / `"false"`. `rationale` makes the
 /// model state its evidence; a non-blank one is kept (redacted, cut) for the log only.
 fn loose_verdict(value: &Value) -> Option<Verdict> {
-    let keep = match value.get("keep")? {
-        Value::Bool(flag) => *flag,
-        Value::String(text) => parse_bool(text)?,
-        _ => return None,
-    };
+    let keep = parse_bool_field(value.get("keep")?)?;
     let rationale = value
         .get("rationale")
         .and_then(Value::as_str)
@@ -686,26 +682,10 @@ fn loose_verdict(value: &Value) -> Option<Verdict> {
     Some(Verdict { keep, rationale })
 }
 
-/// `true` / `false`, ignoring case and surrounding whitespace.
-fn parse_bool(text: &str) -> Option<bool> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
 /// The verdict in reply text: the first JSON object [`loose_verdict`] reads, else a bare
 /// `"keep": true|false` (the value may be quoted), e.g. in a truncated or malformed object.
 fn verdict_in_text(text: &str) -> Option<Verdict> {
-    let object = text.match_indices('{').find_map(|(start, _)| {
-        let value = serde_json::Deserializer::from_str(&text[start..])
-            .into_iter::<Value>()
-            .next()?
-            .ok()?;
-        loose_verdict(&value)
-    });
-    object.or_else(|| {
+    first_json_value(text, |value| loose_verdict(&value)).or_else(|| {
         text.match_indices("\"keep\"").find_map(|(at, key)| {
             let rest = text[at + key.len()..].trim_start().strip_prefix(':')?;
             let rest = rest.trim_start().trim_start_matches('"');

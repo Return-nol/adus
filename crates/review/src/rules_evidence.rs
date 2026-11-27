@@ -21,7 +21,7 @@ use crate::agent::{
     AgentConfig, AgentError, AgentLlm, AgentTools, SubmitSpec, chat_single_turn, run_react_loop,
 };
 use crate::budget::TokenBudget;
-use crate::parse::parse_u32_field;
+use crate::parse::{first_json_value, parse_bool_field, parse_u32_field};
 use crate::prompt::{diff_block, severity_name, truncate_with_marker, wrap};
 use crate::redact::{log_rationale, redact_secrets};
 use crate::rules_judge::RawShardViolation;
@@ -252,7 +252,7 @@ async fn judge(ctx: RuleEvidenceContext<'_>, prompt: String) -> Result<String, &
 /// The citation gate over the judge's reply: `Verified` only for `violated` with a cited line
 /// that appears in `excerpts`.
 fn judge_verdict(reply: &str, excerpts: &[ReadExcerpt]) -> EvidenceVerdict {
-    let Some(value) = first_object(reply, |value| {
+    let Some(value) = first_json_value(reply, |value| {
         value.get("verdict").is_some().then_some(value)
     }) else {
         return EvidenceVerdict::Rejected("unparseable");
@@ -362,17 +362,6 @@ fn normalized(path: &str) -> String {
     normalize_path(path.trim().trim_start_matches("./"))
 }
 
-/// The first JSON object in `text` that `read` accepts.
-fn first_object<T>(text: &str, read: impl Fn(Value) -> Option<T>) -> Option<T> {
-    text.match_indices('{').find_map(|(start, _)| {
-        let value = serde_json::Deserializer::from_str(&text[start..])
-            .into_iter::<Value>()
-            .next()?
-            .ok()?;
-        read(value)
-    })
-}
-
 /// `<rule>` and `<candidate>` sections shared by the collector and the judge prompts.
 fn rule_and_candidate(rule: &Rule, file: &FileDiff, candidate: &RawShardViolation) -> String {
     let mut lines = vec![format!("file: {}", file.path)];
@@ -451,15 +440,7 @@ struct EvidenceSubmission {
 /// Reads a submission loosely: `keep` may be a boolean or `"true"` / `"false"`; an unknown
 /// `confidence` counts as none.
 fn loose_submission(value: &Value) -> Option<EvidenceSubmission> {
-    let keep = match value.get("keep")? {
-        Value::Bool(flag) => *flag,
-        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
-            "true" => true,
-            "false" => false,
-            _ => return None,
-        },
-        _ => return None,
-    };
+    let keep = parse_bool_field(value.get("keep")?)?;
     let confidence = match value
         .get("confidence")
         .and_then(Value::as_str)
@@ -505,7 +486,7 @@ impl SubmitSpec for SubmitEvidence {
     }
 
     fn parse_prose(&self, text: &str) -> Result<EvidenceSubmission, String> {
-        first_object(text, |value| loose_submission(&value))
+        first_json_value(text, |value| loose_submission(&value))
             .ok_or_else(|| "no \"keep\" found".to_string())
     }
 }
