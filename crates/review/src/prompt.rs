@@ -463,13 +463,63 @@ impl ManifestFile {
     }
 }
 
+/// Why a changed file was not reviewed in full (pre-Finder filtering or a failed/timed-out batch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkipReason {
+    NoPatch,
+    TooLarge,
+    FileLimit,
+    Unparseable,
+    LlmError,
+    TimedOut,
+    TokenBudget,
+}
+
+impl SkipReason {
+    /// Short note shown next to a file in `<pr_manifest>`.
+    pub(crate) fn manifest_note(self) -> &'static str {
+        match self {
+            Self::NoPatch => "skipped: no diff available",
+            Self::TooLarge => "skipped: patch too large",
+            Self::FileLimit => "skipped: file limit reached",
+            _ => "skipped",
+        }
+    }
+
+    /// Human-readable reason shown in the PR review summary comment.
+    pub(crate) fn summary_label(self) -> &'static str {
+        match self {
+            Self::NoPatch => "no diff available (binary or too large)",
+            Self::TooLarge => "patch too large",
+            Self::FileLimit => "file limit reached",
+            Self::Unparseable => "review output could not be parsed",
+            Self::LlmError => "LLM error",
+            Self::TimedOut => "review did not finish in time",
+            Self::TokenBudget => "token budget reached",
+        }
+    }
+
+    /// Stable snake_case identifier for structured logs.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoPatch => "no_patch",
+            Self::TooLarge => "too_large",
+            Self::FileLimit => "file_limit",
+            Self::Unparseable => "unparseable",
+            Self::LlmError => "llm_error",
+            Self::TimedOut => "timed_out",
+            Self::TokenBudget => "token_budget",
+        }
+    }
+}
+
 /// The PR file manifest: a header line, then one line per file of `files`, in order.
 /// Files in `ignored_paths` are marked `[ignored]`; files in `skipped_reasons` are marked
 /// `[skipped: ...]`.
 pub(crate) fn build_manifest(
     files: &[ManifestFile],
     ignored_paths: &HashSet<&str>,
-    skipped_reasons: &HashMap<&str, &'static str>,
+    skipped_reasons: &HashMap<&str, SkipReason>,
 ) -> String {
     let count = files.len();
     let noun = if count == 1 { "file" } else { "files" };
@@ -480,7 +530,9 @@ pub(crate) fn build_manifest(
         let note = if ignored_paths.contains(path) {
             Some("ignored")
         } else {
-            skipped_reasons.get(path).map(|reason| skip_note(reason))
+            skipped_reasons
+                .get(path)
+                .map(|reason| reason.manifest_note())
         };
         let suffix = note.map_or(String::new(), |n| format!(" [{n}]"));
         lines.push(format!(
@@ -489,16 +541,6 @@ pub(crate) fn build_manifest(
         ));
     }
     lines.join("\n")
-}
-
-/// Manifest note for a pre-Finder skip reason (see `format_summary`).
-fn skip_note(reason: &str) -> &'static str {
-    match reason {
-        "no_patch" => "skipped: no diff available",
-        "too_large" => "skipped: patch too large",
-        "file_limit" => "skipped: file limit reached",
-        _ => "skipped",
-    }
 }
 
 /// `(+ lines, - lines)` inside the hunks of a single-file patch (file headers do not count).
@@ -575,14 +617,13 @@ pub(crate) fn format_inline(s: &Suggestion, severity: Severity) -> String {
     out
 }
 
-/// Komentar ringkasan review. `skipped` = (path, alasan) dengan alasan `no_patch` |
-/// `too_large` | `file_limit` | `unparseable` | `llm_error` | `timed_out` | `token_budget`.
+/// Komentar ringkasan review. `skipped` = (path, [`SkipReason`]).
 /// `ignored` = jumlah file yang cocok dengan daftar ignore (hanya jumlahnya yang ditampilkan,
 /// bukan namanya).
 /// `warnings` are listed last under **Notes** (e.g. a fallback to diff-only review).
 pub(crate) fn format_summary(
     counts: &BTreeMap<Severity, usize>,
-    skipped: &[(String, &'static str)],
+    skipped: &[(String, SkipReason)],
     ignored: usize,
     warnings: &[String],
 ) -> String {
@@ -607,7 +648,7 @@ pub(crate) fn format_summary(
         out.push_str("\n\n**Skipped files**\n");
         let lines: Vec<String> = skipped
             .iter()
-            .map(|(path, reason)| format!("- `{path}`: {}", skip_reason_label(reason)))
+            .map(|(path, reason)| format!("- `{path}`: {}", reason.summary_label()))
             .collect();
         out.push_str(&lines.join("\n"));
     }
@@ -617,19 +658,6 @@ pub(crate) fn format_summary(
         out.push_str(&lines.join("\n"));
     }
     out
-}
-
-fn skip_reason_label(reason: &str) -> &str {
-    match reason {
-        "no_patch" => "no diff available (binary or too large)",
-        "too_large" => "patch too large",
-        "file_limit" => "file limit reached",
-        "unparseable" => "review output could not be parsed",
-        "llm_error" => "LLM error",
-        "timed_out" => "review did not finish in time",
-        "token_budget" => "token budget reached",
-        other => other,
-    }
 }
 
 #[cfg(test)]
@@ -764,8 +792,8 @@ mod tests {
             (Severity::Critical, 2),
         ]);
         let skipped = [
-            ("logo.png".to_string(), "no_patch"),
-            ("big.rs".to_string(), "too_large"),
+            ("logo.png".to_string(), SkipReason::NoPatch),
+            ("big.rs".to_string(), SkipReason::TooLarge),
         ];
         let warnings = [
             "Codebase context unavailable — reviewed diff only".to_string(),
@@ -970,7 +998,10 @@ mod tests {
         ];
         let files: Vec<_> = raw.iter().map(ManifestFile::from_diff).collect();
         let ignored = HashSet::from(["dist/app.min.js"]);
-        let skipped = HashMap::from([("big.rs", "too_large"), ("logo.png", "no_patch")]);
+        let skipped = HashMap::from([
+            ("big.rs", SkipReason::TooLarge),
+            ("logo.png", SkipReason::NoPatch),
+        ]);
 
         assert_eq!(
             build_manifest(&files, &ignored, &skipped),
@@ -986,6 +1017,54 @@ mod tests {
             build_manifest(&files[..1], &HashSet::new(), &HashMap::new()),
             "1 file changed in this pull request:\n- src/a.rs (modified, +2 -1)"
         );
+    }
+
+    #[test]
+    fn skip_reason_maps_notes_labels_and_keys() {
+        let cases = [
+            (
+                SkipReason::NoPatch,
+                "skipped: no diff available",
+                "no diff available (binary or too large)",
+                "no_patch",
+            ),
+            (
+                SkipReason::TooLarge,
+                "skipped: patch too large",
+                "patch too large",
+                "too_large",
+            ),
+            (
+                SkipReason::FileLimit,
+                "skipped: file limit reached",
+                "file limit reached",
+                "file_limit",
+            ),
+            (
+                SkipReason::Unparseable,
+                "skipped",
+                "review output could not be parsed",
+                "unparseable",
+            ),
+            (SkipReason::LlmError, "skipped", "LLM error", "llm_error"),
+            (
+                SkipReason::TimedOut,
+                "skipped",
+                "review did not finish in time",
+                "timed_out",
+            ),
+            (
+                SkipReason::TokenBudget,
+                "skipped",
+                "token budget reached",
+                "token_budget",
+            ),
+        ];
+        for (reason, note, label, key) in cases {
+            assert_eq!(reason.manifest_note(), note, "{reason:?}");
+            assert_eq!(reason.summary_label(), label, "{reason:?}");
+            assert_eq!(reason.as_str(), key, "{reason:?}");
+        }
     }
 
     #[test]

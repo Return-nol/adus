@@ -42,8 +42,8 @@ use crate::finder::{
 };
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
-    DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, batch_targets, build_manifest, format_inline,
-    format_summary,
+    DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, SkipReason, batch_targets, build_manifest,
+    format_inline, format_summary,
 };
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
@@ -371,7 +371,7 @@ impl Engine {
             let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
             let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
             let mut files: Vec<FileDiff> = Vec::new();
-            let mut skipped: Vec<(String, &'static str)> = Vec::new();
+            let mut skipped: Vec<(String, SkipReason)> = Vec::new();
             let mut ignored_paths: Vec<String> = Vec::new();
             for target in candidates {
                 // File terhapus tidak pernah direview, jadi juga tidak dihitung sebagai di-ignore.
@@ -386,16 +386,16 @@ impl Engine {
                     continue;
                 }
                 let Some(patch) = &target.file.patch else {
-                    skipped.push((target.file.path, "no_patch"));
+                    skipped.push((target.file.path, SkipReason::NoPatch));
                     continue;
                 };
                 if target.allowed.is_empty() {
                     continue; // tidak ada baris baru yang bisa dikomentari
                 }
                 if added_line_count(patch) > max_lines {
-                    skipped.push((target.file.path, "too_large"));
+                    skipped.push((target.file.path, SkipReason::TooLarge));
                 } else if files.len() >= max_files {
-                    skipped.push((target.file.path, "file_limit"));
+                    skipped.push((target.file.path, SkipReason::FileLimit));
                 } else {
                     allowed.insert(normalize_path(&target.file.path), target.allowed);
                     files.push(target.file);
@@ -411,7 +411,7 @@ impl Engine {
                 (false, Vec::new(), Vec::new(), String::new())
             } else {
                 let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
-                let skipped_map: HashMap<&str, &'static str> = skipped
+                let skipped_map: HashMap<&str, SkipReason> = skipped
                     .iter()
                     .map(|(path, reason)| (path.as_str(), *reason))
                     .collect();
@@ -531,7 +531,7 @@ impl Engine {
         files: Vec<FileDiff>,
         allowed: HashMap<String, CommentableRange>,
         manifest: &str,
-        skipped: &mut Vec<(String, &'static str)>,
+        skipped: &mut Vec<(String, SkipReason)>,
         warnings: &mut Vec<String>,
     ) -> Result<ReviewOutput, EngineError> {
         let mode = s.mode;
@@ -1044,7 +1044,7 @@ fn collect_candidates(
     mode: ReviewMode,
     batches: &[DiffBatch<'_>],
     allowed: &HashMap<String, CommentableRange>,
-    skipped: &mut Vec<(String, &'static str)>,
+    skipped: &mut Vec<(String, SkipReason)>,
     warnings: &mut Vec<String>,
 ) -> Result<(Vec<CandidateFinding>, usize), EngineError> {
     if !tasks.is_empty() && tasks.iter().all(|task| task.result.is_err()) {
@@ -1068,7 +1068,7 @@ fn collect_candidates(
     let mut candidates = Vec::new();
     let mut filtered_dropped = 0usize;
     // Batch index → skip reason, for batches no agent reviewed.
-    let mut unreviewed: BTreeMap<usize, &'static str> = BTreeMap::new();
+    let mut unreviewed: BTreeMap<usize, SkipReason> = BTreeMap::new();
     for task in tasks {
         let label = task.kind.label();
         let reason = match task.result {
@@ -1099,16 +1099,16 @@ fn collect_candidates(
             }
             Err(FinderFailure::TimedOut) => {
                 push_once(warnings, format!("{label} reviewer did not finish in time"));
-                "timed_out"
+                SkipReason::TimedOut
             }
             // The summary's token-budget note covers it; no per-reviewer note.
-            Err(FinderFailure::TokenBudget) => "token_budget",
+            Err(FinderFailure::TokenBudget) => SkipReason::TokenBudget,
             Err(FinderFailure::Agent(_)) if reviewed.contains(&task.batch) => {
                 push_once(warnings, format!("{label} reviewer did not complete"));
                 continue;
             }
-            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => "unparseable",
-            Err(FinderFailure::Agent(_)) => "llm_error",
+            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => SkipReason::Unparseable,
+            Err(FinderFailure::Agent(_)) => SkipReason::LlmError,
         };
         if reviewed.contains(&task.batch) {
             continue;
@@ -1118,14 +1118,18 @@ fn collect_candidates(
             .entry(task.batch)
             .and_modify(|current| {
                 if *current != reason {
-                    *current = "llm_error";
+                    *current = SkipReason::LlmError;
                 }
             })
             .or_insert(reason);
     }
     for (index, reason) in unreviewed {
         if let Some(batch) = batches.get(index) {
-            tracing::warn!(batch = index, reason, "no finder agent reviewed a batch");
+            tracing::warn!(
+                batch = index,
+                reason = reason.as_str(),
+                "no finder agent reviewed a batch"
+            );
             skipped.extend(batch.files.iter().map(|file| (file.path.clone(), reason)));
         }
     }
