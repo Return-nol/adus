@@ -475,7 +475,7 @@ pub(crate) fn changed_line_counts(patch: &str) -> (usize, usize) {
     (added, removed)
 }
 
-fn severity_name(severity: Severity) -> &'static str {
+pub(crate) fn severity_name(severity: Severity) -> &'static str {
     match severity {
         Severity::Info => "info",
         Severity::Warning => "warning",

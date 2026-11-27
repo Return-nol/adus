@@ -400,6 +400,23 @@ impl Toolbox {
         .flatten()
     }
 
+    /// [`read_head_file_capped_sync`] run off the async runtime (`spawn_blocking`).
+    pub(crate) async fn read_head_file_capped(
+        &self,
+        rel_path: &str,
+        max_lines: usize,
+        max_chars: usize,
+    ) -> Option<String> {
+        let ws = Arc::clone(&self.workspace);
+        let rel = rel_path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            read_head_file_capped_sync(&ws, &rel, max_lines, max_chars)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// [`read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
     pub(crate) async fn read_file_snippet(
         &self,
@@ -443,6 +460,29 @@ fn read_file_snippet_sync(
         .saturating_add(radius)
         .min(start.saturating_add(READ_MAX_LINES - 1));
     read_file(&target, start, end).ok()
+}
+
+/// The whole of `rel_path` as `{n}: {line}` rows with secrets masked, or `None` when the path is
+/// not a readable text file in the workspace, the file is empty, or it has more than `max_lines`
+/// lines or `max_chars` characters. Blocking.
+fn read_head_file_capped_sync(
+    ws: &RepoWorkspace,
+    rel_path: &str,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let target = ws.resolve_existing_file(rel_path.trim()).ok()?;
+    let text = read_text(target.abs()).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() || lines.len() > max_lines || text.chars().count() > max_chars {
+        return None;
+    }
+    let numbered: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{}: {line}", i + 1))
+        .collect();
+    Some(redact_secrets(&numbered.join("\n")).into_owned())
 }
 
 /// Runs `call` through the cache. Fresh content is redacted before it is cached, so cached
@@ -1803,6 +1843,48 @@ mod tests {
             }
             assert!(!def.description.is_empty());
             assert_portable_schema(&def.parameters);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_head_file_capped_numbers_redacts_and_skips_oversized() {
+        let small = format!("fn main() {{}}\nconst KEY = \"{FAKE_AWS_KEY}\";\n");
+        let many_lines = numbered(601);
+        let long_line = "x".repeat(30_001);
+        let tb = toolbox(&[
+            ("src/small.rs", small.as_bytes()),
+            ("src/many.rs", many_lines.as_bytes()),
+            ("src/long.rs", long_line.as_bytes()),
+            ("src/empty.rs", b""),
+            ("src/blob.bin", b"\0\x01binary"),
+        ]);
+
+        assert_eq!(
+            tb.read_head_file_capped("src/small.rs", 600, 30_000)
+                .await
+                .as_deref(),
+            Some("1: fn main() {}\n2: const KEY = \"[REDACTED]\";")
+        );
+        // The limits are inclusive.
+        assert_eq!(
+            tb.read_head_file_capped("src/many.rs", 601, 30_000)
+                .await
+                .map(|text| text.lines().count()),
+            Some(601)
+        );
+        for skipped in [
+            "src/many.rs",
+            "src/long.rs",
+            "src/empty.rs",
+            "src/blob.bin",
+            "src/gone.rs",
+            "../etc/passwd",
+        ] {
+            assert_eq!(
+                tb.read_head_file_capped(skipped, 600, 30_000).await,
+                None,
+                "{skipped}"
+            );
         }
     }
 }

@@ -284,7 +284,7 @@ pub(crate) fn submit_findings_tool_def(is_generalist: bool) -> ToolDef {
 /// `args[key]` as an array. Claude models often send an array argument as a JSON-encoded string
 /// inside an otherwise valid tool call, so a string that parses to a JSON array is accepted too;
 /// any other value (or string) yields `None`.
-fn array_arg<'a>(args: &'a Value, key: &str) -> Option<Cow<'a, [Value]>> {
+pub(crate) fn array_arg<'a>(args: &'a Value, key: &str) -> Option<Cow<'a, [Value]>> {
     match args.get(key)? {
         Value::Array(items) => Some(Cow::Borrowed(items.as_slice())),
         Value::String(text) => match serde_json::from_str(text) {
