@@ -3,8 +3,9 @@
 //! violations the loop verifies become findings; they skip the Verifier. The engine runs this
 //! next to the Finder when the repository tools are available.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use adus_core::types::normalize_path;
@@ -117,22 +118,25 @@ pub(crate) fn build_shard_prompts(
 /// A `line` that is a `+` line is kept, with its `start_line` only when both lie in one hunk. A
 /// `line` on another line of a hunk (a context line) moves to the nearest `+` line of that hunk,
 /// the earlier one on a tie, losing its `start_line` and recording the cited line. A `line`
-/// outside every hunk of `range`, or in a hunk without a `+` line, drops the entry.
+/// outside every hunk of `range`, or in a hunk without a `+` line, drops the entry. After
+/// anchoring, only the first entry of each `(rule, line)` pair is kept.
 pub(crate) fn parse_shard_response(
     raw: &str,
     rule_count: usize,
     range: &CommentableRange,
 ) -> Vec<RawShardViolation> {
+    let mut seen = HashSet::new();
     shard_items(raw)
         .unwrap_or_default()
         .iter()
         .filter_map(|item| to_violation(item, rule_count, range))
+        .filter(|violation| seen.insert((violation.rule_index, violation.line)))
         .collect()
 }
 
 /// The first list of violation objects in `raw`. An empty list counts only when no list has
 /// entries, so a `[]` in the lead-in prose cannot hide the real one.
-// ponytail: O(n²) on text with many `{` or `[` that are not JSON; model replies are small.
+// O(n²) on text with many `{` or `[` that are not JSON; fine, since model replies are small.
 fn shard_items(raw: &str) -> Option<Vec<Value>> {
     let mut saw_empty = false;
     for (start, _) in raw.match_indices(['{', '[']) {
@@ -208,12 +212,16 @@ fn anchor(
 pub(crate) struct ShardedRulesOutput {
     /// Verified violations, ready for Semantic Dedup (`needs_verify()` is false).
     pub findings: Vec<CandidateFinding>,
-    /// Shard calls started: changed files with at least one matching enabled rule.
+    /// Shard calls planned: changed files with at least one matching enabled rule (shards
+    /// skipped for the token budget or the deadline included).
     pub shards_run: usize,
     /// Violations the shards claimed, each sent to the evidence loop.
     pub candidates: usize,
     /// Violations the evidence loop verified.
     pub verified: usize,
+    /// A collector failed because the fast model does not support tool calling, so the
+    /// violations not yet checked were dropped unchecked.
+    pub tools_unsupported: bool,
 }
 
 /// Judges every changed file of `files` that has a commentable line in `allowed` (keyed by
@@ -221,7 +229,8 @@ pub(crate) struct ShardedRulesOutput {
 /// loop on each violation the shards claim. Shards run [`SHARD_CONCURRENCY`] at a time by
 /// `deadline`; evidence loops [`RULE_EVIDENCE_CONCURRENCY`] at a time by `deadline` minus
 /// [`RULE_EVIDENCE_DEADLINE_RESERVE`]. A shard or a violation that fails or runs out of time is
-/// dropped (and logged at debug); it never fails the review.
+/// dropped (and logged at debug); it never fails the review. No evidence loop starts once the
+/// token budget is exhausted, or once a collector found the fast model without tool support.
 pub(crate) async fn run_sharded_rules(
     ctx: RuleEvidenceContext<'_>,
     files: &[FileDiff],
@@ -270,13 +279,27 @@ pub(crate) async fn run_sharded_rules(
     let evidence_deadline = deadline
         .checked_sub(RULE_EVIDENCE_DEADLINE_RESERVE)
         .unwrap_or(deadline);
+    // Relaxed: the flag only skips work and orders nothing else.
+    let tools_unsupported = AtomicBool::new(false);
+    let tools_unsupported_ref = &tools_unsupported;
     let checks: Vec<_> = claimed
         .iter()
         .map(|(file, rule, violation)| async move {
+            if tools_unsupported_ref.load(Ordering::Relaxed) {
+                return EvidenceVerdict::Rejected("tools_unsupported");
+            }
+            if ctx.token_budget.is_some_and(|budget| budget.exhausted()) {
+                return EvidenceVerdict::Rejected("token_budget");
+            }
             if Instant::now() >= evidence_deadline {
                 return EvidenceVerdict::Rejected("no_time_left");
             }
-            verify_rule_candidate(ctx, rule, file, violation, files, evidence_deadline).await
+            let verdict =
+                verify_rule_candidate(ctx, rule, file, violation, files, evidence_deadline).await;
+            if verdict == EvidenceVerdict::ToolsUnsupported {
+                tools_unsupported_ref.store(true, Ordering::Relaxed);
+            }
+            verdict
         })
         .collect();
     let verdicts: Vec<EvidenceVerdict> = stream::iter(checks)
@@ -306,6 +329,7 @@ pub(crate) async fn run_sharded_rules(
         findings,
         shards_run,
         candidates,
+        tools_unsupported: tools_unsupported.into_inner(),
     }
 }
 
@@ -412,11 +436,12 @@ mod tests {
 
     use adus_core::types::Severity;
     use adus_git::FileStatus;
-    use adus_llm::router::UsageContext;
+    use adus_llm::router::{ChatError, UsageContext};
     use serde_json::json;
     use uuid::Uuid;
 
     use super::*;
+    use crate::budget::TokenBudget;
     use crate::test_support::{ScriptedChat, call, rule, text_turn, tools_turn, user_text};
     use crate::tools::Toolbox;
     use crate::workspace::RepoWorkspace;
@@ -473,6 +498,19 @@ mod tests {
                 violation(1, 12, Some(10), None),
                 violation(2, 12, None, None)
             ]
+        );
+
+        // Only the first entry of a `(rule, line)` pair is kept, also when a context line
+        // anchors onto it.
+        let got = parse(
+            r#"[{"rule_id": 1, "line": 2, "claim": "c"},
+                {"rule_id": 1, "line": 2, "claim": "again"},
+                {"rule_id": 1, "line": 3, "claim": "c"},
+                {"rule_id": 2, "line": 2, "claim": "c"}]"#,
+        );
+        assert_eq!(
+            got,
+            [violation(0, 2, None, None), violation(1, 2, None, None)]
         );
 
         // Invalid rule ids, off-diff lines, missing claims and a hunk without `+` are dropped.
@@ -626,5 +664,89 @@ mod tests {
             s.body,
             "Rule \"No unwrap\": `x.unwrap()` panics (verified at src/a.rs:2: it calls unwrap)"
         );
+    }
+
+    #[tokio::test]
+    async fn evidence_loops_stop_on_exhausted_budget_or_tool_less_fast_model() {
+        let file = FileDiff {
+            path: "src/a.rs".into(),
+            old_path: None,
+            status: FileStatus::Added,
+            patch: Some("@@ -0,0 +1,5 @@\n+l1\n+l2\n+l3\n+l4\n+l5\n".into()),
+        };
+        let files = std::slice::from_ref(&file);
+        let allowed = HashMap::from([(
+            file.path.clone(),
+            CommentableRange::from_patch(file.patch.as_deref().unwrap_or("")),
+        )]);
+        let toolbox = Toolbox::new(Arc::new(RepoWorkspace::from_files(&[(
+            "src/a.rs",
+            b"l1\nl2\nl3\nl4\nl5\n",
+        )])));
+        let usage = UsageContext::default();
+        let rules = [rule("No l", Severity::Warning, None, true)];
+        // Five distinct violations, more than `RULE_EVIDENCE_CONCURRENCY`, plus a duplicate.
+        let shard_reply = || {
+            text_turn(
+                r#"[{"rule_id": 1, "line": 1, "claim": "c"}, {"rule_id": 1, "line": 1, "claim": "c"},
+                    {"rule_id": 1, "line": 2, "claim": "c"}, {"rule_id": 1, "line": 3, "claim": "c"},
+                    {"rule_id": 1, "line": 4, "claim": "c"}, {"rule_id": 1, "line": 5, "claim": "c"}]"#,
+            )
+        };
+        let tools_unsupported = || Err(ChatError::ToolsUnsupported("no tools".into()));
+        // The shard's 100 input tokens spend this budget.
+        let spent = Arc::new(TokenBudget::new(100));
+
+        let cases = [
+            (
+                "exhausted budget",
+                Some(&spent),
+                vec![shard_reply()],
+                0..=0,
+                false,
+            ),
+            (
+                "tool-less fast model",
+                None,
+                std::iter::once(shard_reply())
+                    .chain(std::iter::repeat_with(tools_unsupported).take(5))
+                    .collect(),
+                1..=RULE_EVIDENCE_CONCURRENCY,
+                true,
+            ),
+        ];
+        for (name, token_budget, script, collector_calls, expect_tools_unsupported) in cases {
+            let chat = ScriptedChat::new(script);
+            let ctx = RuleEvidenceContext {
+                chat: &chat,
+                provider_id: Uuid::from_u128(1),
+                fast_model: "fast-model",
+                usage: &usage,
+                token_budget,
+                toolbox: &toolbox,
+            };
+
+            let out = run_sharded_rules(
+                ctx,
+                files,
+                &allowed,
+                &rules,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .await;
+
+            assert_eq!(
+                (out.shards_run, out.candidates, out.verified),
+                (1, 5, 0),
+                "{name}"
+            );
+            assert_eq!(out.tools_unsupported, expect_tools_unsupported, "{name}");
+            // Every call after the shard is a collector; the fifth violation never starts one.
+            let collectors = chat.requests().len() - 1;
+            assert!(
+                collector_calls.contains(&collectors),
+                "{name}: {collectors} collector calls"
+            );
+        }
     }
 }

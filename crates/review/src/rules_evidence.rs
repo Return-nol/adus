@@ -67,6 +67,8 @@ pub(crate) enum EvidenceVerdict {
     Refuted,
     /// The judge said `violated` but cited no line the collector read.
     UnsupportedCitation,
+    /// The fast model rejected the collector's tool calling.
+    ToolsUnsupported,
     /// Dropped for another reason: the judge's verdict, or why the loop could not finish.
     Rejected(&'static str),
 }
@@ -137,7 +139,7 @@ pub(crate) async fn verify_rule_candidate(
         .await;
         let (submission, excerpts) = match collected {
             Ok(Ok(collected)) => collected,
-            Ok(Err(reason)) => return EvidenceVerdict::Rejected(reason),
+            Ok(Err(verdict)) => return verdict,
             Err(_) => return EvidenceVerdict::Rejected("collector_timeout"),
         };
         tracing::debug!(
@@ -172,14 +174,15 @@ pub(crate) async fn verify_rule_candidate(
     verdict
 }
 
-/// Step A: the collector run and the numbered excerpts it read, in read order.
+/// Step A: the collector run and the numbered excerpts it read, in read order; on failure,
+/// the verdict that drops the violation.
 async fn collect_evidence(
     ctx: RuleEvidenceContext<'_>,
     rule: &Rule,
     file: &FileDiff,
     candidate: &RawShardViolation,
     deadline: Instant,
-) -> Result<(EvidenceSubmission, Vec<ReadExcerpt>), &'static str> {
+) -> Result<(EvidenceSubmission, Vec<ReadExcerpt>), EvidenceVerdict> {
     let llm = AgentLlm {
         chat: ctx.chat,
         provider_id: ctx.provider_id,
@@ -215,10 +218,11 @@ async fn collect_evidence(
                 .collect();
             Ok((outcome.result, excerpts))
         }
-        Err(AgentError::Unparseable(_)) => Err("collector_unparseable"),
+        Err(AgentError::Unparseable(_)) => Err(EvidenceVerdict::Rejected("collector_unparseable")),
+        Err(AgentError::ToolsUnsupported(_)) => Err(EvidenceVerdict::ToolsUnsupported),
         Err(err) => {
             tracing::debug!(error = %err, "rule evidence collector failed");
-            Err("collector_failed")
+            Err(EvidenceVerdict::Rejected("collector_failed"))
         }
     }
 }
@@ -718,6 +722,18 @@ mod tests {
 
         assert_eq!(verify(&chat).await, EvidenceVerdict::Refuted);
         assert_eq!(chat.requests().len(), 2);
+
+        // A high-confidence refutation citing a line the collector never read goes to the judge.
+        let chat = ScriptedChat::new(vec![
+            read_a(),
+            submit(false, "high", "Guard at src/b.rs:4 handles it"),
+            text_turn(
+                r#"{"verdict": "satisfied", "path": "src/a.rs", "line": 4, "rationale": "ok"}"#,
+            ),
+        ]);
+
+        assert_eq!(verify(&chat).await, EvidenceVerdict::Rejected("satisfied"));
+        assert_eq!(chat.requests().len(), 3);
     }
 
     #[test]

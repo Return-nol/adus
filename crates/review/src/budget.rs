@@ -23,7 +23,8 @@ pub(crate) struct TokenBudget {
     cache_read: AtomicU64,
     /// Input tokens written to the prompt cache, for the stage log.
     cache_write: AtomicU64,
-    /// Agent runs (Finder or Verifier) that wrapped up early because of the budget.
+    /// Agent runs (Finder, Verifier or rule evidence collector) that wrapped up early because
+    /// the budget was exhausted (budget-driven wrap-ups only).
     wrap_ups: AtomicUsize,
     /// Verifier candidates checked diff-only instead of with the repository tools.
     diff_only_verifications: AtomicUsize,

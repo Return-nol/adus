@@ -69,6 +69,9 @@ const CODEBASE_UNAVAILABLE: &str = "Codebase context unavailable — reviewed di
 const SMALL_PR_NOTE: &str = "Small change — reviewed diff only";
 /// Summary note when the model rejected tool calling.
 const TOOLS_UNSUPPORTED: &str = "Model does not support tool calling — reviewed diff only";
+/// Summary note when the fast model rejected the rule evidence collector's tool calling.
+const RULES_TOOLS_UNSUPPORTED: &str =
+    "Team rules not checked — the fast model does not support tool calling";
 /// Last line of a comment whose suggestion was dropped because it held a secret.
 const SUGGESTION_OMITTED: &str =
     "_Suggested code omitted: it contained a value that looks like a secret._";
@@ -611,6 +614,7 @@ impl Engine {
             shards_run: rule_shards,
             candidates: rule_candidates,
             verified: rule_verified,
+            tools_unsupported: rules_tools_unsupported,
         } = sharded_rules;
         // Read now: the summary names Finder wrap-ups only, not the Verifier's.
         let finder_wrap_ups = s.token_budget.wrap_ups();
@@ -622,12 +626,17 @@ impl Engine {
             .map(|task| task.batch)
             .collect::<HashSet<_>>()
             .len();
-        // Without tool support the Verifier works from the diff as well.
+        // Without tool support the Verifier works from the diff as well, and the diff-only
+        // Finder re-run checks `<rules>`; otherwise rules a tool-less fast model could not
+        // check stay unchecked.
         let verifier_toolbox = if finder.tools_unsupported {
             warnings.push(TOOLS_UNSUPPORTED.into());
             fallback_reason = Some("tools_unsupported");
             None
         } else {
+            if rules_tools_unsupported {
+                warnings.push(RULES_TOOLS_UNSUPPORTED.into());
+            }
             toolbox.as_ref()
         };
         let finder_tasks = finder.tasks.len();
