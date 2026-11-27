@@ -613,7 +613,7 @@ async fn post_review_thread_context_has_leading_slash() {
         .post_review(&repo(), &pr(), &comments, "summary")
         .await
         .unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(n.len(), 1);
 
     let threads = captured_threads(&server).await;
     assert_eq!(
@@ -674,7 +674,7 @@ async fn post_review_posts_multiline_thread_context() {
         .post_review(&repo(), &pr(), &comments, "summary")
         .await
         .unwrap();
-    assert_eq!(n, 3);
+    assert_eq!(n.len(), 3);
 
     let threads = captured_threads(&server).await;
     assert_eq!(

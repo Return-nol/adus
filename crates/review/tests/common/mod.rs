@@ -9,7 +9,7 @@ use adus_db::connections::{self, ConnectionStatus};
 use adus_db::{repositories, settings};
 use adus_git::{
     CloneSpec, FileDiff, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
-    PrThread, PullRequest, RemoteRepo, RepoRef,
+    PostedComment, PrThread, PullRequest, RemoteRepo, RepoRef, ThreadRef, ThreadStatus,
 };
 use adus_llm::router::ChatService;
 use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
@@ -62,6 +62,12 @@ pub struct GitState {
     pub threads: Vec<PrThread>,
     /// When set, `list_pr_threads` fails with this error.
     pub threads_error: Option<GitError>,
+    /// `(thread, body)` of each `reply_in_thread`.
+    pub posted_threads: Vec<(ThreadRef, String)>,
+    /// Each `set_thread_status`.
+    pub statuses: Vec<(ThreadRef, ThreadStatus)>,
+    /// Result of `get_thread` (`None`: `NotFound`).
+    pub thread: Option<PrThread>,
 }
 
 /// Provider git palsu sekaligus pabriknya. Clone berbagi keadaan yang sama.
@@ -91,6 +97,9 @@ impl FakeGit {
                 clone_spec: None,
                 threads: Vec::new(),
                 threads_error: None,
+                posted_threads: Vec::new(),
+                statuses: Vec::new(),
+                thread: None,
             })),
         }
     }
@@ -201,7 +210,7 @@ impl GitProvider for FakeGit {
         _pr: &PullRequest,
         comments: &[InlineComment],
         summary: &str,
-    ) -> Result<usize, GitError> {
+    ) -> Result<Vec<PostedComment>, GitError> {
         let mut state = self.state();
         if let Some(err) = &state.post_error {
             return Err(err.clone());
@@ -217,7 +226,48 @@ impl GitProvider for FakeGit {
             "fake post_review"
         );
         state.reviews.push(review);
-        Ok(count)
+        Ok((0..count)
+            .map(|i| PostedComment {
+                index: i,
+                thread_id: Some(format!("t{i}")),
+                comment_id: format!("c{i}"),
+            })
+            .collect())
+    }
+
+    /// Returns `r{n}`, `n` = replies so far.
+    async fn reply_in_thread(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        thread: &ThreadRef,
+        body: &str,
+    ) -> Result<String, GitError> {
+        let mut state = self.state();
+        state
+            .posted_threads
+            .push((thread.clone(), body.to_string()));
+        Ok(format!("r{}", state.posted_threads.len() - 1))
+    }
+
+    async fn set_thread_status(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        thread: &ThreadRef,
+        status: ThreadStatus,
+    ) -> Result<(), GitError> {
+        self.state().statuses.push((thread.clone(), status));
+        Ok(())
+    }
+
+    async fn get_thread(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        _thread: &ThreadRef,
+    ) -> Result<PrThread, GitError> {
+        self.state().thread.clone().ok_or(GitError::NotFound)
     }
 
     async fn post_comment(

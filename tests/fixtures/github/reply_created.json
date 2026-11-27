@@ -1,0 +1,22 @@
+{
+  "url": "https://api.github.com/repos/octocat/alpha/pulls/comments/103",
+  "pull_request_review_id": 56,
+  "id": 103,
+  "node_id": "PRRC_kwDOAAABc84AAAABZw",
+  "diff_hunk": "@@ -10,3 +10,4 @@ fn main() {",
+  "path": "src/a.rs",
+  "commit_id": "headsha",
+  "original_commit_id": "headsha",
+  "in_reply_to_id": 101,
+  "user": { "login": "octocat", "id": 4242, "type": "User" },
+  "body": "<!-- adudu -->\n🤖 **Adudu**\nThanks, noted.",
+  "created_at": "2026-11-27T11:00:00Z",
+  "updated_at": "2026-11-27T11:00:00Z",
+  "html_url": "https://github.com/octocat/alpha/pull/7#discussion_r103",
+  "pull_request_url": "https://api.github.com/repos/octocat/alpha/pulls/7",
+  "author_association": "OWNER",
+  "line": 12,
+  "original_line": 12,
+  "side": "RIGHT",
+  "subject_type": "line"
+}

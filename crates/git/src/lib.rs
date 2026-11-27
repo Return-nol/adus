@@ -11,8 +11,8 @@ pub use adus_core::types::{ConnectionKind, normalize_path};
 pub use azure::AzureProvider;
 pub use github::GithubProvider;
 pub use types::{
-    CloneSpec, FileDiff, FileStatus, GitError, InlineComment, PatOwner, PrThread, PrThreadComment,
-    PullRequest, RemoteRepo, RepoRef,
+    CloneSpec, FileDiff, FileStatus, GitError, InlineComment, PatOwner, PostedComment, PrThread,
+    PrThreadComment, PullRequest, RemoteRepo, RepoRef, ThreadRef, ThreadStatus,
 };
 
 #[async_trait]
@@ -44,14 +44,38 @@ pub trait GitProvider: Send + Sync {
         base_sha: &str,
         head_sha: &str,
     ) -> Result<Vec<FileDiff>, GitError>;
-    /// Satu review/batch komentar inline + satu komentar ringkasan. Return jumlah inline yang terposting.
+    /// One review/batch of inline comments + one summary comment. Returns the provider ids of
+    /// the inline comments it could identify (its length is the posted count).
     async fn post_review(
         &self,
         repo: &RepoRef,
         pr: &PullRequest,
         comments: &[InlineComment],
         summary: &str,
-    ) -> Result<usize, GitError>;
+    ) -> Result<Vec<PostedComment>, GitError>;
+    /// Replies inside a thread. Returns the new comment id.
+    async fn reply_in_thread(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        thread: &ThreadRef,
+        body: &str,
+    ) -> Result<String, GitError>;
+    /// Sets the thread status. GitHub has only resolved/unresolved.
+    async fn set_thread_status(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        thread: &ThreadRef,
+        status: ThreadStatus,
+    ) -> Result<(), GitError>;
+    /// The current comments of one thread, oldest first.
+    async fn get_thread(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        thread: &ThreadRef,
+    ) -> Result<PrThread, GitError>;
     async fn post_comment(
         &self,
         repo: &RepoRef,

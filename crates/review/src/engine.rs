@@ -473,7 +473,9 @@ impl Engine {
                     .post_review(&repo_ref, &pr, &output.comments, &summary)
                     .await
                 {
-                    Ok(posted) => Ok(Outcome::Done { posted }),
+                    Ok(posted) => Ok(Outcome::Done {
+                        posted: posted.len(),
+                    }),
                     Err(err) => Err(self.post_error(&conn, err).await),
                 }
             };

@@ -1751,11 +1751,14 @@ const ALREADY_RAISED_NOTE: &str = "1 finding(s) skipped: already raised in this 
 async fn setup_with_discussion(pool: &PgPool) -> Setup {
     let s = setup_files(pool, vec![file("src/a.rs", PATCH_234)]).await;
     s.git.state().threads = vec![PrThread {
+        id: None,
+        resolved: false,
         path: Some("src/a.rs".into()),
         line: Some(3),
         status: None,
         url: None,
         comments: vec![PrThreadComment {
+            id: String::new(),
             author: "bob".into(),
             by_adus: false,
             body: "This can overflow.".into(),

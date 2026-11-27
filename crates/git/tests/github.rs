@@ -1,8 +1,11 @@
 use adus_git::{
-    FileStatus, GitError, GitProvider, GithubProvider, InlineComment, PullRequest, RepoRef,
+    FileStatus, GitError, GitProvider, GithubProvider, InlineComment, PostedComment, PullRequest,
+    RepoRef, ThreadRef, ThreadStatus,
 };
 use serde_json::{Value, json};
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{
+    body_json, body_partial_json, body_string_contains, header, method, path, query_param,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture(name: &str) -> String {
@@ -401,7 +404,7 @@ async fn diff_between_reads_compare_files() {
 }
 
 #[tokio::test]
-async fn post_review_sends_right_side_lines() {
+async fn post_review_returns_comment_ids() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/repos/octocat/alpha/pulls/7/reviews"))
@@ -414,7 +417,14 @@ async fn post_review_sends_right_side_lines() {
                 { "path": "src/b.rs", "line": 3, "side": "RIGHT", "body": "oke?" },
             ],
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 1 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 55 })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/pulls/7/reviews/55/comments"))
+        .and(query_param("per_page", "100"))
+        .respond_with(json_body("review_comments_of_review.json"))
         .expect(1)
         .mount(&server)
         .await;
@@ -435,11 +445,25 @@ async fn post_review_sends_right_side_lines() {
             body: "oke?".into(),
         },
     ];
-    let n = provider(&server)
+    let posted = provider(&server)
         .post_review(&repo(), &pr(), &comments, "ringkasan")
         .await
         .unwrap();
-    assert_eq!(n, 2);
+    assert_eq!(
+        posted,
+        [
+            PostedComment {
+                index: 0,
+                thread_id: None,
+                comment_id: "101".into(),
+            },
+            PostedComment {
+                index: 1,
+                thread_id: None,
+                comment_id: "102".into(),
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -502,11 +526,13 @@ async fn post_review_sends_multiline_start_line_and_drops_invalid_start_line() {
             body: "inverted".into(),
         },
     ];
-    let n = provider(&server)
+    // The review's comments cannot be read back (404): the posted review still succeeds,
+    // without ids, so the job does not retry and post it twice.
+    let posted = provider(&server)
         .post_review(&repo(), &pr(), &comments, "summary")
         .await
         .unwrap();
-    assert_eq!(n, 3);
+    assert!(posted.is_empty());
 }
 
 #[tokio::test]
@@ -519,11 +545,11 @@ async fn post_review_without_comments_still_posts_summary() {
         .mount(&server)
         .await;
 
-    let n = provider(&server)
+    let posted = provider(&server)
         .post_review(&repo(), &pr(), &[], "ringkasan")
         .await
         .unwrap();
-    assert_eq!(n, 0);
+    assert!(posted.is_empty());
 }
 
 #[tokio::test]
@@ -782,6 +808,11 @@ async fn list_pr_threads_groups_review_comments_by_reply() {
         .iter()
         .find(|t| t.path.as_deref() == Some("src/a.rs"))
         .unwrap();
+    assert_eq!(
+        a.id.as_deref(),
+        Some("101"),
+        "thread id = root review comment id"
+    );
     assert_eq!(a.line, Some(12));
     assert_eq!(a.status, None);
     assert_eq!(
@@ -805,6 +836,12 @@ async fn list_pr_threads_groups_review_comments_by_reply() {
         .map(|t| t.comments[0].body.as_str())
         .collect();
     assert_eq!(top.len(), 2, "issue comment + one non-empty review body");
+    assert!(
+        threads
+            .iter()
+            .filter(|t| t.path.is_none())
+            .all(|t| t.id.is_none())
+    );
     assert!(top.contains(&"Looks fine overall."));
     assert!(top.contains(&"Please split this PR."));
 }
@@ -855,4 +892,107 @@ async fn list_pr_threads_401_is_unauthorized() {
         .await
         .unwrap_err();
     assert_eq!(err, GitError::Unauthorized);
+}
+
+fn thread_ref(root: &str) -> ThreadRef {
+    ThreadRef {
+        thread_id: root.into(),
+        root_comment_id: root.into(),
+    }
+}
+
+async fn mount_review_threads_query(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("reviewThreads"))
+        .and(body_partial_json(json!({
+            "variables": { "owner": "octocat", "name": "alpha", "number": 7 }
+        })))
+        .respond_with(json_body("review_threads_graphql.json"))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn reply_in_thread_posts_reply() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/alpha/pulls/7/comments/101/replies"))
+        .and(body_json(json!({ "body": "Thanks, noted." })))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_raw(fixture("reply_created.json"), "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let id = provider(&server)
+        .reply_in_thread(&repo(), 7, &thread_ref("101"), "Thanks, noted.")
+        .await
+        .unwrap();
+    assert_eq!(id, "103");
+}
+
+#[tokio::test]
+async fn set_thread_status_resolves_via_graphql() {
+    for (status, mutation) in [
+        (ThreadStatus::Fixed, "{ resolveReviewThread("),
+        (ThreadStatus::ByDesign, "{ resolveReviewThread("),
+        (ThreadStatus::Active, "{ unresolveReviewThread("),
+    ] {
+        let server = MockServer::start().await;
+        mount_review_threads_query(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains(mutation))
+            .and(body_partial_json(
+                json!({ "variables": { "id": "PRRT_x" } }),
+            ))
+            .respond_with(json_body("resolve_review_thread.json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        provider(&server)
+            .set_thread_status(&repo(), 7, &thread_ref("101"), status)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn set_thread_status_unknown_thread_is_not_found() {
+    let server = MockServer::start().await;
+    mount_review_threads_query(&server).await;
+
+    let err = provider(&server)
+        .set_thread_status(&repo(), 7, &thread_ref("999"), ThreadStatus::Fixed)
+        .await
+        .unwrap_err();
+    assert_eq!(err, GitError::NotFound);
+}
+
+#[tokio::test]
+async fn get_thread_collects_replies_and_resolution() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/pulls/7/comments"))
+        .and(query_param("per_page", "100"))
+        .respond_with(json_body("pr_review_comments.json"))
+        .mount(&server)
+        .await;
+    mount_review_threads_query(&server).await;
+
+    let thread = provider(&server)
+        .get_thread(&repo(), 7, &thread_ref("101"))
+        .await
+        .unwrap();
+    assert_eq!(thread.id.as_deref(), Some("101"));
+    assert!(thread.resolved);
+    assert_eq!(thread.path.as_deref(), Some("src/a.rs"));
+    assert_eq!(thread.line, Some(12));
+    let ids: Vec<&str> = thread.comments.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["101", "103"], "the unrelated thread 102 is left out");
 }

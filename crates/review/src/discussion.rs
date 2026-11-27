@@ -91,11 +91,14 @@ mod tests {
 
     fn thread(path: Option<&str>, body: &str) -> PrThread {
         PrThread {
+            id: None,
+            resolved: false,
             path: path.map(str::to_string),
             line: path.map(|_| 2),
             status: None,
             url: None,
             comments: vec![PrThreadComment {
+                id: String::new(),
                 author: "alice".into(),
                 by_adus: false,
                 body: body.into(),
@@ -138,6 +141,7 @@ mod tests {
     fn format_threads_marks_adus_and_cuts() {
         let mut long = thread(Some("src/a.rs"), &"x".repeat(1_500));
         long.comments.push(PrThreadComment {
+            id: String::new(),
             author: "pat-user".into(),
             by_adus: true,
             body: "earlier finding".into(),

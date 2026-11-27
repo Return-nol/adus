@@ -126,6 +126,7 @@ async fn setup(
 
 fn comment(author: &str, by_adus: bool, body: &str) -> PrThreadComment {
     PrThreadComment {
+        id: String::new(),
         author: author.into(),
         by_adus,
         body: body.into(),
@@ -135,6 +136,8 @@ fn comment(author: &str, by_adus: bool, body: &str) -> PrThreadComment {
 /// Adus flags something and `defender` answers that it is intentional.
 fn rebutted(defender: &str, url: &str) -> PrThread {
     PrThread {
+        id: None,
+        resolved: false,
         path: Some("src/a.rs".into()),
         line: Some(3),
         status: None,

@@ -13,9 +13,9 @@ use adus_core::types::is_adus_comment;
 
 use crate::diff::unified_patch;
 use crate::{
-    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PrThread,
-    PrThreadComment, PullRequest, RemoteRepo, RepoRef, basic_auth_header, decode, git_url,
-    normalize_path,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PostedComment,
+    PrThread, PrThreadComment, PullRequest, RemoteRepo, RepoRef, ThreadRef, ThreadStatus,
+    basic_auth_header, decode, git_url, normalize_path,
 };
 
 const API_VERSION: &str = "7.1";
@@ -372,6 +372,8 @@ impl AzThread {
                 let author = c.author.and_then(|a| a.unique_name)?;
                 let body = c.content.unwrap_or_default();
                 Some(PrThreadComment {
+                    // ponytail: ids filled by Task 4 (Azure thread operations).
+                    id: String::new(),
                     author,
                     by_adus: is_adus_comment(&body),
                     body,
@@ -383,6 +385,8 @@ impl AzThread {
         }
         let ctx = self.thread_context;
         Some(PrThread {
+            id: None,
+            resolved: false,
             path: ctx
                 .as_ref()
                 .and_then(|c| c.file_path.as_deref())
@@ -684,14 +688,14 @@ impl GitProvider for AzureProvider {
     }
 
     /// Satu thread per komentar inline (path diberi `/` di depan), lalu satu thread ringkasan
-    /// tanpa `threadContext`. Return jumlah thread inline.
+    /// tanpa `threadContext`. Ids are empty until Task 4 reads them from the responses.
     async fn post_review(
         &self,
         repo: &RepoRef,
         pr: &PullRequest,
         comments: &[InlineComment],
         summary: &str,
-    ) -> Result<usize, GitError> {
+    ) -> Result<Vec<PostedComment>, GitError> {
         for c in comments {
             let (start_line, end_offset) = match c.start_line.filter(|&s| s < c.line) {
                 Some(start) => (start, c.end_offset.filter(|&o| o >= 1).unwrap_or(1)),
@@ -707,7 +711,42 @@ impl GitProvider for AzureProvider {
         }
         self.post_thread(repo, pr.number, &thread_body(summary, None))
             .await?;
-        Ok(comments.len())
+        Ok((0..comments.len())
+            .map(|index| PostedComment {
+                index,
+                thread_id: None,
+                comment_id: String::new(),
+            })
+            .collect())
+    }
+
+    async fn reply_in_thread(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        _thread: &ThreadRef,
+        _body: &str,
+    ) -> Result<String, GitError> {
+        Err(GitError::Status(501))
+    }
+
+    async fn set_thread_status(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        _thread: &ThreadRef,
+        _status: ThreadStatus,
+    ) -> Result<(), GitError> {
+        Err(GitError::Status(501))
+    }
+
+    async fn get_thread(
+        &self,
+        _repo: &RepoRef,
+        _pr_number: i64,
+        _thread: &ThreadRef,
+    ) -> Result<PrThread, GitError> {
+        Err(GitError::Status(501))
     }
 
     async fn post_comment(
