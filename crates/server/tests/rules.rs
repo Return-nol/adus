@@ -541,3 +541,191 @@ async fn list_filters_by_status(pool: PgPool) {
     assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(reply.body["error"]["code"], "validation_error");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn memory_roundtrips_new_fields(pool: PgPool) {
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+
+    // Create with new optional fields (trimmed) and kind; blank optional text -> null.
+    let body = json!({
+        "scope": "global",
+        "content": "Avoid blocking calls",
+        "kind": "fix_pattern",
+        "context": "  Found in handler  ",
+        "reason": "   ",
+        "resolution": "  Use spawn_blocking  "
+    });
+    let created = post(&app, "/api/v1/memories", &body, &admin).await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.body["kind"], "fix_pattern");
+    assert_eq!(created.body["context"], "Found in handler");
+    assert_eq!(created.body["reason"], Value::Null);
+    assert_eq!(created.body["resolution"], "Use spawn_blocking");
+    assert_eq!(created.body["evidence"], json!([]));
+    assert_eq!(created.body["supersedes"], Value::Null);
+    assert_eq!(created.body["superseded_by"], Value::Null);
+
+    let id = created.body["id"].as_str().unwrap();
+    let list = send(&app, get("/api/v1/memories", Some(&admin))).await;
+    assert_eq!(list.body[0]["id"], id);
+    assert_eq!(list.body[0]["kind"], "fix_pattern");
+    assert_eq!(list.body[0]["context"], "Found in handler");
+
+    // Patch: update kind and reason, omit context (kept), clear resolution with null.
+    let uri = format!("/api/v1/memories/{id}");
+    let patched = patch(
+        &app,
+        &uri,
+        &json!({ "kind": "exception", "reason": "  Perf critical  ", "resolution": null }),
+        &admin,
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::OK);
+    assert_eq!(patched.body["kind"], "exception");
+    assert_eq!(patched.body["context"], "Found in handler");
+    assert_eq!(patched.body["reason"], "Perf critical");
+    assert_eq!(patched.body["resolution"], Value::Null);
+
+    // Patch: clear context with blank string.
+    let cleared = patch(&app, &uri, &json!({ "context": "  " }), &admin).await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert_eq!(cleared.body["context"], Value::Null);
+    assert_eq!(cleared.body["reason"], "Perf critical");
+
+    // Validation: > 2000 chars on optional fields -> 422.
+    let too_long = "x".repeat(2001);
+    let bad_create = post(
+        &app,
+        "/api/v1/memories",
+        &json!({ "scope": "global", "content": "ok", "context": too_long }),
+        &admin,
+    )
+    .await;
+    assert_eq!(bad_create.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(bad_create.body["error"]["code"], "validation_error");
+
+    let bad_patch = patch(&app, &uri, &json!({ "resolution": too_long }), &admin).await;
+    assert_eq!(bad_patch.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(bad_patch.body["error"]["code"], "validation_error");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_filters_by_kind(pool: PgPool) {
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+
+    let conv = post(
+        &app,
+        "/api/v1/memories",
+        &json!({ "scope": "global", "content": "c" }),
+        &admin,
+    )
+    .await;
+    assert_eq!(conv.body["kind"], "convention");
+    let exc = post(
+        &app,
+        "/api/v1/memories",
+        &json!({ "scope": "global", "content": "e", "kind": "exception" }),
+        &admin,
+    )
+    .await;
+    let fix = post(
+        &app,
+        "/api/v1/memories",
+        &json!({ "scope": "global", "content": "f", "kind": "fix_pattern" }),
+        &admin,
+    )
+    .await;
+
+    for (kind, expected_id) in [
+        ("convention", conv.body["id"].as_str().unwrap()),
+        ("exception", exc.body["id"].as_str().unwrap()),
+        ("fix_pattern", fix.body["id"].as_str().unwrap()),
+    ] {
+        let reply = send(
+            &app,
+            get(&format!("/api/v1/memories?kind={kind}"), Some(&admin)),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(ids(&reply.body), [expected_id]);
+    }
+
+    let bad = send(&app, get("/api/v1/memories?kind=nope", Some(&admin))).await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(bad.body["error"]["code"], "validation_error");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn approve_supersedes_target(pool: PgPool) {
+    let target = memories::insert(
+        &pool,
+        NewMemory {
+            scope: KnowledgeScope::Global,
+            repository_id: None,
+            content: "old rule",
+            source: MemorySource::PrLearning,
+            source_url: None,
+            created_by: None,
+            status: MemoryStatus::Active,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes: None,
+        },
+    )
+    .await
+    .unwrap();
+    let evidence = [memories::Evidence {
+        url: "https://example.com/pr/12".into(),
+        pr_number: Some(12),
+    }];
+    let replacement = memories::insert(
+        &pool,
+        NewMemory {
+            scope: KnowledgeScope::Global,
+            repository_id: None,
+            content: "new rule",
+            source: MemorySource::PrLearning,
+            source_url: None,
+            created_by: None,
+            status: MemoryStatus::Pending,
+            kind: MemoryKind::Convention,
+            context: Some("updated context"),
+            reason: None,
+            resolution: None,
+            evidence: &evidence,
+            supersedes: Some(target.id),
+        },
+    )
+    .await
+    .unwrap();
+
+    let app = app(pool).await;
+    let admin = setup_admin(&app).await;
+
+    let approved = post(
+        &app,
+        &format!("/api/v1/memories/{}/approve", replacement.id),
+        &json!({}),
+        &admin,
+    )
+    .await;
+    assert_eq!(approved.status, StatusCode::OK);
+    assert_eq!(approved.body["status"], "active");
+    assert_eq!(approved.body["supersedes"], target.id.to_string());
+    assert_eq!(approved.body["evidence"][0]["pr_number"], 12);
+
+    let list = send(&app, get("/api/v1/memories", Some(&admin))).await;
+    let old = list
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == target.id.to_string())
+        .unwrap();
+    assert_eq!(old["superseded_by"], replacement.id.to_string());
+}

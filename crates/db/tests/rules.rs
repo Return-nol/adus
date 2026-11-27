@@ -179,7 +179,12 @@ async fn soft_deleted_repo_rules_and_memories_are_hidden(pool: PgPool) {
     assert_eq!(titles(&rules::list_all(&pool).await.unwrap()), ["global"]);
     assert!(rules::list(&pool, Some(repo)).await.unwrap().is_empty());
     assert!(memories::applicable(&pool, repo).await.unwrap().is_empty());
-    assert!(memories::list_all(&pool, None).await.unwrap().is_empty());
+    assert!(
+        memories::list_all(&pool, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

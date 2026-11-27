@@ -126,15 +126,15 @@ async fn list_hides_rejected_unless_asked(pool: PgPool) {
     add(&pool, repo, "pending", MemoryStatus::Pending).await;
     add(&pool, repo, "rejected", MemoryStatus::Rejected).await;
 
-    let got = memories::list(&pool, Some(repo), None).await.unwrap();
+    let got = memories::list(&pool, Some(repo), None, None).await.unwrap();
     assert_eq!(contents(&got), ["active", "pending"]);
-    let got = memories::list(&pool, Some(repo), Some(MemoryStatus::Rejected))
+    let got = memories::list(&pool, Some(repo), Some(MemoryStatus::Rejected), None)
         .await
         .unwrap();
     assert_eq!(contents(&got), ["rejected"]);
-    let got = memories::list_all(&pool, None).await.unwrap();
+    let got = memories::list_all(&pool, None, None).await.unwrap();
     assert_eq!(contents(&got), ["active", "pending"]);
-    let got = memories::list_all(&pool, Some(MemoryStatus::Pending))
+    let got = memories::list_all(&pool, Some(MemoryStatus::Pending), None)
         .await
         .unwrap();
     assert_eq!(contents(&got), ["pending"]);

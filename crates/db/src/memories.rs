@@ -94,9 +94,9 @@ pub struct MemoryPatch {
     pub content: Option<String>,
     pub enabled: Option<bool>,
     pub kind: Option<MemoryKind>,
-    pub context: Option<String>,
-    pub reason: Option<String>,
-    pub resolution: Option<String>,
+    pub context: Option<Option<String>>,
+    pub reason: Option<Option<String>>,
+    pub resolution: Option<Option<String>>,
 }
 
 // `email` bertipe citext; cast ke text supaya cocok dengan String.
@@ -113,6 +113,10 @@ const ACTIVE_REPO: &str = "(repository_id IS NULL \
 // Filter status untuk `list` / `list_all`; parameter NULL = semua kecuali `rejected`.
 fn status_filter(param: &str) -> String {
     format!("(status = {param} OR ({param}::memory_status IS NULL AND status <> 'rejected'))")
+}
+
+fn kind_filter(param: &str) -> String {
+    format!("(kind = {param} OR {param}::memory_kind IS NULL)")
 }
 
 /// An `active` memory that `supersedes` another retires it in the same statement.
@@ -158,26 +162,35 @@ pub async fn list(
     pool: &PgPool,
     repository_id: Option<Uuid>,
     status: Option<MemoryStatus>,
+    kind: Option<MemoryKind>,
 ) -> Result<Vec<Memory>> {
     sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM memories \
-         WHERE repository_id IS NOT DISTINCT FROM $1 AND {ACTIVE_REPO} AND {} \
+         WHERE repository_id IS NOT DISTINCT FROM $1 AND {ACTIVE_REPO} AND {} AND {} \
          ORDER BY created_at, id",
-        status_filter("$2")
+        status_filter("$2"),
+        kind_filter("$3")
     ))
     .bind(repository_id)
     .bind(status)
+    .bind(kind)
     .fetch_all(pool)
     .await
 }
 
 /// Semua memory: global dan semua repo aktif. `status` `None` = semua kecuali `rejected`.
-pub async fn list_all(pool: &PgPool, status: Option<MemoryStatus>) -> Result<Vec<Memory>> {
+pub async fn list_all(
+    pool: &PgPool,
+    status: Option<MemoryStatus>,
+    kind: Option<MemoryKind>,
+) -> Result<Vec<Memory>> {
     sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM memories WHERE {ACTIVE_REPO} AND {} ORDER BY created_at, id",
-        status_filter("$1")
+        "SELECT {COLUMNS} FROM memories WHERE {ACTIVE_REPO} AND {} AND {} ORDER BY created_at, id",
+        status_filter("$1"),
+        kind_filter("$2")
     ))
     .bind(status)
+    .bind(kind)
     .fetch_all(pool)
     .await
 }
@@ -188,18 +201,21 @@ pub async fn update(pool: &PgPool, id: Uuid, patch: MemoryPatch) -> Result<Optio
            content = COALESCE($2, content), \
            enabled = COALESCE($3, enabled), \
            kind = COALESCE($4, kind), \
-           context = COALESCE($5, context), \
-           reason = COALESCE($6, reason), \
-           resolution = COALESCE($7, resolution) \
+           context = CASE WHEN $5 THEN $6 ELSE context END, \
+           reason = CASE WHEN $7 THEN $8 ELSE reason END, \
+           resolution = CASE WHEN $9 THEN $10 ELSE resolution END \
          WHERE id = $1 RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(patch.content)
     .bind(patch.enabled)
     .bind(patch.kind)
-    .bind(patch.context)
-    .bind(patch.reason)
-    .bind(patch.resolution)
+    .bind(patch.context.is_some())
+    .bind(patch.context.flatten())
+    .bind(patch.reason.is_some())
+    .bind(patch.reason.flatten())
+    .bind(patch.resolution.is_some())
+    .bind(patch.resolution.flatten())
     .fetch_optional(pool)
     .await
 }

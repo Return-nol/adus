@@ -1,5 +1,7 @@
 use adus_db::{
-    memories::{self, Memory, MemoryKind, MemoryPatch, MemorySource, MemoryStatus, NewMemory},
+    memories::{
+        self, Evidence, Memory, MemoryKind, MemoryPatch, MemorySource, MemoryStatus, NewMemory,
+    },
     rules::KnowledgeScope,
     users::{Role, User},
 };
@@ -13,7 +15,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::rules::{check_repo, check_scope, trimmed};
+use super::{
+    repositories::present_or_null,
+    rules::{check_repo, check_scope, trimmed},
+};
 use crate::{
     auth::{AdminUser, CurrentUser},
     error::{ApiError, ApiJson, ApiPath, ApiQuery},
@@ -38,6 +43,8 @@ struct ListQuery {
     all: bool,
     /// String, bukan enum: nilai tak dikenal harus 422, bukan 400 dari `ApiQuery`.
     status: Option<String>,
+    /// String, bukan enum: nilai tak dikenal harus 422, bukan 400 dari `ApiQuery`.
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -51,12 +58,26 @@ struct CreateMemory {
     scope: KnowledgeScope,
     repository_id: Option<Uuid>,
     content: String,
+    kind: Option<MemoryKind>,
+    context: Option<String>,
+    reason: Option<String>,
+    resolution: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct UpdateMemory {
     content: Option<String>,
     enabled: Option<bool>,
+    kind: Option<MemoryKind>,
+    /// Ada dan `null` (atau kosong) = hapus; tidak ada = biarkan.
+    #[serde(default, deserialize_with = "present_or_null")]
+    context: Option<Option<String>>,
+    /// Ada dan `null` (atau kosong) = hapus; tidak ada = biarkan.
+    #[serde(default, deserialize_with = "present_or_null")]
+    reason: Option<Option<String>>,
+    /// Ada dan `null` (atau kosong) = hapus; tidak ada = biarkan.
+    #[serde(default, deserialize_with = "present_or_null")]
+    resolution: Option<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +97,13 @@ struct MemoryJson {
     created_by: Option<CreatorJson>,
     enabled: bool,
     status: MemoryStatus,
+    kind: MemoryKind,
+    context: Option<String>,
+    reason: Option<String>,
+    resolution: Option<String>,
+    evidence: Vec<Evidence>,
+    supersedes: Option<Uuid>,
+    superseded_by: Option<Uuid>,
     created_at: DateTime<Utc>,
 }
 
@@ -94,9 +122,41 @@ impl From<Memory> for MemoryJson {
                 .map(|(id, email)| CreatorJson { id, email }),
             enabled: m.enabled,
             status: m.status,
+            kind: m.kind,
+            context: m.context,
+            reason: m.reason,
+            resolution: m.resolution,
+            evidence: m.evidence,
+            supersedes: m.supersedes,
+            superseded_by: m.superseded_by,
             created_at: m.created_at,
         }
     }
+}
+
+fn optional_trimmed(
+    field: &str,
+    raw: Option<&str>,
+    max: usize,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > max {
+        return Err(ApiError::validation(format!(
+            "{field} must be between 1 and {max} characters"
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn patch_optional_text(
+    field: &str,
+    raw: Option<Option<String>>,
+    max: usize,
+) -> Result<Option<Option<String>>, ApiError> {
+    raw.map(|inner| optional_trimmed(field, inner.as_deref(), max))
+        .transpose()
 }
 
 async fn list(
@@ -115,11 +175,22 @@ async fn list(
             ));
         }
     };
+    let kind = match query.kind.as_deref() {
+        None => None,
+        Some("convention") => Some(MemoryKind::Convention),
+        Some("exception") => Some(MemoryKind::Exception),
+        Some("fix_pattern") => Some(MemoryKind::FixPattern),
+        Some(_) => {
+            return Err(ApiError::validation(
+                "kind must be convention, exception or fix_pattern",
+            ));
+        }
+    };
     let found = if query.all {
-        memories::list_all(&state.db, status).await?
+        memories::list_all(&state.db, status, kind).await?
     } else {
         check_repo(&state, query.repository_id).await?;
-        memories::list(&state.db, query.repository_id, status).await?
+        memories::list(&state.db, query.repository_id, status, kind).await?
     };
     Ok(Json(found.into_iter().map(MemoryJson::from).collect()))
 }
@@ -130,6 +201,9 @@ async fn create(
     ApiJson(body): ApiJson<CreateMemory>,
 ) -> Result<(StatusCode, Json<MemoryJson>), ApiError> {
     let content = trimmed("content", &body.content, CONTENT_MAX)?;
+    let context = optional_trimmed("context", body.context.as_deref(), CONTENT_MAX)?;
+    let reason = optional_trimmed("reason", body.reason.as_deref(), CONTENT_MAX)?;
+    let resolution = optional_trimmed("resolution", body.resolution.as_deref(), CONTENT_MAX)?;
     check_scope(&state, body.scope, body.repository_id).await?;
 
     let memory = memories::insert(
@@ -142,10 +216,10 @@ async fn create(
             source_url: None,
             created_by: Some(user.id),
             status: MemoryStatus::Active,
-            kind: MemoryKind::Convention,
-            context: None,
-            reason: None,
-            resolution: None,
+            kind: body.kind.unwrap_or(MemoryKind::Convention),
+            context: context.as_deref(),
+            reason: reason.as_deref(),
+            resolution: resolution.as_deref(),
             evidence: &[],
             supersedes: None,
         },
@@ -219,7 +293,10 @@ async fn update(
             .map(|c| trimmed("content", &c, CONTENT_MAX))
             .transpose()?,
         enabled: body.enabled,
-        ..Default::default()
+        kind: body.kind,
+        context: patch_optional_text("context", body.context, CONTENT_MAX)?,
+        reason: patch_optional_text("reason", body.reason, CONTENT_MAX)?,
+        resolution: patch_optional_text("resolution", body.resolution, CONTENT_MAX)?,
     };
     let memory = memories::update(&state.db, id, patch)
         .await?
