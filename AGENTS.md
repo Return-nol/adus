@@ -77,7 +77,7 @@ Use the trace, not guesses, to diagnose review quality, refusals, timeouts or to
 3. **Read:** wait for `job finished`, then search `.superpowers/run.log` for these events:
    - `agent prompt`, which carries `call=` on single-turn calls (dedup, severity, enrich, prose_recovery, rule_shard, rule_judge, verify_diff_only, learn);
    - `agent reasoning`, `agent text`, `agent tool call` and `agent tool result` for each step;
-   - the `finder` / `verify` spans;
+   - the `finder` / `verify` spans, and `rule_shard` / `rule_evidence` for the Sharded Rules;
    - `finder review log`, `finder dismissed` and `review stages finished`, which hold the stage counts, budget and timings.
 
 Rules:

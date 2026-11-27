@@ -104,7 +104,7 @@ Cause unknown: harness or model. Kodus has not been run on Sonnet 5.5 here, so t
 - Rule evidence has no per-review cap on candidates: the Finder deadline and the token budget bound it, but a broad rule over a large PR can still start many collectors before the budget runs out.
 - Evidence loops start only after every shard finishes (`run_sharded_rules` collects shards before the evidence stream); pipelining would overlap them.
 - `TokenBudget::wrap_ups()` (read as `finder_wrap_ups` for the summary) now also counts budget-driven rule-collector wrap-ups; a separate counter would keep the Finder note exact.
-- On a `ToolsUnsupported` Finder re-run, shards and collectors that already started still run and fail closed (wasted calls); the diff-only re-run checks `<rules>`.
+- On a `ToolsUnsupported` Finder re-run, shards and collectors that already started still run and their findings are discarded (wasted calls); the diff-only re-run checks `<rules>`.
 - Verified rule findings are lost when every Finder task fails (the review fails and is retried, as with the old Rules specialist).
 - `capped_excerpts` keeps the original `[path: lines X-Y of Z]` header on a truncated excerpt and drops later small excerpts after the first one that crosses the 24,000-char cap.
 - `rules_evidence.rs` `first_object` / `loose_submission` are a third copy of the scan-and-deserialize loop (`parse::first_json_object`, the Verifier's `loose_verdict`); share one helper in `parse.rs`.
