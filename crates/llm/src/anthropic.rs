@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use crate::types::{
     AssistantPart, ChatRequest, ChatResponse, LlmClient, LlmError, Message, ReasoningEffort,
-    StopReason, ToolCall, UserPart, chat_with_effort_fallback, decode, key_header, non_empty,
+    StopReason, ToolCall, UserPart, chat_with_effort_fallback, decode, key_header,
     normalize_model_ids, request_timeout, send,
 };
 
@@ -29,8 +29,17 @@ impl AnthropicClient {
 struct Messages {
     #[serde(default)]
     content: Vec<Block>,
+    /// The model that produced the reply: a fallback model when a refusal fell back.
+    model: Option<String>,
     stop_reason: Option<String>,
+    stop_details: Option<StopDetails>,
     usage: Option<Usage>,
+}
+
+/// Set on a `refusal`: the policy category that declined the request (may be absent).
+#[derive(Deserialize)]
+struct StopDetails {
+    category: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +63,8 @@ enum Block {
         name: String,
         input: Value,
     },
+    /// A server-side fallback switch point: what comes before it is the declined attempt.
+    Fallback {},
     #[serde(other)]
     Other,
 }
@@ -77,36 +88,55 @@ struct Usage {
     cache_creation_input_tokens: Option<u32>,
 }
 
-/// Claude 4.6+ and non-(opus|sonnet|haiku) Claude models use adaptive thinking and
-/// `output_config.effort`; older Claude models and non-Claude proxies use `budget_tokens`.
-fn adaptive_thinking(model: &str) -> bool {
-    let Some((_, rest)) = model.split_once("claude-") else {
-        return false;
-    };
-    if model.contains("claude-3") {
-        return false;
-    }
+/// The family (`opus`, `sonnet`, `haiku`, `fable`, ...) and `(major, minor)` version of a Claude
+/// model id; `None` for an id without `claude-`, a `None` version when the id names none. A
+/// minor part longer than two digits is a date suffix, not a minor version.
+fn claude_model(model: &str) -> Option<(&str, Option<(u32, u32)>)> {
+    let (_, rest) = model.split_once("claude-")?;
     let mut parts = rest.split(['-', '.']);
-    let Some(family) = parts.next() else {
-        return true;
-    };
-    if !matches!(family, "opus" | "sonnet" | "haiku") {
-        return true;
-    }
-    let Some(major) = parts
+    let family = parts.next().unwrap_or_default();
+    let version = parts
         .next()
         .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|s| s.parse::<u32>().ok())
-    else {
-        return true;
-    };
-    let minor = parts
-        .next()
-        .filter(|s| (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-    major > 4 || (major == 4 && minor > 5)
+        .map(|major| {
+            let minor = parts
+                .next()
+                .filter(|s| (1..=2).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            (major, minor)
+        });
+    Some((family, version))
 }
+
+/// Claude 4.6+ and non-(opus|sonnet|haiku) Claude models use adaptive thinking and
+/// `output_config.effort`; older Claude models and non-Claude proxies use `budget_tokens`.
+fn adaptive_thinking(model: &str) -> bool {
+    if model.contains("claude-3") {
+        return false;
+    }
+    match claude_model(model) {
+        None => false,
+        Some(("opus" | "sonnet" | "haiku", Some(version))) => version > (4, 5),
+        Some(_) => true,
+    }
+}
+
+/// Models whose safety classifiers can decline a request and that accept the server-side
+/// `fallbacks: "default"` opt-in: Claude Fable, Claude Opus 5+ and Claude Sonnet 5.5+. Claude
+/// Haiku has no server-side fallback.
+fn server_fallback(model: &str) -> bool {
+    match claude_model(model) {
+        Some(("fable", _)) => true,
+        Some(("opus", Some(version))) => version >= (5, 0),
+        Some(("sonnet", Some(version))) => version >= (5, 5),
+        _ => false,
+    }
+}
+
+/// Beta header of the server-side refusal fallback (`fallbacks: "default"`).
+const SERVER_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
 impl AnthropicClient {
     async fn chat_once(
@@ -134,6 +164,12 @@ impl AnthropicClient {
             }
         }
         // Up to three cache breakpoints (system, last tool, last user turn); the API allows four.
+        let fallback = server_fallback(&req.model);
+        if fallback {
+            // A request the safety classifiers decline is re-run on Anthropic's recommended
+            // fallback model (routed by refusal category) instead of coming back as a refusal.
+            body["fallbacks"] = json!("default");
+        }
         if !req.system.is_empty() {
             body["system"] = json!([{
                 "type": "text",
@@ -159,12 +195,15 @@ impl AnthropicClient {
             body["tools"] = tools.into();
         }
         let url = format!("{}/v1/messages", self.base_url);
-        let request = self
+        let mut request = self
             .http
             .post(url)
             .header("x-api-key", key_header(api_key)?)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body);
+            .header("anthropic-version", "2023-06-01");
+        if fallback {
+            request = request.header("anthropic-beta", SERVER_FALLBACK_BETA);
+        }
+        let request = request.json(&body);
         let messages: Messages =
             decode(send(request, !req.tools.is_empty(), request_timeout(effort)).await?).await?;
         let mut text = String::new();
@@ -191,20 +230,47 @@ impl AnthropicClient {
                     arguments: input,
                     provider_meta: None,
                 }),
+                Block::Fallback {} => {
+                    // Everything before a switch point is the declined attempt's partial output:
+                    // never run or echo it.
+                    text.clear();
+                    thinking_blocks.clear();
+                    tool_calls.clear();
+                }
                 Block::Other => {}
             }
+        }
+        if messages.stop_reason.as_deref() == Some("refusal") {
+            // Content of a refusal is empty or partial; it is never a reply.
+            let category = messages
+                .stop_details
+                .and_then(|d| d.category)
+                .unwrap_or_else(|| "none".into());
+            return Err(LlmError::Invalid(format!(
+                "request declined (stop_reason refusal, category {category})"
+            )));
+        }
+        if let Some(served) = messages.model.as_deref().filter(|m| *m != req.model) {
+            tracing::info!(requested = %req.model, served, "a fallback model served a declined request");
         }
         if !thinking_blocks.is_empty()
             && let Some(first) = tool_calls.first_mut()
         {
             first.provider_meta = serde_json::to_string(&thinking_blocks).ok();
         }
+        if text.trim().is_empty() && tool_calls.is_empty() {
+            // The stop reason tells a reply cut short (`max_tokens`) apart from an empty turn.
+            let reason = messages.stop_reason.as_deref().unwrap_or("none");
+            return Err(LlmError::Invalid(format!(
+                "empty response (stop_reason {reason})"
+            )));
+        }
         let usage = messages.usage;
         let field = |f: fn(&Usage) -> Option<u32>| usage.as_ref().and_then(f).unwrap_or(0);
         let cache_read = field(|u| u.cache_read_input_tokens);
         let cache_write = field(|u| u.cache_creation_input_tokens);
         Ok(ChatResponse {
-            text: non_empty(text, &tool_calls)?,
+            text,
             tool_calls,
             stop_reason: stop_reason(messages.stop_reason.as_deref()),
             // Anthropic reports cached input separately; the total keeps usage comparable.
@@ -336,10 +402,10 @@ fn stop_reason(stop_reason: Option<&str>) -> StopReason {
 
 #[cfg(test)]
 mod tests {
-    use super::adaptive_thinking;
+    use super::{adaptive_thinking, server_fallback};
 
     #[test]
-    fn adaptive_thinking_follows_model_generation() {
+    fn thinking_mode_and_server_fallback_follow_model_generation() {
         for model in [
             "claude-opus-5-5",
             "claude-sonnet-5-5",
@@ -366,6 +432,30 @@ mod tests {
             "m-1",
         ] {
             assert!(!adaptive_thinking(model), "{model} should use budget");
+        }
+
+        for model in [
+            "claude-sonnet-5-5",
+            "claude-sonnet-5.5",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-fable-5-2",
+        ] {
+            assert!(server_fallback(model), "{model} should opt into fallbacks");
+        }
+        for model in [
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-haiku-5-5",
+            "claude-opus-4-8",
+            "claude-opus-4-5-20251101",
+            "claude-3-7-sonnet-latest",
+            "kimi-k2",
+        ] {
+            assert!(
+                !server_fallback(model),
+                "{model} should not opt into fallbacks"
+            );
         }
     }
 }

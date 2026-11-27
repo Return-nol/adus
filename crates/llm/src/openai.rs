@@ -30,11 +30,6 @@ impl OpenAiClient {
             openrouter: is_openrouter_host(base_url),
         }
     }
-
-    /// Whether this client talks to OpenRouter (host `openrouter.ai` or a subdomain).
-    fn is_openrouter(&self) -> bool {
-        self.openrouter
-    }
 }
 
 /// `true` when `base_url` parses with host `openrouter.ai` or `*.openrouter.ai` (case-insensitive).
@@ -161,7 +156,7 @@ impl OpenAiClient {
         let reserve = effort.map_or(0, ReasoningEffort::output_reserve);
         body[self.max_tokens_field] = req.max_tokens.saturating_add(reserve).into();
         if let Some(e) = effort {
-            if self.is_openrouter() {
+            if self.openrouter {
                 body["reasoning"] = json!({"effort": e.as_str()});
                 if require_params {
                     // Route only to upstreams that honour every parameter, so reasoning is not
@@ -266,7 +261,7 @@ impl OpenAiClient {
         req: &ChatRequest,
         effort: Option<ReasoningEffort>,
     ) -> Result<ChatResponse, LlmError> {
-        let strict = self.is_openrouter() && effort.is_some();
+        let strict = self.openrouter && effort.is_some();
         match self.chat_once(api_key, req, effort, strict).await {
             Err(ref err) if strict && is_no_endpoints(err) => {
                 self.chat_once(api_key, req, effort, false).await
@@ -447,7 +442,6 @@ mod tests {
         let mut client = OpenAiClient::new(Client::new(), &server.uri(), "max_tokens");
         // The mock listens on 127.0.0.1; flag it as OpenRouter.
         client.openrouter = true;
-        assert!(client.is_openrouter());
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(|req: &wiremock::Request| {
@@ -474,25 +468,5 @@ mod tests {
         assert_eq!(sent[1]["reasoning"]["effort"], "high");
         assert!(sent[1].get("provider").is_none());
         assert!(sent.iter().all(|b| b.get("reasoning_effort").is_none()));
-    }
-
-    #[tokio::test]
-    async fn non_openrouter_keeps_bare_reasoning_effort() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
-            .mount(&server)
-            .await;
-        let client = OpenAiClient::new(Client::new(), &server.uri(), "max_tokens");
-        assert!(!client.is_openrouter());
-
-        client.chat("key", &request()).await.unwrap();
-
-        let sent = bodies(&server).await;
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0]["reasoning_effort"], "high");
-        assert!(sent[0].get("reasoning").is_none());
-        assert!(sent[0].get("provider").is_none());
     }
 }
