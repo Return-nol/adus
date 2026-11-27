@@ -527,12 +527,49 @@ async fn post_review_sends_multiline_start_line_and_drops_invalid_start_line() {
         },
     ];
     // The review's comments cannot be read back (404): the posted review still succeeds,
-    // without ids, so the job does not retry and post it twice.
+    // one entry per comment without ids, so the job does not retry and post it twice.
     let posted = provider(&server)
         .post_review(&repo(), &pr(), &comments, "summary")
         .await
         .unwrap();
-    assert!(posted.is_empty());
+    assert_eq!(posted.len(), 3);
+    assert!(posted.iter().all(|p| p.comment_id.is_empty()));
+}
+
+#[tokio::test]
+async fn post_review_matches_duplicate_spots_by_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octocat/alpha/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 55 })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/octocat/alpha/pulls/7/reviews/55/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "id": 201, "path": "src/a.rs", "line": 4, "body": "second" },
+            { "id": 202, "path": "src/a.rs", "line": 4, "body": "first" },
+        ])))
+        .mount(&server)
+        .await;
+
+    let at = |line, body: &str| InlineComment {
+        path: "src/a.rs".into(),
+        start_line: None,
+        line,
+        end_offset: None,
+        body: body.into(),
+    };
+    let comments = [at(4, "first"), at(4, "second"), at(9, "not echoed")];
+    let posted = provider(&server)
+        .post_review(&repo(), &pr(), &comments, "summary")
+        .await
+        .unwrap();
+    let ids: Vec<(usize, &str)> = posted
+        .iter()
+        .map(|p| (p.index, p.comment_id.as_str()))
+        .collect();
+    assert_eq!(ids, [(0, "202"), (1, "201"), (2, "")]);
 }
 
 #[tokio::test]
@@ -969,6 +1006,39 @@ async fn set_thread_status_unknown_thread_is_not_found() {
 
     let err = provider(&server)
         .set_thread_status(&repo(), 7, &thread_ref("999"), ThreadStatus::Fixed)
+        .await
+        .unwrap_err();
+    assert_eq!(err, GitError::NotFound);
+}
+
+#[tokio::test]
+async fn set_thread_status_follows_cursor_and_maps_graphql_not_found() {
+    let server = MockServer::start().await;
+    let page1 = json!({ "data": { "repository": { "pullRequest": { "reviewThreads": {
+        "nodes": [{ "id": "PRRT_y", "isResolved": false,
+                    "comments": { "nodes": [{ "fullDatabaseId": "102" }] } }],
+        "pageInfo": { "hasNextPage": true, "endCursor": "c1" }
+    } } } } });
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_partial_json(json!({ "variables": { "after": null } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page1))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_partial_json(json!({ "variables": { "after": "c1" } })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": null,
+            "errors": [{ "type": "NOT_FOUND", "message": "Could not resolve to a PullRequest." }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = provider(&server)
+        .set_thread_status(&repo(), 7, &thread_ref("101"), ThreadStatus::Fixed)
         .await
         .unwrap_err();
     assert_eq!(err, GitError::NotFound);

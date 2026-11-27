@@ -132,6 +132,7 @@ impl GithubProvider {
             return Err(match err.kind.as_deref() {
                 Some("NOT_FOUND") => GitError::NotFound,
                 Some("RATE_LIMITED") => GitError::RateLimited,
+                Some("FORBIDDEN") => GitError::Status(403),
                 _ => GitError::Decode(
                     format!("graphql: {}", err.message)
                         .chars()
@@ -188,38 +189,19 @@ impl GithubProvider {
         Err(GitError::NotFound)
     }
 
-    /// The comments of review `review_id`, matched to `comments` by `(path, line)` in order.
-    /// Unmatched comments are left out.
-    async fn posted_ids(
+    /// The comments of review `review_id`.
+    async fn review_comments(
         &self,
         repo: &RepoRef,
         pr_number: i64,
         review_id: i64,
-        comments: &[InlineComment],
-    ) -> Result<Vec<PostedComment>, GitError> {
+    ) -> Result<Vec<GhComment>, GitError> {
         let url = self.repo_url(
             repo,
             &format!("/pulls/{pr_number}/reviews/{review_id}/comments?per_page=100"),
         );
         let pages: Vec<Vec<GhComment>> = self.get_pages(url).await?;
-        let mut created: Vec<GhComment> = pages.into_iter().flatten().collect();
-        created.sort_by_key(|c| c.id);
-        let mut posted = Vec::new();
-        for (index, c) in comments.iter().enumerate() {
-            let path = normalize_path(&c.path);
-            let hit = created.iter().position(|g| {
-                g.line == Some(c.line)
-                    && g.path.as_deref().is_some_and(|p| normalize_path(p) == path)
-            });
-            if let Some(i) = hit {
-                posted.push(PostedComment {
-                    index,
-                    thread_id: None,
-                    comment_id: created.remove(i).id.to_string(),
-                });
-            }
-        }
-        Ok(posted)
+        Ok(pages.into_iter().flatten().collect())
     }
 
     async fn files_of(&self, first_url: String) -> Result<Vec<FileDiff>, GitError> {
@@ -389,6 +371,33 @@ impl GhComment {
     }
 }
 
+/// One entry per inline comment, matched to the review's `created` comments by `(path, line)`,
+/// preferring the one whose body is the one sent, then the lowest id. Each created comment is
+/// used once; an unmatched inline comment gets an empty `comment_id`.
+fn match_posted(comments: &[InlineComment], mut created: Vec<GhComment>) -> Vec<PostedComment> {
+    created.sort_by_key(|c| c.id);
+    comments
+        .iter()
+        .enumerate()
+        .map(|(index, c)| {
+            let path = normalize_path(&c.path);
+            let same_spot = |g: &GhComment| {
+                g.line == Some(c.line)
+                    && g.path.as_deref().is_some_and(|p| normalize_path(p) == path)
+            };
+            let hit = created
+                .iter()
+                .position(|g| same_spot(g) && g.body.as_deref() == Some(c.body.as_str()))
+                .or_else(|| created.iter().position(same_spot));
+            PostedComment {
+                index,
+                thread_id: None,
+                comment_id: hit.map_or_else(String::new, |i| created.remove(i).id.to_string()),
+            }
+        })
+        .collect()
+}
+
 /// A review comment id from a `ThreadRef`; anything but a number is an unknown thread.
 fn comment_id(id: &str) -> Result<i64, GitError> {
     id.parse().map_err(|_| GitError::NotFound)
@@ -415,7 +424,13 @@ struct GqlError {
 }
 
 /// `fullDatabaseId` is a `BigInt`, which GitHub encodes as a string (`databaseId` is deprecated).
-const REVIEW_THREADS_QUERY: &str = "    query($owner: String!, $name: String!, $number: Int!, $after: String) {     repository(owner: $owner, name: $name) { pullRequest(number: $number) {     reviewThreads(first: 100, after: $after) {     nodes { id isResolved comments(first: 1) { nodes { fullDatabaseId } } }     pageInfo { hasNextPage endCursor } } } } }";
+const REVIEW_THREADS_QUERY: &str = concat!(
+    "query($owner: String!, $name: String!, $number: Int!, $after: String) { ",
+    "repository(owner: $owner, name: $name) { pullRequest(number: $number) { ",
+    "reviewThreads(first: 100, after: $after) { ",
+    "nodes { id isResolved comments(first: 1) { nodes { fullDatabaseId } } } ",
+    "pageInfo { hasNextPage endCursor } } } } }",
+);
 const RESOLVE_MUTATION: &str =
     "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }";
 const UNRESOLVE_MUTATION: &str =
@@ -681,7 +696,7 @@ impl GitProvider for GithubProvider {
 
     /// Selalu satu review `COMMENT` di commit `pr.head_sha`; daftar komentar kosong tetap
     /// mengirim review yang hanya berisi `summary`. Then reads the review's comments back for
-    /// their ids; if that read fails the review stays posted and no ids are returned (an error
+    /// their ids; if that read fails the review stays posted and the ids stay empty (an error
     /// would make the job retry and post the review twice).
     async fn post_review(
         &self,
@@ -719,13 +734,14 @@ impl GitProvider for GithubProvider {
         if comments.is_empty() {
             return Ok(Vec::new());
         }
-        match self.posted_ids(repo, pr.number, review.id, comments).await {
-            Ok(posted) => Ok(posted),
-            Err(err) => {
+        let created = self
+            .review_comments(repo, pr.number, review.id)
+            .await
+            .unwrap_or_else(|err| {
                 tracing::warn!(error = %err, "github review comments not read back");
-                Ok(Vec::new())
-            }
-        }
+                Vec::new()
+            });
+        Ok(match_posted(comments, created))
     }
 
     async fn reply_in_thread(

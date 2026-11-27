@@ -44,8 +44,9 @@ pub trait GitProvider: Send + Sync {
         base_sha: &str,
         head_sha: &str,
     ) -> Result<Vec<FileDiff>, GitError>;
-    /// One review/batch of inline comments + one summary comment. Returns the provider ids of
-    /// the inline comments it could identify (its length is the posted count).
+    /// One review/batch of inline comments + one summary comment. Returns one entry per inline
+    /// comment, in order (its length is the posted count); `comment_id` is empty when the
+    /// provider id could not be identified.
     async fn post_review(
         &self,
         repo: &RepoRef,
