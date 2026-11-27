@@ -823,7 +823,7 @@ async fn list_pr_threads_skips_bot_users_and_flags_adus() {
         {
             "id": 2,
             "user": { "login": "octocat", "type": "User" },
-            "body": "**Warning:** leak\n\n<!-- adudu -->",
+            "body": "<!-- adudu -->\n🤖 **Adudu** · **⚠️ Warning:** leak",
             "html_url": "javascript:alert(1)"
         }
     ]);

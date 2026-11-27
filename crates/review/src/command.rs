@@ -2,7 +2,7 @@
 //! `remember: <isi>` (simpan memory repo). Hanya user Adus terdaftar yang boleh memerintah.
 
 use adus_core::job::{CommentAuthor, Job, Trigger};
-use adus_core::types::{ConnectionKind, ReviewMode};
+use adus_core::types::{ConnectionKind, ReviewMode, is_adus_comment};
 use adus_db::connections::Connection;
 use adus_db::memories::{self, MemorySource, MemoryStatus, NewMemory};
 use adus_db::repositories;
@@ -13,7 +13,7 @@ use adus_queue::Queue;
 use sqlx::PgPool;
 
 use crate::engine::{Engine, EngineError, db_error};
-use crate::prompt::MARKER;
+use crate::prompt::{REPLY_LABEL, adus_body};
 
 const MENTION: &str = "@adudu";
 /// Batas panjang isi `remember`, dalam karakter.
@@ -33,10 +33,10 @@ pub enum Command {
     Unknown,
 }
 
-/// `None` jika tidak ada mention `@adudu` atau komentar itu buatan Adus sendiri (memuat MARKER).
+/// `None` jika tidak ada mention `@adudu` atau komentar itu buatan Adus sendiri (diawali MARKER).
 /// Hanya teks setelah mention pertama yang dibaca; kata pertamanya adalah perintah.
 pub(crate) fn parse_command(body: &str) -> Option<Command> {
-    if body.contains(MARKER) {
+    if is_adus_comment(body) {
         return None;
     }
     let rest = after_mention(body)?.trim_start();
@@ -201,7 +201,7 @@ impl Engine {
             Command::Unknown => (HELP.to_string(), false),
         };
 
-        let body = format!("{MARKER}\n{reply}");
+        let body = adus_body(REPLY_LABEL, &reply);
         let Err(err) = git.post_comment(&repo_ref, *pr_number, &body).await else {
             return Ok(());
         };
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn non_mentions_and_marker_return_none() {
-        let marker_body = format!("{MARKER}\n@adudu review");
+        let marker_body = adus_body(REPLY_LABEL, "@adudu review");
         for body in [
             "please review this",
             "adudu review",

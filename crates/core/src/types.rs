@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Penanda di setiap komentar yang diposting Adus. Komentar yang memuatnya diabaikan.
+/// Penanda di awal setiap komentar yang diposting Adus (lihat [`is_adus_comment`]).
 pub const ADUDU_MARKER: &str = "<!-- adudu -->";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -60,6 +60,11 @@ pub enum LearningMode {
     Auto,
 }
 
+/// Komentar buatan Adus selalu diawali MARKER; balasan manusia yang mengutipnya bukan buatan Adus.
+pub fn is_adus_comment(body: &str) -> bool {
+    body.trim_start().starts_with(ADUDU_MARKER)
+}
+
 /// Path file di dalam Adus tidak punya `/` di depan (Azure mengembalikan `/src/a.rs`).
 pub fn normalize_path(path: &str) -> String {
     path.trim_start_matches('/').to_string()
@@ -68,6 +73,14 @@ pub fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_adus_comment_requires_marker_first() {
+        assert!(is_adus_comment("<!-- adudu -->\nx"));
+        assert!(is_adus_comment("  \n<!-- adudu -->"));
+        assert!(!is_adus_comment("> <!-- adudu -->\nquoted"));
+        assert!(!is_adus_comment("ok <!-- adudu -->"));
+    }
 
     #[test]
     fn normalize_path_strips_leading_slash() {

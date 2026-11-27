@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use adus_core::types::ADUDU_MARKER;
+use adus_core::types::is_adus_comment;
 
 use crate::diff::unified_patch;
 use crate::{
@@ -373,7 +373,7 @@ impl AzThread {
                 let body = c.content.unwrap_or_default();
                 Some(PrThreadComment {
                     author,
-                    by_adus: body.contains(ADUDU_MARKER),
+                    by_adus: is_adus_comment(&body),
                     body,
                 })
             })

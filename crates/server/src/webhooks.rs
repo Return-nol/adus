@@ -8,7 +8,7 @@
 
 use adus_core::{
     job::{CommentAuthor, Job, Trigger},
-    types::{ADUDU_MARKER, ConnectionKind},
+    types::{ConnectionKind, is_adus_comment},
 };
 use adus_db::{
     connections,
@@ -261,7 +261,7 @@ fn github_comment(body: &Value, number: &Value, repo_id: Uuid) -> Option<Job> {
     }
     let comment = &body["comment"];
     let text = comment["body"].as_str()?;
-    if text.contains(ADUDU_MARKER) {
+    if is_adus_comment(text) {
         return None;
     }
     Some(Job::PrComment {
@@ -308,7 +308,7 @@ fn azure_comment(resource: &Value, repo_id: Uuid) -> Option<Job> {
         return None;
     }
     let text = comment["content"].as_str()?;
-    if text.contains(ADUDU_MARKER) {
+    if is_adus_comment(text) {
         return None;
     }
     let pr = &resource["pullRequest"];
@@ -507,8 +507,16 @@ mod tests {
         assert_eq!(parse_github("issue_comment", &body, id), None);
 
         let mut body = fixture(GH_ISSUE_COMMENT);
-        body["comment"]["body"] = json!("summary\n<!-- adudu -->");
+        body["comment"]["body"] = json!("<!-- adudu -->\nsummary");
         assert_eq!(parse_github("issue_comment", &body, id), None);
+
+        // A human quoting an Adus comment is still a human comment.
+        let mut body = fixture(GH_ISSUE_COMMENT);
+        body["comment"]["body"] = json!("> <!-- adudu -->\nthanks @adudu review");
+        assert!(matches!(
+            parse_github("issue_comment", &body, id),
+            Some(Job::PrComment { .. })
+        ));
 
         // URL non-http(s) dibuang, job tetap jalan.
         let mut body = fixture(GH_ISSUE_COMMENT);

@@ -14,6 +14,18 @@ use crate::specialists::SpecialistKind;
 
 pub(crate) use adus_core::types::ADUDU_MARKER as MARKER;
 
+/// Label yang terlihat di setiap komentar Adus.
+pub(crate) const REPLY_LABEL: &str = "🤖 **Adudu**";
+
+/// Satu-satunya cara membangun isi komentar Adus: MARKER selalu di baris pertama, lalu label.
+pub(crate) fn adus_body(label: &str, text: &str) -> String {
+    if text.is_empty() {
+        format!("{MARKER}\n{label}")
+    } else {
+        format!("{MARKER}\n{label}\n\n{text}")
+    }
+}
+
 /// Deskripsi PR dipotong sepanjang ini (karakter, bukan byte).
 const MAX_DESCRIPTION_CHARS: usize = 4000;
 
@@ -413,19 +425,19 @@ fn severity_label(severity: Severity) -> &'static str {
 pub(crate) fn format_inline(s: &Suggestion) -> String {
     // Judul harus satu baris supaya tetap di dalam label tebal.
     let title = s.title.lines().collect::<Vec<_>>().join(" ");
-    let mut out = format!(
-        "{MARKER}\n**{}:** {title}\n\n{}",
-        severity_label(s.severity),
-        s.body
+    let label = format!(
+        "{REPLY_LABEL} · **{}:** {title}",
+        severity_label(s.severity)
     );
+    let mut text = s.body.clone();
     if let Some(code) = &s.suggestion {
         let code = code.trim_end_matches(['\n', '\r']);
         // Fence satu backtick lebih panjang dari deretan backtick terpanjang di kode (minimal 3).
         let longest = code.split(|c| c != '`').map(str::len).max().unwrap_or(0);
         let fence = "`".repeat((longest + 1).max(3));
-        out.push_str(&format!("\n\n{fence}suggestion\n{code}\n{fence}"));
+        text.push_str(&format!("\n\n{fence}suggestion\n{code}\n{fence}"));
     }
-    out
+    adus_body(&label, &text)
 }
 
 /// Komentar ringkasan review. `skipped` = (path, alasan) dengan alasan `no_patch` |
@@ -439,7 +451,7 @@ pub(crate) fn format_summary(
     ignored: usize,
     warnings: &[String],
 ) -> String {
-    let mut out = format!("{MARKER}\n### Adudu reviewed this PR\n\n");
+    let mut out = String::new();
     let rows: Vec<String> = counts
         .iter()
         .rev() // critical dulu
@@ -469,7 +481,7 @@ pub(crate) fn format_summary(
         let lines: Vec<String> = warnings.iter().map(|w| format!("- {w}")).collect();
         out.push_str(&lines.join("\n"));
     }
-    out
+    adus_body(&format!("{REPLY_LABEL} reviewed this PR"), &out)
 }
 
 fn skip_reason_label(reason: &str) -> &str {
@@ -569,8 +581,9 @@ mod tests {
             suggestion: Some("let x = y?;".into()),
         };
         let inline = format_inline(&s);
-        assert!(inline.starts_with(MARKER));
-        assert!(inline.contains("**⚠️ Warning:** Possible panic"));
+        assert!(
+            inline.starts_with("<!-- adudu -->\n🤖 **Adudu** · **⚠️ Warning:** Possible panic\n")
+        );
         assert!(inline.contains("`unwrap` on user input."));
         assert!(inline.ends_with("```suggestion\nlet x = y?;\n```"));
 
@@ -608,8 +621,7 @@ mod tests {
             "Performance reviewer did not complete".to_string(),
         ];
         let summary = format_summary(&counts, &skipped, 3, &warnings);
-        assert!(summary.contains(MARKER));
-        assert!(summary.contains("Adudu reviewed this PR"));
+        assert!(summary.starts_with("<!-- adudu -->\n🤖 **Adudu** reviewed this PR\n\n"));
         assert!(summary.contains("- 🚨 Critical: 2\n- ℹ️ Info: 1\n\n3 files ignored\n\n"));
         assert!(!summary.contains("Warning"));
         assert!(summary.ends_with(

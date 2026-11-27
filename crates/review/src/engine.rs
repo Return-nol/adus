@@ -36,8 +36,8 @@ use crate::discussion::threads_for_dedup;
 use crate::finder::{FinderFailure, FinderInput, FinderLlm, FinderTask, run_finder};
 use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
 use crate::prompt::{
-    DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, batch_targets, build_manifest, format_inline,
-    format_summary,
+    DiffBatch, MAX_BATCH_CHARS, ManifestFile, REPLY_LABEL, adus_body, batch_targets,
+    build_manifest, format_inline, format_summary,
 };
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
@@ -278,9 +278,10 @@ impl Engine {
             if trigger == Trigger::Updated {
                 return Ok(Outcome::Skipped("no_model"));
             }
-            let body = format!(
-                "{MARKER}\nAdudu can't review yet: no AI model is configured. \
-                 An admin can pick a provider under Settings and its model under AI Providers."
+            let body = adus_body(
+                REPLY_LABEL,
+                "Adudu can't review yet: no AI model is configured. \
+                 An admin can pick a provider under Settings and its model under AI Providers.",
             );
             // Gagal posting tidak mengubah hasilnya: review tetap tidak bisa jalan.
             match git.post_comment(&repo_ref, pr_number, &body).await {

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use adus_core::types::ADUDU_MARKER;
+use adus_core::types::is_adus_comment;
 
 use crate::{
     CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PrThread,
@@ -270,7 +270,7 @@ impl GhComment {
         PrThreadComment {
             // GitHub shows deleted accounts as `ghost`.
             author: self.user.map_or_else(|| "ghost".into(), |u| u.login),
-            by_adus: body.contains(ADUDU_MARKER),
+            by_adus: is_adus_comment(&body),
             body,
         }
     }
