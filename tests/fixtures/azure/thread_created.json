@@ -1,0 +1,32 @@
+{
+  "pullRequestThreadContext": null,
+  "id": 148,
+  "publishedDate": "2026-11-27T09:00:00.000Z",
+  "lastUpdatedDate": "2026-11-27T09:00:00.000Z",
+  "comments": [
+    {
+      "id": 1,
+      "parentCommentId": 0,
+      "author": {
+        "displayName": "Adus Bot",
+        "id": "d6245f20-2af8-44f4-9451-8107cb2767db",
+        "uniqueName": "adus@acme.com"
+      },
+      "content": "careful",
+      "publishedDate": "2026-11-27T09:00:00.000Z",
+      "lastUpdatedDate": "2026-11-27T09:00:00.000Z",
+      "lastContentUpdatedDate": "2026-11-27T09:00:00.000Z",
+      "commentType": "text",
+      "usersLiked": []
+    }
+  ],
+  "status": "active",
+  "threadContext": {
+    "filePath": "/src/a.rs",
+    "rightFileStart": { "line": 12, "offset": 1 },
+    "rightFileEnd": { "line": 12, "offset": 1 }
+  },
+  "properties": {},
+  "identities": null,
+  "isDeleted": false
+}
