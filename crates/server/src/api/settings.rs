@@ -252,7 +252,6 @@ async fn replace(
             .max_learned_per_pr
             .unwrap_or(current.max_learned_per_pr),
         curator_effort: body.curator_effort.unwrap_or(current.curator_effort),
-        ..current
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }
