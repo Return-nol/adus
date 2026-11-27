@@ -9,13 +9,13 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use adus_core::types::ADUDU_MARKER;
+use adus_core::types::is_adus_comment;
 
 use crate::diff::unified_patch;
 use crate::{
-    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PrThread,
-    PrThreadComment, PullRequest, RemoteRepo, RepoRef, basic_auth_header, decode, git_url,
-    normalize_path,
+    CloneSpec, FileDiff, FileStatus, GitError, GitProvider, InlineComment, PatOwner, PostedComment,
+    PrThread, PrThreadComment, PullRequest, RemoteRepo, RepoRef, ThreadRef, ThreadStatus,
+    basic_auth_header, decode, git_url, normalize_path,
 };
 
 const API_VERSION: &str = "7.1";
@@ -81,6 +81,11 @@ impl AzureProvider {
 
     fn post(&self, url: &str) -> RequestBuilder {
         self.with_headers(self.http.post(url))
+            .query(&[("api-version", API_VERSION)])
+    }
+
+    fn patch(&self, url: &str) -> RequestBuilder {
+        self.with_headers(self.http.patch(url))
             .query(&[("api-version", API_VERSION)])
     }
 
@@ -236,11 +241,30 @@ impl AzureProvider {
         repo: &RepoRef,
         pr_number: i64,
         body: &Value,
-    ) -> Result<(), GitError> {
+    ) -> Result<Response, GitError> {
         let url = self.repo_url(repo, &format!("/pullRequests/{pr_number}/threads"))?;
-        self.send(self.post(&url).json(body)).await?;
-        Ok(())
+        self.send(self.post(&url).json(body)).await
     }
+
+    /// URL of one thread. The id must be numeric so stored ids cannot reshape the path.
+    fn thread_url(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        thread: &ThreadRef,
+        rest: &str,
+    ) -> Result<String, GitError> {
+        let id = numeric_id(&thread.thread_id)?;
+        self.repo_url(
+            repo,
+            &format!("/pullRequests/{pr_number}/threads/{id}{rest}"),
+        )
+    }
+}
+
+/// Azure ids are integers; anything else cannot name an existing thread or comment.
+fn numeric_id(id: &str) -> Result<i64, GitError> {
+    id.parse().map_err(|_| GitError::NotFound)
 }
 
 /// Thread status `1` = active; `commentType` 1 = text.
@@ -253,6 +277,19 @@ fn thread_body(content: &str, context: Option<Value>) -> Value {
         body["threadContext"] = ctx;
     }
     body
+}
+
+#[derive(Deserialize)]
+struct AzId {
+    id: i64,
+}
+
+/// `POST …/threads` response: the new thread and its comments.
+#[derive(Deserialize)]
+struct AzCreatedThread {
+    id: i64,
+    #[serde(default)]
+    comments: Vec<AzId>,
 }
 
 #[derive(Deserialize)]
@@ -324,6 +361,7 @@ struct AzCommit {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzThread {
+    id: i64,
     status: Option<String>,
     thread_context: Option<AzThreadContext>,
     #[serde(default)]
@@ -345,6 +383,7 @@ struct AzPosition {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzComment {
+    id: i64,
     #[serde(default)]
     author: Option<AzIdentity>,
     content: Option<String>,
@@ -362,8 +401,8 @@ struct AzIdentity {
 
 impl AzThread {
     /// Drops system and deleted comments and comments without an author name (`uniqueName` is
-    /// deprecated in Azure's IdentityRef); `None` when nothing is left.
-    fn into_thread(self) -> Option<PrThread> {
+    /// deprecated in Azure's IdentityRef). Resolved = any status but `active`/`pending`/absent.
+    fn into_thread(self) -> PrThread {
         let comments: Vec<PrThreadComment> = self
             .comments
             .into_iter()
@@ -372,17 +411,17 @@ impl AzThread {
                 let author = c.author.and_then(|a| a.unique_name)?;
                 let body = c.content.unwrap_or_default();
                 Some(PrThreadComment {
+                    id: c.id.to_string(),
                     author,
-                    by_adus: body.contains(ADUDU_MARKER),
+                    by_adus: is_adus_comment(&body),
                     body,
                 })
             })
             .collect();
-        if comments.is_empty() {
-            return None;
-        }
         let ctx = self.thread_context;
-        Some(PrThread {
+        PrThread {
+            id: Some(self.id.to_string()),
+            resolved: !matches!(self.status.as_deref(), None | Some("active" | "pending")),
             path: ctx
                 .as_ref()
                 .and_then(|c| c.file_path.as_deref())
@@ -392,7 +431,7 @@ impl AzThread {
             // The threads response carries no web URL and the brief forbids an extra request.
             url: None,
             comments,
-        })
+        }
     }
 }
 
@@ -501,7 +540,8 @@ impl GitProvider for AzureProvider {
         Ok(list
             .value
             .into_iter()
-            .filter_map(AzThread::into_thread)
+            .map(AzThread::into_thread)
+            .filter(|t| !t.comments.is_empty())
             .collect())
     }
 
@@ -684,15 +724,16 @@ impl GitProvider for AzureProvider {
     }
 
     /// Satu thread per komentar inline (path diberi `/` di depan), lalu satu thread ringkasan
-    /// tanpa `threadContext`. Return jumlah thread inline.
+    /// tanpa `threadContext`. Ids come from each created thread and its first comment.
     async fn post_review(
         &self,
         repo: &RepoRef,
         pr: &PullRequest,
         comments: &[InlineComment],
         summary: &str,
-    ) -> Result<usize, GitError> {
-        for c in comments {
+    ) -> Result<Vec<PostedComment>, GitError> {
+        let mut posted = Vec::with_capacity(comments.len());
+        for (index, c) in comments.iter().enumerate() {
             let (start_line, end_offset) = match c.start_line.filter(|&s| s < c.line) {
                 Some(start) => (start, c.end_offset.filter(|&o| o >= 1).unwrap_or(1)),
                 None => (c.line, 1),
@@ -702,12 +743,82 @@ impl GitProvider for AzureProvider {
                 "rightFileStart": { "line": start_line, "offset": 1 },
                 "rightFileEnd": { "line": c.line, "offset": end_offset },
             });
-            self.post_thread(repo, pr.number, &thread_body(&c.body, Some(context)))
+            let resp = self
+                .post_thread(repo, pr.number, &thread_body(&c.body, Some(context)))
                 .await?;
+            // The thread is already on the PR: an unreadable response must not fail the review,
+            // or the retry would post every thread again. Unknown ids stay empty.
+            let created: Result<AzCreatedThread, GitError> = decode(resp).await;
+            let comment_id = created
+                .as_ref()
+                .ok()
+                .and_then(|t| t.comments.first())
+                .map(|c| c.id.to_string());
+            match &created {
+                Err(err) => tracing::warn!(error = %err, "azure created thread not decoded"),
+                Ok(_) if comment_id.is_none() => {
+                    tracing::warn!("azure created thread has no comment")
+                }
+                Ok(_) => {}
+            }
+            posted.push(PostedComment {
+                index,
+                thread_id: created.ok().map(|t| t.id.to_string()),
+                comment_id: comment_id.unwrap_or_default(),
+            });
         }
         self.post_thread(repo, pr.number, &thread_body(summary, None))
             .await?;
-        Ok(comments.len())
+        Ok(posted)
+    }
+
+    /// `commentType` 1 = text.
+    async fn reply_in_thread(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        thread: &ThreadRef,
+        body: &str,
+    ) -> Result<String, GitError> {
+        let url = self.thread_url(repo, pr_number, thread, "/comments")?;
+        let body = json!({
+            "content": body,
+            "parentCommentId": numeric_id(&thread.root_comment_id)?,
+            "commentType": 1,
+        });
+        let created: AzId = decode(self.send(self.post(&url).json(&body)).await?).await?;
+        Ok(created.id.to_string())
+    }
+
+    async fn set_thread_status(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        thread: &ThreadRef,
+        status: ThreadStatus,
+    ) -> Result<(), GitError> {
+        let url = self.thread_url(repo, pr_number, thread, "")?;
+        let status = match status {
+            ThreadStatus::Active => "active",
+            ThreadStatus::Fixed => "fixed",
+            ThreadStatus::WontFix => "wontFix",
+            ThreadStatus::ByDesign => "byDesign",
+        };
+        self.send(self.patch(&url).json(&json!({ "status": status })))
+            .await?;
+        Ok(())
+    }
+
+    async fn get_thread(
+        &self,
+        repo: &RepoRef,
+        pr_number: i64,
+        thread: &ThreadRef,
+    ) -> Result<PrThread, GitError> {
+        let thread: AzThread = self
+            .get_json(&self.thread_url(repo, pr_number, thread, "")?)
+            .await?;
+        Ok(thread.into_thread())
     }
 
     async fn post_comment(
@@ -717,7 +828,8 @@ impl GitProvider for AzureProvider {
         body: &str,
     ) -> Result<(), GitError> {
         self.post_thread(repo, pr_number, &thread_body(body, None))
-            .await
+            .await?;
+        Ok(())
     }
 
     /// Fetches the head commit by SHA; servers that refuse a bare SHA get the source branch.

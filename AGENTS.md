@@ -35,10 +35,10 @@ crates/db       sqlx Postgres: connect(), embedded migrations/, queries (users, 
 crates/git      GitProvider, GitProviderFactory, CloneSpec, diff utilities, GitHub & Azure clients
 crates/llm      LlmClient, OpenAI / Anthropic / Gemini / OpenAI-compatible clients, ReasoningEffort, LlmRouter (ChatService)
 crates/queue    Redis Streams job queue, delivery dedup, per-PR lock, worker heartbeats
-crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, coverage, specialists, finder, rules_judge, rules_evidence, verifier, discussion, dedup, severity, enrich, budget, small_pr, prompt, parse, trace, command, learn, engine
+crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, coverage, specialists, finder, rules_judge, rules_evidence, verifier, discussion, dedup, severity, enrich, budget, small_pr, prompt, parse, trace, command, threads, learn, engine
 crates/server   axum: router(), state.rs, error.rs, auth.rs, spa.rs, webhooks.rs, doctor.rs, api/*
 crates/adus     binary (serve, gen-secret, check-config, doctor, healthcheck), worker loop & scheduler
-migrations/     sqlx migrations (0001..0008), embedded by crates/db
+migrations/     sqlx migrations (0001..0010), embedded by crates/db
 web/            SvelteKit SPA (adapter-static) + shadcn-svelte; web/build is embedded into the binary
 ```
 
@@ -77,7 +77,7 @@ Use the trace, not guesses, to diagnose review quality, refusals, timeouts or to
 1. **Run:** `cargo run -p adus -- serve --trace > .superpowers/run.log 2>&1` (or set `ADUS_TRACE=true`; `--trace` adds `adus_review=debug,adus_review::trace=trace` to `RUST_LOG`; the log has no colour codes when redirected).
 2. **Trigger:** in a second terminal, `cargo run -q -p adus -- rereview <repository_id> <pr_number>` queues a full review on the running serve (`repository_id` is in the review logs). Findings Adus already posted on the PR are dropped by Dedup, so use a fresh PR (or count `finding already raised in an existing thread` lines) when measuring detections.
 3. **Read:** wait for `job finished`, then search `.superpowers/run.log` for these events:
-   - `agent prompt`, which carries `call=` on single-turn calls (dedup, severity, enrich, prose_recovery, rule_shard, rule_judge, verify_diff_only, learn);
+   - `agent prompt`, which carries `call=` on single-turn calls (dedup, severity, enrich, prose_recovery, rule_shard, rule_judge, verify_diff_only, learn, thread_reply, thread_validate);
    - `agent reasoning`, `agent text`, `agent tool call` and `agent tool result` for each step;
    - the `finder` / `verify` spans, and `rule_shard` / `rule_evidence` for the Sharded Rules;
    - `finder review log`, `finder dismissed` and `review stages finished`, which hold the stage counts, budget and timings.
@@ -100,7 +100,7 @@ Full subsystem specs live in [docs/SPEC.md](docs/SPEC.md). Follow these standing
   - `display_name` is server-only (`repositories::label` / `display_name_sql`).
   - Normalize repo paths with `normalize_path` (no leading `/`; add `/` only for Azure API calls).
   - Every comment Adus posts carries `<!-- adudu -->`, and comments containing it are ignored.
-  - Keep worker/engine timeout hierarchy intact (`REVIEW_TIMEOUT < SPECIALISTS_REVIEW_TIMEOUT < JOB_TIMEOUT < LOCK_TTL / RECLAIM_IDLE / STALE_AFTER`, enforced by compile-time asserts).
+  - Keep worker/engine timeout hierarchy intact (`REVIEW_TIMEOUT < SPECIALISTS_REVIEW_TIMEOUT`, `SPECIALISTS_REVIEW_TIMEOUT + VALIDATE_TIMEOUT < JOB_TIMEOUT < LOCK_TTL / RECLAIM_IDLE / STALE_AFTER`, enforced by compile-time asserts).
   - Never send a saved LLM key to a modified `base_url`; model-list cache uses HMAC under `ADUS_SECRET_KEY`.
 - **Frontend (`web/`):** Read [web/AGENTS.md](web/AGENTS.md) and [DESIGN.md](docs/DESIGN.md) before touching `web/`. Always use `#lib/...` (never `$lib`), follow [DESIGN.md](docs/DESIGN.md) OKLCH theming, and ship matching skeletons on every data page. Release/Docker builds must run `pnpm -C web build` before `cargo build --release`.
 - **Testing (no redundant tests):** Check existing tests before writing new ones; extend or parameterize existing cases instead of duplicating them. Do not write unit tests that mirror coverage already verified by integration tests or that only test trivial wrappers, getters, or `serde` derives — every test must cover a distinct behavior, edge case, invariant, or regression. Reuse existing fakes/fixtures (`FakeGitFactory`/`FakeGit`, `crates/review/tests/common/mod.rs`, `#[sqlx::test(migrations = "../../migrations")]`).

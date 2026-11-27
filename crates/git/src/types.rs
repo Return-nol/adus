@@ -88,6 +88,12 @@ pub struct FileDiff {
 /// One discussion thread on a PR: an inline thread (`path` set) or a top-level comment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrThread {
+    /// Provider thread id (GitHub: root review comment id; Azure: thread id). `None` for
+    /// GitHub top-level comments.
+    pub id: Option<String>,
+    /// Thread resolved (GitHub `isResolved`, only filled by `get_thread`; Azure status not
+    /// `active`/`pending`).
+    pub resolved: bool,
     /// `normalize_path`-ed. `None` for top-level comments.
     pub path: Option<String>,
     /// New-side line. `None` when top-level or outdated.
@@ -102,10 +108,38 @@ pub struct PrThread {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrThreadComment {
+    /// Provider comment id.
+    pub id: String,
     pub author: String,
     /// The body carries the Adus comment marker.
     pub by_adus: bool,
     pub body: String,
+}
+
+/// Provider ids of one posted inline comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedComment {
+    /// Index into the `comments` passed to `post_review`.
+    pub index: usize,
+    /// Azure thread id. GitHub: `None` (the thread is keyed by `comment_id`).
+    pub thread_id: Option<String>,
+    pub comment_id: String,
+}
+
+/// One provider thread Adus started. GitHub: both ids are the root review comment id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRef {
+    pub thread_id: String,
+    pub root_comment_id: String,
+}
+
+/// GitHub has only resolved/unresolved: `Fixed`, `WontFix` and `ByDesign` all resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadStatus {
+    Active,
+    Fixed,
+    WontFix,
+    ByDesign,
 }
 
 #[derive(Debug, Clone, PartialEq)]

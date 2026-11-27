@@ -1,7 +1,7 @@
 use adus_core::types::{ConnectionKind, Severity};
 use adus_db::{
     connections, memories,
-    memories::{MemorySource, MemoryStatus, NewMemory},
+    memories::{MemoryKind, MemorySource, MemoryStatus, NewMemory},
     repositories::{self, NewRepository},
     rules::{self, KnowledgeScope, NewRule, Rule},
 };
@@ -117,6 +117,12 @@ async fn add_memory(pool: &PgPool, repo: Option<Uuid>, content: &str) -> memorie
             source_url: None,
             created_by: None,
             status: MemoryStatus::Active,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes: None,
         },
     )
     .await
@@ -173,7 +179,12 @@ async fn soft_deleted_repo_rules_and_memories_are_hidden(pool: PgPool) {
     assert_eq!(titles(&rules::list_all(&pool).await.unwrap()), ["global"]);
     assert!(rules::list(&pool, Some(repo)).await.unwrap().is_empty());
     assert!(memories::applicable(&pool, repo).await.unwrap().is_empty());
-    assert!(memories::list_all(&pool, None).await.unwrap().is_empty());
+    assert!(
+        memories::list_all(&pool, None, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -216,6 +227,12 @@ async fn check_constraint_rejects_scope_mismatch(pool: PgPool) {
             source_url: None,
             created_by: None,
             status: MemoryStatus::Active,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes: None,
         },
     )
     .await;

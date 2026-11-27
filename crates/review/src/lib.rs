@@ -17,6 +17,7 @@ mod rules_judge;
 mod severity;
 mod small_pr;
 mod specialists;
+mod threads;
 mod tools;
 mod trace;
 mod verifier;

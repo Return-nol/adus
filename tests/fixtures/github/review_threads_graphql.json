@@ -1,0 +1,23 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "nodes": [
+            {
+              "id": "PRRT_y",
+              "isResolved": false,
+              "comments": { "nodes": [{ "fullDatabaseId": "102" }] }
+            },
+            {
+              "id": "PRRT_x",
+              "isResolved": true,
+              "comments": { "nodes": [{ "fullDatabaseId": "101" }] }
+            }
+          ],
+          "pageInfo": { "hasNextPage": false, "endCursor": "Y3Vyc29yOjI=" }
+        }
+      }
+    }
+  }
+}

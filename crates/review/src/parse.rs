@@ -57,6 +57,8 @@ pub(crate) struct Suggestion {
     pub body: String,
     /// Kode pengganti untuk baris/rentang itu (opsional).
     pub suggestion: Option<String>,
+    /// Optional 0-based index into `<memories>` when this finding matches an exception or fix pattern.
+    pub precedent: Option<usize>,
 }
 
 #[cfg(test)]
@@ -214,6 +216,10 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
     };
     let severity = text("severity").and_then(|s| parse_severity(&s));
     let file = text("file").filter(|f| !f.trim().is_empty())?;
+    let precedent = item
+        .get("precedent")
+        .and_then(parse_u32_field)
+        .and_then(|n| usize::try_from(n).ok());
     Some(Suggestion {
         file,
         start_line,
@@ -223,6 +229,7 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
         title: text("title").unwrap_or_default(),
         body: text("body")?,
         suggestion: text("suggestion").filter(|_| range_ok),
+        precedent,
     })
 }
 
@@ -278,6 +285,10 @@ pub(crate) fn submit_findings_tool_def(is_generalist: bool) -> ToolDef {
                             "body": {
                                 "type": "string",
                                 "description": "The concrete trigger, the impact, and the code path (symbols and file paths) through which it fails, then the fix. Posted as written."
+                            },
+                            "precedent": {
+                                "type": "integer",
+                                "description": "Optional. The 0-based [index] of the exception or fix pattern in <memories> that this finding matches."
                             }
                         },
                         "required": finding_required
@@ -545,6 +556,7 @@ mod tests {
             title: title.into(),
             body: "body".into(),
             suggestion: None,
+            precedent: None,
         }
     }
 
@@ -633,6 +645,7 @@ mod tests {
                 title: "T".into(),
                 body: "B".into(),
                 suggestion: Some("let x = 1;".into()),
+                precedent: None,
             }]
         );
 
@@ -729,6 +742,7 @@ mod tests {
                     title: "T".into(),
                     body: "B".into(),
                     suggestion: Some("let x = 1;".into()),
+                    precedent: None,
                 },
                 Suggestion {
                     file: "src/b.rs".into(),
@@ -739,6 +753,7 @@ mod tests {
                     title: "T2".into(),
                     body: "B2".into(),
                     suggestion: None,
+                    precedent: None,
                 },
             ]
         );
@@ -776,7 +791,17 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(fields, ["file", "start_line", "line", "category", "body"]);
+        assert_eq!(
+            fields,
+            [
+                "file",
+                "start_line",
+                "line",
+                "category",
+                "body",
+                "precedent"
+            ]
+        );
         assert_eq!(item["properties"]["start_line"]["type"], json!("integer"));
         assert_eq!(
             item["properties"]["category"]["enum"],
@@ -820,6 +845,7 @@ mod tests {
             title: String::new(),
             body: "why".into(),
             suggestion: None,
+            precedent: None,
         }];
         assert_eq!(parse_submit_findings(&lean).unwrap(), expected);
         assert_eq!(
@@ -1002,5 +1028,34 @@ mod tests {
         for invalid in [json!("yes"), json!("1"), json!(""), json!(1), json!(null)] {
             assert_eq!(parse_bool_field(&invalid), None, "{invalid}");
         }
+    }
+
+    #[test]
+    fn parse_reads_precedent() {
+        let raw = r#"[
+            {"file":"a.rs","line":1,"severity":"warning","title":"T1","body":"B","precedent":2},
+            {"file":"a.rs","line":2,"severity":"warning","title":"T2","body":"B","precedent":"0"},
+            {"file":"a.rs","line":3,"severity":"warning","title":"T3","body":"B","precedent":-1},
+            {"file":"a.rs","line":4,"severity":"warning","title":"T4","body":"B","precedent":null}
+        ]"#;
+        let precedents: Vec<Option<usize>> = parse_suggestions(raw)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.precedent)
+            .collect();
+        assert_eq!(precedents, vec![Some(2), Some(0), None, None]);
+
+        let tool_args = json!({"findings": [
+            {"file":"a.rs","line":5,"severity":"critical","title":"T5","body":"B","precedent":3}
+        ]});
+        let from_tool = parse_submit_findings(&tool_args).unwrap();
+        assert_eq!(from_tool.len(), 1);
+        assert_eq!(from_tool[0].precedent, Some(3));
+
+        let def = submit_findings_tool_def(true);
+        assert_eq!(
+            def.parameters["properties"]["findings"]["items"]["properties"]["precedent"]["type"],
+            json!("integer")
+        );
     }
 }

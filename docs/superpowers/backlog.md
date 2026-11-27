@@ -114,3 +114,12 @@ Cause unknown: harness or model. Kodus has not been run on Sonnet 5.5 here, so t
 - Rule-collector wrap-ups after the Finder finishes are not counted in `finder_wrap_ups`, and `budget_skipped` counts only rule work that never started, so a collector cut by the budget mid-run is not named in the summary warning.
 - `read_file` formats each row number twice (`prefix` for the budget check, then `push_numbered_row`).
 - Small polish: the shard rule formatter (`[n] (sev) title`) lacks a comment on why it does not reuse `prompt::format_rules`; rule body ends with two parentheticals in a row when `cited_line` is set; `body.push_str(&format!(..))` allocates twice; the first collector that hits `ToolsUnsupported` logs the variant name rather than a reason string; SPEC's fail-closed item does not list the skipped-start reasons (`token_budget`, `no_time_left`, `tools_unsupported`), which the evidence-loop bullet does; `queue_key` keeps an unreachable `ShardedRules` arm for exhaustiveness.
+
+## Thread conversations & curated learning (plan 2026-11-27)
+
+- `web/src/lib/components/memory-dialog.svelte`: edit-and-approve makes 2 sequential requests (`PATCH` then `POST /approve`)
+- Azure thread-id parser (`webhooks.rs`, `_links.threads.href`) trailing-slash/query hardening + reply detection `id > 1`
+- Azure `PATCH` status camelCase vs numeric `CommentThreadStatus` verification against a live Azure PR
+- `crates/review/tests/threads.rs`: missing test for 20-comment prompt cap / `shown_index`
+- `review_threads` fixed via human-status sync have `fix_sha = None`
+- GitHub `fullDatabaseId` may be absent on older GitHub Enterprise Server

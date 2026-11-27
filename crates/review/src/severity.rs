@@ -149,6 +149,7 @@ mod tests {
             title: String::new(),
             body: body.into(),
             suggestion: None,
+            precedent: None,
         }
     }
 

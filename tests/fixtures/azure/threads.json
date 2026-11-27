@@ -14,7 +14,7 @@
           "id": 1,
           "parentCommentId": 0,
           "author": { "displayName": "Bot", "uniqueName": "adus@acme.com" },
-          "content": "Possible panic <!-- adudu -->",
+          "content": "<!-- adudu -->\n🤖 **Adudu** · **⚠️ Warning:** Possible panic",
           "commentType": "text",
           "isDeleted": false
         },

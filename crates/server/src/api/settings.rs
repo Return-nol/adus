@@ -32,6 +32,9 @@ const FILES_RANGE: RangeInclusive<i32> = 1..=500;
 const PATCH_LINES_RANGE: RangeInclusive<i32> = 1..=100_000;
 const SMALL_PR_RANGE: RangeInclusive<i32> = 0..=10_000;
 const INPUT_TOKENS_RANGE: RangeInclusive<i32> = 0..=100_000_000;
+const THREAD_REPLIES_RANGE: RangeInclusive<i32> = 0..=100;
+const VALIDATE_THREADS_RANGE: RangeInclusive<i32> = 0..=100;
+const LEARNED_PER_PR_RANGE: RangeInclusive<i32> = 1..=50;
 const MAX_KEYWORD_LEN: usize = 100;
 const MAX_KEYWORDS: usize = 500;
 const MAX_TEST_PATH_LEN: usize = 1000;
@@ -49,6 +52,10 @@ struct SettingsJson {
     review_mode: ReviewMode,
     small_pr_max_lines: i32,
     max_review_input_tokens: i32,
+    max_thread_replies: i32,
+    max_validate_threads: i32,
+    max_learned_per_pr: i32,
+    curator_effort: String,
 }
 
 impl From<Settings> for SettingsJson {
@@ -63,6 +70,10 @@ impl From<Settings> for SettingsJson {
             review_mode: s.review_mode,
             small_pr_max_lines: s.small_pr_max_lines,
             max_review_input_tokens: s.max_review_input_tokens,
+            max_thread_replies: s.max_thread_replies,
+            max_validate_threads: s.max_validate_threads,
+            max_learned_per_pr: s.max_learned_per_pr,
+            curator_effort: s.curator_effort,
         }
     }
 }
@@ -83,6 +94,14 @@ struct SettingsBody {
     small_pr_max_lines: Option<i32>,
     /// Tidak ada = biarkan.
     max_review_input_tokens: Option<i32>,
+    /// Tidak ada = biarkan.
+    max_thread_replies: Option<i32>,
+    /// Tidak ada = biarkan.
+    max_validate_threads: Option<i32>,
+    /// Tidak ada = biarkan.
+    max_learned_per_pr: Option<i32>,
+    /// Tidak ada = biarkan.
+    curator_effort: Option<String>,
 }
 
 impl From<IgnoreError> for ApiError {
@@ -161,6 +180,34 @@ async fn replace(
             "max_review_input_tokens must be between 0 and 100000000",
         ));
     }
+    if let Some(replies) = body.max_thread_replies
+        && !THREAD_REPLIES_RANGE.contains(&replies)
+    {
+        return Err(ApiError::validation(
+            "max_thread_replies must be between 0 and 100",
+        ));
+    }
+    if let Some(threads) = body.max_validate_threads
+        && !VALIDATE_THREADS_RANGE.contains(&threads)
+    {
+        return Err(ApiError::validation(
+            "max_validate_threads must be between 0 and 100",
+        ));
+    }
+    if let Some(learned) = body.max_learned_per_pr
+        && !LEARNED_PER_PR_RANGE.contains(&learned)
+    {
+        return Err(ApiError::validation(
+            "max_learned_per_pr must be between 1 and 50",
+        ));
+    }
+    if let Some(ref effort) = body.curator_effort
+        && !matches!(effort.as_str(), "low" | "medium" | "high")
+    {
+        return Err(ApiError::validation(
+            "curator_effort must be low, medium or high",
+        ));
+    }
     if let Some(provider_id) = body.default_provider_id
         && ai::get_provider(&state.db, provider_id).await?.is_none()
     {
@@ -195,6 +242,16 @@ async fn replace(
         max_review_input_tokens: body
             .max_review_input_tokens
             .unwrap_or(current.max_review_input_tokens),
+        max_thread_replies: body
+            .max_thread_replies
+            .unwrap_or(current.max_thread_replies),
+        max_validate_threads: body
+            .max_validate_threads
+            .unwrap_or(current.max_validate_threads),
+        max_learned_per_pr: body
+            .max_learned_per_pr
+            .unwrap_or(current.max_learned_per_pr),
+        curator_effort: body.curator_effort.unwrap_or(current.curator_effort),
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }

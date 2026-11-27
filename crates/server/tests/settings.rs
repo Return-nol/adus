@@ -98,6 +98,10 @@ async fn settings_defaults_include_limits_review_mode_and_ignore_paths(pool: PgP
     assert_eq!(now["max_patch_lines_per_file"], 1500);
     assert_eq!(now["small_pr_max_lines"], 100);
     assert_eq!(now["max_review_input_tokens"], 2_000_000);
+    assert_eq!(now["max_thread_replies"], 5);
+    assert_eq!(now["max_validate_threads"], 30);
+    assert_eq!(now["max_learned_per_pr"], 10);
+    assert_eq!(now["curator_effort"], "medium");
     assert_eq!(now["review_mode"], "generalist");
     assert_eq!(now["ignore_paths_is_default"], true);
     assert!(now["ignore_paths"].as_array().unwrap().len() > 1000);
@@ -178,6 +182,54 @@ async fn update_settings_validates_small_pr_max_lines_and_max_review_input_token
         read_settings(&app, &admin).await["small_pr_max_lines"],
         10_000
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn settings_validate_thread_limits(pool: PgPool) {
+    let (app, _git) = app_and_git(pool).await;
+    let admin = setup_admin(&app).await;
+
+    for (field, ok_vals, bad_vals) in [
+        (
+            "max_thread_replies",
+            vec![json!(0), json!(100)],
+            vec![json!(-1), json!(101)],
+        ),
+        (
+            "max_validate_threads",
+            vec![json!(0), json!(100)],
+            vec![json!(-1), json!(101)],
+        ),
+        (
+            "max_learned_per_pr",
+            vec![json!(1), json!(50)],
+            vec![json!(0), json!(51)],
+        ),
+        (
+            "curator_effort",
+            vec![json!("low"), json!("high")],
+            vec![json!(""), json!("ultra")],
+        ),
+    ] {
+        for ok in &ok_vals {
+            let reply = put_settings(&app, &admin, json!({ field: ok })).await;
+            assert_eq!(reply.status, StatusCode::OK, "{field}={ok}");
+            assert_eq!(reply.body[field], *ok);
+        }
+        for bad in &bad_vals {
+            let reply = put_settings(&app, &admin, json!({ field: bad })).await;
+            assert_eq!(
+                reply.status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{field}={bad}"
+            );
+            assert_eq!(reply.body["error"]["code"], "validation_error");
+        }
+        // Omitting the field keeps the last valid value.
+        let kept = put_settings(&app, &admin, json!({})).await;
+        assert_eq!(kept.status, StatusCode::OK);
+        assert_eq!(kept.body[field], *ok_vals.last().unwrap());
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]

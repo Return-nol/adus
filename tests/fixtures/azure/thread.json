@@ -1,0 +1,38 @@
+{
+  "pullRequestThreadContext": null,
+  "id": 148,
+  "publishedDate": "2026-11-27T09:00:00.000Z",
+  "lastUpdatedDate": "2026-11-27T09:10:00.000Z",
+  "comments": [
+    {
+      "id": 1,
+      "parentCommentId": 0,
+      "author": { "displayName": "Adus Bot", "uniqueName": "adus@acme.com" },
+      "content": "<!-- adudu -->\n🤖 **Adudu** · **⚠️ Warning:** Possible panic",
+      "commentType": "text"
+    },
+    {
+      "id": 2,
+      "parentCommentId": 1,
+      "author": { "displayName": "Dev", "uniqueName": "dev@acme.com" },
+      "content": "Fixed in the last push.",
+      "commentType": "text"
+    },
+    {
+      "id": 3,
+      "parentCommentId": 0,
+      "author": { "displayName": "Microsoft.VisualStudio.Services.TFS", "uniqueName": "00000002-0000-8888-8000-000000000000@2c895908-04e0-4952-89fd-54b0046d6288" },
+      "content": "Dev resolved the thread",
+      "commentType": "system"
+    }
+  ],
+  "status": "fixed",
+  "threadContext": {
+    "filePath": "/src/a.rs",
+    "rightFileStart": { "line": 12, "offset": 1 },
+    "rightFileEnd": { "line": 12, "offset": 1 }
+  },
+  "properties": {},
+  "identities": null,
+  "isDeleted": false
+}

@@ -440,6 +440,7 @@ fn rule_finding(
             title: String::new(),
             body: redact_secrets(&body).into_owned(),
             suggestion: None,
+            precedent: None,
         },
         specialist: SpecialistKind::Generalist,
         investigated_by_finder: false,

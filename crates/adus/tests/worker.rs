@@ -15,7 +15,9 @@ use adus_db::{connections, repositories};
 use adus_git::HttpGitProviderFactory;
 use adus_llm::router::LlmRouter;
 use adus_queue::{Delivery, Queue};
-use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
+use adus_review::engine::{
+    Engine, EngineError, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT, VALIDATE_TIMEOUT,
+};
 use adus_review::workspace::GitCliCloner;
 use async_trait::async_trait;
 use redis::AsyncCommands;
@@ -250,6 +252,7 @@ async fn fifth_failure_goes_to_dead_letter_and_marks_review_failed(pool: PgPool)
         cloner: Arc::new(GitCliCloner::default()),
         review_timeout: REVIEW_TIMEOUT,
         specialists_review_timeout: SPECIALISTS_REVIEW_TIMEOUT,
+        validate_timeout: VALIDATE_TIMEOUT,
     };
     let delivery = deliver(&queue, &review_job(repo.id, 7), 5).await;
 
@@ -347,13 +350,7 @@ async fn same_pr_jobs_never_run_concurrently() {
 
 #[tokio::test]
 async fn lock_busy_requeues_without_consuming_attempt() {
-    let (queue, prefix) = new_queue().await;
     let repository_id = Uuid::new_v4();
-    let held = queue
-        .try_lock(&format!("pr:{repository_id}:4"), Duration::from_secs(60))
-        .await
-        .unwrap();
-    assert!(held.is_some());
     let comment = Job::PrComment {
         repository_id,
         pr_number: 4,
@@ -364,23 +361,49 @@ async fn lock_busy_requeues_without_consuming_attempt() {
         },
         body: "@adudu review".into(),
     };
-    let delivery = deliver(&queue, &comment, 3).await;
-    let runner = FakeRunner::new(Ok(()), Duration::ZERO);
+    let reply = Job::ThreadReply {
+        repository_id,
+        pr_number: 4,
+        thread_id: "5".into(),
+        comment_id: "2".into(),
+    };
+    for job in [comment, reply] {
+        let (queue, prefix) = new_queue().await;
+        let held = queue
+            .try_lock(&format!("pr:{repository_id}:4"), Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(held.is_some());
+        let delivery = deliver(&queue, &job, 3).await;
+        let runner = FakeRunner::new(Ok(()), Duration::ZERO);
 
-    handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
-        .await
-        .unwrap();
+        handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
+            .await
+            .unwrap();
 
-    assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
-    let retries = delayed(&prefix).await;
-    assert_eq!(retries.len(), 1);
-    let (attempt, due_in) = retries[0];
-    assert_eq!(attempt, 3);
-    assert!((29.0..=30.5).contains(&due_in), "due in {due_in}s");
-    assert_eq!(stream_len(&format!("{prefix}:jobs")).await, 0);
-    // Lock milik pihak lain tidak disentuh.
-    assert!(lock_exists(&prefix, repository_id, 4).await);
-    cleanup(&prefix).await;
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0, "{job:?}");
+        let retries = delayed(&prefix).await;
+        assert_eq!(retries.len(), 1);
+        let (attempt, due_in) = retries[0];
+        assert_eq!(attempt, 3);
+        assert!((29.0..=30.5).contains(&due_in), "due in {due_in}s");
+        assert_eq!(stream_len(&format!("{prefix}:jobs")).await, 0);
+        // Lock milik pihak lain tidak disentuh.
+        assert!(lock_exists(&prefix, repository_id, 4).await);
+
+        // Once the PR is free the job reaches the runner and is acked.
+        queue
+            .unlock(&format!("pr:{repository_id}:4"), &held.unwrap())
+            .await
+            .unwrap();
+        let delivery = deliver(&queue, &job, 1).await;
+        handle_delivery(&queue, runner.clone(), delivery, JOB_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1, "{job:?}");
+        assert!(!lock_exists(&prefix, repository_id, 4).await);
+        cleanup(&prefix).await;
+    }
 }
 
 #[tokio::test]

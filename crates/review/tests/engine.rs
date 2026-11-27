@@ -1,3 +1,5 @@
+// Not every harness helper is used here.
+#[allow(dead_code)]
 mod common;
 
 use std::time::{Duration, Instant};
@@ -6,6 +8,7 @@ use adus_core::job::Trigger;
 use adus_core::types::{ADUDU_MARKER, ReviewMode, Severity};
 use adus_db::connections::ConnectionStatus;
 use adus_db::repositories::RepoPatch;
+use adus_db::review_threads::{self, ThreadOutcome};
 use adus_db::reviews::{self, Review, ReviewStatus};
 use adus_db::rules::{self, KnowledgeScope, NewRule};
 use adus_git::{ConnectionKind, FileStatus, GitError, PrThread, PrThreadComment};
@@ -1569,8 +1572,16 @@ async fn slow_review_times_out_and_is_marked_failed(pool: PgPool) {
     s.git.state().get_pr_delay = Duration::from_secs(5);
     s.engine.review_timeout = Duration::from_millis(100);
     s.engine.specialists_review_timeout = Duration::from_millis(100);
+    s.engine.validate_timeout = Duration::from_millis(100);
+    let started = Instant::now();
 
     let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    // The backstop (the larger budget plus the push-validation cap) cuts the slow PR fetch.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cut by the backstop"
+    );
 
     assert_eq!(err, EngineError::Fatal("review timed out".into()));
     let row = latest(&pool).await;
@@ -1888,7 +1899,7 @@ d
         vec![
             format!(
                 "{ADUDU_MARKER}
-**🚨 Critical:** Token written to the log
+🤖 **Adudu** · **🚨 Critical:** Token written to the log
 
 {redacted_body}
 
@@ -1898,13 +1909,13 @@ log_redacted(b);
             ),
             format!(
                 "{ADUDU_MARKER}
-**ℹ️ Info:** Off by one when the list is empty.
+🤖 **Adudu** · **ℹ️ Info:** Off by one when the list is empty.
 
 Off by one when the list is empty."
             ),
             format!(
                 "{ADUDU_MARKER}
-**⚠️ Warning:** `d` is never freed!
+🤖 **Adudu** · **⚠️ Warning:** `d` is never freed!
 
 `d` is never freed!"
             ),
@@ -2008,11 +2019,14 @@ const ALREADY_RAISED_NOTE: &str = "1 finding(s) skipped: already raised in this 
 async fn setup_with_discussion(pool: &PgPool) -> Setup {
     let s = setup_files(pool, vec![file("src/a.rs", PATCH_234)]).await;
     s.git.state().threads = vec![PrThread {
+        id: None,
+        resolved: false,
         path: Some("src/a.rs".into()),
         line: Some(3),
         status: None,
         url: None,
         comments: vec![PrThreadComment {
+            id: String::new(),
             author: "bob".into(),
             by_adus: false,
             body: "This can overflow.".into(),
@@ -3089,4 +3103,150 @@ async fn tool_less_finder_owns_rules_and_drops_verified_rule_findings(pool: PgPo
     for field in ["rule_verified=1", "sharded_rules=0"] {
         assert!(line.contains(field), "{field} missing: {line}");
     }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_records_finding_threads(pool: PgPool) {
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    let findings = json!([
+        finding_json("src/a.rs", 2, "critical", "First"),
+        finding_json("src/a.rs", 4, "warning", "Second"),
+    ]);
+    s.chat.push(Ok(&findings.to_string()));
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1]}"#));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let posted = s.git.state().reviews[0].comments.clone();
+    assert_eq!(posted.len(), 2);
+    let threads = review_threads::for_pr(&pool, s.repository_id, 7)
+        .await
+        .unwrap();
+    assert_eq!(threads.len(), 2);
+    for t in &threads {
+        // The fake gives the comment at index `i` the ids `t{i}` / `c{i}`.
+        let i = posted
+            .iter()
+            .position(|c| Some(i32::try_from(c.line).unwrap()) == t.line)
+            .expect("a posted comment on the thread's line");
+        assert_eq!(t.outcome, ThreadOutcome::Open);
+        assert_eq!(t.provider_thread_id, format!("t{i}"));
+        assert_eq!(t.root_comment_id, format!("c{i}"));
+        assert_eq!(t.posted_head_sha, "h1");
+        assert_eq!(t.review_id, Some(id));
+        assert_eq!(t.path, "src/a.rs");
+        assert_eq!(t.body, posted[i].body);
+        let expected = match t.line {
+            Some(2) => (Severity::Critical, "First"),
+            _ => (Severity::Warning, "Second"),
+        };
+        assert_eq!((t.severity, t.title.as_str()), expected);
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_applies_precedents_to_comments_counts_and_threads(pool: PgPool) {
+    use adus_db::memories::{self, Evidence, MemoryKind, MemorySource, MemoryStatus, NewMemory};
+
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    let ev0 = [Evidence {
+        url: "https://github.com/org/repo/pull/5#discussion_r1".into(),
+        pr_number: Some(5),
+    }];
+    memories::insert(
+        &pool,
+        NewMemory {
+            scope: KnowledgeScope::Repo,
+            repository_id: Some(s.repository_id),
+            content: "skip auth on healthcheck",
+            source: MemorySource::PrLearning,
+            source_url: None,
+            created_by: None,
+            status: MemoryStatus::Active,
+            kind: MemoryKind::Exception,
+            context: Some("By design: public probe"),
+            reason: Some("Liveness probe must be unauthenticated"),
+            resolution: None,
+            evidence: &ev0,
+            supersedes: None,
+        },
+    )
+    .await
+    .unwrap();
+    let ev1 = [Evidence {
+        url: "https://github.com/org/repo/pull/6#discussion_r2".into(),
+        pr_number: Some(6),
+    }];
+    memories::insert(
+        &pool,
+        NewMemory {
+            scope: KnowledgeScope::Repo,
+            repository_id: Some(s.repository_id),
+            content: "integer overflow on counter",
+            source: MemorySource::PrLearning,
+            source_url: None,
+            created_by: None,
+            status: MemoryStatus::Active,
+            kind: MemoryKind::FixPattern,
+            context: None,
+            reason: None,
+            resolution: Some("Use saturating_add"),
+            evidence: &ev1,
+            supersedes: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let findings = json!([
+        {
+            "file": "src/a.rs",
+            "line": 2,
+            "severity": "critical",
+            "title": "Unauthenticated route",
+            "body": "Missing auth check.",
+            "precedent": 0
+        },
+        {
+            "file": "src/a.rs",
+            "line": 4,
+            "severity": "warning",
+            "title": "Possible overflow",
+            "body": "Counter can wrap.",
+            "precedent": 1
+        }
+    ]);
+    s.chat.push(Ok(&findings.to_string()));
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1]}"#));
+
+    run(&s, Trigger::Opened).await.unwrap();
+
+    {
+        let git = s.git.state();
+        let review = &git.reviews[0];
+        // Summary counts reflect post-precedent severities (Critical -> Info, Warning stays Warning).
+        assert!(review.summary.contains("Warning: 1"), "{}", review.summary);
+        assert!(review.summary.contains("Info: 1"), "{}", review.summary);
+        assert!(!review.summary.contains("Critical"), "{}", review.summary);
+
+        let c0 = review.comments.iter().find(|c| c.line == 2).unwrap();
+        assert!(c0.body.contains("**ℹ️ Info:** Unauthenticated route"));
+        assert!(c0.body.contains("**Precedent:** A similar case was declared by design in PR #5: Liveness probe must be unauthenticated"));
+
+        let c1 = review.comments.iter().find(|c| c.line == 4).unwrap();
+        assert!(c1.body.contains("**⚠️ Warning:** Possible overflow"));
+        assert!(
+            c1.body
+                .contains("**Precedent:** A similar case was fixed in PR #6: Use saturating_add")
+        );
+    }
+
+    let threads = review_threads::for_pr(&pool, s.repository_id, 7)
+        .await
+        .unwrap();
+    let t0 = threads.iter().find(|t| t.line == Some(2)).unwrap();
+    assert_eq!(t0.severity, Severity::Info);
+    assert!(t0.body.contains("**Precedent:**"));
 }

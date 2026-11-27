@@ -4,7 +4,11 @@
 	import { toast } from 'svelte-sonner';
 	import { api, ApiError } from '#lib/api.js';
 	import { session } from '#lib/session.svelte.js';
-	import MemoryDialog, { type Memory } from '#lib/components/memory-dialog.svelte';
+	import MemoryDialog, {
+		kindLabel,
+		type Memory,
+		type MemoryKind
+	} from '#lib/components/memory-dialog.svelte';
 	import RuleDialog, {
 		severityLabel,
 		type Rule,
@@ -25,6 +29,7 @@
 	type Repo = { id: string; display_name: string };
 
 	const GLOBAL = 'global';
+	const ALL_KINDS = 'all';
 	const MEMORY_PREVIEW = 120;
 	const sourceLabel: Record<Memory['source'], string> = {
 		manual: 'manual',
@@ -39,17 +44,22 @@
 
 	let repos = $state<Repo[]>([]);
 	let scope = $state(GLOBAL);
+	let kindFilter = $state<string>(ALL_KINDS);
 	let rules = $state<Rule[]>([]);
 	let memories = $state<Memory[]>([]);
-	let loaded = $state(false);
-	let loadError = $state(false);
+	let rulesLoaded = $state(false);
+	let rulesError = $state(false);
+	let memoriesLoaded = $state(false);
+	let memoriesError = $state(false);
 	// Learned memories awaiting a decision, across all repositories (not tied to `scope`).
 	let pending = $state<Memory[]>([]);
 	let rejected = $state<Memory[]>([]);
+	let activeById = $state<Record<string, Memory>>({});
 	let learnedLoaded = $state(false);
 	let learnedError = $state(false);
 	// Ids (rule, memory) with a request in flight; their controls are disabled.
 	const busy = new SvelteSet<string>();
+	const expanded = new SvelteSet<string>();
 
 	let ruleOpen = $state(false);
 	let editRule = $state<Rule | null>(null);
@@ -67,7 +77,9 @@
 	// The server enforces admin too; this only hides pending/rejected controls for role `user`.
 	const isAdmin = $derived(session.user?.role === 'admin');
 	const learnedHeaders = $derived(
-		isAdmin ? ['Content', 'Repository', 'Source', 'Actions'] : ['Content', 'Repository', 'Source']
+		isAdmin
+			? ['Content', 'Kind', 'Repository', 'Source', 'Actions']
+			: ['Content', 'Kind', 'Repository', 'Source']
 	);
 
 	const repositoryId = $derived(scope === GLOBAL ? null : scope);
@@ -80,37 +92,68 @@
 		toast.error(e instanceof ApiError ? e.message : 'Could not reach the server');
 	}
 
+	function toggleExpanded(id: string) {
+		if (expanded.has(id)) expanded.delete(id);
+		else expanded.add(id);
+	}
+
+	function hasCuratedDetails(m: Memory): boolean {
+		return Boolean(
+			m.context || m.reason || m.resolution || m.evidence.some((ev) => safeHttpUrl(ev.url))
+		);
+	}
+
 	// Only the newest request may write results, so a slow response for a previous scope is dropped.
-	let seq = 0;
-	async function load() {
-		const mine = ++seq;
-		loadError = false;
+	let rulesSeq = 0;
+	async function loadRules() {
+		const mine = ++rulesSeq;
+		rulesError = false;
 		const q = repositoryId ? `?repository_id=${repositoryId}` : '';
-		const mq = repositoryId ? `?status=active&repository_id=${repositoryId}` : '?status=active';
 		try {
-			const [r, m] = await Promise.all([
-				api<Rule[]>('GET', `/rules${q}`),
-				api<Memory[]>('GET', `/memories${mq}`)
-			]);
-			if (mine !== seq) return;
+			const r = await api<Rule[]>('GET', `/rules${q}`);
+			if (mine !== rulesSeq) return;
 			rules = r;
-			memories = m;
 		} catch (e) {
-			if (mine === seq) {
-				loadError = true;
+			if (mine === rulesSeq) {
+				rulesError = true;
 				fail(e);
 			}
 		}
-		if (mine === seq) loaded = true;
+		if (mine === rulesSeq) rulesLoaded = true;
+	}
+
+	let memoriesSeq = 0;
+	async function loadMemories() {
+		const mine = ++memoriesSeq;
+		memoriesError = false;
+		const params = new URLSearchParams({ status: 'active' });
+		if (repositoryId) params.set('repository_id', repositoryId);
+		if (kindFilter !== ALL_KINDS) params.set('kind', kindFilter);
+		const mq = `?${params.toString()}`;
+		try {
+			const m = await api<Memory[]>('GET', `/memories${mq}`);
+			if (mine !== memoriesSeq) return;
+			memories = m;
+		} catch (e) {
+			if (mine === memoriesSeq) {
+				memoriesError = true;
+				fail(e);
+			}
+		}
+		if (mine === memoriesSeq) memoriesLoaded = true;
 	}
 
 	async function loadLearned() {
 		learnedError = false;
 		try {
-			[pending, rejected] = await Promise.all([
+			const [p, r, activeAll] = await Promise.all([
 				api<Memory[]>('GET', '/memories?all=true&status=pending'),
-				api<Memory[]>('GET', '/memories?all=true&status=rejected')
+				api<Memory[]>('GET', '/memories?all=true&status=rejected'),
+				api<Memory[]>('GET', '/memories?all=true&status=active').catch(() => [] as Memory[])
 			]);
+			pending = p;
+			rejected = r;
+			activeById = Object.fromEntries(activeAll.map((m) => [m.id, m]));
 		} catch (e) {
 			learnedError = true;
 			fail(e);
@@ -119,7 +162,7 @@
 	}
 
 	function reloadAll() {
-		return Promise.all([load(), loadLearned()]);
+		return Promise.all([loadRules(), loadMemories(), loadLearned()]);
 	}
 
 	function repoName(id: string | null): string {
@@ -135,13 +178,21 @@
 		}
 	});
 
-	// Reload whenever the scope changes (also runs once on mount).
+	// Reload rules whenever the scope changes (also runs once on mount).
 	$effect(() => {
 		void scope;
-		loaded = false;
+		rulesLoaded = false;
 		rules = [];
+		loadRules();
+	});
+
+	// Reload memories whenever the scope or kind filter changes (also runs once on mount).
+	$effect(() => {
+		void scope;
+		void kindFilter;
+		memoriesLoaded = false;
 		memories = [];
-		load();
+		loadMemories();
 	});
 
 	/** Runs `fn` with `id` marked busy, then reloads (which also snaps a failed switch back). */
@@ -226,6 +277,15 @@
 {/snippet}
 
 {#snippet memoryContent(m: Memory)}
+	{#if m.status === 'pending' && m.supersedes}
+		{@const target = activeById[m.supersedes]}
+		<div class="mb-2 rounded-md border border-border bg-muted/40 p-2 text-xs">
+			<div class="font-medium text-muted-foreground">Replaces active memory:</div>
+			<div class="mt-0.5 text-muted-foreground line-through">
+				{target ? target.content : m.supersedes}
+			</div>
+		</div>
+	{/if}
 	{#if m.content.length > MEMORY_PREVIEW}
 		<Tooltip.Root>
 			<Tooltip.Trigger class="text-left" title={m.content}>
@@ -238,6 +298,56 @@
 	{:else}
 		{m.content}
 	{/if}
+	{#if hasCuratedDetails(m)}
+		<button
+			type="button"
+			class="mt-1 block text-xs text-primary underline-offset-4 hover:underline"
+			aria-expanded={expanded.has(m.id)}
+			onclick={() => toggleExpanded(m.id)}
+		>
+			{expanded.has(m.id) ? 'Hide details' : 'Show details'}
+		</button>
+		{#if expanded.has(m.id)}
+			<div class="mt-2 space-y-1.5 rounded-md border border-border bg-muted/40 p-2.5 text-xs">
+				{#if m.context}
+					<div>
+						<span class="font-medium text-foreground">Context:</span>
+						<span class="whitespace-pre-wrap text-muted-foreground">{m.context}</span>
+					</div>
+				{/if}
+				{#if m.reason}
+					<div>
+						<span class="font-medium text-foreground">Reason:</span>
+						<span class="whitespace-pre-wrap text-muted-foreground">{m.reason}</span>
+					</div>
+				{/if}
+				{#if m.resolution}
+					<div>
+						<span class="font-medium text-foreground">Resolution:</span>
+						<span class="whitespace-pre-wrap text-muted-foreground">{m.resolution}</span>
+					</div>
+				{/if}
+				{#if m.evidence.some((ev) => safeHttpUrl(ev.url))}
+					<div class="flex flex-wrap items-center gap-2">
+						<span class="font-medium text-foreground">Evidence:</span>
+						{#each m.evidence as ev, i (ev.url + i)}
+							{@const href = safeHttpUrl(ev.url)}
+							{#if href}
+								<a
+									{href}
+									target="_blank"
+									rel="noopener noreferrer"
+									class="text-primary underline-offset-4 hover:underline"
+								>
+									{ev.pr_number != null ? `PR #${ev.pr_number}` : 'Link'}
+								</a>
+							{/if}
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
+	{/if}
 {/snippet}
 
 <!-- Pending or rejected learned memories; only admins get the actions column. -->
@@ -248,6 +358,7 @@
 				<Table.Header>
 					<Table.Row>
 						<Table.Head>Content</Table.Head>
+						<Table.Head>Kind</Table.Head>
 						<Table.Head>Repository</Table.Head>
 						<Table.Head>Source</Table.Head>
 						{#if isAdmin}<Table.Head class="text-right">Actions</Table.Head>{/if}
@@ -257,6 +368,7 @@
 					{#each items as m (m.id)}
 						<Table.Row>
 							<Table.Cell class="max-w-md whitespace-normal">{@render memoryContent(m)}</Table.Cell>
+							<Table.Cell><Badge variant="outline">{kindLabel[m.kind]}</Badge></Table.Cell>
 							<Table.Cell>{repoName(m.repository_id)}</Table.Cell>
 							<Table.Cell>
 								{#if safeHttpUrl(m.source_url)}
@@ -328,7 +440,7 @@
 	<Tabs.Content value="rules" class="space-y-4">
 		<div class="flex justify-end">
 			<Button
-				disabled={!loaded}
+				disabled={!rulesLoaded}
 				onclick={() => {
 					editRule = null;
 					ruleOpen = true;
@@ -337,9 +449,9 @@
 				Add rule
 			</Button>
 		</div>
-		{#if loadError}
-			{@render loadFailed('Could not load this scope.', load)}
-		{:else if !loaded}
+		{#if rulesError}
+			{@render loadFailed('Could not load this scope.', loadRules)}
+		{:else if !rulesLoaded}
 			<TableSkeleton card headers={['Title', 'Path glob', 'Severity', 'Enabled', 'Actions']} />
 		{:else if rules.length === 0}
 			<div
@@ -413,19 +525,37 @@
 	</Tabs.Content>
 
 	<Tabs.Content value="memory" class="space-y-4">
-		<div class="flex justify-end">
-			<Button disabled={!loaded} onclick={() => openMemory(null, false)}>Add memory</Button>
+		<div class="flex flex-wrap items-center justify-between gap-3">
+			<Select.Root type="single" bind:value={kindFilter}>
+				<Select.Trigger class="w-48" aria-label="Kind filter">
+					{kindFilter === ALL_KINDS ? 'All kinds' : kindLabel[kindFilter as MemoryKind]}
+				</Select.Trigger>
+				<Select.Content>
+					<Select.Item value={ALL_KINDS} label="All kinds">All kinds</Select.Item>
+					{#each Object.entries(kindLabel) as [value, label] (value)}
+						<Select.Item {value} {label}>{label}</Select.Item>
+					{/each}
+				</Select.Content>
+			</Select.Root>
+			<Button disabled={!memoriesLoaded} onclick={() => openMemory(null, false)}>Add memory</Button>
 		</div>
-		{#if loadError}
-			{@render loadFailed('Could not load this scope.', load)}
-		{:else if !loaded}
-			<TableSkeleton card headers={['Content', 'Source', 'Created by', 'Enabled', 'Actions']} />
+		{#if memoriesError}
+			{@render loadFailed('Could not load this scope.', loadMemories)}
+		{:else if !memoriesLoaded}
+			<TableSkeleton
+				card
+				headers={['Content', 'Kind', 'Source', 'Created by', 'Enabled', 'Actions']}
+			/>
 		{:else if memories.length === 0}
 			<div
 				class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 			>
-				No memories for this scope yet. Add one here, or comment <code>@adudu remember: …</code> on a
-				pull request.
+				{#if kindFilter !== ALL_KINDS}
+					No memories of this kind for this scope yet.
+				{:else}
+					No memories for this scope yet. Add one here, or comment <code>@adudu remember: …</code> on
+					a pull request.
+				{/if}
 			</div>
 		{:else if memories.length > 0}
 			<Card.Root class="py-0">
@@ -434,6 +564,7 @@
 						<Table.Header>
 							<Table.Row>
 								<Table.Head>Content</Table.Head>
+								<Table.Head>Kind</Table.Head>
 								<Table.Head>Source</Table.Head>
 								<Table.Head>Created by</Table.Head>
 								<Table.Head>Enabled</Table.Head>
@@ -445,6 +576,14 @@
 								<Table.Row>
 									<Table.Cell class="max-w-md whitespace-normal">
 										{@render memoryContent(m)}
+									</Table.Cell>
+									<Table.Cell>
+										<div class="flex flex-wrap gap-1">
+											<Badge variant="outline">{kindLabel[m.kind]}</Badge>
+											{#if m.superseded_by !== null}
+												<Badge variant="outline">Superseded</Badge>
+											{/if}
+										</div>
 									</Table.Cell>
 									<Table.Cell>
 										<Badge variant="secondary">
@@ -531,7 +670,7 @@
 	{/if}
 </Tabs.Root>
 
-<RuleDialog bind:open={ruleOpen} rule={editRule} {repositoryId} onsaved={load} />
+<RuleDialog bind:open={ruleOpen} rule={editRule} {repositoryId} onsaved={loadRules} />
 <MemoryDialog
 	bind:open={memoryOpen}
 	memory={editMemory}

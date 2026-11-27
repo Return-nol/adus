@@ -475,7 +475,7 @@ async fn wrong_provider_endpoint_404(pool: PgPool) {
 async fn own_marker_comment_ignored(pool: PgPool) {
     let hook = setup(pool, ConnectionKind::Github).await;
     let body = edited(GH_ISSUE_COMMENT, |v| {
-        v["comment"]["body"] = json!("Review done.\n\n<!-- adudu -->")
+        v["comment"]["body"] = json!("<!-- adudu -->\n🤖 **Adudu** reviewed this PR")
     });
     let reply = common::send(
         &hook.app,

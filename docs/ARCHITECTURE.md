@@ -19,7 +19,7 @@ flowchart LR
         WebSPA["Embedded SvelteKit SPA (rust-embed)"]
         API["Axum REST API (/api/v1/*) & Auth"]
         WH["Webhook Ingress (/webhooks/github, /webhooks/azure)"]
-        Worker["Worker Pool (N workers, JOB_TIMEOUT 31m)"]
+        Worker["Worker Pool (N workers, JOB_TIMEOUT 33m)"]
         Sched["Scheduler (delayed job promotion + 5m stale sweep)"]
         Engine["Review & Learning Engine (crates/review)"]
         Clones["Ephemeral Clones (temp/adus-clones/adus-uuid)"]
@@ -27,7 +27,7 @@ flowchart LR
     end
 
     subgraph Storage["State & Queue"]
-        PG["PostgreSQL 18 (users, repos, rules, memories, reviews, llm_usage)"]
+        PG["PostgreSQL 18 (users, repos, rules, memories, reviews, review_threads, llm_usage)"]
         RD["Redis 8 (Streams adus:jobs, delayed ZSET, PR locks, dedup, cache)"]
     end
 
@@ -65,11 +65,11 @@ Dependencies across the Rust workspace are strictly acyclic:
 
 ```text
 crates/core     Config, AES-256-GCM Cipher, default ignore globs, shared domain types (ReviewMode, Job, normalize_path)
-crates/db       sqlx Postgres pool + embedded migrations (0001..0009); users, sessions, connections, repositories, ai, settings, usage, reviews, rules, memories, learning_runs
+crates/db       sqlx Postgres pool + embedded migrations (0001..0010); users, sessions, connections, repositories, ai, settings, usage, reviews, review_threads, rules, memories, learning_runs
 crates/git      GitProvider / GitProviderFactory traits, CloneSpec, diff utilities (commentable_lines, commentable_hunks, unified_patch), GitHub & Azure clients
 crates/llm      LlmClient / ChatService traits, OpenAI / Anthropic / Gemini / OpenAI-compatible clients, ReasoningEffort, LlmRouter
 crates/queue    Redis Streams job queue (XADD, XREADGROUP, XAUTOCLAIM), delivery dedup, distributed per-PR lock, worker heartbeats
-crates/review   Review & learning engine: workspace, tools, redact, repo_instructions, agent, coverage, specialists, finder, rules_judge, rules_evidence, verifier, discussion, dedup, severity, enrich, budget, small_pr, prompt, parse, trace, command, learn, engine
+crates/review   Review & learning engine: workspace, tools, redact, repo_instructions, agent, coverage, specialists, finder, rules_judge, rules_evidence, verifier, discussion, dedup, severity, enrich, budget, small_pr, prompt, parse, trace, command, threads, learn, engine
 crates/server   Axum router, AppState, ApiError/ApiJson/ApiPath/ApiQuery, cookie auth & RBAC, webhooks, doctor, embedded SPA
 crates/adus     CLI binary (serve, gen-secret, check-config, doctor, healthcheck, rereview), worker loop & scheduler
 web/            SvelteKit static SPA + shadcn-svelte (built to web/build and embedded into crates/server)
@@ -121,7 +121,7 @@ Dynamic dispatch (`dyn Trait`) is restricted to 6 explicit test/runtime seams:
 | `GitProviderFactory` | `adus-git` | `HttpGitProviderFactory` | Constructs provider client per `Connection` PAT |
 | `LlmClient` | `adus-llm` | `OpenAiClient`, `AnthropicClient`, `GeminiClient` | Provider wire protocol & model discovery |
 | `ChatService` | `adus-llm` | `LlmRouter` | Multi-key LRU routing, cooldowns, usage tracking |
-| `JobRunner` | `adus` | `Engine` | Executes `ReviewPr`, `PrComment`, and `LearnPr` jobs |
+| `JobRunner` | `adus` | `Engine` | Executes `ReviewPr`, `PrComment`, `ThreadReply`, and `LearnPr` jobs |
 | `RepoCloner` | `adus-review` | `GitCliCloner` | Ephemeral shallow PR checkout (`git >= 2.31`) |
 
 All internal review dispatch (specialists, tools, parsers) uses closed enums and static dispatch.
@@ -132,10 +132,10 @@ All internal review dispatch (specialists, tools, parsers) uses closed enums and
 
 ### Job Ingestion & Execution
 
-1. **Ingestion:** Webhook handlers (`POST /webhooks/github/{repo_id}`, `POST /webhooks/azure/{repo_id}?token=...`) and `adus rereview <repo_id> <pr>` enqueue `Job` payloads (`review_pr`, `pr_comment`, `learn_pr`) onto Redis Stream `{prefix}:jobs`. Webhook deliveries are deduplicated atomically via `ENQUEUE_ONCE_SCRIPT` (`SET NX EX 86400` + `XADD`).
+1. **Ingestion:** Webhook handlers (`POST /webhooks/github/{repo_id}`, `POST /webhooks/azure/{repo_id}?token=...`) and `adus rereview <repo_id> <pr>` enqueue `Job` payloads (`review_pr`, `pr_comment`, `thread_reply`, `learn_pr`) onto Redis Stream `{prefix}:jobs`. Webhook deliveries are deduplicated atomically via `ENQUEUE_ONCE_SCRIPT` (`SET NX EX 86400` + `XADD`).
 2. **Worker Loop (`crates/adus/src/worker.rs`):** Each worker refreshes a 30 s heartbeat key (`{prefix}:worker:{name}:hb`) every 10 s and reads from consumer group `adus-workers` (`XREADGROUP`, reclaiming idle entries after `RECLAIM_IDLE = 35 min`).
 3. **Per-PR Serialization:** Before running any job, `handle_delivery` acquires Redis lock `pr:{repository_id}:{pr_number}` (`LOCK_TTL = 35 min`). If busy, the delivery is re-queued to `{prefix}:delayed` with a 30 s delay without incrementing `attempt`.
-4. **Isolation & Retries:** Jobs execute inside an isolated `tokio::spawn` bounded by `JOB_TIMEOUT = 31 min`:
+4. **Isolation & Retries:** Jobs execute inside an isolated `tokio::spawn` bounded by `JOB_TIMEOUT = 33 min`:
    - `Ok(())` -> `XACK`.
    - `EngineError::Retryable` -> while `attempt < MAX_ATTEMPTS (5)`, scheduled into `{prefix}:delayed` with `max(retry_after, backoff(attempt))`, then promoted back to `{prefix}:jobs` every 1 s by `run_scheduler`. For `review_pr`, the engine deletes its `reviews` row on `Retryable` so the retry starts clean; if all 5 attempts fail, `JobRunner::gave_up` inserts a `failed` row.
    - `EngineError::Fatal` -> moved immediately to `{prefix}:jobs:dead`; for `review_pr`, `reviews` row is marked `failed`.
@@ -147,7 +147,8 @@ All internal review dispatch (specialists, tools, parsers) uses closed enums and
 ```text
 REVIEW_TIMEOUT (20 min, Generalist & Small PR)
   < SPECIALISTS_REVIEW_TIMEOUT (30 min, Specialists)
-  < JOB_TIMEOUT (31 min, worker tokio::spawn backstop)
+  + VALIDATE_TIMEOUT (2 min, push validation before the review budget starts; engine backstop = 30 + 2 min)
+  < JOB_TIMEOUT (33 min, worker tokio::spawn backstop)
   < LOCK_TTL (35 min) == RECLAIM_IDLE (35 min) == reviews::STALE_AFTER (35 min)
 ```
 
@@ -186,7 +187,7 @@ Within each review run (`start = Instant::now()` in `Engine::run`), stage deadli
 
 Before spawning any LLM agents, `Engine::review_pr` executes deterministic gating and diff preparation:
 
-1. **Eligibility & Metadata:** Checks `repo.enabled`, `repo.auto_review` (bypassed by `Trigger::Command`), fetches PR (`base_sha`, `head_sha`), skips drafts (unless `Command`), skips `ignored_title_keywords` (unless `Command`), and resolves `(provider_id, primary_model, effective_fast_model())`.
+1. **Eligibility & Metadata:** Checks `repo.enabled`, `repo.auto_review` (bypassed by `Trigger::Command`), fetches PR (`base_sha`, `head_sha`), and resolves `(provider_id, primary_model, effective_fast_model())`. On `Updated` / `Command` it first runs push validation of open finding threads (§10; capped at `VALIDATE_TIMEOUT = 120 s`, its time added back to the review budget), then skips drafts (unless `Command`) and `ignored_title_keywords` (unless `Command`).
 2. **Diff Scope:**
    - `Trigger::Opened` / `Trigger::Command` -> `full_targets` (all `+` lines in `pr_diff`).
    - `Trigger::Updated` -> looks up `reviews::last_done`; if `head_sha` matches, skips (`already_reviewed`). Otherwise computes `diff_between(last_head, head_sha)` and intersects hunks with the full PR diff (`incremental_targets`), falling back to full diff if force-pushed (`NotFound`).
@@ -208,7 +209,7 @@ Before spawning any LLM agents, `Engine::review_pr` executes deterministic gatin
 
 ## 6. Agentic Core Loop (`crates/review/src/agent.rs`)
 
-All tool-using agents in Adus — **Finder** (Pass 1 & Synthesis Rescue), **Verifier** (Light & Evidence Gate), and **Sharded Rules Evidence Collector** — run on one unified ReAct loop: `agent::run_react_loop`, while all non-tool LLM calls (`dedup`, `severity`, `enrich`, `prose_recovery`, `rule_shard`, `rule_judge`, `verify_diff_only`, `learn`) run through `agent::chat_single_turn`.
+All tool-using agents in Adus — **Finder** (Pass 1 & Synthesis Rescue), **Verifier** (Light & Evidence Gate), and **Sharded Rules Evidence Collector** — run on one unified ReAct loop: `agent::run_react_loop`, while all non-tool LLM calls (`dedup`, `severity`, `enrich`, `prose_recovery`, `rule_shard`, `rule_judge`, `verify_diff_only`, `learn`, `thread_reply`, `thread_validate`) run through `agent::chat_single_turn`.
 
 Every prompt and response through both functions is secret-redacted and emitted to the `adus_review::trace` target when `--trace` / `ADUS_TRACE` is enabled.
 
@@ -359,9 +360,11 @@ flowchart TD
 
     JoinPoint --> Dedup["Semantic Dedup (93% deadline, fast @ Medium): merge same-root-cause + drop already_raised in existing PR threads"]
     Dedup --> Sev["Severity Classifier (fast @ Medium): label findings lacking severity (fallback Warning)"]
-    Sev --> Enrich["Enrichment (fast @ Medium, concurrency 4, reserve 20s): generate title <= 100c + optional suggestion (never edits body)"]
+    Sev --> Prec["Precedent: exception forces Info + note, fix_pattern adds the recorded fix"]
+    Prec --> Enrich["Enrichment (fast @ Medium, concurrency 4, reserve 20s): generate title <= 100c + optional suggestion (never edits body)"]
     Enrich --> CheckFix["check_fix gate: validate non-empty, no fences, changed, same hunk, balanced brackets"]
     CheckFix --> Post["Secret-redact comments & summary -> git.post_review"]
+    Post --> Record["Record review_threads rows (after the review deadlines)"]
 ```
 
 ---
@@ -445,8 +448,9 @@ flowchart TD
     VLight --> Merge["Join Tracks (discard Rule findings if Finder hit ToolsUnsupported)"]
     EvLoop --> Merge
 
-    Merge --> Funnel["Post-Verify Funnel (93% deadline = 27.9m, fast @ Medium): Semantic Dedup (merges cross-specialist duplicates + PR discussion) -> Severity -> Enrichment + check_fix"]
+    Merge --> Funnel["Post-Verify Funnel (93% deadline = 27.9m, fast @ Medium): Semantic Dedup (merges cross-specialist duplicates + PR discussion) -> Severity -> Precedent -> Enrichment + check_fix"]
     Funnel --> Post["Secret Redaction & git.post_review"]
+    Post --> Record["Record review_threads rows"]
 ```
 
 ---
@@ -464,7 +468,8 @@ flowchart TD
 ### Post-Verify Funnel (`dedup.rs`, `severity.rs`, `enrich.rs`)
 1. **Semantic Dedup:** Single-turn call (`fast_model` @ `Medium`, `1,024` tokens) over Verifier-kept + Sharded-Rules findings and `<existing_comments>` (up to 60 PR threads within `40,000` chars, bodies redacted & capped at `1,000` chars). Merges same-root-cause findings and drops `already_raised` findings (including prior `@adudu` comments). Safe fallback keeps all findings.
 2. **Severity Classifier:** Single-turn call (`fast_model` @ `Medium`, `1,024` tokens) labels findings with `severity: None` (`ShardedRules` findings keep `rule.severity`). Any missing/failed label defaults to `Warning`.
-3. **Enrichment & `check_fix`:** One call per finding (`ENRICH_CONCURRENCY = 4`, `fast_model` @ `Medium`, `2,048` tokens, stops starting inside `ENRICH_RESERVE = 20 s` before `post_verify`) adds a `title` (<= 100 chars; fallback = first sentence of `body`) and optional `suggestion` + `start_line`. **The Finder's verified `body` is never rewritten.** `check_fix` validates every suggestion against `CommentableRange` and bracket balance (`()`, `[]`, `{}`), stripping invalid suggestions while keeping the comment.
+3. **Precedent (`prompt::apply_precedent`):** A finding whose `precedent` index names an `exception` memory is forced to `Info` with a "declared by design / won't fix" note; a `fix_pattern` keeps its severity and gets a "similar case was fixed" note. Conventions and invalid indices are ignored. It runs after Severity so the classifier cannot undo it.
+4. **Enrichment & `check_fix`:** One call per finding (`ENRICH_CONCURRENCY = 4`, `fast_model` @ `Medium`, `2,048` tokens, stops starting inside `ENRICH_RESERVE = 20 s` before `post_verify`) adds a `title` (<= 100 chars; fallback = first sentence of `body`) and optional `suggestion` + `start_line`. **The Finder's verified `body` is never rewritten.** `check_fix` validates every suggestion against `CommentableRange` and bracket balance (`()`, `[]`, `{}`), stripping invalid suggestions while keeping the comment.
 
 ### Cache-Weighted `TokenBudget` (`crates/review/src/budget.rs`)
 - `settings.max_review_input_tokens` (`0` = unlimited) is shared across Finder, Sharded Rules, Verifier, and post-verify stages.
@@ -473,7 +478,8 @@ flowchart TD
 
 ---
 
-## 10. PR Commands & Closed-PR Learning
+## 10. PR Commands, Thread Conversations & Closed-PR Learning
 
-- **`@adudu` Commands (`crates/review/src/command.rs`):** `Job::PrComment` verifies the commenter is a non-disabled Adus user (by email on Azure, `github_login` or public email on GitHub; ignoring comments carrying `<!-- adudu -->`), parses `@adudu review [generalist|deep|specialists]` (enqueues `Job::ReviewPr` with `Trigger::Command`) or `@adudu remember: <text>` (stores an `active` repo memory and replies), or replies with command help.
-- **Closed-PR Learning (`crates/review/src/learn.rs`):** When a PR closes/merges/abandons, webhooks enqueue `Job::LearnPr`. If `repo.enabled`, `learning_mode != off`, and `pr_learning_runs` has no entry for `(repo_id, pr_number, head_sha)`, `Engine::learn_pr` runs one silent `chat_single_turn` (`"learn"`, `fast_model` @ `Low`, `8,192` tokens) over qualifying discussion threads (>= 2 comments from >= 2 authors, max 60 threads / 40,000 chars) alongside `<known_memories>` and `<rejected_memories>`. Up to 5 extracted design exceptions become `source = pr_learning` repo memories (`active` in `auto` mode only if a registered Adus user defended the exception and all non-Adus thread participants are registered Adus users; otherwise `pending` for admin approval).
+- **`@adudu` Commands (`crates/review/src/command.rs`):** `Job::PrComment` verifies the commenter is a non-disabled Adus user (by email on Azure, `github_login` or public email on GitHub; ignoring Adus's own comments, whose trimmed body starts with `<!-- adudu -->`), parses `@adudu review [generalist|deep|specialists]` (enqueues `Job::ReviewPr` with `Trigger::Command`) or `@adudu remember: <text>` (stores an `active` repo memory and replies), or replies with command help.
+- **Thread conversations (`crates/review/src/threads.rs`):** After a review posts, the engine records one `review_threads` row per posted finding. A human reply in such a thread enqueues `Job::ThreadReply`: one traced single-turn call (`"thread_reply"`, `fast_model` @ `Low`) judges the reply against the finding and code, answers in the thread and updates its outcome and provider status. On `Updated`/`Command` reviews, `validate_open_threads` (`"thread_validate"`, `fast_model` @ `Low`, capped at `VALIDATE_TIMEOUT = 120 s`, not counted against the review budget) checks open threads whose files changed and resolves the fixed ones; the summary reports "N earlier finding(s) confirmed fixed".
+- **Closed-PR Learning (`crates/review/src/learn.rs`):** When a PR closes/merges/abandons, webhooks enqueue `Job::LearnPr`. If `repo.enabled`, `learning_mode != off`, and `pr_learning_runs` has no entry for `(repo_id, pr_number, head_sha)`, `Engine::learn_pr` runs one curator `chat_single_turn` (`"learn"`, `primary_model` @ `settings.curator_effort`, `16,384` tokens) over `review_threads` outcomes and human discussion threads, alongside `<known_memories>` and `<rejected_memories>`. It yields up to `settings.max_learned_per_pr` `convention`, `exception` and `fix_pattern` repo memories (`source = pr_learning`), which may supersede similar existing ones; `learning_mode` decides whether they start `active` or `pending` (SPEC §8.5).

@@ -202,6 +202,7 @@ mod tests {
                 title: title.into(),
                 body: format!("body of {title}"),
                 suggestion: None,
+                precedent: None,
             },
             specialist,
             investigated_by_finder: false,
@@ -238,11 +239,14 @@ mod tests {
 
     fn existing(body: &str) -> PrThread {
         PrThread {
+            id: None,
+            resolved: false,
             path: Some("src/a.rs".into()),
             line: Some(2),
             status: Some("active".into()),
             url: None,
             comments: vec![PrThreadComment {
+                id: String::new(),
                 author: "alice".into(),
                 by_adus: false,
                 body: body.into(),
