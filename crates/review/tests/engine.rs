@@ -2932,6 +2932,8 @@ async fn review_runs_sharded_rules_in_parallel_and_skips_general_verifier(pool: 
     s.chat
         .finder(Reply::tool("read_file", json!({"path": "src/a.rs"})));
     s.chat.finder(Reply::finding("src/a.rs", 3, "Finder bug"));
+    s.chat
+        .delay("<ReviewInstructions>", Duration::from_millis(300));
     // The shard cites context line 1, which moves to the nearest `+` line, 2.
     s.chat.push_stage(
         Stage::RuleShard,
@@ -2976,13 +2978,15 @@ async fn review_runs_sharded_rules_in_parallel_and_skips_general_verifier(pool: 
     );
     assert_eq!(shards[0].model, "gpt-fast");
     assert_eq!(shards[0].effort, Some(ReasoningEffort::High));
-    // Run alongside the Finder: the shard starts before the Finder's last call.
-    let last_finder = *s
-        .chat
-        .positions(Stage::Finder)
-        .last()
-        .expect("finder calls");
-    assert!(s.chat.positions(Stage::RuleShard)[0] < last_finder);
+    // Run alongside the Finder: every Finder call is held 300 ms, so the shard (a quick head
+    // read, then its call) is recorded while the Finder's first call is still in flight.
+    let finder_at = s.chat.positions(Stage::Finder);
+    assert_eq!(finder_at.len(), 2);
+    let shard_at = s.chat.positions(Stage::RuleShard)[0];
+    assert!(
+        finder_at[0] < shard_at && shard_at < finder_at[1],
+        "{finder_at:?} {shard_at}"
+    );
     assert_eq!(s.chat.stage_calls(Stage::RuleEvidenceCollector).len(), 2);
     assert_eq!(s.chat.stage_calls(Stage::RuleEvidenceJudge).len(), 1);
 
