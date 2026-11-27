@@ -375,7 +375,9 @@ mod support {
                 input_tokens: 1,
                 output_tokens: 1,
                 cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                // One per call, so the stage log's review-wide cache count is visible; writes
+                // do not change the budget's weighting.
+                cache_write_tokens: 1,
                 provider_meta: None,
             };
             match reply {
@@ -1918,7 +1920,8 @@ Off by one when the list is empty."
         "budget_used=13",
         "input_tokens=13",
         "cache_read_tokens=0",
-        "cache_write_tokens=0",
+        // Every call of the review, not only the Finder's: 4 Finder, 4 Verifier, 5 funnel.
+        "cache_write_tokens=13",
         "token_budget_reached=false",
     ] {
         assert!(line.contains(field), "{field} missing: {line}");
@@ -2611,7 +2614,8 @@ async fn multiline_finding_keeps_same_hunk_span_and_drops_cross_hunk_start_line(
     );
 }
 
-/// Sets `settings.max_review_input_tokens`. Every `FakeChat` answer reports 1 input token.
+/// Sets `settings.max_review_input_tokens`. Every `FakeChat` answer reports 1 input token (and
+/// 1 cache write, which the budget does not weigh).
 async fn set_token_limit(pool: &PgPool, limit: i32) {
     update_settings(pool, |st| st.max_review_input_tokens = limit).await;
 }

@@ -217,8 +217,8 @@ pub(crate) struct FinderTask {
     /// Index into `FinderInput::batches`.
     pub batch: usize,
     pub kind: SpecialistKind,
-    /// Pass 1's outcome with the merged findings of every pass, Pass 2's steps and cache
-    /// tokens added, and the files either pass opened. A failed Pass 2 only loses its own part.
+    /// Pass 1's outcome with the merged findings of every pass, Pass 2's steps added, and the
+    /// files either pass opened. A failed Pass 2 only loses its own part.
     pub result: Result<AgentOutcome<Vec<FinderFinding>>, FinderFailure>,
     pub synthesis_skipped: Option<SynthesisSkipped>,
     /// Findings Pass 2 added after the merge.
@@ -428,12 +428,6 @@ async fn run_task(
                         .await;
                         synthesis_candidates = merge_findings(&mut findings, added);
                         outcome.steps_used += pass2.steps_used;
-                        outcome.cache_read_tokens = outcome
-                            .cache_read_tokens
-                            .saturating_add(pass2.cache_read_tokens);
-                        outcome.cache_write_tokens = outcome
-                            .cache_write_tokens
-                            .saturating_add(pass2.cache_write_tokens);
                         outcome.opened_files.extend(pass2.opened_files);
                     }
                     // Pass 1's findings stand on their own.
@@ -1303,7 +1297,7 @@ mod tests {
             ]);
             let budget = used_before.map(|used| {
                 let budget = Arc::new(TokenBudget::new(10_000));
-                budget.add(used, 0);
+                budget.add(used, 0, 0);
                 budget
             });
             let deadline = Instant::now() + Duration::from_secs(secs_left);
@@ -1344,9 +1338,9 @@ mod tests {
             );
         }
         let budget = TokenBudget::new(100);
-        budget.add(75, 0);
+        budget.add(75, 0, 0);
         assert_eq!(synthesis_gate(Some(&budget), secs(600), None), Ok(()));
-        budget.add(1, 0);
+        budget.add(1, 0, 0);
         assert_eq!(
             synthesis_gate(Some(&budget), secs(600), None),
             Err(SynthesisSkipped::Budget)

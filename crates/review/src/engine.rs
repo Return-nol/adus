@@ -596,7 +596,6 @@ impl Engine {
         let finder_tasks = finder.tasks.len();
         let synthesis_skipped = finder.synthesis_skipped.map(SynthesisSkipped::label);
         let synthesis_candidates = finder.synthesis_candidates;
-        let (cache_read_tokens, cache_write_tokens) = finder_cache_tokens(&finder.tasks);
         let (finder_steps, gate_refusals) = finder_steps_and_refusals(&finder.tasks);
         let (candidates, filtered_dropped) =
             collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
@@ -742,8 +741,8 @@ impl Engine {
             kept_by_origin = %kept_by_origin,
             budget_used = budget.used(),
             input_tokens = budget.raw_input(),
-            cache_read_tokens,
-            cache_write_tokens,
+            cache_read_tokens = budget.cache_read(),
+            cache_write_tokens = budget.cache_write(),
             token_budget_reached = budget.exhausted(),
             "review stages finished"
         );
@@ -933,19 +932,6 @@ fn finder_steps_and_refusals(tasks: &[FinderTask]) -> (usize, usize) {
             (
                 steps + outcome.steps_used,
                 refusals + usize::from(outcome.gate_refused),
-            )
-        })
-}
-
-/// Cache tokens summed over the Finder agents that finished.
-fn finder_cache_tokens(tasks: &[FinderTask]) -> (u32, u32) {
-    tasks
-        .iter()
-        .filter_map(|task| task.result.as_ref().ok())
-        .fold((0u32, 0u32), |(read, write), outcome| {
-            (
-                read.saturating_add(outcome.cache_read_tokens),
-                write.saturating_add(outcome.cache_write_tokens),
             )
         })
 }

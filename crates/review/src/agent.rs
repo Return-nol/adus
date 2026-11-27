@@ -135,8 +135,6 @@ pub(crate) struct AgentOutcome<T> {
     pub result: T,
     /// LLM calls made (the overflow retry repeats a step and is not counted twice).
     pub steps_used: usize,
-    pub cache_read_tokens: u32,
-    pub cache_write_tokens: u32,
     /// The step budget ran out and `result` was recovered from the last reply's prose, or the
     /// run ended unparseable and `result` is the submission the completion gate held.
     pub cut_short: bool,
@@ -158,8 +156,6 @@ impl<T> AgentOutcome<T> {
         AgentOutcome {
             result: f(self.result),
             steps_used: self.steps_used,
-            cache_read_tokens: self.cache_read_tokens,
-            cache_write_tokens: self.cache_write_tokens,
             cut_short: self.cut_short,
             gate_refused: self.gate_refused,
             opened_files: self.opened_files,
@@ -246,7 +242,11 @@ pub(crate) async fn chat_low_effort(
         .chat(llm.provider_id, request, llm.usage.clone())
         .await?;
     if let Some(budget) = token_budget {
-        budget.add(response.input_tokens, response.cache_read_tokens);
+        budget.add(
+            response.input_tokens,
+            response.cache_read_tokens,
+            response.cache_write_tokens,
+        );
     }
     Ok(response.text)
 }
@@ -337,9 +337,13 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
         let step_started = Instant::now();
         compact(&mut messages, config.compaction_char_limit);
         let response = request(llm, &mut messages, offered, &mut overflow_retried).await?;
-        tally.add(&response, step_started.elapsed());
+        tally.add(step_started.elapsed());
         if let Some(budget) = &config.token_budget {
-            budget.add(response.input_tokens, response.cache_read_tokens);
+            budget.add(
+                response.input_tokens,
+                response.cache_read_tokens,
+                response.cache_write_tokens,
+            );
         }
         tracing::debug!(
             step = tally.steps_used,
@@ -659,12 +663,10 @@ impl WrapUp {
     }
 }
 
-/// Steps, cache tokens, LLM time, opened files and recent tool calls of one run.
+/// Steps, LLM time, opened files and recent tool calls of one run.
 #[derive(Default)]
 struct Tally {
     steps_used: usize,
-    cache_read_tokens: u32,
-    cache_write_tokens: u32,
     /// Summed wall time of the LLM calls.
     llm_time: Duration,
     opened_files: HashSet<String>,
@@ -672,15 +674,9 @@ struct Tally {
 }
 
 impl Tally {
-    fn add(&mut self, response: &ChatResponse, llm_time: Duration) {
+    fn add(&mut self, llm_time: Duration) {
         self.steps_used += 1;
         self.llm_time = self.llm_time.saturating_add(llm_time);
-        self.cache_read_tokens = self
-            .cache_read_tokens
-            .saturating_add(response.cache_read_tokens);
-        self.cache_write_tokens = self
-            .cache_write_tokens
-            .saturating_add(response.cache_write_tokens);
     }
 
     /// Keeps a summary of every executed call of a turn except `submit_name`.
@@ -701,8 +697,6 @@ impl Tally {
         AgentOutcome {
             result,
             steps_used: self.steps_used,
-            cache_read_tokens: self.cache_read_tokens,
-            cache_write_tokens: self.cache_write_tokens,
             cut_short,
             gate_refused,
             opened_files: std::mem::take(&mut self.opened_files),
@@ -1459,13 +1453,17 @@ mod tests {
             with_cache(tools_turn(vec![read("c1", "src/a.rs")])),
             with_cache(tools_turn(vec![submit("c2", "done")])),
         ]);
-        let out = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(20))
-            .await
-            .unwrap();
+        // Unlimited: the review's budget still sums every step's cache reads and writes.
+        let budget = Arc::new(TokenBudget::new(0));
+        let config = AgentConfig {
+            token_budget: Some(Arc::clone(&budget)),
+            ..AgentConfig::new(20)
+        };
+        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
         assert_eq!(out.result, "done");
         assert_eq!(out.steps_used, 2);
         assert!(!out.cut_short);
-        assert_eq!((out.cache_read_tokens, out.cache_write_tokens), (14, 6));
+        assert_eq!((budget.cache_read(), budget.cache_write()), (14, 6));
 
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 2);
