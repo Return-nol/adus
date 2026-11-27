@@ -47,8 +47,10 @@
 	let kindFilter = $state<string>(ALL_KINDS);
 	let rules = $state<Rule[]>([]);
 	let memories = $state<Memory[]>([]);
-	let loaded = $state(false);
-	let loadError = $state(false);
+	let rulesLoaded = $state(false);
+	let rulesError = $state(false);
+	let memoriesLoaded = $state(false);
+	let memoriesError = $state(false);
 	// Learned memories awaiting a decision, across all repositories (not tied to `scope`).
 	let pending = $state<Memory[]>([]);
 	let rejected = $state<Memory[]>([]);
@@ -102,30 +104,43 @@
 	}
 
 	// Only the newest request may write results, so a slow response for a previous scope is dropped.
-	let seq = 0;
-	async function load() {
-		const mine = ++seq;
-		loadError = false;
+	let rulesSeq = 0;
+	async function loadRules() {
+		const mine = ++rulesSeq;
+		rulesError = false;
 		const q = repositoryId ? `?repository_id=${repositoryId}` : '';
+		try {
+			const r = await api<Rule[]>('GET', `/rules${q}`);
+			if (mine !== rulesSeq) return;
+			rules = r;
+		} catch (e) {
+			if (mine === rulesSeq) {
+				rulesError = true;
+				fail(e);
+			}
+		}
+		if (mine === rulesSeq) rulesLoaded = true;
+	}
+
+	let memoriesSeq = 0;
+	async function loadMemories() {
+		const mine = ++memoriesSeq;
+		memoriesError = false;
 		const params = new URLSearchParams({ status: 'active' });
 		if (repositoryId) params.set('repository_id', repositoryId);
 		if (kindFilter !== ALL_KINDS) params.set('kind', kindFilter);
 		const mq = `?${params.toString()}`;
 		try {
-			const [r, m] = await Promise.all([
-				api<Rule[]>('GET', `/rules${q}`),
-				api<Memory[]>('GET', `/memories${mq}`)
-			]);
-			if (mine !== seq) return;
-			rules = r;
+			const m = await api<Memory[]>('GET', `/memories${mq}`);
+			if (mine !== memoriesSeq) return;
 			memories = m;
 		} catch (e) {
-			if (mine === seq) {
-				loadError = true;
+			if (mine === memoriesSeq) {
+				memoriesError = true;
 				fail(e);
 			}
 		}
-		if (mine === seq) loaded = true;
+		if (mine === memoriesSeq) memoriesLoaded = true;
 	}
 
 	async function loadLearned() {
@@ -134,7 +149,7 @@
 			const [p, r, activeAll] = await Promise.all([
 				api<Memory[]>('GET', '/memories?all=true&status=pending'),
 				api<Memory[]>('GET', '/memories?all=true&status=rejected'),
-				api<Memory[]>('GET', '/memories?all=true&status=active')
+				api<Memory[]>('GET', '/memories?all=true&status=active').catch(() => [] as Memory[])
 			]);
 			pending = p;
 			rejected = r;
@@ -147,7 +162,7 @@
 	}
 
 	function reloadAll() {
-		return Promise.all([load(), loadLearned()]);
+		return Promise.all([loadRules(), loadMemories(), loadLearned()]);
 	}
 
 	function repoName(id: string | null): string {
@@ -163,14 +178,21 @@
 		}
 	});
 
-	// Reload whenever the scope or kind filter changes (also runs once on mount).
+	// Reload rules whenever the scope changes (also runs once on mount).
+	$effect(() => {
+		void scope;
+		rulesLoaded = false;
+		rules = [];
+		loadRules();
+	});
+
+	// Reload memories whenever the scope or kind filter changes (also runs once on mount).
 	$effect(() => {
 		void scope;
 		void kindFilter;
-		loaded = false;
-		rules = [];
+		memoriesLoaded = false;
 		memories = [];
-		load();
+		loadMemories();
 	});
 
 	/** Runs `fn` with `id` marked busy, then reloads (which also snaps a failed switch back). */
@@ -418,7 +440,7 @@
 	<Tabs.Content value="rules" class="space-y-4">
 		<div class="flex justify-end">
 			<Button
-				disabled={!loaded}
+				disabled={!rulesLoaded}
 				onclick={() => {
 					editRule = null;
 					ruleOpen = true;
@@ -427,9 +449,9 @@
 				Add rule
 			</Button>
 		</div>
-		{#if loadError}
-			{@render loadFailed('Could not load this scope.', load)}
-		{:else if !loaded}
+		{#if rulesError}
+			{@render loadFailed('Could not load this scope.', loadRules)}
+		{:else if !rulesLoaded}
 			<TableSkeleton card headers={['Title', 'Path glob', 'Severity', 'Enabled', 'Actions']} />
 		{:else if rules.length === 0}
 			<div
@@ -515,11 +537,11 @@
 					{/each}
 				</Select.Content>
 			</Select.Root>
-			<Button disabled={!loaded} onclick={() => openMemory(null, false)}>Add memory</Button>
+			<Button disabled={!memoriesLoaded} onclick={() => openMemory(null, false)}>Add memory</Button>
 		</div>
-		{#if loadError}
-			{@render loadFailed('Could not load this scope.', load)}
-		{:else if !loaded}
+		{#if memoriesError}
+			{@render loadFailed('Could not load this scope.', loadMemories)}
+		{:else if !memoriesLoaded}
 			<TableSkeleton
 				card
 				headers={['Content', 'Kind', 'Source', 'Created by', 'Enabled', 'Actions']}
@@ -528,8 +550,12 @@
 			<div
 				class="rounded-xl border border-dashed border-border bg-card px-8 py-12 text-center text-sm text-muted-foreground"
 			>
-				No memories for this scope yet. Add one here, or comment <code>@adudu remember: …</code> on a
-				pull request.
+				{#if kindFilter !== ALL_KINDS}
+					No memories of this kind for this scope yet.
+				{:else}
+					No memories for this scope yet. Add one here, or comment <code>@adudu remember: …</code> on
+					a pull request.
+				{/if}
 			</div>
 		{:else if memories.length > 0}
 			<Card.Root class="py-0">
@@ -552,7 +578,12 @@
 										{@render memoryContent(m)}
 									</Table.Cell>
 									<Table.Cell>
-										<Badge variant="outline">{kindLabel[m.kind]}</Badge>
+										<div class="flex flex-wrap gap-1">
+											<Badge variant="outline">{kindLabel[m.kind]}</Badge>
+											{#if m.superseded_by !== null}
+												<Badge variant="outline">Superseded</Badge>
+											{/if}
+										</div>
 									</Table.Cell>
 									<Table.Cell>
 										<Badge variant="secondary">
@@ -639,7 +670,7 @@
 	{/if}
 </Tabs.Root>
 
-<RuleDialog bind:open={ruleOpen} rule={editRule} {repositoryId} onsaved={load} />
+<RuleDialog bind:open={ruleOpen} rule={editRule} {repositoryId} onsaved={loadRules} />
 <MemoryDialog
 	bind:open={memoryOpen}
 	memory={editMemory}

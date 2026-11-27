@@ -186,10 +186,6 @@
 					default_provider_id: saved.default_provider_id,
 					max_files_per_review: saved.max_files_per_review,
 					max_patch_lines_per_file: saved.max_patch_lines_per_file,
-					max_thread_replies: saved.max_thread_replies,
-					max_validate_threads: saved.max_validate_threads,
-					max_learned_per_pr: saved.max_learned_per_pr,
-					curator_effort: saved.curator_effort,
 					ignore_paths: null
 				})
 			);
@@ -235,22 +231,37 @@
 		<Button variant="outline" size="sm" class="ml-2" onclick={load}>Retry</Button>
 	</div>
 {:else if !loaded}
-	<Card.Root class="max-w-2xl" aria-busy="true">
-		<Card.Content class="grid gap-4">
-			<span class="sr-only" role="status">Loading…</span>
-			{#each ['w-28', 'w-24', 'w-44', 'w-52', 'w-56', 'w-52', 'w-48', 'w-56', 'w-48', 'w-44'] as w, i (i)}
-				<div class="grid gap-2">
-					<Skeleton class={`h-4 ${w}`} />
-					<Skeleton class="h-9 w-full rounded-sm" />
-				</div>
-			{/each}
-			<Skeleton class="h-9 w-16 rounded-lg" />
-		</Card.Content>
-	</Card.Root>
+	<div class="grid gap-6" aria-busy="true">
+		<span class="sr-only" role="status">Loading…</span>
+		<Card.Root class="max-w-2xl">
+			<Card.Content class="grid gap-4">
+				{#each ['w-28', 'w-24', 'w-44', 'w-52', 'w-56', 'w-52', 'w-48', 'w-24', 'w-44'] as w, i (i)}
+					<div class="grid gap-2">
+						<Skeleton class={`h-4 ${w}`} />
+						<Skeleton class="h-9 w-full rounded-sm" />
+					</div>
+				{/each}
+			</Card.Content>
+		</Card.Root>
+		<Card.Root class="max-w-2xl">
+			<Card.Header>
+				<Skeleton class="h-5 w-56" />
+			</Card.Header>
+			<Card.Content class="grid gap-4">
+				{#each ['w-48', 'w-56', 'w-52', 'w-44'] as w, i (i)}
+					<div class="grid gap-2">
+						<Skeleton class={`h-4 ${w}`} />
+						<Skeleton class="h-9 w-full rounded-sm" />
+					</div>
+				{/each}
+			</Card.Content>
+		</Card.Root>
+		<Skeleton class="h-9 w-16 rounded-lg" />
+	</div>
 {:else}
-	<Card.Root class="max-w-2xl">
-		<Card.Content>
-			<form class="grid gap-4" onsubmit={save}>
+	<form class="grid gap-6" onsubmit={save}>
+		<Card.Root class="max-w-2xl">
+			<Card.Content class="grid gap-4">
 				<div class="grid gap-2">
 					<Label>Default provider</Label>
 					<Select.Root type="single" bind:value={providerId}>
@@ -406,71 +417,73 @@
 						automatically.
 					</p>
 				</div>
-				<div class="space-y-4 border-t border-border pt-4">
-					<h2 class="text-base font-semibold text-foreground">
-						Thread conversations &amp; learning
-					</h2>
-					<div class="grid gap-2">
-						<Label for="s-thread-replies">Max replies per thread (0-100)</Label>
-						<Input
-							id="s-thread-replies"
-							type="number"
-							min="0"
-							max="100"
-							required
-							bind:value={maxThreadReplies}
-						/>
-						<p class="text-xs text-muted-foreground">
-							Maximum Adudu replies per PR review thread. 0 disables thread replies.
-						</p>
-					</div>
-					<div class="grid gap-2">
-						<Label for="s-validate-threads">Max threads validated per push (0-100)</Label>
-						<Input
-							id="s-validate-threads"
-							type="number"
-							min="0"
-							max="100"
-							required
-							bind:value={maxValidateThreads}
-						/>
-						<p class="text-xs text-muted-foreground">
-							Maximum open finding threads re-checked when new commits are pushed. 0 disables push
-							validation.
-						</p>
-					</div>
-					<div class="grid gap-2">
-						<Label for="s-learned-pr">Max learned memories per PR (1-50)</Label>
-						<Input
-							id="s-learned-pr"
-							type="number"
-							min="1"
-							max="50"
-							required
-							bind:value={maxLearnedPerPr}
-						/>
-						<p class="text-xs text-muted-foreground">
-							Maximum curated memories proposed when a pull request closes.
-						</p>
-					</div>
-					<div class="grid gap-2">
-						<Label>Curator reasoning effort</Label>
-						<Select.Root type="single" bind:value={curatorEffort}>
-							<Select.Trigger class="w-full" aria-label="Curator reasoning effort">
-								{curatorEffortLabels[curatorEffort]}
-							</Select.Trigger>
-							<Select.Content>
-								{#each Object.entries(curatorEffortLabels) as [value, label] (value)}
-									<Select.Item {value} {label}>{label}</Select.Item>
-								{/each}
-							</Select.Content>
-						</Select.Root>
-					</div>
+			</Card.Content>
+		</Card.Root>
+		<Card.Root class="max-w-2xl">
+			<Card.Header>
+				<Card.Title>Thread conversations &amp; learning</Card.Title>
+			</Card.Header>
+			<Card.Content class="grid gap-4">
+				<div class="grid gap-2">
+					<Label for="s-thread-replies">Max replies per thread (0-100)</Label>
+					<Input
+						id="s-thread-replies"
+						type="number"
+						min="0"
+						max="100"
+						required
+						bind:value={maxThreadReplies}
+					/>
+					<p class="text-xs text-muted-foreground">
+						Maximum Adudu replies per PR review thread. 0 disables thread replies.
+					</p>
 				</div>
-				<div><Button type="submit" disabled={busy}>Save</Button></div>
-			</form>
-		</Card.Content>
-	</Card.Root>
+				<div class="grid gap-2">
+					<Label for="s-validate-threads">Max threads validated per push (0-100)</Label>
+					<Input
+						id="s-validate-threads"
+						type="number"
+						min="0"
+						max="100"
+						required
+						bind:value={maxValidateThreads}
+					/>
+					<p class="text-xs text-muted-foreground">
+						Maximum open finding threads re-checked when new commits are pushed. 0 disables push
+						validation.
+					</p>
+				</div>
+				<div class="grid gap-2">
+					<Label for="s-learned-pr">Max learned memories per PR (1-50)</Label>
+					<Input
+						id="s-learned-pr"
+						type="number"
+						min="1"
+						max="50"
+						required
+						bind:value={maxLearnedPerPr}
+					/>
+					<p class="text-xs text-muted-foreground">
+						Maximum curated memories proposed when a pull request closes.
+					</p>
+				</div>
+				<div class="grid gap-2">
+					<Label>Curator reasoning effort</Label>
+					<Select.Root type="single" bind:value={curatorEffort}>
+						<Select.Trigger class="w-full" aria-label="Curator reasoning effort">
+							{curatorEffortLabels[curatorEffort]}
+						</Select.Trigger>
+						<Select.Content>
+							{#each Object.entries(curatorEffortLabels) as [value, label] (value)}
+								<Select.Item {value} {label}>{label}</Select.Item>
+							{/each}
+						</Select.Content>
+					</Select.Root>
+				</div>
+			</Card.Content>
+		</Card.Root>
+		<div><Button type="submit" disabled={busy}>Save</Button></div>
+	</form>
 {/if}
 
 <AlertDialog.Root bind:open={resetOpen}>
