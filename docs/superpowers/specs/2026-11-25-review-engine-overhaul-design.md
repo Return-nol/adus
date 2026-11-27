@@ -74,7 +74,7 @@ Live debugging on `manot40/better-booru` PR #13 exposed three distinct failure m
   ```text
   Unread changed code. You have not opened these changed lines with read_file yet:
   - path/to/file.rs: lines 40-55, 80-95
-  Read them before you call {submit}. A grep or list_dir match does not count as reading them.
+  Read them before you call {submit}. Only read_file opens code; search and directory results show where it is, not what it does.
   ```
   (Wording written for Adus; it must not reproduce Kodus's debt-note text.)
 - **Deliberate differences from Kodus (recorded 2026-11-26):** Kodus sends its debt note with every request for that request only and tells the model it "does not need to read every hunk" (depth over breadth). Adus keeps the note in the conversation (cache and preserved-thinking reasons above) and asks for every qualifying hunk to be read, because the PR #13 runs showed models answering from the diff alone.
@@ -125,11 +125,12 @@ Live debugging on `manot40/better-booru` PR #13 exposed three distinct failure m
 ### 4.4 Adversarial Multi-Lens Prompt & Lean Finder Schema (`prompt.rs`, `specialists.rs`, `parse.rs`)
 
 - **Mindset & Workflow (written fresh for Adus):**
-  - Require tool use on the first step (`"Your first action must be a tool call — not prose or submit_findings."`).
+  - Require tool use on the first step: the run opens with a tool call, with no prose and no `submit_findings` before code was read (wording written fresh; amended 2026-11-27 after a clean-room check found the first draft echoed Kodus's sentence).
   - Remove *"nobody counts your findings"* and *"Do not keep searching just because steps remain"*.
-  - Require adversarial proof (`"Treat every change as unproven until you verify why it cannot fail; 'looks correct' is not a valid dismissal"`).
+  - Require adversarial proof: every change is unproven until the agent verifies why it cannot fail, and a change is never cleared because it reads plausibly, only by the code that rules the failure out.
+  - One hunk or file can hold several defects: after one is found, the same code is challenged for more (added 2026-11-27; `cache.go` in the reference PR holds two).
   - For each entry in `<changed_functions>` (and each changed hunk without one), grep its callers and read what they pass and expect before judging the change.
-  - For `Generalist`: require explicit checks across all three lenses (**Bug**, **Security**, **Performance**) with concrete checklists (swallowed errors / errors treated as cache miss or not-found, SQL `NULL` propagation in `CONCAT`/joins, dropped fallbacks, race/TOCTOU, migration hazards, delegation/wrapper bugs, unbounded queries/loops, auth/path traversal) and require `dismissed` to record hypotheses tested per lens.
+  - For `Generalist`: require explicit checks across all three lenses (**Bug**, **Security**, **Performance**) with concrete checklists (swallowed errors / errors treated as cache miss or not-found, SQL `NULL` propagation in `CONCAT`/joins, dropped fallbacks — for every branch the change adds or reroutes, what happens when that branch's own dependency is missing, disabled or fails, and whether it still reaches a correct fallback (added 2026-11-27; also in the `Bug` Role) —, race/TOCTOU, migration hazards, delegation/wrapper bugs, unbounded queries/loops, auth/path traversal) and require `dismissed` to record hypotheses tested per lens.
   - **Finish condition** (replaces "submit immediately"): submit once `reasoning` can account for every changed function and every lens. No sentence in the Workflow, Role or budget notes tells the model to submit early or to avoid spending steps.
 - **Lean Finder Schema (`submit_findings`):**
   - `reasoning` (**required** string, listed before `findings` in the schema and the prompt): for each changed function or hunk, what was challenged, which callers or callees were read, and why each suspicion was reported or dismissed. Models write it before the findings, so it is where the investigation is accounted for; an optional summary is skipped in practice. The parser accepts a submission without it (a missing or empty `reasoning` is logged as `finder reasoning missing` at debug, never refused), so a non-compliant model loses no findings. It is logged at debug and never posted.
@@ -183,6 +184,8 @@ Live debugging on `manot40/better-booru` PR #13 exposed three distinct failure m
      3. **Original position** (the sort is stable).
    - The Evidence Gate's re-verify (item 4) queues its findings in the same order.
    - `VERIFY_CONCURRENCY` stays 4. `verify_candidates` still returns kept findings in their original order, and the existing `"{n} candidate finding(s) could not be verified and were omitted"` warning still reports deadline cuts.
+7. **Refutation rules (amended 2026-11-27 after the Kodus comparison):** never grounds to drop — a rare trigger (edge case, error path, timeout, concurrent callers, hostile input); damage that surfaces in another function or file when the changed line sets it off (the Verifier follows the path first; the 2026-11-24 spec already adopted this clause but it had not reached the prompt); older code the change makes reachable or worse; an expectation that a library, the runtime or timing prevents the failure that nothing read confirms. The hedge rule drops only bodies that ask for a check and state no failure; a body that states a concrete failure and admits which premise is unconfirmed is a claim to check, because the Finder is told to say which part is unproven (§4.4). The intended-behaviour rule is reworded fresh.
+8. **Verdict shape and logs:** `submit_verdict` is `{keep, rationale}`. `drop_suggestion` is removed: the Finder no longer sends suggestions (§4.4) and Enrichment writes them after verification, gated by `check_fix` (§6), so the Verifier never sees one. The rationale (secret-redacted, ≤ 300 chars) is logged on the per-candidate verdict debug line, and `VerificationReport.kept_unreadable` (stage log `verifier_kept_unreadable`) counts findings kept only because the verdict could not be read.
 
 ---
 
@@ -190,7 +193,7 @@ Live debugging on `manot40/better-booru` PR #13 exposed three distinct failure m
 
 Stage order for surviving findings after Verification:
 
-1. **Semantic Dedup (`dedup.rs`):** Runs on `fast` at `Medium` (`DEDUP_MAX_TOKENS = 1_024`). Merges duplicate root causes across Finder passes/specialists and drops findings already raised in existing PR threads (`threads_for_dedup`).
+1. **Semantic Dedup (`dedup.rs`):** Runs on `fast` at `Medium` (`DEDUP_MAX_TOKENS = 1_024`). Merges duplicate root causes across Finder passes/specialists and drops findings already raised in existing PR threads (`threads_for_dedup`). Two findings are duplicates only when one fix would resolve both; different calls, ignored errors or branches stay separate even in one function, and when unsure both are kept (added 2026-11-27: the reference `cache.go` holds two distinct error-handling defects). Every removed finding is logged at debug with file, line, origin and, for `already_raised`, the cited thread's path, line and URL.
 2. **Severity Classification (`severity.rs`):** Runs on `fast` at `Medium` (`SEVERITY_MAX_TOKENS = 1_024`) for all findings with `severity.is_none()` (findings that already carry an explicit severity, such as Sharded Rule findings, keep it untouched). Maps each finding to Adus's `Severity` (`info`, `warning`, `critical`); falls back to `Severity::Warning` on LLM/parse failure (never drops findings).
 3. **Post-Verify Enrichment (`enrich.rs`):** Runs concurrently (`ENRICH_CONCURRENCY = 4`, bounded by `deadlines.post_verify` minus `ENRICH_RESERVE`, §4.3) on `fast` at `Medium` (`ENRICH_MAX_TOKENS = 2_048`) for each surviving finding:
    - Input: the finding (`file`, `start_line`, `line`, `category`, `body`), its file's diff hunk, and the surrounding head-file lines (`read_file_snippet`).
@@ -229,7 +232,7 @@ Replaces `SpecialistKind::Rules` and stops putting `<rules>` into tool-enabled `
 ## 8. Observability
 
 - `AgentOutcome` tracks `gate_refused: bool` and `read_files: HashSet<String>`.
-- `review stages finished` info log records `finder_steps`, `gate_refusals`, `synthesis_candidates`, `synthesis_skipped`, `kept_by_origin`, `evidence_gate_runs`, `verify_candidates` (queued), `dropped_unverified`, `rule_shards`, `rule_candidates`, `rule_verified`, `budget_used` (weighted), `input_tokens` (raw), `cache_read_tokens`, `cache_write_tokens`, `token_budget_reached`.
+- `review stages finished` info log records `finder_steps`, `gate_refusals`, `synthesis_candidates`, `synthesis_skipped`, `kept_by_origin`, `evidence_gate_runs`, `verify_candidates` (queued), `verifier_kept_unreadable`, `dropped_unverified`, `rule_shards`, `rule_candidates`, `rule_verified`, `budget_used` (weighted), `input_tokens` (raw), `cache_read_tokens`, `cache_write_tokens`, `token_budget_reached`.
 
 ---
 
@@ -257,6 +260,8 @@ Extend existing tests and fakes (`crates/review/tests/common/mod.rs`, the script
 
 Re-run `manot40/better-booru` PR #13 with `adus rereview` and `RUST_LOG=info,adus_review=debug,adus_review::trace=trace` three times: in `Generalist` mode with the DeepSeek model through OpenRouter as `primary`, in `Generalist` mode with Claude Sonnet 5.5 as `primary`, and in `Specialists` mode with DeepSeek (the repository's review mode switched in its settings). The four reference defects are: `internal/api/posts.go:165` (orphaned rows reach `PreviewDimExpr`), `internal/image/cache.go` swallowed `_, _ =` update errors, the `s3Storage.Exists` error treated as a miss, and the CDN branch falling through to the hard-coded `"webp"` fallback.
 
+Run it on a pull request with no earlier Adus comments: Dedup drops findings an existing Adus thread already raised (§6 item 1), and PR #13 carries comments from earlier Adus runs. Either open a fresh PR from the same branch, or count each finding the debug log reports as `finding already raised in an existing thread` as a detection.
+
 Pass criteria:
 
 1. **DeepSeek, Generalist:** at least 3 of the 4 reference defects are posted, and the url_builder and migration findings of the earlier runs are still raised as candidates.
@@ -282,6 +287,7 @@ Read at `main`; nothing under `libs/ee/**` or `*.ee.*` was opened:
 - `libs/llm/reasoning-options.ts` & `libs/llm/providers/openrouter/index.ts` — OpenRouter `reasoning: { effort }`, and `provider.require_parameters: true` only for models known to reason by default (no retry; the Adus retry in §3.4 is Adus's own).
 - Re-checked against `main` at 2026-11-26 (commit `59dedb8`), adding: `libs/agent-harness/infrastructure/policies/force-text-finalize.policy.ts` (no tools on the last step plus a verdict-due note), `core/findings-schema.ts` (stringified `suggestions` arrays from Claude), `providers/base-code-review-agent.provider.ts` (gate and tiers only for PRs over the prompt budget), the verifier's keep-on-unreadable-verdict path in `core/verifier.agent.ts`, and the finder's empty-resubmit fallback in `core/finder.agent.ts`. Also `libs/agent-harness/infrastructure/orchestration/verification-pass.ts` (every candidate verified, four at a time, no count cap), the call in `core/finder.agent.ts` that passes the whole candidate list to it, and `libs/llm/agent-run-context.ts` (the 30-minute per-agent timeout that is Kodus's only bound on verification).
 
+- Compared again against `main` at 2026-11-27 (commit `0cc826f`; review and harness code unchanged since `59dedb8`), behaviour only, adding: `agents/prompts/verifier-prompt.ts` (what is and is not a refutation: cross-file root causes, races and recalled library behaviour are not refutations), `agents/prompts/prompt-builder.ts` and `agents/prompts/review-prompt-blocks.ts` (one file can hold several defects; new branches must still reach their fallback), `agents/engine/dedup-prompt.ts` and `agents/engine/finding-dedup.ts` (conservative grouping, keep both when unsure, per-finding removal logs), `agents/engine/severity-prompt.ts` (fix size does not lower severity) and `agents/engine/enrich-content.ts` (a suggestion replaces exactly the cited lines, as plain code) — the two files `severity.rs` and `enrich.rs` follow, previously uncited; `agents/engine/is-usable-fix.ts` (fix gate; Adus's `check_fix` rules are its own, §6 item 4). The wording Adus took in these areas was rewritten fresh on 2026-11-27 where the comparison found it too close.
 ---
 
 ## 11. Assumptions
@@ -304,6 +310,7 @@ Read at `main`; nothing under `libs/ee/**` or `*.ee.*` was opened:
 16. A completed Verifier run with an unreadable verdict keeps the finding; only provider errors, deadline cuts and runs with no final reply drop it.
 17. Only `Generalist` and `Bug` Pass 1 runs with repository tools get a coverage ledger (debt notes and gate); `Security` and `Performance` get neither. The 2 M token default is kept for `Specialists` mode too, though its estimate comes close; the §9.2 Specialists run measures it.
 18. (User decision 2026-11-26.) The Verifier has no candidate count cap; the Verifier deadline and the token budget bound it, and `verify_order` (category, then origin, then original position) decides which candidates they cut. The category ranking is Adus's own; Kodus verifies in Finder order.
+19. (2026-11-27, after the Kodus comparison.) The Verifier no longer judges suggestions (`drop_suggestion` removed); its refutation rules gain the cross-file, concurrency and recalled-library clauses and a narrowed hedge rule; Dedup keeps both findings when unsure; the Finder prompt adds the several-defects-per-file rule and the per-branch fallback check. The §9.2 run uses a PR without earlier Adus comments, or counts logged `already_raised` findings as detections.
 
 ---
 

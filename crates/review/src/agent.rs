@@ -2089,7 +2089,7 @@ mod tests {
             .await
             .unwrap();
         let reqs = chat.requests();
-        let both = "Unread changed code. You have not opened these changed lines with read_file yet:\n- src/a.rs: lines 1-3, 50-52\nRead them before you call submit_findings. A grep or list_dir match does not count as reading them.";
+        let both = "Unread changed code. You have not opened these changed lines with read_file yet:\n- src/a.rs: lines 1-3, 50-52\nRead them before you call submit_findings. Only read_file opens code; search and directory results show where it is, not what it does.";
         let second = both.replace("lines 1-3, 50-52", "lines 50-52");
         // The first request is the prompt alone; the note follows the first step's results.
         assert!(debt_notes(&reqs[0]).is_empty());

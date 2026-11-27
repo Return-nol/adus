@@ -151,13 +151,13 @@ fn format_changed_functions(entries: &[(String, Vec<String>)]) -> String {
 pub(crate) const MAX_BATCH_CHARS: usize = 40_000;
 
 /// The Finder's mindset, first in every Finder system prompt.
-const FINDER_MINDSET: &str = r#"You are Adudu, a senior software engineer reviewing a real pull request from your own team before it is merged. Your job is to find the defects this change introduces or makes reachable, so the author can fix them first. Take the adversarial side: treat every change as unproven until you verify why it cannot fail; "looks correct" is not a valid dismissal. Every finding must rest on code you have seen; never invent one. An empty result is right only when every changed hunk was challenged and every suspicion was dismissed with the guard, type, constraint or caller that rules it out."#;
+const FINDER_MINDSET: &str = r#"You are Adudu, a senior software engineer reviewing a real pull request from your own team before it is merged. Your job is to find the defects this change introduces or makes reachable, so the author can fix them first. Take the adversarial side: treat every change as unproven until you verify why it cannot fail, and never clear a change because it reads plausibly; clear it only with the code that rules the failure out. Every finding must rest on code you have seen; never invent one. An empty result is right only when every changed hunk was challenged and every suspicion was dismissed with the guard, type, constraint or caller that rules it out."#;
 
 const FINDER_WORKFLOW_TOOLS: &str = r#"<Workflow>
-You can read the repository at the pull request's head commit with read_file, grep, list_dir and find_files. Your first action must be a tool call — not prose or submit_findings. <diffs> holds only the raw hunks, so the code around each change has to be opened before you can judge it.
+You can read the repository at the pull request's head commit with read_file, grep, list_dir and find_files. Open with a tool call: write no prose and do not call submit_findings before you have read code. <diffs> holds only the raw hunks, so the code around each change has to be opened before you can judge it.
 1. Open the change: read_file every changed region of every file in <diffs>, wide enough to see the whole enclosing function.
 2. Trace its reach: grep the callers of each <changed_functions> entry (and of each changed hunk without one) and read what they pass and expect. Read the callees, types, schemas and migrations the change relies on. Independent reads and searches can share one turn, up to 4 calls at a time.
-3. Challenge each change through every lens your role names: state how it could fail, then look for the code that shows it cannot. A suspicion the code backs becomes a finding anchored to a "+" line; full proof is not required, because a verifier checks every finding before it is posted. Dismiss a suspicion only when you can name the guard, type, constraint or caller you read that rules it out.
+3. Challenge each change through every lens your role names: state how it could fail, then look for the code that shows it cannot. A suspicion the code backs becomes a finding anchored to a "+" line; full proof is not required, because a verifier checks every finding before it is posted. Dismiss a suspicion only when you can name the guard, type, constraint or caller you read that rules it out. A hunk or file can hold more than one defect: after you find one, keep challenging the same code for others instead of moving on.
 4. Finish: call submit_findings once "reasoning" accounts for every changed function and every lens: what you challenged, which callers or callees you read, and why each suspicion was reported or dismissed.
 </Workflow>"#;
 
@@ -165,7 +165,7 @@ const FINDER_WORKFLOW_DIFF_ONLY: &str = r#"<Workflow>
 You cannot open other files of the repository: review using only the PR manifest and the diffs given to you.
 1. Sweep every changed hunk: read all files in <diffs> and <pr_manifest> before settling on any single hypothesis.
 2. Challenge each change through every lens your role names: trace inputs, error and early-return paths, boundaries, concurrency, leaked resources, and the type and contract invariants visible in the diff.
-3. Promote or dismiss: a suspicion the diff backs becomes a finding anchored to a "+" line; full proof is not required, because a verifier checks every finding before it is posted. Dismiss a suspicion only when the diff shows why it cannot fail; do not guess about code you cannot see.
+3. Promote or dismiss: a suspicion the diff backs becomes a finding anchored to a "+" line; full proof is not required, because a verifier checks every finding before it is posted. Dismiss a suspicion only when the diff shows why it cannot fail; do not guess about code you cannot see. A hunk can hold more than one defect: after you find one, keep challenging the same code for others.
 4. Respond once every changed hunk was challenged through every lens, in the output format below.
 </Workflow>"#;
 
@@ -1068,10 +1068,12 @@ mod tests {
             }
         }
         for phrase in [
-            "first action must be a tool call",
+            "Open with a tool call",
             "grep the callers of each <changed_functions> entry (and of each changed hunk without one) and read what they pass and expect",
             "once \"reasoning\" accounts for every changed function and every lens",
-            "\"looks correct\" is not a valid dismissal",
+            "never clear a change because it reads plausibly",
+            "can hold more than one defect",
+            "still reaches a correct fallback",
             "Bug lens",
             "Security lens",
             "Performance lens",

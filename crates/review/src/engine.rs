@@ -49,7 +49,9 @@ use crate::repo_instructions::load_repo_instructions;
 use crate::severity::{classify_severity, fill_unclassified};
 use crate::small_pr::is_small_pr;
 use crate::tools::Toolbox;
-use crate::verifier::{CandidateFinding, VerifyContext, VerifyInput, verify_candidates};
+use crate::verifier::{
+    CandidateFinding, VerificationReport, VerifyContext, VerifyInput, verify_candidates,
+};
 use crate::workspace::{RepoCloner, WorkspaceError};
 
 /// Budget of one Generalist review (`Engine::review_timeout`), small PRs included.
@@ -602,48 +604,42 @@ impl Engine {
         // Every candidate is queued for the Verifier (no count cap, spec §5).
         let queued = candidates.len();
 
-        let (verified, dropped_refuted, dropped_unverified, evidence_gate_runs) =
-            if candidates.is_empty() {
-                (Vec::new(), 0, 0, 0)
-            } else {
-                let ctx = VerifyContext {
-                    chat: self.chat.as_ref(),
-                    provider_id: s.provider_id,
-                    model: s.primary_model,
-                    usage: s.usage,
-                    token_budget: Some(&s.token_budget),
-                };
-                let report = verify_candidates(
-                    ctx,
-                    VerifyInput {
-                        pr: s.pr,
-                        manifest,
-                        candidates,
-                        targets: &files,
-                        rules: s.rules,
-                        memories: s.memories,
-                        repo_instructions: repo_instructions.as_deref(),
-                        toolbox: verifier_toolbox,
-                        deadline: s.deadlines.verifier,
-                    },
-                )
-                .await;
-                if let Some(err) = report.all_retryable_error {
-                    return Err(chat_error(err));
-                }
-                if report.dropped_unverified > 0 {
-                    warnings.push(format!(
-                        "{} candidate finding(s) could not be verified and were omitted",
-                        report.dropped_unverified
-                    ));
-                }
-                (
-                    report.kept,
-                    report.dropped_refuted,
-                    report.dropped_unverified,
-                    report.evidence_gate_runs,
-                )
+        let mut report = if candidates.is_empty() {
+            VerificationReport::default()
+        } else {
+            let ctx = VerifyContext {
+                chat: self.chat.as_ref(),
+                provider_id: s.provider_id,
+                model: s.primary_model,
+                usage: s.usage,
+                token_budget: Some(&s.token_budget),
             };
+            verify_candidates(
+                ctx,
+                VerifyInput {
+                    pr: s.pr,
+                    manifest,
+                    candidates,
+                    targets: &files,
+                    rules: s.rules,
+                    memories: s.memories,
+                    repo_instructions: repo_instructions.as_deref(),
+                    toolbox: verifier_toolbox,
+                    deadline: s.deadlines.verifier,
+                },
+            )
+            .await
+        };
+        if let Some(err) = report.all_retryable_error.take() {
+            return Err(chat_error(err));
+        }
+        if report.dropped_unverified > 0 {
+            warnings.push(format!(
+                "{} candidate finding(s) could not be verified and were omitted",
+                report.dropped_unverified
+            ));
+        }
+        let verified = std::mem::take(&mut report.kept);
         let verified_kept = verified.len();
 
         // Post-verify funnel (spec §6), all by `deadlines.post_verify`: Semantic Dedup,
@@ -732,9 +728,10 @@ impl Engine {
             synthesis_skipped,
             verify_candidates = queued,
             verified_kept,
-            dropped_refuted,
-            dropped_unverified,
-            evidence_gate_runs,
+            verifier_kept_unreadable = report.kept_unreadable,
+            dropped_refuted = report.dropped_refuted,
+            dropped_unverified = report.dropped_unverified,
+            evidence_gate_runs = report.evidence_gate_runs,
             dedup_dropped = verified_kept.saturating_sub(found.len() + already_raised),
             already_raised,
             posted = found.len(),

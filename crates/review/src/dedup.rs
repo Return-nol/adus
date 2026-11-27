@@ -2,7 +2,7 @@
 //! describe the same root cause (often reported by two specialists) and drops findings the PR's
 //! existing discussion already raised. Any failure keeps the findings as they are.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use adus_git::PrThread;
 use adus_llm::ReasoningEffort;
@@ -26,7 +26,7 @@ const DEDUP_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 const DEDUP_SYSTEM: &str = r#"You merge duplicate findings of a pull request review and set aside findings the pull request's discussion has already covered.
 <findings> holds the findings of this review, each with an index; several reviewers produced them. <existing_comments>, when present, holds discussion threads already on the pull request (by Adus earlier, by human reviewers or by the author), each with an index.
 
-Task 1, duplicates: two findings are duplicates when they describe one root cause at the same or a related location, even if worded differently or reported by different reviewers. Findings about different problems are never duplicates, even on the same line. From each group of duplicates keep one finding, preferring in order: (1) higher severity, when findings carry one, (2) concrete file/symbol evidence and a tighter line anchor, and (3) a finding that cites a team rule or repository instruction when applicable; keep every finding without a duplicate. List the kept findings in "keep_indices"; it is never empty.
+Task 1, duplicates: two findings are duplicates only when one fix would resolve both: the same faulty code with the same root cause, even if worded differently or reported by different reviewers. Findings about different problems are never duplicates, even on the same line or in the same function; in particular, two findings about different calls, different ignored errors or different branches are separate problems, even when they share a theme. When you are not sure two findings are duplicates, keep both. From each group of duplicates keep one finding, preferring in order: (1) higher severity, when findings carry one, (2) concrete file/symbol evidence and a tighter line anchor, and (3) a finding that cites a team rule or repository instruction when applicable; keep every finding without a duplicate. List the kept findings in "keep_indices"; it is never empty.
 
 Task 2, already raised: a finding is already raised only when one existing thread already points out the same problem at the same or a related location, whether that thread agreed with it, fixed it or rejected it. A thread about a different problem, or one that only touches the same code, does not count. For each such finding add {"finding": <finding index>, "comment": <thread index>} to "already_raised", citing that thread. When unsure, leave the finding out of "already_raised".
 
@@ -104,26 +104,41 @@ pub(crate) async fn deduplicate_findings(
         tracing::warn!("semantic dedup answer has no valid keep_indices; keeping all findings");
         return unchanged(findings);
     };
-    // A citation of a thread that does not exist is ignored: the finding stays.
-    let raised: BTreeSet<usize> = answer
-        .already_raised
-        .iter()
-        .filter(|cited| cited.comment < existing.len())
-        .map(|cited| cited.finding)
-        .collect();
+    // A citation of a thread that does not exist is ignored: the finding stays. The first valid
+    // citation of a finding names the thread in the log.
+    let mut raised: BTreeMap<usize, &PrThread> = BTreeMap::new();
+    for cited in &answer.already_raised {
+        if let Some(thread) = existing.get(cited.comment) {
+            raised.entry(cited.finding).or_insert(thread);
+        }
+    }
 
     let mut already_raised = 0;
-    let kept = findings
-        .into_iter()
-        .enumerate()
-        .filter(|(index, _)| keep.contains(index))
-        .filter(|(index, _)| {
-            let drop = raised.contains(index);
-            already_raised += usize::from(drop);
-            !drop
-        })
-        .map(|(_, finding)| finding)
-        .collect();
+    let mut kept = Vec::with_capacity(keep.len());
+    for (index, finding) in findings.into_iter().enumerate() {
+        let s = &finding.suggestion;
+        if !keep.contains(&index) {
+            tracing::debug!(
+                file = %s.file,
+                line = s.line,
+                origin = finding.origin.label(),
+                "semantic dedup merged this finding into a duplicate"
+            );
+        } else if let Some(thread) = raised.get(&index) {
+            already_raised += 1;
+            tracing::debug!(
+                file = %s.file,
+                line = s.line,
+                origin = finding.origin.label(),
+                thread_path = thread.path.as_deref().unwrap_or(""),
+                thread_line = thread.line,
+                thread_url = thread.url.as_deref().unwrap_or(""),
+                "finding already raised in an existing thread; not posted"
+            );
+        } else {
+            kept.push(finding);
+        }
+    }
     DedupOutcome {
         kept,
         already_raised,
@@ -160,7 +175,7 @@ fn build_user_prompt(findings: &[CandidateFinding], existing: &[&PrThread]) -> S
     let items: Vec<_> = findings
         .iter()
         .enumerate()
-        .map(|(index, finding)| SerializedCandidate::new(finding, Some(index), false))
+        .map(|(index, finding)| SerializedCandidate::new(finding, Some(index)))
         .collect();
     let list = serde_json::to_string_pretty(&items).unwrap_or_else(|_| json!(items).to_string());
     let mut prompt = wrap("findings", &list);
@@ -262,6 +277,12 @@ mod tests {
         assert_eq!(req.effort, Some(ReasoningEffort::Medium));
         assert!(req.tools.is_empty());
         assert_eq!(req.messages.len(), 1);
+        // Distinct failing operations stay separate; doubt keeps both.
+        assert!(req.system.contains("different ignored errors"));
+        assert!(
+            req.system
+                .contains("When you are not sure two findings are duplicates, keep both.")
+        );
         let prompt = user_text(req);
         assert!(prompt.contains("\"index\": 3"));
         assert!(prompt.contains("\"title\": \"zero\""));

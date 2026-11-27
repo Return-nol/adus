@@ -24,7 +24,10 @@ Bug lens:
 - swallowed errors: an error logged and dropped, replaced by a default value, or never returned;
 - an error treated as a miss: a failed lookup read as a cache miss or not-found, so the caller \
 carries on with missing data;
-- a dropped fallback: a default, retry or recovery path the old code had and the new code lost;
+- a dropped fallback: a default, retry or recovery path the old code had and the new code lost; \
+for every branch the change adds or reroutes (a new mode, location, provider or flag value), \
+check what happens when that branch's own dependency is missing, disabled or fails, and whether \
+it still reaches a correct fallback instead of a generic default;
 - SQL NULL propagation: NULL in CONCAT or arithmetic yields NULL, outer joins add NULL columns, \
 NOT IN over a NULL matches nothing;
 - wrong conditions and off-by-one errors, empty/zero/very large/unicode inputs, broken invariants \
@@ -51,6 +54,9 @@ const BUG_ROLE: &str = "<Role>
 You are the correctness reviewer. Challenge every changed function for code that does the wrong \
 thing:
 - swallowed errors, errors treated as a cache miss or not-found, dropped fallbacks and defaults;
+- for every branch the change adds or reroutes (a new mode, location, provider or flag value): \
+what happens when that branch's own dependency is missing, disabled or fails, and whether it \
+still reaches a correct fallback instead of a generic default;
 - wrong conditions, off-by-one errors, missing None/null cases, empty/zero/very large/unicode \
 inputs, SQL NULL propagation (CONCAT, outer joins, NOT IN);
 - broken invariants or contracts that callers rely on, wrappers that drop or swap an argument;
@@ -66,6 +72,9 @@ const BUG_ROLE_DIFF_ONLY: &str = "<Role>
 You are the correctness reviewer. Challenge every changed function for code that does the wrong \
 thing:
 - swallowed errors, errors treated as a cache miss or not-found, dropped fallbacks and defaults;
+- for every branch the change adds or reroutes (a new mode, location, provider or flag value): \
+what happens when that branch's own dependency is missing, disabled or fails, and whether it \
+still reaches a correct fallback instead of a generic default;
 - wrong conditions, off-by-one errors, missing None/null cases, empty/zero/very large/unicode \
 inputs, SQL NULL propagation (CONCAT, outer joins, NOT IN);
 - broken invariants or contracts that callers rely on, wrappers that drop or swap an argument;

@@ -145,7 +145,7 @@ impl CoverageLedger {
         Some(format!(
             "Unread changed code. You have not opened these changed lines with read_file yet:\n\
              {}\n\
-             Read them before you call {submit_name}. A grep or list_dir match does not count as reading them.",
+             Read them before you call {submit_name}. Only read_file opens code; search and directory results show where it is, not what it does.",
             files.join("\n")
         ))
     }
@@ -243,7 +243,7 @@ mod tests {
         let note = two.debt_note("submit_findings").unwrap();
         assert!(note.contains("- src/a.rs: lines 50-60\n"), "{note}");
         assert!(note.ends_with(
-            "Read them before you call submit_findings. A grep or list_dir match does not count as reading them."
+            "Read them before you call submit_findings. Only read_file opens code; search and directory results show where it is, not what it does."
         ));
         two.record_read("src/a.rs", 45, 65);
         assert!(two.pending_qualifying_files().is_empty());

@@ -519,6 +519,8 @@ This is spec §9.2. It needs a user's running stack and LLM keys, so it is run b
 
 - [ ] **Step 1: Run the review with DeepSeek through OpenRouter as `primary`**
 
+Before the first run: PR #13 carries comments from earlier Adus runs, and Dedup drops findings an existing Adus thread already raised (spec §9.2). Open a fresh PR from the same branch for these runs, or count every `finding already raised in an existing thread` debug line as a detection.
+
 ```powershell
 $env:NO_COLOR = "1"; $env:RUST_LOG = "info,adus_review=debug,adus_review::trace=trace"; cargo run -p adus *> .superpowers/run-deepseek.log
 ```
