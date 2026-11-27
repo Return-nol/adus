@@ -48,7 +48,7 @@ Not yet verified: one full `cargo test --workspace` run over all of Tasks 1–7 
 
 ## Uncommitted in the working tree
 
-- `docs/superpowers/specs/2026-11-27-thread-conversations-and-curated-learning-design.md`: §4.1 inline label corrected to `**⚠️ Warning:**`. Commit it with Task 13 or on its own.
+- Nothing (the §4.1 label correction was committed in e986731).
 
 ## Housekeeping after the feature is done
 
