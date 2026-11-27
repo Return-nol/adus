@@ -68,6 +68,24 @@ CI (`.github/workflows/ci.yml`): `rust` (`fmt`, `clippy`, `cargo test` with Post
 - **Disk space & linking on Windows:** `target/` grows rapidly (`LNK1318` if C: fills; deleting `target/debug/incremental` or running `cargo clean` recovers space). Always pass `-j 2` to `cargo test` to avoid `os error 1455`.
 - **No browser automation for UI checks:** Headless Chrome automation previously hung >13 min against this dashboard. Verify UI changes via `pnpm -C web check`, code inspection, and `curl` against `/api/v1/*`, and state this explicitly in reports.
 
+## Debugging Reviews (Live Trace)
+
+Use the trace, not guesses, to diagnose review quality, refusals, timeouts or token use. Full behaviour: [docs/SPEC.md §8.4](docs/SPEC.md) "Live tracing".
+
+1. **Run:** `cargo run -p adus -- serve --trace > .superpowers/run.log 2>&1` (or set `ADUS_TRACE=true`; `--trace` adds `adus_review=debug,adus_review::trace=trace` to `RUST_LOG`; the log has no colour codes when redirected).
+2. **Trigger:** in a second terminal, `cargo run -q -p adus -- rereview <repository_id> <pr_number>` queues a full review on the running serve (`repository_id` is in the review logs). Findings Adus already posted on the PR are dropped by Dedup, so use a fresh PR (or count `finding already raised in an existing thread` lines) when measuring detections.
+3. **Read:** wait for `job finished`, then search `.superpowers/run.log` for these events:
+   - `agent prompt`, which carries `call=` on single-turn calls (dedup, severity, enrich, prose_recovery, verify_diff_only, learn);
+   - `agent reasoning`, `agent text`, `agent tool call` and `agent tool result` for each step;
+   - the `finder` / `verify` spans;
+   - `finder review log`, `finder dismissed` and `review stages finished`, which hold the stage counts, budget and timings.
+
+Rules:
+
+- Every new LLM call goes through `agent::run_react_loop` or `agent::chat_single_turn` (with a new `call` label), so it is traced. Never call `ChatService::chat` directly from review code.
+- Every traced or debug-logged model text passes through `redact_secrets`; trace events live only in `crates/review/src/trace.rs`.
+- A trace contains source code and full prompts. Keep run logs under `.superpowers/` (git-ignored), never commit them, and never enable `--trace` in production or Docker defaults.
+
 ## Cross-Cutting Code Conventions
 
 Full subsystem specs live in [docs/SPEC.md](docs/SPEC.md). Follow these standing rules everywhere:
