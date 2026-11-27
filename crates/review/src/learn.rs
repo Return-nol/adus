@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::agent::{AgentLlm, chat_single_turn};
+use crate::agent::LlmContext;
 use crate::command::{MAX_MEMORY_CHARS, authorize};
 use crate::discussion::{format_threads, within_budget};
 use crate::engine::{Engine, EngineError, chat_error, db_error, is_retryable};
@@ -132,16 +132,24 @@ impl Engine {
             review_id: None,
             repository_id: Some(repository_id),
         };
-        let llm = AgentLlm {
+        let llm = LlmContext {
             chat: self.chat.as_ref(),
             provider_id,
             model: &fast_model,
-            system: LEARN_SYSTEM,
-            effort: Some(ReasoningEffort::Low),
             usage: &usage,
+            token_budget: None,
         };
         let prompt = build_user_prompt(&qualifying, &known);
-        let text = match chat_single_turn(&llm, "learn", None, prompt, LEARN_MAX_TOKENS).await {
+        let text = match llm
+            .single_turn(
+                "learn",
+                LEARN_SYSTEM,
+                Some(ReasoningEffort::Low),
+                prompt,
+                LEARN_MAX_TOKENS,
+            )
+            .await
+        {
             Ok(text) => text,
             Err(err) if is_retryable(&err) => return Err(chat_error(err)),
             Err(err) => {

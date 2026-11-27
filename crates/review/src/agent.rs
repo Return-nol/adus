@@ -126,6 +126,52 @@ impl AgentConfig {
             capture_reads: false,
         }
     }
+
+    pub(crate) fn finder(
+        max_steps: usize,
+        wrap_up_steps: usize,
+        deadline: Instant,
+        token_budget: Option<&Arc<TokenBudget>>,
+        coverage_ledger: Option<CoverageLedger>,
+    ) -> Self {
+        Self {
+            enforce_gate: coverage_ledger.is_some(),
+            budget_bands: true,
+            wrap_up_steps,
+            deadline: Some(deadline),
+            token_budget: token_budget.cloned(),
+            coverage_ledger,
+            ..Self::new(max_steps)
+        }
+    }
+
+    pub(crate) fn verifier(
+        max_steps: usize,
+        deadline: Instant,
+        token_budget: Option<&Arc<TokenBudget>>,
+    ) -> Self {
+        Self {
+            no_tools_on_last_step: true,
+            widen_short_reads: true,
+            deadline: Some(deadline),
+            token_budget: token_budget.cloned(),
+            ..Self::new(max_steps)
+        }
+    }
+
+    pub(crate) fn rule_collector(
+        max_steps: usize,
+        deadline: Instant,
+        token_budget: Option<&Arc<TokenBudget>>,
+    ) -> Self {
+        Self {
+            no_tools_on_last_step: true,
+            capture_reads: true,
+            deadline: Some(deadline),
+            token_budget: token_budget.cloned(),
+            ..Self::new(max_steps)
+        }
+    }
 }
 
 /// A finished run.
@@ -218,6 +264,68 @@ pub(crate) enum AgentTools<'a> {
     SubmitOnly,
     /// No tools at all (the model rejected tool calling); results come from prose.
     NoTools,
+}
+
+/// Shared LLM call context carried by review stages before binding a system prompt and effort.
+#[derive(Clone, Copy)]
+pub(crate) struct LlmContext<'a> {
+    pub chat: &'a dyn ChatService,
+    pub provider_id: Uuid,
+    pub model: &'a str,
+    pub usage: &'a UsageContext,
+    pub token_budget: Option<&'a Arc<TokenBudget>>,
+}
+
+impl<'a> LlmContext<'a> {
+    /// Returns a copy targeting `model` while keeping the same provider, usage, and budget.
+    pub(crate) fn with_model<'b>(self, model: &'b str) -> LlmContext<'b>
+    where
+        'a: 'b,
+    {
+        LlmContext {
+            chat: self.chat,
+            provider_id: self.provider_id,
+            model,
+            usage: self.usage,
+            token_budget: self.token_budget,
+        }
+    }
+
+    /// Binds `system` and `effort` for a ReAct loop or single-turn call.
+    pub(crate) fn for_agent(
+        self,
+        system: &'a str,
+        effort: Option<ReasoningEffort>,
+    ) -> AgentLlm<'a> {
+        AgentLlm {
+            chat: self.chat,
+            provider_id: self.provider_id,
+            model: self.model,
+            system,
+            effort,
+            usage: self.usage,
+        }
+    }
+
+    /// Runs a single-turn text call and records its input tokens in `self.token_budget`.
+    pub(crate) async fn single_turn(
+        self,
+        call: &'static str,
+        system: &str,
+        effort: Option<ReasoningEffort>,
+        prompt: String,
+        max_tokens: u32,
+    ) -> Result<String, ChatError> {
+        let llm = LlmContext::for_agent(self, system, effort);
+        chat_single_turn(
+            &llm,
+            call,
+            self.token_budget.map(Arc::as_ref),
+            prompt,
+            max_tokens,
+        )
+        .await
+    }
 }
 
 /// Where and how the agent talks to the model.
@@ -839,6 +947,13 @@ async fn request(
         max_tokens: MAX_OUTPUT_TOKENS,
         effort: llm.effort,
     };
+    if *overflow_retried {
+        return llm
+            .chat
+            .chat(llm.provider_id, build(messages, tools), llm.usage.clone())
+            .await
+            .map_err(agent_error);
+    }
     let first = llm
         .chat
         .chat(
@@ -848,7 +963,7 @@ async fn request(
         )
         .await;
     match first {
-        Err(ChatError::ContextOverflow(_)) if !*overflow_retried => {
+        Err(ChatError::ContextOverflow(_)) => {
             *overflow_retried = true;
             tracing::debug!("context overflow; retrying once with a compacted conversation");
             compact_for_overflow(messages);

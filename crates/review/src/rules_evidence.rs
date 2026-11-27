@@ -5,22 +5,15 @@
 //! that literally appears in an excerpt (the citation gate). Every failure drops the violation:
 //! no rule finding is posted without evidence.
 
-use std::sync::Arc;
-
 use adus_core::types::normalize_path;
 use adus_db::rules::Rule;
 use adus_git::FileDiff;
-use adus_llm::router::{ChatService, UsageContext};
 use adus_llm::{ReasoningEffort, ToolDef};
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tracing::Instrument;
-use uuid::Uuid;
 
-use crate::agent::{
-    AgentConfig, AgentError, AgentLlm, AgentTools, SubmitSpec, chat_single_turn, run_react_loop,
-};
-use crate::budget::TokenBudget;
+use crate::agent::{AgentConfig, AgentError, AgentTools, LlmContext, SubmitSpec, run_react_loop};
 use crate::parse::{first_json_value, parse_bool_field, parse_u32_field};
 use crate::prompt::{diff_block, severity_name, truncate_with_marker, wrap};
 use crate::redact::{log_rationale, redact_secrets};
@@ -74,13 +67,7 @@ pub(crate) enum EvidenceVerdict {
 /// Where the evidence loop talks to the model and reads the repository.
 #[derive(Clone, Copy)]
 pub(crate) struct RuleEvidenceContext<'a> {
-    pub chat: &'a dyn ChatService,
-    pub provider_id: Uuid,
-    pub fast_model: &'a str,
-    /// Cloned into every `chat` call.
-    pub usage: &'a UsageContext,
-    /// The review's shared input-token budget, if any.
-    pub token_budget: Option<&'a Arc<TokenBudget>>,
+    pub llm: LlmContext<'a>,
     pub toolbox: &'a Toolbox,
 }
 
@@ -181,21 +168,11 @@ async fn collect_evidence(
     candidate: &RawShardViolation,
     deadline: Instant,
 ) -> Result<(EvidenceSubmission, Vec<ReadExcerpt>), EvidenceVerdict> {
-    let llm = AgentLlm {
-        chat: ctx.chat,
-        provider_id: ctx.provider_id,
-        model: ctx.fast_model,
-        system: COLLECTOR_SYSTEM,
-        effort: Some(RULE_EVIDENCE_EFFORT),
-        usage: ctx.usage,
-    };
-    let config = AgentConfig {
-        deadline: Some(deadline),
-        token_budget: ctx.token_budget.cloned(),
-        no_tools_on_last_step: true,
-        capture_reads: true,
-        ..AgentConfig::new(RULE_EVIDENCE_MAX_STEPS)
-    };
+    let llm = ctx
+        .llm
+        .for_agent(COLLECTOR_SYSTEM, Some(RULE_EVIDENCE_EFFORT));
+    let config =
+        AgentConfig::rule_collector(RULE_EVIDENCE_MAX_STEPS, deadline, ctx.llm.token_budget);
     let submit = SubmitEvidence(submit_evidence_tool_def());
     let prompt = collector_prompt(rule, file, candidate);
     match run_react_loop(
@@ -227,26 +204,19 @@ async fn collect_evidence(
 
 /// Step B: the judge's raw reply.
 async fn judge(ctx: RuleEvidenceContext<'_>, prompt: String) -> Result<String, &'static str> {
-    let llm = AgentLlm {
-        chat: ctx.chat,
-        provider_id: ctx.provider_id,
-        model: ctx.fast_model,
-        system: JUDGE_SYSTEM,
-        effort: Some(RULE_EVIDENCE_EFFORT),
-        usage: ctx.usage,
-    };
-    chat_single_turn(
-        &llm,
-        RULE_JUDGE_CALL,
-        ctx.token_budget.map(Arc::as_ref),
-        prompt,
-        RULE_JUDGE_MAX_TOKENS,
-    )
-    .await
-    .map_err(|err| {
-        tracing::debug!(error = %err, "rule evidence judge failed");
-        "judge_failed"
-    })
+    ctx.llm
+        .single_turn(
+            RULE_JUDGE_CALL,
+            JUDGE_SYSTEM,
+            Some(RULE_EVIDENCE_EFFORT),
+            prompt,
+            RULE_JUDGE_MAX_TOKENS,
+        )
+        .await
+        .map_err(|err| {
+            tracing::debug!(error = %err, "rule evidence judge failed");
+            "judge_failed"
+        })
 }
 
 /// The citation gate over the judge's reply: `Verified` only for `violated` with a cited line
@@ -555,12 +525,14 @@ Answer with one JSON object and nothing else:
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use adus_core::types::Severity;
     use adus_git::FileStatus;
     use adus_llm::ChatResponse;
-    use adus_llm::router::ChatError;
+    use adus_llm::router::{ChatError, UsageContext};
+    use uuid::Uuid;
 
     use super::*;
     use crate::test_support::{ScriptedChat, call, rule, text_turn, tools_turn, user_text};
@@ -616,11 +588,13 @@ mod tests {
         )])));
         let usage = UsageContext::default();
         let ctx = RuleEvidenceContext {
-            chat,
-            provider_id: Uuid::from_u128(1),
-            fast_model: FAST_MODEL,
-            usage: &usage,
-            token_budget: None,
+            llm: LlmContext {
+                chat,
+                provider_id: Uuid::from_u128(1),
+                model: FAST_MODEL,
+                usage: &usage,
+                token_budget: None,
+            },
             toolbox: &toolbox,
         };
         let rule = rule("No unwrap", Severity::Warning, None, true);

@@ -4,7 +4,6 @@
 //! next to the Finder when the repository tools are available.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -17,7 +16,6 @@ use serde_json::Value;
 use tokio::time::Instant;
 use tracing::Instrument;
 
-use crate::agent::{AgentLlm, chat_single_turn};
 use crate::finder::FinderPass;
 use crate::parse::{CommentableRange, Suggestion, array_arg, parse_u32_field};
 use crate::prompt::{diff_block, severity_name, wrap};
@@ -294,7 +292,11 @@ pub(crate) async fn run_sharded_rules(
         .map(|(file, rule, violation)| async move {
             let verdict = if tools_unsupported_ref.load(Ordering::Relaxed) {
                 EvidenceVerdict::Rejected("tools_unsupported")
-            } else if ctx.token_budget.is_some_and(|budget| budget.exhausted()) {
+            } else if ctx
+                .llm
+                .token_budget
+                .is_some_and(|budget| budget.exhausted())
+            {
                 EvidenceVerdict::Rejected("token_budget")
             } else if Instant::now() >= evidence_deadline {
                 EvidenceVerdict::Rejected("no_time_left")
@@ -355,7 +357,11 @@ async fn run_shard(
 ) -> Option<Vec<RawShardViolation>> {
     let span = tracing::debug_span!("rule_shard", file = %file.path, rules = matching.len());
     async {
-        if ctx.token_budget.is_some_and(|budget| budget.exhausted()) {
+        if ctx
+            .llm
+            .token_budget
+            .is_some_and(|budget| budget.exhausted())
+        {
             tracing::debug!("token budget exhausted; rule shard not started");
             return None;
         }
@@ -374,22 +380,15 @@ async fn run_shard(
                 }
             };
             let (system, user) = build_shard_prompts(file, matching, head.as_deref());
-            let llm = AgentLlm {
-                chat: ctx.chat,
-                provider_id: ctx.provider_id,
-                model: ctx.fast_model,
-                system: &system,
-                effort: Some(SHARD_EFFORT),
-                usage: ctx.usage,
-            };
-            chat_single_turn(
-                &llm,
-                RULE_SHARD_CALL,
-                ctx.token_budget.map(Arc::as_ref),
-                user,
-                SHARD_MAX_TOKENS,
-            )
-            .await
+            ctx.llm
+                .single_turn(
+                    RULE_SHARD_CALL,
+                    &system,
+                    Some(SHARD_EFFORT),
+                    user,
+                    SHARD_MAX_TOKENS,
+                )
+                .await
         })
         .await;
         let violations = match judged {
@@ -449,6 +448,7 @@ fn rule_finding(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use adus_core::types::Severity;
@@ -458,6 +458,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::agent::LlmContext;
     use crate::budget::TokenBudget;
     use crate::test_support::{ScriptedChat, call, rule, text_turn, tools_turn, user_text};
     use crate::tools::Toolbox;
@@ -626,11 +627,13 @@ mod tests {
         ]);
         let usage = UsageContext::default();
         let ctx = RuleEvidenceContext {
-            chat: &chat,
-            provider_id: Uuid::from_u128(1),
-            fast_model: "fast-model",
-            usage: &usage,
-            token_budget: None,
+            llm: LlmContext {
+                chat: &chat,
+                provider_id: Uuid::from_u128(1),
+                model: "fast-model",
+                usage: &usage,
+                token_budget: None,
+            },
             toolbox: &toolbox,
         };
         let rules = [rule("No unwrap", Severity::Critical, Some("src/**"), true)];
@@ -744,11 +747,13 @@ mod tests {
         {
             let chat = ScriptedChat::new(script);
             let ctx = RuleEvidenceContext {
-                chat: &chat,
-                provider_id: Uuid::from_u128(1),
-                fast_model: "fast-model",
-                usage: &usage,
-                token_budget,
+                llm: LlmContext {
+                    chat: &chat,
+                    provider_id: Uuid::from_u128(1),
+                    model: "fast-model",
+                    usage: &usage,
+                    token_budget,
+                },
                 toolbox: &toolbox,
             };
 

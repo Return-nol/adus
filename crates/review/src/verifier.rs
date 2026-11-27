@@ -7,27 +7,23 @@
 //! dropped, while an Evidence Gate run that ends without a verdict keeps the light verdict.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use adus_core::types::{Severity, normalize_path};
 use adus_db::memories::Memory;
 use adus_db::rules::{Rule, rule_matches_path};
 use adus_git::{FileDiff, PullRequest};
-use adus_llm::router::{ChatError, ChatService, UsageContext};
+use adus_llm::router::ChatError;
 use adus_llm::{ReasoningEffort, ToolDef};
 use futures::{StreamExt, stream};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tracing::Instrument;
-use uuid::Uuid;
 
 use crate::agent::{
-    AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec, chat_single_turn,
-    run_react_loop,
+    AgentConfig, AgentError, AgentOutcome, AgentTools, LlmContext, SubmitSpec, run_react_loop,
 };
-use crate::budget::TokenBudget;
 use crate::engine::is_retryable;
 use crate::finder::FinderPass;
 use crate::parse::{FindingCategory, Suggestion, first_json_value, parse_bool_field};
@@ -138,17 +134,6 @@ pub(crate) struct VerificationReport {
     pub all_retryable_error: Option<ChatError>,
 }
 
-/// Where the Verifier talks to the model. `model` is the provider's primary model.
-#[derive(Clone, Copy)]
-pub(crate) struct VerifyContext<'a> {
-    pub chat: &'a dyn ChatService,
-    pub provider_id: Uuid,
-    pub model: &'a str,
-    pub usage: &'a UsageContext,
-    /// The review's shared input-token budget, if any.
-    pub token_budget: Option<&'a Arc<TokenBudget>>,
-}
-
 /// What the Verifier pass is given for one review.
 pub(crate) struct VerifyInput<'a> {
     pub pr: &'a PullRequest,
@@ -174,7 +159,7 @@ pub(crate) struct VerifyInput<'a> {
 /// exhausted) a light run is a single diff-only call. A light run still going at `deadline`, or
 /// starting after it, is dropped as unverified, never as retryable.
 pub(crate) async fn verify_candidates(
-    ctx: VerifyContext<'_>,
+    ctx: LlmContext<'_>,
     input: VerifyInput<'_>,
 ) -> VerificationReport {
     let evidence = Evidence {
@@ -301,7 +286,7 @@ fn gate_split(light: Vec<Verified>) -> GateSplit {
 /// One Verifier pass over a queue of candidates; shared by the light pass and the Evidence Gate.
 #[derive(Clone, Copy)]
 struct Pass<'p, 'a> {
-    ctx: VerifyContext<'a>,
+    ctx: LlmContext<'a>,
     evidence: &'p Evidence<'a>,
     submit: &'p SubmitVerdict,
     diff_only: &'p AtomicBool,
@@ -545,7 +530,8 @@ async fn verify_one(
             budget.note_diff_only();
         } else {
             let prompt = build_user_prompt(candidate, evidence, snippet.as_deref(), true);
-            let config = verifier_config(mode.max_steps(), evidence.deadline, ctx.token_budget);
+            let config =
+                AgentConfig::verifier(mode.max_steps(), evidence.deadline, ctx.token_budget);
             match verify_with_tools(ctx, toolbox, submit, prompt, &config).await {
                 Err(AgentError::ToolsUnsupported(_)) => {
                     tracing::warn!(
@@ -575,38 +561,15 @@ pub(crate) fn snippet_window(s: &Suggestion) -> (u32, u32) {
     (s.line - half, SNIPPET_RADIUS.saturating_add(half))
 }
 
-/// The Verifier's loop policy: the final step offers no tools and asks for the JSON verdict,
-/// short reads are widened so enclosing guards show, and no Finder budget bands or gate.
-fn verifier_config(
-    max_steps: usize,
-    deadline: Instant,
-    token_budget: Option<&Arc<TokenBudget>>,
-) -> AgentConfig {
-    AgentConfig {
-        deadline: Some(deadline),
-        token_budget: token_budget.cloned(),
-        no_tools_on_last_step: true,
-        widen_short_reads: true,
-        ..AgentConfig::new(max_steps)
-    }
-}
-
 async fn verify_with_tools(
-    ctx: VerifyContext<'_>,
+    ctx: LlmContext<'_>,
     toolbox: &Toolbox,
     submit: &SubmitVerdict,
     prompt: String,
     config: &AgentConfig,
 ) -> Result<AgentOutcome<Verdict>, AgentError> {
     let system = build_system_prompt(true);
-    let llm = AgentLlm {
-        chat: ctx.chat,
-        provider_id: ctx.provider_id,
-        model: ctx.model,
-        system: &system,
-        effort: Some(VERIFY_EFFORT),
-        usage: ctx.usage,
-    };
+    let llm = ctx.for_agent(&system, Some(VERIFY_EFFORT));
     run_react_loop(&llm, AgentTools::Full(toolbox), submit, config, prompt).await
 }
 
@@ -625,22 +588,18 @@ fn agent_outcome(result: Result<AgentOutcome<Verdict>, AgentError>) -> Outcome {
     }
 }
 
-async fn verify_diff_only(
-    ctx: VerifyContext<'_>,
-    submit: &SubmitVerdict,
-    prompt: String,
-) -> Outcome {
+async fn verify_diff_only(ctx: LlmContext<'_>, submit: &SubmitVerdict, prompt: String) -> Outcome {
     let system = build_system_prompt(false);
-    let llm = AgentLlm {
-        chat: ctx.chat,
-        provider_id: ctx.provider_id,
-        model: ctx.model,
-        system: &system,
-        effort: Some(VERIFY_EFFORT),
-        usage: ctx.usage,
-    };
-    let budget = ctx.token_budget.map(Arc::as_ref);
-    match chat_single_turn(&llm, "verify_diff_only", budget, prompt, VERDICT_MAX_TOKENS).await {
+    match ctx
+        .single_turn(
+            "verify_diff_only",
+            &system,
+            Some(VERIFY_EFFORT),
+            prompt,
+            VERDICT_MAX_TOKENS,
+        )
+        .await
+    {
         Ok(text) => match submit.parse_prose(&text) {
             Ok(verdict) => Outcome::from_verdict(verdict),
             Err(_) => unreadable(),
@@ -873,9 +832,12 @@ mod tests {
 
     use adus_core::types::Severity;
     use adus_git::FileStatus;
+    use adus_llm::router::UsageContext;
     use adus_llm::{ChatRequest, Message, ToolCall};
+    use uuid::Uuid;
 
     use super::*;
+    use crate::budget::TokenBudget;
     use crate::redact::RATIONALE_LOG_CHARS;
     use crate::test_support::{
         Reply, RoutedChat, answer, call, is_for, memory, msg_text, rule, text_turn, tool_names,
@@ -991,7 +953,7 @@ mod tests {
             review_id: Some(Uuid::from_u128(7)),
             repository_id: Some(Uuid::from_u128(8)),
         };
-        let ctx = VerifyContext {
+        let ctx = LlmContext {
             chat,
             provider_id: PROVIDER,
             model: PRIMARY_MODEL,
@@ -1496,7 +1458,7 @@ mod tests {
         ];
         let memories = [memory("We use sqlx")];
         let usage = UsageContext::default();
-        let ctx = VerifyContext {
+        let ctx = LlmContext {
             chat: &chat,
             provider_id: PROVIDER,
             model: PRIMARY_MODEL,

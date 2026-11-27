@@ -20,16 +20,13 @@ use adus_db::memories::Memory;
 use adus_git::{FileDiff, PullRequest};
 use adus_llm::ReasoningEffort;
 use adus_llm::ToolDef;
-use adus_llm::router::{ChatService, UsageContext};
 use futures::{StreamExt, future, stream};
 use serde_json::Value;
 use tokio::time::Instant;
 use tracing::Instrument;
-use uuid::Uuid;
 
 use crate::agent::{
-    AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec, chat_single_turn,
-    run_react_loop,
+    AgentConfig, AgentError, AgentOutcome, AgentTools, LlmContext, SubmitSpec, run_react_loop,
 };
 use crate::budget::TokenBudget;
 use crate::coverage::CoverageLedger;
@@ -115,18 +112,13 @@ fn finder_max_steps(files: usize) -> usize {
     (FINDER_BASE_STEPS + files.saturating_sub(FINDER_FREE_FILES).div_ceil(2)).min(FINDER_STEP_CAP)
 }
 
-/// Where the Finder talks to the model: both passes use `model` at `effort`; prose recovery
+/// Where the Finder talks to the model: both passes use `primary` at `effort`; prose recovery
 /// uses `fast_model` at [`PROSE_RECOVERY_EFFORT`].
 #[derive(Clone, Copy)]
 pub(crate) struct FinderLlm<'a> {
-    pub chat: &'a dyn ChatService,
-    pub provider_id: Uuid,
-    pub model: &'a str,
+    pub primary: LlmContext<'a>,
     pub fast_model: &'a str,
     pub effort: ReasoningEffort,
-    pub usage: &'a UsageContext,
-    /// The review's shared input-token budget, if any.
-    pub token_budget: Option<&'a Arc<TokenBudget>>,
 }
 
 /// What every Finder agent of one review is shown.
@@ -310,7 +302,11 @@ async fn run_all(
             let allowed = batch_allowed(batch, input.allowed);
             async move {
                 // Checked when the batch starts (the stream polls it), not when it is built.
-                if llm.token_budget.is_some_and(|budget| budget.exhausted()) {
+                if llm
+                    .primary
+                    .token_budget
+                    .is_some_and(|budget| budget.exhausted())
+                {
                     tracing::debug!(batch = index, "token budget exhausted; batch not started");
                     return kinds
                         .into_iter()
@@ -397,7 +393,7 @@ async fn run_task(
         && matches!(kind, SpecialistKind::Generalist | SpecialistKind::Bug);
     if rescues {
         let gate = synthesis_gate(
-            llm.token_budget.map(Arc::as_ref),
+            llm.primary.token_budget.map(Arc::as_ref),
             deadline.saturating_duration_since(Instant::now()),
             outcome.mean_step,
         );
@@ -618,23 +614,15 @@ async fn recover_prose_findings(
 ) -> Vec<Suggestion> {
     let mut files: Vec<&str> = submit.allowed.keys().map(String::as_str).collect();
     files.sort_unstable();
-    let agent = AgentLlm {
-        chat: llm.chat,
-        provider_id: llm.provider_id,
-        model: llm.fast_model,
-        system: PROSE_RECOVERY_SYSTEM,
-        effort: Some(PROSE_RECOVERY_EFFORT),
-        usage: llm.usage,
-    };
     let prompt = format!(
         "{}\n\n{}\n\n{PROSE_RECOVERY_TASK}",
         wrap("batch_files", &files.join("\n")),
         wrap("reviewer_notes", prose),
     );
-    let call = chat_single_turn(
-        &agent,
+    let call = llm.primary.with_model(llm.fast_model).single_turn(
         "prose_recovery",
-        llm.token_budget.map(Arc::as_ref),
+        PROSE_RECOVERY_SYSTEM,
+        Some(PROSE_RECOVERY_EFFORT),
         prompt,
         PROSE_RECOVERY_MAX_TOKENS,
     );
@@ -683,24 +671,15 @@ async fn run_one(
         && matches!(tools, AgentTools::Full(_))
         && matches!(kind, SpecialistKind::Generalist | SpecialistKind::Bug);
     let system = build_finder_system_prompt(kind, matches!(tools, AgentTools::Full(_)));
-    let agent = AgentLlm {
-        chat: llm.chat,
-        provider_id: llm.provider_id,
-        model: llm.model,
-        system: &system,
-        effort: Some(llm.effort),
-        usage: llm.usage,
-    };
+    let agent = llm.primary.for_agent(&system, Some(llm.effort));
     // The agent wraps up on its own before the deadline; `timeout_at` stays the hard cut.
-    let config = AgentConfig {
-        wrap_up_steps: FINDER_WRAP_UP_STEPS,
-        deadline: Some(deadline),
-        token_budget: llm.token_budget.cloned(),
-        coverage_ledger: gated.then(|| CoverageLedger::from_files(files)),
-        enforce_gate: gated,
-        budget_bands: true,
-        ..AgentConfig::new(max_steps)
-    };
+    let config = AgentConfig::finder(
+        max_steps,
+        FINDER_WRAP_UP_STEPS,
+        deadline,
+        llm.primary.token_budget,
+        gated.then(|| CoverageLedger::from_files(files)),
+    );
     let pass = if rescue {
         FinderPass::SynthesisRescue
     } else {
@@ -873,12 +852,14 @@ mod tests {
 
     use adus_core::types::ReviewMode;
     use adus_git::{FileDiff, FileStatus, PullRequest};
+    use adus_llm::router::UsageContext;
     use adus_llm::{Message, ReasoningEffort};
     use serde_json::json;
     use tokio::time::Instant;
     use uuid::Uuid;
 
     use super::*;
+    use crate::agent::AgentLlm;
     use crate::parse::CommentableRange;
     use crate::test_support::{ScriptedChat, call, msg_text, text_turn, tools_turn, user_text};
     use crate::workspace::RepoWorkspace;
@@ -962,13 +943,15 @@ mod tests {
         token_budget: Option<&'a Arc<TokenBudget>>,
     ) -> FinderLlm<'a> {
         FinderLlm {
-            chat,
-            provider_id: Uuid::from_u128(1),
-            model: "m",
+            primary: LlmContext {
+                chat,
+                provider_id: Uuid::from_u128(1),
+                model: "m",
+                usage,
+                token_budget,
+            },
             fast_model: "fast",
             effort: ReasoningEffort::High,
-            usage,
-            token_budget,
         }
     }
 

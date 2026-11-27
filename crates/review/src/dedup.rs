@@ -6,12 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use adus_git::PrThread;
 use adus_llm::ReasoningEffort;
-use adus_llm::router::{ChatService, UsageContext};
 use serde::Deserialize;
-use uuid::Uuid;
 
-use crate::agent::{AgentLlm, chat_single_turn};
-use crate::budget::TokenBudget;
+use crate::agent::LlmContext;
 use crate::discussion::format_threads;
 use crate::parse::first_json_object;
 use crate::prompt::wrap;
@@ -43,20 +40,16 @@ pub(crate) struct DedupOutcome {
 
 /// Merges semantic duplicates among `findings` and drops the ones an `existing` thread already
 /// raised, with one single-turn call. `existing` is already selected (`threads_for_dedup`).
-/// `model` is the provider's `effective_fast_model()`; the call uses `ReasoningEffort::Medium`.
+/// `llm.model` is the provider's `effective_fast_model()`; the call uses `ReasoningEffort::Medium`.
 ///
 /// No call is made without findings, or for one finding with no existing thread. An LLM error,
 /// an unparseable answer, an index out of range or an empty `keep_indices` keeps every finding
 /// (logged as a warning), except that an empty `keep_indices` with at least one valid
 /// `already_raised` citation means "keep all, then drop the cited ones". A finding is dropped as
 /// already raised only when the answer cites a thread that exists. The call's input tokens are
-/// added to `token_budget`; it runs even when the budget is exhausted (one small call).
+/// added to `llm.token_budget`; it runs even when the budget is exhausted (one small call).
 pub(crate) async fn deduplicate_findings(
-    chat: &dyn ChatService,
-    provider_id: Uuid,
-    model: &str,
-    usage_ctx: &UsageContext,
-    token_budget: Option<&TokenBudget>,
+    llm: LlmContext<'_>,
     findings: Vec<CandidateFinding>,
     existing: &[&PrThread],
 ) -> DedupOutcome {
@@ -68,22 +61,15 @@ pub(crate) async fn deduplicate_findings(
         return unchanged(findings);
     }
 
-    let llm = AgentLlm {
-        chat,
-        provider_id,
-        model,
-        system: DEDUP_SYSTEM,
-        effort: Some(DEDUP_EFFORT),
-        usage: usage_ctx,
-    };
-    let text = match chat_single_turn(
-        &llm,
-        "dedup",
-        token_budget,
-        build_user_prompt(&findings, existing),
-        DEDUP_MAX_TOKENS,
-    )
-    .await
+    let text = match llm
+        .single_turn(
+            "dedup",
+            DEDUP_SYSTEM,
+            Some(DEDUP_EFFORT),
+            build_user_prompt(&findings, existing),
+            DEDUP_MAX_TOKENS,
+        )
+        .await
     {
         Ok(text) => text,
         Err(err) => {
@@ -193,7 +179,8 @@ fn build_user_prompt(findings: &[CandidateFinding], existing: &[&PrThread]) -> S
 mod tests {
     use adus_core::types::Severity;
     use adus_git::PrThreadComment;
-    use adus_llm::router::ChatError;
+    use adus_llm::router::{ChatError, UsageContext};
+    use uuid::Uuid;
 
     use super::*;
     use crate::finder::FinderPass;
@@ -235,8 +222,14 @@ mod tests {
         existing: &[&PrThread],
     ) -> DedupOutcome {
         let usage = UsageContext::default();
-        let id = Uuid::from_u128(1);
-        deduplicate_findings(chat, id, FAST_MODEL, &usage, None, findings, existing).await
+        let llm = LlmContext {
+            chat,
+            provider_id: Uuid::from_u128(1),
+            model: FAST_MODEL,
+            usage: &usage,
+            token_budget: None,
+        };
+        deduplicate_findings(llm, findings, existing).await
     }
 
     async fn dedup(chat: &ScriptedChat, findings: Vec<CandidateFinding>) -> Vec<CandidateFinding> {

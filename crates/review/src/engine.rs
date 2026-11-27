@@ -31,7 +31,7 @@ use sqlx::PgPool;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::agent::{AgentError, AgentOutcome};
+use crate::agent::{AgentError, AgentOutcome, LlmContext};
 use crate::budget::TokenBudget;
 use crate::dedup::{DedupOutcome, deduplicate_findings};
 use crate::discussion::threads_for_dedup;
@@ -52,9 +52,7 @@ use crate::rules_judge::{ShardedRulesOutput, run_sharded_rules};
 use crate::severity::{classify_severity, fill_unclassified};
 use crate::small_pr::is_small_pr;
 use crate::tools::Toolbox;
-use crate::verifier::{
-    CandidateFinding, VerificationReport, VerifyContext, VerifyInput, verify_candidates,
-};
+use crate::verifier::{CandidateFinding, VerificationReport, VerifyInput, verify_candidates};
 use crate::workspace::{RepoCloner, WorkspaceError};
 
 /// Budget of one Generalist review (`Engine::review_timeout`), small PRs included.
@@ -177,6 +175,26 @@ struct Stages<'a> {
     /// Input tokens this run may send (`settings.max_review_input_tokens`), shared by every
     /// Finder, Sharded Rules, Verifier and post-verify call.
     token_budget: Arc<TokenBudget>,
+}
+
+impl<'a> Stages<'a> {
+    fn llm<'b>(&'b self, chat: &'b dyn ChatService, model: &'b str) -> LlmContext<'b> {
+        LlmContext {
+            chat,
+            provider_id: self.provider_id,
+            model,
+            usage: self.usage,
+            token_budget: Some(&self.token_budget),
+        }
+    }
+
+    fn primary_llm<'b>(&'b self, chat: &'b dyn ChatService) -> LlmContext<'b> {
+        self.llm(chat, self.primary_model)
+    }
+
+    fn fast_llm<'b>(&'b self, chat: &'b dyn ChatService) -> LlmContext<'b> {
+        self.llm(chat, self.fast_model)
+    }
 }
 
 /// What the Finder stage leaves for the stage log and the budget warning.
@@ -592,13 +610,9 @@ impl Engine {
             mode,
         };
         let llm = FinderLlm {
-            chat: self.chat.as_ref(),
-            provider_id: s.provider_id,
-            model: s.primary_model,
+            primary: s.primary_llm(self.chat.as_ref()),
             fast_model: s.fast_model,
             effort: FINDER_EFFORT,
-            usage: s.usage,
-            token_budget: Some(&s.token_budget),
         };
         // The Sharded Rules check the team rules only with the repository tools; diff-only,
         // the Finder prompt carries `<rules>` instead.
@@ -606,11 +620,7 @@ impl Engine {
             .as_ref()
             .filter(|_| s.rules.iter().any(|rule| rule.enabled))
             .map(|toolbox| RuleEvidenceContext {
-                chat: self.chat.as_ref(),
-                provider_id: s.provider_id,
-                fast_model: s.fast_model,
-                usage: s.usage,
-                token_budget: Some(&s.token_budget),
+                llm: s.fast_llm(self.chat.as_ref()),
                 toolbox,
             });
         let sharded_rules = async {
@@ -662,15 +672,8 @@ impl Engine {
             let mut report = if candidates.is_empty() {
                 VerificationReport::default()
             } else {
-                let ctx = VerifyContext {
-                    chat: self.chat.as_ref(),
-                    provider_id: s.provider_id,
-                    model: s.primary_model,
-                    usage: s.usage,
-                    token_budget: Some(&s.token_budget),
-                };
                 verify_candidates(
-                    ctx,
+                    s.primary_llm(self.chat.as_ref()),
                     VerifyInput {
                         pr: s.pr,
                         manifest,
@@ -737,15 +740,7 @@ impl Engine {
             .collect();
         let existing = threads_for_dedup(s.threads, &finding_paths);
         let fallback = verified.clone();
-        let dedup = deduplicate_findings(
-            self.chat.as_ref(),
-            s.provider_id,
-            s.fast_model,
-            s.usage,
-            Some(s.token_budget.as_ref()),
-            verified,
-            &existing,
-        );
+        let dedup = deduplicate_findings(s.fast_llm(self.chat.as_ref()), verified, &existing);
         let DedupOutcome {
             kept,
             already_raised,
@@ -767,14 +762,7 @@ impl Engine {
         let kept_by_origin = count_by_origin(&kept);
         let mut found: Vec<Suggestion> = kept.into_iter().map(|c| c.suggestion).collect();
 
-        let classify = classify_severity(
-            self.chat.as_ref(),
-            s.provider_id,
-            s.fast_model,
-            s.usage,
-            Some(s.token_budget.as_ref()),
-            &mut found,
-        );
+        let classify = classify_severity(s.fast_llm(self.chat.as_ref()), &mut found);
         if tokio::time::timeout_at(s.deadlines.post_verify, classify)
             .await
             .is_err()
@@ -784,11 +772,7 @@ impl Engine {
         }
         // Returns by the deadline on its own: no call starts in its last `ENRICH_RESERVE`.
         enrich_suggestions(
-            self.chat.as_ref(),
-            s.provider_id,
-            s.fast_model,
-            s.usage,
-            Some(s.token_budget.as_ref()),
+            s.fast_llm(self.chat.as_ref()),
             toolbox.as_ref(),
             &files,
             &allowed,
