@@ -26,6 +26,8 @@ const REPLY_MAX_TOKENS: u32 = 4_096;
 const CODE_LINES: usize = 120;
 /// Longest `<code>` section, in chars (guards against minified lines).
 const MAX_CODE_CHARS: usize = 20_000;
+/// Most thread comments after the root finding sent to the model (the latest ones).
+const MAX_PROMPT_COMMENTS: usize = 20;
 
 const REPLY_SYSTEM: &str = r#"You are Adus, an AI code reviewer. You opened the review thread in <thread> to report the finding in <finding>, and a person has replied in it. Decide what the reply means for the finding and write your answer.
 <finding> holds the finding as you posted it (file, line, severity, title, body) and the outcome recorded so far. <thread> holds the whole thread, oldest comment first; comments whose author is "adus" are yours. <code> holds the pull request's current diff of the finding's file around the finding's line, at the PR head, with new-file line numbers.
@@ -111,22 +113,8 @@ impl Engine {
                 .help_reply(&repo, pr_number, thread_id, comment_id)
                 .await;
         };
-        let settings = settings::get(&self.db).await.map_err(db_error)?;
-        if row.adus_replies >= settings.max_thread_replies {
-            return Ok(());
-        }
-        let Some((provider_id, _, fast_model)) = self.models(&repo, &settings).await? else {
-            return Ok(());
-        };
         let conn = self.connection(&repo).await?;
         let (git, repo_ref) = self.provider(&conn, &repo)?;
-        let pr = match git.get_pr(&repo_ref, pr_number).await {
-            Ok(pr) => pr,
-            Err(GitError::NotFound) => {
-                return Err(EngineError::Fatal("pull request not found".into()));
-            }
-            Err(err) => return Err(self.fetch_error(&conn, err).await),
-        };
         let thread_ref = ThreadRef {
             thread_id: row.provider_thread_id.clone(),
             root_comment_id: row.root_comment_id.clone(),
@@ -136,18 +124,11 @@ impl Engine {
             Err(GitError::NotFound) => return Ok(()),
             Err(err) => return Err(self.fetch_error(&conn, err).await),
         };
-        let Some(index) = thread.comments.iter().position(|c| c.id == comment_id) else {
-            return Ok(());
-        };
-        // The trigger is Adus's own, or Adus already answered it (or a later reply).
-        if thread.comments[index..].iter().any(|c| c.by_adus) {
-            return Ok(());
-        }
 
-        // Status set by a human: unless Adus's reply right before the trigger set it.
-        let adus_set_it = index > 1 && thread.comments[index - 1].by_adus;
+        // Status set by a human. Needs no LLM, so it runs before the reply cap and model checks.
+        // While the row is open, no Adus verdict closed the thread: every closing verdict
+        // records its outcome first.
         if row.outcome == ThreadOutcome::Open
-            && !adus_set_it
             && let Some(outcome) = human_outcome(&thread)
         {
             let update = ThreadUpdate {
@@ -163,6 +144,39 @@ impl Engine {
             row.reason = None;
         }
 
+        let Some(index) = thread.comments.iter().position(|c| c.id == comment_id) else {
+            return Ok(());
+        };
+        // The trigger is Adus's own, or Adus already answered it (or a later reply).
+        if thread.comments[index..].iter().any(|c| c.by_adus) {
+            return Ok(());
+        }
+        let settings = settings::get(&self.db).await.map_err(db_error)?;
+        if row.adus_replies >= settings.max_thread_replies {
+            return Ok(());
+        }
+        let Some((provider_id, _, fast_model)) = self.models(&repo, &settings).await? else {
+            return Ok(());
+        };
+        let pr = match git.get_pr(&repo_ref, pr_number).await {
+            Ok(pr) => pr,
+            Err(GitError::NotFound) => {
+                return Err(EngineError::Fatal("pull request not found".into()));
+            }
+            Err(err) => return Err(self.fetch_error(&conn, err).await),
+        };
+
+        // The model sees the root finding and the last `MAX_PROMPT_COMMENTS` comments only.
+        let start = thread
+            .comments
+            .len()
+            .saturating_sub(MAX_PROMPT_COMMENTS)
+            .max(1);
+        let mut shown = thread.clone();
+        shown.comments.drain(1..start);
+        // Index of the trigger in `shown` (the first shown reply when it was cut off).
+        let shown_index = index.saturating_sub(start) + 1;
+
         let diff = match git.pr_diff(&repo_ref, &pr).await {
             Ok(diff) => diff,
             Err(err) => return Err(self.fetch_error(&conn, err).await),
@@ -177,9 +191,9 @@ impl Engine {
             "reason": row.reason,
         });
         let prompt = format!(
-            "{}\n\n{}\n\n{}\n\nAnswer comment {index} of the thread as {{\"verdict\": \"...\", \"reason\": \"...\", \"resolution\": \"...\", \"reply\": \"...\"}}.",
+            "{}\n\n{}\n\n{}\n\nAnswer comment {shown_index} and any later comments by people in the thread as {{\"verdict\": \"...\", \"reason\": \"...\", \"resolution\": \"...\", \"reply\": \"...\"}}.",
             wrap("finding", &finding.to_string()),
-            wrap("thread", &format_threads(&[&thread])),
+            wrap("thread", &format_threads(&[&shown])),
             wrap("code", &code_context(&diff, &row.path, row.line)),
         );
         let usage = UsageContext {
@@ -255,6 +269,7 @@ impl Engine {
         {
             return Err(self.reply_error(&conn, err).await);
         }
+        // ponytail: a DB error here leaves the reply uncounted (cap off by one per failure).
         review_threads::record_reply(&self.db, row.id)
             .await
             .map_err(db_error)

@@ -240,9 +240,53 @@ async fn human_resolved_thread_is_synced_before_answering(pool: PgPool) {
 
     assert!(s.git.state().statuses.is_empty());
     assert_eq!(replies(&s).len(), 1);
-    let row = row(&pool, s.repository_id).await;
-    assert_eq!(row.outcome, ThreadOutcome::WontFix);
-    assert_eq!(row.reason, None);
+    let synced = row(&pool, s.repository_id).await;
+    assert_eq!(synced.outcome, ThreadOutcome::WontFix);
+    assert_eq!(synced.reason, None);
+
+    // Adus answered a question, then the developer resolved the GitHub thread and said thanks.
+    let reopen = || ThreadUpdate {
+        outcome: ThreadOutcome::Open,
+        reason: None,
+        fix_sha: None,
+        resolution: None,
+    };
+    review_threads::set_outcome(&pool, synced.id, reopen())
+        .await
+        .unwrap();
+    let mut resolved = thread(vec![
+        comment("c1", false, "Why?"),
+        comment("c2", true, "Because retries can storm."),
+        comment("c3", false, "Thanks, fixed."),
+    ]);
+    resolved.resolved = true;
+    s.git.state().thread = Some(resolved);
+    chat.reply(&answer("discussion", "", "", "Glad it helped."));
+
+    reply_to(&s, "t0", "c3").await;
+
+    assert_eq!(replies(&s).len(), 2);
+    assert_eq!(
+        row(&pool, s.repository_id).await.outcome,
+        ThreadOutcome::Fixed
+    );
+
+    // The sync needs no LLM: it still runs when Adus may not reply.
+    review_threads::set_outcome(&pool, synced.id, reopen())
+        .await
+        .unwrap();
+    let mut current = settings::get(&pool).await.unwrap();
+    current.max_thread_replies = 0;
+    settings::update(&pool, &current).await.unwrap();
+
+    reply_to(&s, "t0", "c3").await;
+
+    assert_eq!(chat.requests().len(), 2);
+    assert_eq!(
+        row(&pool, s.repository_id).await.outcome,
+        ThreadOutcome::Fixed
+    );
+    assert!(s.git.state().statuses.is_empty());
 }
 
 #[sqlx::test(migrations = "../../migrations")]
