@@ -14,14 +14,15 @@ use adus_db::connections::{self, Connection, ConnectionStatus};
 use adus_db::ignore::{IgnoreMatcher, default_ignore_paths, effective_ignore_paths, title_matches};
 use adus_db::memories::Memory;
 use adus_db::repositories::{self, Repository};
+use adus_db::review_threads::{self, NewReviewThread};
 use adus_db::reviews::{self, NewReview, ReviewStatus};
 use adus_db::rules::Rule;
 use adus_db::settings::Settings;
 use adus_db::{ai, memories, rules, settings};
 use adus_git::diff::{added_line_count, intersect_hunks, right_line_end_offset};
 use adus_git::{
-    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PrThread,
-    PullRequest, RepoRef,
+    FileDiff, FileStatus, GitError, GitProvider, GitProviderFactory, InlineComment, PostedComment,
+    PrThread, PullRequest, RepoRef,
 };
 use adus_llm::ReasoningEffort;
 use adus_llm::router::{ChatError, ChatService, UsageContext};
@@ -108,6 +109,8 @@ struct Target {
 struct ReviewOutput {
     counts: BTreeMap<Severity, usize>,
     comments: Vec<InlineComment>,
+    /// The finding behind each of `comments`, same order.
+    findings: Vec<Suggestion>,
     /// Tool results that had a secret masked.
     redacted_tool_outputs: u64,
     /// Inline comments that had a secret masked or their suggestion dropped.
@@ -473,9 +476,13 @@ impl Engine {
                     .post_review(&repo_ref, &pr, &output.comments, &summary)
                     .await
                 {
-                    Ok(posted) => Ok(Outcome::Done {
-                        posted: posted.len(),
-                    }),
+                    Ok(posted) => {
+                        self.record_threads(repo.id, review_id, &pr, &output, &posted)
+                            .await;
+                        Ok(Outcome::Done {
+                            posted: posted.len(),
+                        })
+                    }
                     Err(err) => Err(self.post_error(&conn, err).await),
                 }
             };
@@ -487,6 +494,48 @@ impl Engine {
         match tokio::time::timeout_at(cut, rest).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => Err(timed_out()),
+        }
+    }
+
+    /// One `review_threads` row per posted finding the provider identified. The review is
+    /// already posted: a DB error is only logged.
+    async fn record_threads(
+        &self,
+        repository_id: Uuid,
+        review_id: Uuid,
+        pr: &PullRequest,
+        output: &ReviewOutput,
+        posted: &[PostedComment],
+    ) {
+        // The body is already redacted; the title is stored on its own.
+        let titles: Vec<Cow<'_, str>> = output
+            .findings
+            .iter()
+            .map(|f| redact_secrets(&f.title))
+            .collect();
+        let rows: Vec<NewReviewThread<'_>> = posted
+            .iter()
+            .filter(|p| !p.comment_id.is_empty())
+            .filter_map(|p| {
+                let comment = output.comments.get(p.index)?;
+                let finding = output.findings.get(p.index)?;
+                Some(NewReviewThread {
+                    repository_id,
+                    review_id: Some(review_id),
+                    pr_number: pr.number,
+                    provider_thread_id: p.thread_id.as_deref().unwrap_or(&p.comment_id),
+                    root_comment_id: &p.comment_id,
+                    path: &comment.path,
+                    line: i32::try_from(finding.line).ok(),
+                    severity: finding.severity,
+                    title: titles.get(p.index)?,
+                    body: &comment.body,
+                    posted_head_sha: &pr.head_sha,
+                })
+            })
+            .collect();
+        if let Err(err) = review_threads::insert_many(&self.db, &rows).await {
+            tracing::warn!(%review_id, error = %err, "could not record finding threads");
         }
     }
 
@@ -726,6 +775,7 @@ impl Engine {
         Ok(ReviewOutput {
             counts,
             comments,
+            findings: found,
             redacted_tool_outputs: toolbox.as_ref().map_or(0, Toolbox::redacted_outputs),
             redacted_comments,
         })

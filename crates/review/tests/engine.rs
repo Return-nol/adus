@@ -6,6 +6,7 @@ use adus_core::job::Trigger;
 use adus_core::types::{ADUDU_MARKER, ReviewMode, Severity};
 use adus_db::connections::ConnectionStatus;
 use adus_db::repositories::RepoPatch;
+use adus_db::review_threads::{self, ThreadOutcome};
 use adus_db::reviews::{self, Review, ReviewStatus};
 use adus_db::rules::{self, KnowledgeScope, NewRule};
 use adus_git::{ConnectionKind, FileStatus, GitError, PrThread, PrThreadComment};
@@ -2591,4 +2592,41 @@ async fn finder_still_sees_the_raw_diff(pool: PgPool) {
     // The posted comment never carries the key.
     let git = s.git.state();
     assert!(!git.reviews[0].comments[0].body.contains(FAKE_AWS_KEY));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_records_finding_threads(pool: PgPool) {
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    let findings = json!([
+        finding_json("src/a.rs", 2, "critical", "First"),
+        finding_json("src/a.rs", 4, "warning", "Second"),
+    ]);
+    s.chat.push(Ok(&findings.to_string()));
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1]}"#));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let posted = s.git.state().reviews[0].comments.clone();
+    assert_eq!(posted.len(), 2);
+    let mut threads = review_threads::for_pr(&pool, s.repository_id, 7)
+        .await
+        .unwrap();
+    threads.sort_by(|a, b| a.root_comment_id.cmp(&b.root_comment_id));
+    assert_eq!(threads.len(), 2);
+    for (i, t) in threads.iter().enumerate() {
+        assert_eq!(t.outcome, ThreadOutcome::Open);
+        assert_eq!(t.provider_thread_id, format!("t{i}"));
+        assert_eq!(t.root_comment_id, format!("c{i}"));
+        assert_eq!(t.posted_head_sha, "h1");
+        assert_eq!(t.review_id, Some(id));
+        assert_eq!(t.path, "src/a.rs");
+        assert_eq!(t.line, Some(i32::try_from(posted[i].line).unwrap()));
+        assert_eq!(t.body, posted[i].body);
+        let expected = match t.line {
+            Some(2) => (Severity::Critical, "First"),
+            _ => (Severity::Warning, "Second"),
+        };
+        assert_eq!((t.severity, t.title.as_str()), expected);
+    }
 }
