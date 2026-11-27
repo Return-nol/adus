@@ -15,10 +15,16 @@
 	import { Skeleton } from '#lib/components/ui/skeleton/index.js';
 
 	type ReviewMode = 'generalist' | 'specialists';
+	type CuratorEffort = 'low' | 'medium' | 'high';
 
 	const reviewModeLabels: Record<ReviewMode, string> = {
 		generalist: 'Generalist — balanced single-pass review',
 		specialists: 'Specialists — parallel Bug, Security, Performance & Rules'
+	};
+	const curatorEffortLabels: Record<CuratorEffort, string> = {
+		low: 'Low',
+		medium: 'Medium',
+		high: 'High'
 	};
 
 	type Settings = {
@@ -31,6 +37,10 @@
 		ignore_paths: string[];
 		ignore_paths_is_default: boolean;
 		ignored_title_keywords: string[];
+		max_thread_replies: number;
+		max_validate_threads: number;
+		max_learned_per_pr: number;
+		curator_effort: CuratorEffort;
 	};
 
 	const isAdmin = $derived(session.user?.role === 'admin');
@@ -45,6 +55,10 @@
 	let maxPatchLines = $state(0);
 	let smallPrMaxLines = $state(0);
 	let maxInputTokens = $state(0);
+	let maxThreadReplies = $state(5);
+	let maxValidateThreads = $state(30);
+	let maxLearnedPerPr = $state(10);
+	let curatorEffort = $state<CuratorEffort>('medium');
 	// Ignored files: the textarea text, plus what the server last gave us.
 	let ignoreText = $state('');
 	let savedIgnore = $state<string[]>([]);
@@ -93,6 +107,10 @@
 		maxPatchLines = s.max_patch_lines_per_file;
 		smallPrMaxLines = s.small_pr_max_lines;
 		maxInputTokens = s.max_review_input_tokens;
+		maxThreadReplies = s.max_thread_replies;
+		maxValidateThreads = s.max_validate_threads;
+		maxLearnedPerPr = s.max_learned_per_pr;
+		curatorEffort = s.curator_effort;
 	}
 
 	async function load() {
@@ -128,6 +146,10 @@
 					max_patch_lines_per_file: maxPatchLines,
 					small_pr_max_lines: smallPrMaxLines,
 					max_review_input_tokens: maxInputTokens,
+					max_thread_replies: maxThreadReplies,
+					max_validate_threads: maxValidateThreads,
+					max_learned_per_pr: maxLearnedPerPr,
+					curator_effort: curatorEffort,
 					// Omitted unless edited, so saving other settings never pins the defaults.
 					...(ignoreChanged ? { ignore_paths: patterns } : {}),
 					ignored_title_keywords: lines(keywordsText)
@@ -164,6 +186,10 @@
 					default_provider_id: saved.default_provider_id,
 					max_files_per_review: saved.max_files_per_review,
 					max_patch_lines_per_file: saved.max_patch_lines_per_file,
+					max_thread_replies: saved.max_thread_replies,
+					max_validate_threads: saved.max_validate_threads,
+					max_learned_per_pr: saved.max_learned_per_pr,
+					curator_effort: saved.curator_effort,
 					ignore_paths: null
 				})
 			);
@@ -212,7 +238,7 @@
 	<Card.Root class="max-w-2xl" aria-busy="true">
 		<Card.Content class="grid gap-4">
 			<span class="sr-only" role="status">Loading…</span>
-			{#each ['w-28', 'w-24', 'w-44', 'w-52', 'w-56', 'w-52'] as w, i (i)}
+			{#each ['w-28', 'w-24', 'w-44', 'w-52', 'w-56', 'w-52', 'w-48', 'w-56', 'w-48', 'w-44'] as w, i (i)}
 				<div class="grid gap-2">
 					<Skeleton class={`h-4 ${w}`} />
 					<Skeleton class="h-9 w-full rounded-sm" />
@@ -379,6 +405,67 @@
 						One per line. Pull requests whose title contains one (any case) are not reviewed
 						automatically.
 					</p>
+				</div>
+				<div class="space-y-4 border-t border-border pt-4">
+					<h2 class="text-base font-semibold text-foreground">
+						Thread conversations &amp; learning
+					</h2>
+					<div class="grid gap-2">
+						<Label for="s-thread-replies">Max replies per thread (0-100)</Label>
+						<Input
+							id="s-thread-replies"
+							type="number"
+							min="0"
+							max="100"
+							required
+							bind:value={maxThreadReplies}
+						/>
+						<p class="text-xs text-muted-foreground">
+							Maximum Adudu replies per PR review thread. 0 disables thread replies.
+						</p>
+					</div>
+					<div class="grid gap-2">
+						<Label for="s-validate-threads">Max threads validated per push (0-100)</Label>
+						<Input
+							id="s-validate-threads"
+							type="number"
+							min="0"
+							max="100"
+							required
+							bind:value={maxValidateThreads}
+						/>
+						<p class="text-xs text-muted-foreground">
+							Maximum open finding threads re-checked when new commits are pushed. 0 disables push
+							validation.
+						</p>
+					</div>
+					<div class="grid gap-2">
+						<Label for="s-learned-pr">Max learned memories per PR (1-50)</Label>
+						<Input
+							id="s-learned-pr"
+							type="number"
+							min="1"
+							max="50"
+							required
+							bind:value={maxLearnedPerPr}
+						/>
+						<p class="text-xs text-muted-foreground">
+							Maximum curated memories proposed when a pull request closes.
+						</p>
+					</div>
+					<div class="grid gap-2">
+						<Label>Curator reasoning effort</Label>
+						<Select.Root type="single" bind:value={curatorEffort}>
+							<Select.Trigger class="w-full" aria-label="Curator reasoning effort">
+								{curatorEffortLabels[curatorEffort]}
+							</Select.Trigger>
+							<Select.Content>
+								{#each Object.entries(curatorEffortLabels) as [value, label] (value)}
+									<Select.Item {value} {label}>{label}</Select.Item>
+								{/each}
+							</Select.Content>
+						</Select.Root>
+					</div>
 				</div>
 				<div><Button type="submit" disabled={busy}>Save</Button></div>
 			</form>
