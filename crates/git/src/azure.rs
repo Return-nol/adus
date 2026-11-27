@@ -262,9 +262,9 @@ impl AzureProvider {
     }
 }
 
+/// Azure ids are integers; anything else cannot name an existing thread or comment.
 fn numeric_id(id: &str) -> Result<i64, GitError> {
-    id.parse()
-        .map_err(|_| GitError::Http("invalid thread or comment id".into()))
+    id.parse().map_err(|_| GitError::NotFound)
 }
 
 /// Thread status `1` = active; `commentType` 1 = text.
@@ -746,15 +746,25 @@ impl GitProvider for AzureProvider {
             let resp = self
                 .post_thread(repo, pr.number, &thread_body(&c.body, Some(context)))
                 .await?;
-            let created: AzCreatedThread = decode(resp).await?;
-            let first = created
-                .comments
-                .first()
-                .ok_or_else(|| GitError::Decode("created thread has no comment".into()))?;
+            // The thread is already on the PR: an unreadable response must not fail the review,
+            // or the retry would post every thread again. Unknown ids stay empty.
+            let created: Result<AzCreatedThread, GitError> = decode(resp).await;
+            let comment_id = created
+                .as_ref()
+                .ok()
+                .and_then(|t| t.comments.first())
+                .map(|c| c.id.to_string());
+            match &created {
+                Err(err) => tracing::warn!(error = %err, "azure created thread not decoded"),
+                Ok(_) if comment_id.is_none() => {
+                    tracing::warn!("azure created thread has no comment")
+                }
+                Ok(_) => {}
+            }
             posted.push(PostedComment {
                 index,
-                thread_id: Some(created.id.to_string()),
-                comment_id: first.id.to_string(),
+                thread_id: created.ok().map(|t| t.id.to_string()),
+                comment_id: comment_id.unwrap_or_default(),
             });
         }
         self.post_thread(repo, pr.number, &thread_body(summary, None))

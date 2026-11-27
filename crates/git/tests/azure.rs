@@ -1052,10 +1052,18 @@ fn thread_ref() -> ThreadRef {
 #[tokio::test]
 async fn post_review_returns_thread_ids() {
     let server = MockServer::start().await;
+    // First inline thread: response without comments, so only the thread id is known.
+    Mock::given(method("POST"))
+        .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 5 })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path(format!("{REPO_BASE}/pullRequests/7/threads")))
         .respond_with(json_body("thread_created.json"))
-        .expect(3)
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -1070,12 +1078,21 @@ async fn post_review_returns_thread_ids() {
         .post_review(&repo(), &pr(), &[comment.clone(), comment], "summary")
         .await
         .unwrap();
-    let expected = |index| PostedComment {
-        index,
-        thread_id: Some("148".into()),
-        comment_id: "1".into(),
-    };
-    assert_eq!(posted, [expected(0), expected(1)]);
+    assert_eq!(
+        posted,
+        [
+            PostedComment {
+                index: 0,
+                thread_id: Some("5".into()),
+                comment_id: String::new(),
+            },
+            PostedComment {
+                index: 1,
+                thread_id: Some("148".into()),
+                comment_id: "1".into(),
+            },
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1157,7 +1174,7 @@ async fn get_thread_maps_status() {
             &repo(),
             7,
             &ThreadRef {
-                thread_id: "999".into(),
+                thread_id: "../148".into(),
                 root_comment_id: "1".into(),
             },
         )
