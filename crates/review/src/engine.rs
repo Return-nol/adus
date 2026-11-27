@@ -31,18 +31,18 @@ use sqlx::PgPool;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::agent::{AgentError, AgentOutcome, LlmContext};
+use crate::agent::LlmContext;
 use crate::budget::TokenBudget;
 use crate::dedup::{DedupOutcome, deduplicate_findings};
 use crate::discussion::threads_for_dedup;
 use crate::enrich::enrich_suggestions;
 use crate::finder::{
-    FinderFailure, FinderInput, FinderLlm, FinderPass, FinderTask, SynthesisSkipped, batch_allowed,
-    run_finder,
+    FinderFailure, FinderInput, FinderLlm, FinderStats, SynthesisSkipped, collect_candidates,
+    count_by_origin, finder_steps_and_refusals, run_finder,
 };
-use crate::parse::{CommentableRange, Suggestion, dedup_exact, keep_valid_batch};
+use crate::parse::{CommentableRange, Suggestion};
 use crate::prompt::{
-    DiffBatch, MARKER, MAX_BATCH_CHARS, ManifestFile, SkipReason, batch_targets, build_manifest,
+    MARKER, MAX_BATCH_CHARS, ManifestFile, SkipReason, batch_targets, build_manifest,
     format_inline, format_summary,
 };
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
@@ -197,19 +197,29 @@ impl<'a> Stages<'a> {
     }
 }
 
-/// What the Finder stage leaves for the stage log and the budget warning.
-struct FinderStats {
-    /// The Finder re-ran diff-only because the primary model rejected tool calling.
-    tools_unsupported: bool,
-    /// [`TokenBudget::wrap_ups`] read when the Finder finished.
-    wrap_ups: usize,
-    /// Batches never started because the token budget was exhausted.
-    budget_skipped_batches: usize,
-    tasks: usize,
-    steps: usize,
-    gate_refusals: usize,
-    synthesis_skipped: Option<&'static str>,
-    synthesis_candidates: usize,
+struct TargetInput<'a> {
+    conn: &'a Connection,
+    git: &'a dyn GitProvider,
+    repo_ref: &'a RepoRef,
+    repo_id: Uuid,
+    pr_number: i64,
+    review_id: Uuid,
+    pr: &'a PullRequest,
+    trigger: Trigger,
+    settings: &'a Settings,
+}
+
+struct PreparedTargets {
+    files: Vec<FileDiff>,
+    allowed: HashMap<String, CommentableRange>,
+    skipped: Vec<(String, SkipReason)>,
+    ignored: usize,
+    manifest: String,
+}
+
+enum TargetPrep {
+    Ready(PreparedTargets),
+    Skipped(&'static str),
 }
 
 impl Engine {
@@ -351,89 +361,27 @@ impl Engine {
                 ReviewMode::Specialists => self.specialists_review_timeout.max(self.review_timeout),
             };
         let rest = async {
-            // Updated + review sebelumnya di commit lain → hanya baris dari commit baru.
-            let last = match trigger {
-                Trigger::Updated => reviews::last_done(&self.db, repo.id, pr_number)
-                    .await
-                    .map_err(db_error)?
-                    .and_then(|review| review.head_sha),
-                _ => None,
-            };
-            if last.as_deref() == Some(pr.head_sha.as_str()) {
-                return Ok(Outcome::Skipped("already_reviewed"));
-            }
-            let full = match git.pr_diff(&repo_ref, &pr).await {
-                Ok(files) => files,
-                Err(err) => return Err(self.fetch_error(&conn, err).await),
-            };
-            // The PR file manifest lists every file of the PR, not only those reviewed now.
-            let manifest_files: Vec<ManifestFile> =
-                full.iter().map(ManifestFile::from_diff).collect();
-            let candidates = match last {
-                None => full_targets(full),
-                Some(last_head) => {
-                    match git.diff_between(&repo_ref, &last_head, &pr.head_sha).await {
-                        Ok(changed) => incremental_targets(changed, full),
-                        // Setelah force-push commit lama bisa hilang; review penuh saja daripada gagal terus.
-                        Err(GitError::NotFound) => {
-                            tracing::warn!(%review_id, "previous head not found, falling back to a full review");
-                            full_targets(full)
-                        }
-                        Err(err) => return Err(self.fetch_error(&conn, err).await),
-                    }
-                }
+            let mut targets = match self
+                .prepare_targets(TargetInput {
+                    conn: &conn,
+                    git: git.as_ref(),
+                    repo_ref: &repo_ref,
+                    repo_id: repo.id,
+                    pr_number,
+                    review_id,
+                    pr: &pr,
+                    trigger,
+                    settings: &settings,
+                })
+                .await?
+            {
+                TargetPrep::Ready(targets) => targets,
+                TargetPrep::Skipped(reason) => return Ok(Outcome::Skipped(reason)),
             };
 
-            let matcher = ignore_matcher(&effective_ignore_paths(&settings));
-            let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
-            let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
-            let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
-            let mut files: Vec<FileDiff> = Vec::new();
-            let mut skipped: Vec<(String, SkipReason)> = Vec::new();
-            let mut ignored_paths: Vec<String> = Vec::new();
-            for target in candidates {
-                // File terhapus tidak pernah direview, jadi juga tidak dihitung sebagai di-ignore.
-                if target.file.status == FileStatus::Deleted {
-                    continue;
-                }
-                // Hanya `path` baru yang dicocokkan, juga untuk file yang di-rename.
-                if let Some(matcher) = &matcher
-                    && matcher.is_ignored(&target.file.path)
-                {
-                    ignored_paths.push(target.file.path);
-                    continue;
-                }
-                let Some(patch) = &target.file.patch else {
-                    skipped.push((target.file.path, SkipReason::NoPatch));
-                    continue;
-                };
-                if target.allowed.is_empty() {
-                    continue; // tidak ada baris baru yang bisa dikomentari
-                }
-                if added_line_count(patch) > max_lines {
-                    skipped.push((target.file.path, SkipReason::TooLarge));
-                } else if files.len() >= max_files {
-                    skipped.push((target.file.path, SkipReason::FileLimit));
-                } else {
-                    allowed.insert(normalize_path(&target.file.path), target.allowed);
-                    files.push(target.file);
-                }
-            }
-            let ignored = ignored_paths.len();
-
-            if files.is_empty() && skipped.is_empty() {
-                return Ok(Outcome::Skipped("nothing_to_review"));
-            }
-
-            let (small, rules, memories, manifest) = if files.is_empty() {
-                (false, Vec::new(), Vec::new(), String::new())
+            let (small, rules, memories) = if targets.files.is_empty() {
+                (false, Vec::new(), Vec::new())
             } else {
-                let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
-                let skipped_map: HashMap<&str, SkipReason> = skipped
-                    .iter()
-                    .map(|(path, reason)| (path.as_str(), *reason))
-                    .collect();
-                let manifest = build_manifest(&manifest_files, &ignored_set, &skipped_map);
                 let rules = rules::applicable(&self.db, repo.id)
                     .await
                     .map_err(db_error)?;
@@ -447,14 +395,14 @@ impl Engine {
                     Trigger::Command => 0,
                     _ => u32::try_from(settings.small_pr_max_lines).unwrap_or(0),
                 };
-                let small = is_small_pr(&files, &rules, small_pr_max_lines);
+                let small = is_small_pr(&targets.files, &rules, small_pr_max_lines);
                 if small {
                     mode = ReviewMode::Generalist;
                 }
-                (small, rules, memories, manifest)
+                (small, rules, memories)
             };
             // Read once, for Semantic Dedup. Without it the review still runs, as before.
-            let threads = if files.is_empty() {
+            let threads = if targets.files.is_empty() {
                 Vec::new()
             } else {
                 git.list_pr_threads(&repo_ref, pr_number)
@@ -492,20 +440,21 @@ impl Engine {
             let mut warnings: Vec<String> = Vec::new();
             let finish = async {
                 // Only skipped files left: no clone and no LLM, just the summary.
-                let output = if files.is_empty() {
+                let output = if targets.files.is_empty() {
                     ReviewOutput::default()
                 } else {
                     self.review_targets(
                         &stages,
-                        files,
-                        allowed,
-                        &manifest,
-                        &mut skipped,
+                        targets.files,
+                        targets.allowed,
+                        &targets.manifest,
+                        &mut targets.skipped,
                         &mut warnings,
                     )
                     .await?
                 };
-                let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
+                let summary =
+                    format_summary(&output.counts, &targets.skipped, targets.ignored, &warnings);
                 let (summary, summary_redacted) = redact_owned(summary);
                 tracing::debug!(
                     redacted_tool_outputs = output.redacted_tool_outputs,
@@ -529,6 +478,112 @@ impl Engine {
             Ok(outcome) => outcome,
             Err(_elapsed) => Err(timed_out()),
         }
+    }
+
+    /// Fetch incremental or full diff targets, filter ignored/empty/oversized/over-limit files,
+    /// and build the PR manifest.
+    async fn prepare_targets(&self, input: TargetInput<'_>) -> Result<TargetPrep, EngineError> {
+        let TargetInput {
+            conn,
+            git,
+            repo_ref,
+            repo_id,
+            pr_number,
+            review_id,
+            pr,
+            trigger,
+            settings,
+        } = input;
+
+        // Updated + review sebelumnya di commit lain → hanya baris dari commit baru.
+        let last = match trigger {
+            Trigger::Updated => reviews::last_done(&self.db, repo_id, pr_number)
+                .await
+                .map_err(db_error)?
+                .and_then(|review| review.head_sha),
+            _ => None,
+        };
+        if last.as_deref() == Some(pr.head_sha.as_str()) {
+            return Ok(TargetPrep::Skipped("already_reviewed"));
+        }
+        let full = match git.pr_diff(repo_ref, pr).await {
+            Ok(files) => files,
+            Err(err) => return Err(self.fetch_error(conn, err).await),
+        };
+        // The PR file manifest lists every file of the PR, not only those reviewed now.
+        let manifest_files: Vec<ManifestFile> = full.iter().map(ManifestFile::from_diff).collect();
+        let candidates = match last {
+            None => full_targets(full),
+            Some(last_head) => match git.diff_between(repo_ref, &last_head, &pr.head_sha).await {
+                Ok(changed) => incremental_targets(changed, full),
+                // Setelah force-push commit lama bisa hilang; review penuh saja daripada gagal terus.
+                Err(GitError::NotFound) => {
+                    tracing::warn!(%review_id, "previous head not found, falling back to a full review");
+                    full_targets(full)
+                }
+                Err(err) => return Err(self.fetch_error(conn, err).await),
+            },
+        };
+
+        let matcher = ignore_matcher(&effective_ignore_paths(settings));
+        let max_files = usize::try_from(settings.max_files_per_review).unwrap_or(0);
+        let max_lines = usize::try_from(settings.max_patch_lines_per_file).unwrap_or(0);
+        let mut allowed: HashMap<String, CommentableRange> = HashMap::new();
+        let mut files: Vec<FileDiff> = Vec::new();
+        let mut skipped: Vec<(String, SkipReason)> = Vec::new();
+        let mut ignored_paths: Vec<String> = Vec::new();
+        for target in candidates {
+            // File terhapus tidak pernah direview, jadi juga tidak dihitung sebagai di-ignore.
+            if target.file.status == FileStatus::Deleted {
+                continue;
+            }
+            // Hanya `path` baru yang dicocokkan, juga untuk file yang di-rename.
+            if let Some(matcher) = &matcher
+                && matcher.is_ignored(&target.file.path)
+            {
+                ignored_paths.push(target.file.path);
+                continue;
+            }
+            let Some(patch) = &target.file.patch else {
+                skipped.push((target.file.path, SkipReason::NoPatch));
+                continue;
+            };
+            if target.allowed.is_empty() {
+                continue; // tidak ada baris baru yang bisa dikomentari
+            }
+            if added_line_count(patch) > max_lines {
+                skipped.push((target.file.path, SkipReason::TooLarge));
+            } else if files.len() >= max_files {
+                skipped.push((target.file.path, SkipReason::FileLimit));
+            } else {
+                allowed.insert(normalize_path(&target.file.path), target.allowed);
+                files.push(target.file);
+            }
+        }
+        let ignored = ignored_paths.len();
+
+        if files.is_empty() && skipped.is_empty() {
+            return Ok(TargetPrep::Skipped("nothing_to_review"));
+        }
+
+        let manifest = if files.is_empty() {
+            String::new()
+        } else {
+            let ignored_set: HashSet<&str> = ignored_paths.iter().map(String::as_str).collect();
+            let skipped_map: HashMap<&str, SkipReason> = skipped
+                .iter()
+                .map(|(path, reason)| (path.as_str(), *reason))
+                .collect();
+            build_manifest(&manifest_files, &ignored_set, &skipped_map)
+        };
+
+        Ok(TargetPrep::Ready(PreparedTargets {
+            files,
+            allowed,
+            skipped,
+            ignored,
+            manifest,
+        }))
     }
 
     /// The time budget of a review in `mode` (the effective mode, after the small-PR force).
@@ -732,52 +787,14 @@ impl Engine {
         verified.extend(rule_findings);
         let dedup_input = verified.len();
 
-        // Post-verify funnel (spec §6), all by `deadlines.post_verify`: Semantic Dedup,
-        // severity, enrichment (which ends with `check_fix`).
-        let finding_paths = verified
-            .iter()
-            .map(|c| normalize_path(&c.suggestion.file))
-            .collect();
-        let existing = threads_for_dedup(s.threads, &finding_paths);
-        let fallback = verified.clone();
-        let dedup = deduplicate_findings(s.fast_llm(self.chat.as_ref()), verified, &existing);
-        let DedupOutcome {
-            kept,
-            already_raised,
-        } = match tokio::time::timeout_at(s.deadlines.post_verify, dedup).await {
-            Ok(outcome) => outcome,
-            Err(_elapsed) => {
-                tracing::warn!("semantic dedup cut by the deadline; keeping all findings");
-                DedupOutcome {
-                    kept: fallback,
-                    already_raised: 0,
-                }
-            }
-        };
-        if already_raised > 0 {
-            warnings.push(format!(
-                "{already_raised} finding(s) skipped: already raised in this PR's discussion."
-            ));
-        }
-        let kept_by_origin = count_by_origin(&kept);
-        let mut found: Vec<Suggestion> = kept.into_iter().map(|c| c.suggestion).collect();
-
-        let classify = classify_severity(s.fast_llm(self.chat.as_ref()), &mut found);
-        if tokio::time::timeout_at(s.deadlines.post_verify, classify)
-            .await
-            .is_err()
-        {
-            tracing::warn!("severity classification cut by the deadline; using warning");
-            fill_unclassified(&mut found);
-        }
-        // Returns by the deadline on its own: no call starts in its last `ENRICH_RESERVE`.
-        enrich_suggestions(
-            s.fast_llm(self.chat.as_ref()),
+        let (found, kept_by_origin, already_raised) = run_post_verify_funnel(
+            s,
+            self.chat.as_ref(),
             toolbox.as_ref(),
             &files,
             &allowed,
-            &mut found,
-            s.deadlines.post_verify,
+            verified,
+            warnings,
         )
         .await;
 
@@ -821,41 +838,7 @@ impl Engine {
             token_budget_reached = budget.exhausted(),
             "review stages finished"
         );
-        let patches: HashMap<String, Option<&str>> = files
-            .iter()
-            .map(|file| (normalize_path(&file.path), file.patch.as_deref()))
-            .collect();
-        let mut counts: BTreeMap<Severity, usize> = BTreeMap::new();
-        let mut redacted_comments = 0;
-        let comments = found
-            .iter()
-            .map(|s| {
-                // The one default left: `classify_severity`, or its deadline fallback, has
-                // already given every finding a severity; the field stays an `Option` because
-                // the Finder sends none.
-                let severity = s.severity.unwrap_or(Severity::Warning);
-                *counts.entry(severity).or_default() += 1;
-                let end_offset = s.start_line.and_then(|_| {
-                    let patch = patches.get(s.file.as_str()).copied().flatten()?;
-                    right_line_end_offset(patch, s.line)
-                });
-                let (body, redacted) = inline_body(s, severity);
-                redacted_comments += usize::from(redacted);
-                InlineComment {
-                    path: s.file.clone(),
-                    start_line: s.start_line,
-                    line: s.line,
-                    end_offset,
-                    body,
-                }
-            })
-            .collect();
-        Ok(ReviewOutput {
-            counts,
-            comments,
-            redacted_tool_outputs: toolbox.as_ref().map_or(0, Toolbox::redacted_outputs),
-            redacted_comments,
-        })
+        Ok(build_review_output(&files, &found, toolbox.as_ref()))
     }
 
     /// The repo's review provider (else the default one) when it is enabled and has a model:
@@ -945,6 +928,109 @@ impl Engine {
     }
 }
 
+/// Post-verify funnel (spec §6), all by `deadlines.post_verify`: Semantic Dedup, severity,
+/// and enrichment (which ends with `check_fix`).
+async fn run_post_verify_funnel(
+    s: &Stages<'_>,
+    chat: &dyn ChatService,
+    toolbox: Option<&Toolbox>,
+    files: &[FileDiff],
+    allowed: &HashMap<String, CommentableRange>,
+    verified: Vec<CandidateFinding>,
+    warnings: &mut Vec<String>,
+) -> (Vec<Suggestion>, String, usize) {
+    let finding_paths = verified
+        .iter()
+        .map(|c| normalize_path(&c.suggestion.file))
+        .collect();
+    let existing = threads_for_dedup(s.threads, &finding_paths);
+    let fallback = verified.clone();
+    let dedup = deduplicate_findings(s.fast_llm(chat), verified, &existing);
+    let DedupOutcome {
+        kept,
+        already_raised,
+    } = match tokio::time::timeout_at(s.deadlines.post_verify, dedup).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => {
+            tracing::warn!("semantic dedup cut by the deadline; keeping all findings");
+            DedupOutcome {
+                kept: fallback,
+                already_raised: 0,
+            }
+        }
+    };
+    if already_raised > 0 {
+        warnings.push(format!(
+            "{already_raised} finding(s) skipped: already raised in this PR's discussion."
+        ));
+    }
+    let kept_by_origin = count_by_origin(&kept);
+    let mut found: Vec<Suggestion> = kept.into_iter().map(|c| c.suggestion).collect();
+
+    let classify = classify_severity(s.fast_llm(chat), &mut found);
+    if tokio::time::timeout_at(s.deadlines.post_verify, classify)
+        .await
+        .is_err()
+    {
+        tracing::warn!("severity classification cut by the deadline; using warning");
+        fill_unclassified(&mut found);
+    }
+    // Returns by the deadline on its own: no call starts in its last `ENRICH_RESERVE`.
+    enrich_suggestions(
+        s.fast_llm(chat),
+        toolbox,
+        files,
+        allowed,
+        &mut found,
+        s.deadlines.post_verify,
+    )
+    .await;
+
+    (found, kept_by_origin, already_raised)
+}
+
+fn build_review_output(
+    files: &[FileDiff],
+    found: &[Suggestion],
+    toolbox: Option<&Toolbox>,
+) -> ReviewOutput {
+    let patches: HashMap<String, Option<&str>> = files
+        .iter()
+        .map(|file| (normalize_path(&file.path), file.patch.as_deref()))
+        .collect();
+    let mut counts: BTreeMap<Severity, usize> = BTreeMap::new();
+    let mut redacted_comments = 0;
+    let comments = found
+        .iter()
+        .map(|s| {
+            // The one default left: `classify_severity`, or its deadline fallback, has
+            // already given every finding a severity; the field stays an `Option` because
+            // the Finder sends none.
+            let severity = s.severity.unwrap_or(Severity::Warning);
+            *counts.entry(severity).or_default() += 1;
+            let end_offset = s.start_line.and_then(|_| {
+                let patch = patches.get(s.file.as_str()).copied().flatten()?;
+                right_line_end_offset(patch, s.line)
+            });
+            let (body, redacted) = inline_body(s, severity);
+            redacted_comments += usize::from(redacted);
+            InlineComment {
+                path: s.file.clone(),
+                start_line: s.start_line,
+                line: s.line,
+                end_offset,
+                body,
+            }
+        })
+        .collect();
+    ReviewOutput {
+        counts,
+        comments,
+        redacted_tool_outputs: toolbox.map_or(0, Toolbox::redacted_outputs),
+        redacted_comments,
+    }
+}
+
 /// The posted body of one finding with secrets masked. A suggestion that holds a secret, or a
 /// value already masked as [`REDACTED`], is dropped (the comment keeps its span, and its body
 /// ends with [`SUGGESTION_OMITTED`]), so "Apply suggestion" never writes `[REDACTED]` into
@@ -981,213 +1067,12 @@ fn redact_owned(text: String) -> (String, bool) {
     (text, false)
 }
 
-/// Findings per origin, as `pass1=N synthesis_rescue=N prose_recovery=N sharded_rules=N`.
-fn count_by_origin(candidates: &[CandidateFinding]) -> String {
-    [
-        FinderPass::Pass1,
-        FinderPass::SynthesisRescue,
-        FinderPass::ProseRecovery,
-        FinderPass::ShardedRules,
-    ]
-    .iter()
-    .map(|&pass| {
-        let count = candidates.iter().filter(|c| c.origin == pass).count();
-        format!("{}={count}", pass.label())
-    })
-    .collect::<Vec<_>>()
-    .join(" ")
-}
-
-/// LLM calls and completion-gate refusals summed over the Finder tasks that finished (both
-/// passes).
-fn finder_steps_and_refusals(tasks: &[FinderTask]) -> (usize, usize) {
-    tasks
-        .iter()
-        .filter_map(|task| task.result.as_ref().ok())
-        .fold((0, 0), |(steps, refusals), outcome| {
-            (
-                steps + outcome.steps_used,
-                refusals + usize::from(outcome.gate_refused),
-            )
-        })
-}
-
-/// Turns Finder results into candidates for the Verifier, in (batch, specialist) order: each
-/// result is filtered to its batch's [`CommentableRange`]s (commentable lines, and hunks for a
-/// `start_line`), then exact `(file, line, title)` duplicates are merged across the whole
-/// review (see [`dedup_exact`]).
-///
-/// A failed task becomes a summary note when another agent reviewed its batch; when no agent
-/// reviewed a batch, its files are listed as skipped (reason `timed_out` when the Finder
-/// deadline cut every agent of it, `token_budget` when the batch was never started because
-/// the token budget was exhausted). When no task succeeded at all, the review fails (see
-/// [`all_failed`]); in `Generalist` mode it is also retried when every failure was retryable
-/// (see [`generalist_retry`]).
-fn collect_candidates(
-    tasks: Vec<FinderTask>,
-    mode: ReviewMode,
-    batches: &[DiffBatch<'_>],
-    allowed: &HashMap<String, CommentableRange>,
-    skipped: &mut Vec<(String, SkipReason)>,
-    warnings: &mut Vec<String>,
-) -> Result<(Vec<CandidateFinding>, usize), EngineError> {
-    if !tasks.is_empty() && tasks.iter().all(|task| task.result.is_err()) {
-        return Err(all_failed(tasks));
-    }
-    if mode == ReviewMode::Generalist
-        && let Some(err) = generalist_retry(&tasks)
-    {
-        return Err(err);
-    }
-    let reviewed: HashSet<usize> = tasks
-        .iter()
-        .filter(|task| task.result.is_ok())
-        .map(|task| task.batch)
-        .collect();
-    let batch_ranges: Vec<HashMap<String, &CommentableRange>> = batches
-        .iter()
-        .map(|batch| batch_allowed(batch, allowed))
-        .collect();
-
-    let mut candidates = Vec::new();
-    let mut filtered_dropped = 0usize;
-    // Batch index → skip reason, for batches no agent reviewed.
-    let mut unreviewed: BTreeMap<usize, SkipReason> = BTreeMap::new();
-    for task in tasks {
-        let label = task.kind.label();
-        let reason = match task.result {
-            Ok(outcome) => {
-                let Some(range) = batch_ranges.get(task.batch) else {
-                    continue;
-                };
-                let AgentOutcome {
-                    result,
-                    opened_files,
-                    ..
-                } = outcome;
-                let raw_count = result.len();
-                let found = result
-                    .into_iter()
-                    .map(|finding| CandidateFinding {
-                        investigated_by_finder: opened_files
-                            .contains(&normalize_path(&finding.suggestion.file)),
-                        origin: finding.origin,
-                        suggestion: finding.suggestion,
-                        specialist: task.kind,
-                    })
-                    .collect();
-                let valid = keep_valid_batch(found, range);
-                filtered_dropped += raw_count.saturating_sub(valid.len());
-                candidates.extend(valid);
-                continue;
-            }
-            Err(FinderFailure::TimedOut) => {
-                push_once(warnings, format!("{label} reviewer did not finish in time"));
-                SkipReason::TimedOut
-            }
-            // The summary's token-budget note covers it; no per-reviewer note.
-            Err(FinderFailure::TokenBudget) => SkipReason::TokenBudget,
-            Err(FinderFailure::Agent(_)) if reviewed.contains(&task.batch) => {
-                push_once(warnings, format!("{label} reviewer did not complete"));
-                continue;
-            }
-            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => SkipReason::Unparseable,
-            Err(FinderFailure::Agent(_)) => SkipReason::LlmError,
-        };
-        if reviewed.contains(&task.batch) {
-            continue;
-        }
-        // Differing reasons for one batch read as a plain LLM error.
-        unreviewed
-            .entry(task.batch)
-            .and_modify(|current| {
-                if *current != reason {
-                    *current = SkipReason::LlmError;
-                }
-            })
-            .or_insert(reason);
-    }
-    for (index, reason) in unreviewed {
-        if let Some(batch) = batches.get(index) {
-            tracing::warn!(
-                batch = index,
-                reason = reason.as_str(),
-                "no finder agent reviewed a batch"
-            );
-            skipped.extend(batch.files.iter().map(|file| (file.path.clone(), reason)));
-        }
-    }
-    Ok((dedup_exact(candidates, |c| &c.suggestion), filtered_dropped))
-}
-
-/// Generalist rule of spec decision 8: when some Finder task failed and every failure was a
-/// retryable chat error (`AllKeysFailed`, `NoKeys`, `Internal`), retry the review rather than
-/// post it with those files skipped. A deadline cut is never retryable. The retry waits for
-/// the first `AllKeysFailed`'s `retry_after`.
-fn generalist_retry(tasks: &[FinderTask]) -> Option<EngineError> {
-    let mut first_retryable: Option<&ChatError> = None;
-    let mut rate_limited: Option<&ChatError> = None;
-    for task in tasks {
-        let err = match &task.result {
-            Ok(_) => continue,
-            Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(err) => err,
-            Err(_) => return None,
-        };
-        first_retryable.get_or_insert(err);
-        if matches!(err, ChatError::AllKeysFailed { .. }) {
-            rate_limited.get_or_insert(err);
-        }
-    }
-    rate_limited.or(first_retryable).cloned().map(chat_error)
-}
-
 /// `AllKeysFailed`, `NoKeys` and `Internal` may pass when the job is retried later.
 pub(crate) fn is_retryable(err: &ChatError) -> bool {
     matches!(
         err,
         ChatError::AllKeysFailed { .. } | ChatError::NoKeys | ChatError::Internal(_)
     )
-}
-
-/// The error when no Finder task succeeded. Retryable only when every failure was a
-/// retryable chat error (`AllKeysFailed`, `NoKeys`, `Internal`); otherwise the first other
-/// failure decides, and a review cut entirely by the deadline is `review timed out`.
-fn all_failed(tasks: Vec<FinderTask>) -> EngineError {
-    let mut retryable: Option<ChatError> = None;
-    let mut fatal: Option<EngineError> = None;
-    for task in tasks {
-        let error = match task.result {
-            Ok(_) => continue,
-            Err(FinderFailure::TimedOut) => timed_out(),
-            // Never retryable: a retry would spend the same tokens again.
-            Err(FinderFailure::TokenBudget) => {
-                EngineError::Fatal("review stopped: token budget reached".into())
-            }
-            Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(&err) => {
-                retryable.get_or_insert(err);
-                continue;
-            }
-            Err(FinderFailure::Agent(AgentError::Chat(err))) => chat_error(err),
-            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => {
-                EngineError::Fatal("LLM: review output could not be parsed".into())
-            }
-            Err(FinderFailure::Agent(AgentError::ToolsUnsupported(message))) => {
-                chat_error(ChatError::ToolsUnsupported(message))
-            }
-        };
-        fatal.get_or_insert(error);
-    }
-    match (fatal, retryable) {
-        (Some(error), _) => error,
-        (None, Some(err)) => chat_error(err),
-        (None, None) => timed_out(),
-    }
-}
-
-fn push_once(warnings: &mut Vec<String>, warning: String) {
-    if !warnings.contains(&warning) {
-        warnings.push(warning);
-    }
 }
 
 /// Matcher daftar ignore. Daftar tersimpan yang tidak valid tidak boleh menggagalkan review:
@@ -1247,7 +1132,7 @@ fn incremental_targets(changed: Vec<FileDiff>, full: Vec<FileDiff>) -> Vec<Targe
 }
 
 /// A review cut by its time budget. Fatal: a retry would spend the same LLM tokens again.
-fn timed_out() -> EngineError {
+pub(crate) fn timed_out() -> EngineError {
     EngineError::Fatal("review timed out".into())
 }
 

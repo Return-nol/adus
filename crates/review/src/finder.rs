@@ -10,7 +10,7 @@
 //! then run a second pass, the synthesis rescue, when enough budget and time are left: it
 //! looks for defects the first pass missed, and its new findings are merged in.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -20,6 +20,7 @@ use adus_db::memories::Memory;
 use adus_git::{FileDiff, PullRequest};
 use adus_llm::ReasoningEffort;
 use adus_llm::ToolDef;
+use adus_llm::router::ChatError;
 use futures::{StreamExt, future, stream};
 use serde_json::Value;
 use tokio::time::Instant;
@@ -30,17 +31,19 @@ use crate::agent::{
 };
 use crate::budget::TokenBudget;
 use crate::coverage::CoverageLedger;
+use crate::engine::{EngineError, chat_error, is_retryable, timed_out};
 use crate::parse::{
-    CommentableRange, Suggestion, parse_dismissed, parse_review_log, parse_submit_findings,
-    parse_suggestions, submit_findings_tool_def, validate_batch_anchors,
+    CommentableRange, Suggestion, dedup_exact, keep_valid_batch, parse_dismissed, parse_review_log,
+    parse_submit_findings, parse_suggestions, submit_findings_tool_def, validate_batch_anchors,
 };
 use crate::prompt::{
-    DiffBatch, build_finder_system_prompt, build_finder_user_prompt, or_none, truncate_with_marker,
-    wrap,
+    DiffBatch, SkipReason, build_finder_system_prompt, build_finder_user_prompt, or_none,
+    truncate_with_marker, wrap,
 };
 use crate::redact::redact_secrets;
 use crate::specialists::{SpecialistKind, active_specialists};
 use crate::tools::Toolbox;
+use crate::verifier::CandidateFinding;
 
 /// Diff batches reviewed at the same time (SPEC.md §8.4).
 const BATCH_CONCURRENCY: usize = 2;
@@ -282,6 +285,222 @@ pub(crate) async fn run_finder(
         run_all(llm, input, AgentTools::NoTools, deadline).await,
         true,
     )
+}
+
+/// What the Finder stage leaves for the stage log and the budget warning.
+pub(crate) struct FinderStats {
+    /// The Finder re-ran diff-only because the primary model rejected tool calling.
+    pub tools_unsupported: bool,
+    /// [`TokenBudget::wrap_ups`] read when the Finder finished.
+    pub wrap_ups: usize,
+    /// Batches never started because the token budget was exhausted.
+    pub budget_skipped_batches: usize,
+    pub tasks: usize,
+    pub steps: usize,
+    pub gate_refusals: usize,
+    pub synthesis_skipped: Option<&'static str>,
+    pub synthesis_candidates: usize,
+}
+
+/// Findings per origin, as `pass1=N synthesis_rescue=N prose_recovery=N sharded_rules=N`.
+pub(crate) fn count_by_origin(candidates: &[CandidateFinding]) -> String {
+    [
+        FinderPass::Pass1,
+        FinderPass::SynthesisRescue,
+        FinderPass::ProseRecovery,
+        FinderPass::ShardedRules,
+    ]
+    .iter()
+    .map(|&pass| {
+        let count = candidates.iter().filter(|c| c.origin == pass).count();
+        format!("{}={count}", pass.label())
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+/// LLM calls and completion-gate refusals summed over the Finder tasks that finished (both
+/// passes).
+pub(crate) fn finder_steps_and_refusals(tasks: &[FinderTask]) -> (usize, usize) {
+    tasks
+        .iter()
+        .filter_map(|task| task.result.as_ref().ok())
+        .fold((0, 0), |(steps, refusals), outcome| {
+            (
+                steps + outcome.steps_used,
+                refusals + usize::from(outcome.gate_refused),
+            )
+        })
+}
+
+/// Turns Finder results into candidates for the Verifier, in (batch, specialist) order: each
+/// result is filtered to its batch's [`CommentableRange`]s (commentable lines, and hunks for a
+/// `start_line`), then exact `(file, line, title)` duplicates are merged across the whole
+/// review (see [`dedup_exact`]).
+///
+/// A failed task becomes a summary note when another agent reviewed its batch; when no agent
+/// reviewed a batch, its files are listed as skipped (reason `timed_out` when the Finder
+/// deadline cut every agent of it, `token_budget` when the batch was never started because
+/// the token budget was exhausted). When no task succeeded at all, the review fails (see
+/// [`all_failed`]); in `Generalist` mode it is also retried when every failure was retryable
+/// (see [`generalist_retry`]).
+pub(crate) fn collect_candidates(
+    tasks: Vec<FinderTask>,
+    mode: ReviewMode,
+    batches: &[DiffBatch<'_>],
+    allowed: &HashMap<String, CommentableRange>,
+    skipped: &mut Vec<(String, SkipReason)>,
+    warnings: &mut Vec<String>,
+) -> Result<(Vec<CandidateFinding>, usize), EngineError> {
+    if !tasks.is_empty() && tasks.iter().all(|task| task.result.is_err()) {
+        return Err(all_failed(tasks));
+    }
+    if mode == ReviewMode::Generalist
+        && let Some(err) = generalist_retry(&tasks)
+    {
+        return Err(err);
+    }
+    let reviewed: HashSet<usize> = tasks
+        .iter()
+        .filter(|task| task.result.is_ok())
+        .map(|task| task.batch)
+        .collect();
+    let batch_ranges: Vec<HashMap<String, &CommentableRange>> = batches
+        .iter()
+        .map(|batch| batch_allowed(batch, allowed))
+        .collect();
+
+    let mut candidates = Vec::new();
+    let mut filtered_dropped = 0usize;
+    // Batch index → skip reason, for batches no agent reviewed.
+    let mut unreviewed: BTreeMap<usize, SkipReason> = BTreeMap::new();
+    for task in tasks {
+        let label = task.kind.label();
+        let reason = match task.result {
+            Ok(outcome) => {
+                let Some(range) = batch_ranges.get(task.batch) else {
+                    continue;
+                };
+                let AgentOutcome {
+                    result,
+                    opened_files,
+                    ..
+                } = outcome;
+                let raw_count = result.len();
+                let found = result
+                    .into_iter()
+                    .map(|finding| CandidateFinding {
+                        investigated_by_finder: opened_files
+                            .contains(&normalize_path(&finding.suggestion.file)),
+                        origin: finding.origin,
+                        suggestion: finding.suggestion,
+                        specialist: task.kind,
+                    })
+                    .collect();
+                let valid = keep_valid_batch(found, range);
+                filtered_dropped += raw_count.saturating_sub(valid.len());
+                candidates.extend(valid);
+                continue;
+            }
+            Err(FinderFailure::TimedOut) => {
+                push_once(warnings, format!("{label} reviewer did not finish in time"));
+                SkipReason::TimedOut
+            }
+            // The summary's token-budget note covers it; no per-reviewer note.
+            Err(FinderFailure::TokenBudget) => SkipReason::TokenBudget,
+            Err(FinderFailure::Agent(_)) if reviewed.contains(&task.batch) => {
+                push_once(warnings, format!("{label} reviewer did not complete"));
+                continue;
+            }
+            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => SkipReason::Unparseable,
+            Err(FinderFailure::Agent(_)) => SkipReason::LlmError,
+        };
+        if reviewed.contains(&task.batch) {
+            continue;
+        }
+        // Differing reasons for one batch read as a plain LLM error.
+        unreviewed
+            .entry(task.batch)
+            .and_modify(|current| {
+                if *current != reason {
+                    *current = SkipReason::LlmError;
+                }
+            })
+            .or_insert(reason);
+    }
+    for (index, reason) in unreviewed {
+        if let Some(batch) = batches.get(index) {
+            tracing::warn!(
+                batch = index,
+                reason = reason.as_str(),
+                "no finder agent reviewed a batch"
+            );
+            skipped.extend(batch.files.iter().map(|file| (file.path.clone(), reason)));
+        }
+    }
+    Ok((dedup_exact(candidates, |c| &c.suggestion), filtered_dropped))
+}
+
+/// Generalist rule of spec decision 8: when some Finder task failed and every failure was a
+/// retryable chat error (`AllKeysFailed`, `NoKeys`, `Internal`), retry the review rather than
+/// post it with those files skipped. A deadline cut is never retryable. The retry waits for
+/// the first `AllKeysFailed`'s `retry_after`.
+fn generalist_retry(tasks: &[FinderTask]) -> Option<EngineError> {
+    let mut first_retryable: Option<&ChatError> = None;
+    let mut rate_limited: Option<&ChatError> = None;
+    for task in tasks {
+        let err = match &task.result {
+            Ok(_) => continue,
+            Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(err) => err,
+            Err(_) => return None,
+        };
+        first_retryable.get_or_insert(err);
+        if matches!(err, ChatError::AllKeysFailed { .. }) {
+            rate_limited.get_or_insert(err);
+        }
+    }
+    rate_limited.or(first_retryable).cloned().map(chat_error)
+}
+
+/// The error when no Finder task succeeded. Retryable only when every failure was a
+/// retryable chat error (`AllKeysFailed`, `NoKeys`, `Internal`); otherwise the first other
+/// failure decides, and a review cut entirely by the deadline is `review timed out`.
+fn all_failed(tasks: Vec<FinderTask>) -> EngineError {
+    let mut retryable: Option<ChatError> = None;
+    let mut fatal: Option<EngineError> = None;
+    for task in tasks {
+        let error = match task.result {
+            Ok(_) => continue,
+            Err(FinderFailure::TimedOut) => timed_out(),
+            // Never retryable: a retry would spend the same tokens again.
+            Err(FinderFailure::TokenBudget) => {
+                EngineError::Fatal("review stopped: token budget reached".into())
+            }
+            Err(FinderFailure::Agent(AgentError::Chat(err))) if is_retryable(&err) => {
+                retryable.get_or_insert(err);
+                continue;
+            }
+            Err(FinderFailure::Agent(AgentError::Chat(err))) => chat_error(err),
+            Err(FinderFailure::Agent(AgentError::Unparseable(_))) => {
+                EngineError::Fatal("LLM: review output could not be parsed".into())
+            }
+            Err(FinderFailure::Agent(AgentError::ToolsUnsupported(message))) => {
+                chat_error(ChatError::ToolsUnsupported(message))
+            }
+        };
+        fatal.get_or_insert(error);
+    }
+    match (fatal, retryable) {
+        (Some(error), _) => error,
+        (None, Some(err)) => chat_error(err),
+        (None, None) => timed_out(),
+    }
+}
+
+fn push_once(warnings: &mut Vec<String>, warning: String) {
+    if !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
 }
 
 async fn run_all(
