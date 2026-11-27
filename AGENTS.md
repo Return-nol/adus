@@ -9,8 +9,9 @@ Repo: https://github.com/Return-nol/adus · GHCR image: `ghcr.io/return-nol/adus
 1. **Task brief / active change spec** (any unmerged feature spec in `docs/superpowers/specs/` currently being implemented)
 2. **Living technical spec (binding):** [SPEC.md](docs/SPEC.md)
 3. **Web visual design (binding for `web/`):** [DESIGN.md](docs/DESIGN.md) · **Web conventions:** [web/AGENTS.md](web/AGENTS.md)
-4. **Existing Adus code** and this file
-5. **Backlog of deferred minor findings:** [docs/superpowers/backlog.md](docs/superpowers/backlog.md)
+4. **System architecture overview:** [ARCHITECTURE.md](docs/ARCHITECTURE.md) (crate topology, worker/queue flow, Generalist & Specialists review flows, and ReAct loop)
+5. **Existing Adus code** and this file
+6. **Backlog of deferred minor findings:** [docs/superpowers/backlog.md](docs/superpowers/backlog.md)
 
 Historical dated specs and plans live under `docs/superpowers/specs/` and `docs/superpowers/plans/`. If a spec and a plan conflict, the spec wins.
 
@@ -21,9 +22,10 @@ For new work, follow `brainstorming` → `writing-plans` → `subagent-driven-de
 **Whenever SDD (or any feature/spec-driven change) completes, before committing the final state or merging:**
 
 1. **Update [docs/SPEC.md](docs/SPEC.md)** so it reflects all implemented behavior, schema migrations, API endpoints, settings, and invariants introduced by the branch (and update [DESIGN.md](docs/DESIGN.md) if visual tokens or UI patterns changed).
-2. **Mark the dated change spec** (`docs/superpowers/specs/YYYY-MM-DD-*.md`) as `Status: implemented` (keep the file as the historical ADR/delta) and add/update its entry in Section 10 of [docs/SPEC.md](docs/SPEC.md).
-3. **Update `AGENTS.md` / [web/AGENTS.md](web/AGENTS.md) selectively** — only add or adjust cross-cutting guardrails, commands, or environment gotchas. Keep subsystem details in [docs/SPEC.md](docs/SPEC.md) so `AGENTS.md` stays concise and never truncates.
-4. **Plan & reviewer enforcement:** Every new implementation plan must include **"Sync `docs/SPEC.md` and mark spec implemented"** as its final task, and SDD/whole-branch reviewers must flag missing `docs/SPEC.md` updates on behavior-, schema-, or API-changing branches as **Important**.
+2. **Update [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) when necessary** — whenever crate boundaries, trait seams, worker/queue lifecycle, timeout hierarchy, Generalist/Specialist review stages, or the agentic core loop (`run_react_loop`, `CoverageLedger`, `TokenBudget`, Sharded Rules, Verifier, post-verify funnel) change, update its prose and Mermaid diagrams to match.
+3. **Mark the dated change spec** (`docs/superpowers/specs/YYYY-MM-DD-*.md`) as `Status: implemented` (keep the file as the historical ADR/delta) and add/update its entry in Section 10 of [docs/SPEC.md](docs/SPEC.md).
+4. **Update `AGENTS.md` / [web/AGENTS.md](web/AGENTS.md) selectively** — only add or adjust cross-cutting guardrails, commands, or environment gotchas. Keep subsystem details in [docs/SPEC.md](docs/SPEC.md) so `AGENTS.md` stays concise and never truncates.
+5. **Plan & reviewer enforcement:** Every new implementation plan must include **"Sync `docs/SPEC.md` (and `docs/ARCHITECTURE.md` if needed) and mark spec implemented"** as its final task, and SDD/whole-branch reviewers must flag missing `docs/SPEC.md` or `docs/ARCHITECTURE.md` updates on behavior-, schema-, architecture-, or API-changing branches as **Important**.
 
 ## Layout
 
