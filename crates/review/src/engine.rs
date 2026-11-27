@@ -156,7 +156,8 @@ struct Stages<'a> {
     provider_id: Uuid,
     /// Finder and Verifier model.
     primary_model: &'a str,
-    /// Post-verify funnel model (`effective_fast_model()`): Dedup, Severity and Enrichment.
+    /// Fast model (`effective_fast_model()`): Finder Prose Recovery and the post-verify funnel
+    /// (Dedup, Severity and Enrichment).
     fast_model: &'a str,
     rules: &'a [Rule],
     memories: &'a [Memory],
@@ -1193,9 +1194,9 @@ mod tests {
     #[test]
     fn deadlines_split_budget_55_80_93() {
         let start = Instant::now();
-        let d = Deadlines::new(start, REVIEW_TIMEOUT);
-        assert_eq!(d.finder, start + Duration::from_secs(11 * 60));
-        assert_eq!(d.verifier, start + Duration::from_secs(16 * 60));
-        assert_eq!(d.post_verify, start + Duration::from_secs(18 * 60 + 36));
+        let d = Deadlines::new(start, Duration::from_secs(100));
+        assert_eq!(d.finder, start + Duration::from_secs(55));
+        assert_eq!(d.verifier, start + Duration::from_secs(80));
+        assert_eq!(d.post_verify, start + Duration::from_secs(93));
     }
 }

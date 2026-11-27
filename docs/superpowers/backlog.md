@@ -80,3 +80,21 @@ Task numbers below are this plan's tasks. Sources: the per-task reviews, final r
 - Learned-memory inserts and the `pr_learning_runs` row are not one transaction: a DB failure between them can duplicate up to 5 memories on retry
 - Semantic Dedup's `already_raised` citation is not checked against the finding's file (only the prompt-level data guard stops an injected thread from suppressing an unrelated finding)
 - Memory prompt injection has no cap or relevance selection, so prompts grow with the number of active memories
+
+## Anthropic safety-classifier refusals (2026-11-27, live run on better-booru PR #15)
+
+- Resolved 2026-11-27 (Finder field renamed to `review_log`, worded as a work record; confirmed by live Sonnet 5.5 runs on PR #18 and #20, no refusal): Sonnet 5.5 declines the first Finder request with `stop_reason: "refusal"`, `category reasoning_extraction`. The likely trigger is the Finder prompt asking the model to write out its reasoning: the required, first-listed `submit_findings.reasoning` field, "Write \"reasoning\" first ... why each suspicion was reported or dismissed" (`prompt.rs` FINDER_OUTPUT_TOOLS, workflow step 4) and "they record your reasoning" (FINDER_DISMISSED_TOOLS). Server-side `fallbacks: "default"` never retries this category. Options: rename the field to a work log that never asks for reasoning (keeps prose recovery), or drop it and rely on summarized thinking; either changes the Task 3 decision, so update the change spec and SPEC.md. A refusal is `Invalid`, so the whole job goes dead on one Finder refusal.
+- Uncommitted with this note: `anthropic.rs` reports refusals as `request declined (stop_reason refusal, category …)`, discards output before a `fallback` block, and opts Sonnet 5.5+/Opus 5+/Fable into `fallbacks: "default"` (SPEC.md §8.4 updated).
+
+## Finder recall on Claude Sonnet 5.5 (2026-11-27, live runs on better-booru PR #18 and #20)
+
+Cause unknown: harness or model. Kodus has not been run on Sonnet 5.5 here, so there is no baseline; run Kodus on the same PR with Sonnet 5.5 before changing Adus for it.
+
+- Sonnet's first Finder pass stops after 4 to 6 of its steps with zero or one candidate (PR #20: two read rounds, one grep round, submit); the coverage gate lets it through because every changed file was read. The Synthesis Rescue pass adds one finding. PR #20 covered 2 of Kodus's 4 PR #14 problems (`posts.go:165`, the migration hash leak); DeepSeek on the same prompts (PR #21) covered all 4.
+- It overrides the Finder's dismissal rules in its own thinking: its review log calls the S3 `Exists` error read as a miss "acceptable" because the caller regenerates (PR #20), and the discarded `_, _ =` update errors "only affect orphan bookkeeping" (PR #18); both are excuses the prompt forbids.
+- It never fills `dismissed` (`dismissed=0` in every pass); dismissals go into `review_log` only, so the per-dismissal debug lines are missing.
+- Levers to try once a baseline exists: Finder effort `xhigh` for Sonnet 5.5 (Anthropic recalibrated its effort levels and recommends `xhigh` for agentic coding); a required `dismissed` entry per suspicion in the forbidden-excuse categories (beyond Kodus, which has no `dismissed` list).
+
+## Verifier refutes on "the caller copes" (2026-11-27, DeepSeek run on PR #21)
+
+- The Verifier refuted `cache.go:124` (transient S3 `Exists` error read as a cache miss) with "the error-swallow is real, but the described harm is refuted … returning the error would fall into the exact same regeneration". That is the "a caller recovers" argument the Finder may no longer use for dismissals; the Verifier's "None of these refutes a finding" list has no such clause. Option: add that a caller coping with the outcome afterwards does not refute a hidden error, an error read as a miss, or a skipped fallback. Kodus's Verifier has no such clause either, so check its behaviour on the same finding first.

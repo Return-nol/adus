@@ -14,7 +14,7 @@ use thiserror::Error;
 
 /// Which lens a finding belongs to. The generalist names it; a specialist's findings default to
 /// its own (`SpecialistKind::category`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FindingCategory {
     Bug,
@@ -59,12 +59,14 @@ pub(crate) struct Suggestion {
     pub suggestion: Option<String>,
 }
 
+#[cfg(test)]
 impl AsRef<Suggestion> for Suggestion {
     fn as_ref(&self) -> &Suggestion {
         self
     }
 }
 
+#[cfg(test)]
 impl AsMut<Suggestion> for Suggestion {
     fn as_mut(&mut self) -> &mut Suggestion {
         self
@@ -192,9 +194,10 @@ fn to_suggestion(item: &Map<String, Value>) -> Option<Suggestion> {
 
 /// The Finder's terminal tool. Uses only `type`, `properties`, `required`, `description`,
 /// `items` and `enum`, the JSON-schema subset every provider (Gemini included) accepts.
-/// `reasoning` is listed (and required) before `findings` so the model accounts for its
-/// investigation first. `category` is required from the generalist only; a specialist's
-/// findings default to its own category.
+/// `review_log` is listed (and required) before `findings` so the model records its review
+/// work first. It is a work record, never a request for the model's reasoning: Anthropic's
+/// `reasoning_extraction` classifier declines requests that ask for that. `category` is required
+/// from the generalist only; a specialist's findings default to its own category.
 pub(crate) fn submit_findings_tool_def(is_generalist: bool) -> ToolDef {
     let finding_required = if is_generalist {
         json!(["file", "line", "category", "body"])
@@ -204,16 +207,16 @@ pub(crate) fn submit_findings_tool_def(is_generalist: bool) -> ToolDef {
     ToolDef {
         name: "submit_findings".into(),
         description: "Submit your final review and end it. Call it exactly once, after your \
-            reasoning accounts for every changed function and every lens, with every finding \
-            you promoted, or with an empty list when nothing is worth reporting. List in \
-            `dismissed` every suspicion you ruled out, with the reason it cannot fail."
+            review_log covers every changed function and every lens, with every finding you \
+            promoted, or with an empty list when nothing is worth reporting. List in \
+            `dismissed` every suspicion you ruled out, with the code that rules it out."
             .into(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "reasoning": {
+                "review_log": {
                     "type": "string",
-                    "description": "Write this first. For each changed function or hunk: what you challenged, which callers or callees you read, and why each suspicion was reported or dismissed. Never posted."
+                    "description": "Write this first. A record of the review work, never posted: for each changed function or hunk, the lenses applied, the callers, callees and files read, and each suspicion with its outcome (reported, or dismissed with the code that rules it out)."
                 },
                 "findings": {
                     "type": "array",
@@ -266,14 +269,14 @@ pub(crate) fn submit_findings_tool_def(is_generalist: bool) -> ToolDef {
                             },
                             "why_safe": {
                                 "type": "string",
-                                "description": "Why it cannot fail: the guard, type, constraint or caller you read."
+                                "description": "What rules it out: the guard, type, constraint or caller you read."
                             }
                         },
                         "required": ["file", "suspicion", "why_safe"]
                     }
                 }
             },
-            "required": ["reasoning", "findings"]
+            "required": ["review_log", "findings"]
         }),
     }
 }
@@ -293,9 +296,9 @@ fn array_arg<'a>(args: &'a Value, key: &str) -> Option<Cow<'a, [Value]>> {
 }
 
 /// Most `dismissed` entries kept from one `submit_findings` call.
-pub(crate) const MAX_DISMISSED: usize = 30;
+const MAX_DISMISSED: usize = 30;
 /// Characters kept of a dismissal's `suspicion` and `why_safe`.
-pub(crate) const DISMISSED_TEXT_CHARS: usize = 300;
+const DISMISSED_TEXT_CHARS: usize = 300;
 
 /// A suspicion the Finder ruled out, from the optional `dismissed` list of `submit_findings`.
 /// Only logged: never posted, persisted or shown to another stage.
@@ -350,17 +353,23 @@ pub(crate) fn parse_dismissed(args: &Value) -> Vec<Dismissal> {
         .collect()
 }
 
-/// The `reasoning` of a `submit_findings` call, trimmed and secret-redacted so it is safe to
-/// log; `None` when missing or blank. Never posted, and its absence never refuses a submission.
-pub(crate) fn parse_reasoning(args: &Value) -> Option<String> {
-    args.get("reasoning")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
+/// The `review_log` of a `submit_findings` call, trimmed and secret-redacted so it is safe to
+/// log; `None` when missing or blank. A model that still names it `reasoning` (the field's
+/// earlier name, and Kodus's) is read the same way. Never posted, and its absence never refuses
+/// a submission.
+pub(crate) fn parse_review_log(args: &Value) -> Option<String> {
+    ["review_log", "reasoning"]
+        .into_iter()
+        .find_map(|key| {
+            args.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })
         .map(|text| crate::redact::redact_secrets(text).into_owned())
 }
 
-/// Reads the `submit_findings` findings (an array, or a string holding one; `reasoning` is not
+/// Reads the `submit_findings` findings (an array, or a string holding one; `review_log` is not
 /// needed). Elements that are not objects or lack a required field are skipped, as in
 /// [`parse_suggestions`]. The error text is shown to the model.
 pub(crate) fn parse_submit_findings(args: &Value) -> Result<Vec<Suggestion>, String> {
@@ -668,7 +677,7 @@ mod tests {
     fn parse_submit_findings_validates_and_sanitizes() {
         let args = json!({"findings": [
             {"file": "src/a.rs", "start_line": 2, "line": 3, "severity": "critical", "title": "T",
-             "body": "B", "suggestion": "let x = 1;"},
+             "body": "B", "suggestion": "let x = 1;", "category": "style"},
             {"file": "src/a.rs", "title": "no line", "body": "B"},
             "not an object",
             {"file": "src/b.rs", "start_line": "bad", "line": "4", "title": "T2", "body": "B2", "suggestion": "y"}
@@ -710,15 +719,18 @@ mod tests {
         let def = submit_findings_tool_def(true);
         assert_eq!(def.name, "submit_findings");
         let params = &def.parameters;
-        assert_eq!(params["required"], json!(["reasoning", "findings"]));
+        assert_eq!(params["required"], json!(["review_log", "findings"]));
         let keys: Vec<&str> = params["properties"]
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, ["reasoning", "findings", "dismissed"]);
-        assert_eq!(params["properties"]["reasoning"]["type"], json!("string"));
+        assert_eq!(keys, ["review_log", "findings", "dismissed"]);
+        assert_eq!(params["properties"]["review_log"]["type"], json!("string"));
+        // The schema never asks for the model's reasoning (Anthropic `reasoning_extraction`).
+        assert!(!def.description.to_lowercase().contains("reason"));
+        assert!(!params.to_string().to_lowercase().contains("reason"));
         let item = &params["properties"]["findings"]["items"];
         assert_eq!(
             item["required"],
@@ -760,9 +772,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_lean_finder_findings_and_back_compat_full_findings() {
+    fn parses_lean_finder_findings_and_review_log() {
         let lean = json!({
-            "reasoning": "GetCache: read both callers; the nil error path is reported.",
+            "review_log": "GetCache: read both callers; the nil error path is reported.",
             "findings": [{"file": "src/a.rs", "line": 4, "category": "bug", "body": "why"}]
         });
         let expected = vec![Suggestion {
@@ -777,38 +789,27 @@ mod tests {
         }];
         assert_eq!(parse_submit_findings(&lean).unwrap(), expected);
         assert_eq!(
-            parse_reasoning(&lean).as_deref(),
+            parse_review_log(&lean).as_deref(),
             Some("GetCache: read both callers; the nil error path is reported.")
         );
-
-        // A missing or blank `reasoning` never refuses the submission.
-        let mut without = lean.clone();
-        without.as_object_mut().unwrap().remove("reasoning");
-        assert_eq!(parse_submit_findings(&without).unwrap(), expected);
-        assert_eq!(parse_reasoning(&without), None);
-        assert_eq!(parse_reasoning(&json!({"reasoning": "  "})), None);
-
-        // Legacy full objects keep title, severity and suggestion; an unknown category is unset.
-        let legacy = json!({"findings": [{
-            "file": "src/a.rs", "line": 4, "severity": "critical", "title": "T",
-            "body": "B", "suggestion": "x", "category": "style"
-        }]});
-        let got = parse_submit_findings(&legacy).unwrap();
+        // The field's earlier name is still read.
         assert_eq!(
-            (
-                got[0].severity,
-                got[0].category,
-                got[0].title.as_str(),
-                got[0].suggestion.as_deref()
-            ),
-            (Some(Severity::Critical), None, "T", Some("x"))
+            parse_review_log(&json!({"reasoning": " read a.rs "})).as_deref(),
+            Some("read a.rs")
         );
+
+        // A missing or blank `review_log` never refuses the submission.
+        let mut without = lean.clone();
+        without.as_object_mut().unwrap().remove("review_log");
+        assert_eq!(parse_submit_findings(&without).unwrap(), expected);
+        assert_eq!(parse_review_log(&without), None);
+        assert_eq!(parse_review_log(&json!({"review_log": "  "})), None);
     }
 
     #[test]
     fn parses_stringified_findings_and_dismissed_arrays() {
         let args = json!({
-            "reasoning": "r",
+            "review_log": "r",
             "findings": "[{\"file\": \"src/a.rs\", \"line\": 4, \"category\": \"bug\", \"body\": \"why\"}]",
             "dismissed": "[{\"file\": \"src/a.rs\", \"suspicion\": \"s\", \"why_safe\": \"w\"}]"
         });

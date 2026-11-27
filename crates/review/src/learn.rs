@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::agent::{AgentLlm, chat_low_effort};
+use crate::agent::{AgentLlm, chat_single_turn};
 use crate::command::{MAX_MEMORY_CHARS, authorize};
 use crate::discussion::{format_threads, within_budget};
 use crate::engine::{Engine, EngineError, chat_error, db_error, is_retryable};
@@ -141,7 +141,7 @@ impl Engine {
             usage: &usage,
         };
         let prompt = build_user_prompt(&qualifying, &known);
-        let text = match chat_low_effort(&llm, None, prompt, LEARN_MAX_TOKENS).await {
+        let text = match chat_single_turn(&llm, "learn", None, prompt, LEARN_MAX_TOKENS).await {
             Ok(text) => text,
             Err(err) if is_retryable(&err) => return Err(chat_error(err)),
             Err(err) => {
@@ -294,7 +294,7 @@ fn build_user_prompt(threads: &[&PrThread], known: &[Memory]) -> String {
                 length <= MAX_MEMORIES_CHARS
             })
             .collect();
-        serde_json::to_string_pretty(&contents).unwrap_or_else(|_| json!(contents).to_string())
+        serde_json::to_string_pretty(&contents).unwrap_or_default()
     };
     format!(
         "{}\n\n{}\n\n{}\n\nAnswer as {{\"exceptions\": [{{\"content\": \"...\", \"thread\": i, \"defended_by\": [j, ...]}}]}}.",

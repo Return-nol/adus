@@ -54,6 +54,8 @@ pnpm -C web check                                           # must report 0 erro
 pnpm -C web build                                           # required before spa tests and release builds
 pnpm -C web dev                                             # http://localhost:5173, proxies /api and /webhooks to :8000
 ADUS_PUBLIC_URL=http://localhost:8000 cargo run -p adus     # http://localhost:8000
+cargo run -p adus -- serve --trace > .superpowers/run.log 2>&1  # live LLM trace of every review (SPEC §8.4)
+cargo run -q -p adus -- rereview <repository_id> <pr>       # queue a full re-review on the running serve
 ```
 
 CI (`.github/workflows/ci.yml`): `rust` (`fmt`, `clippy`, `cargo test` with Postgres/Redis) and `web` (`check`, `fmt:check`). Release (`.github/workflows/release.yml`): pushes multi-arch image on `v*` tags. On Windows, if `cargo` is missing from `PATH`, check `%USERPROFILE%\.cargo\bin` (MSVC toolchain).

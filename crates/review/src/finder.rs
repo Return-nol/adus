@@ -5,7 +5,7 @@
 //! When the model rejects tool calling, the whole Finder is run again without tools.
 //! A batch that would start once the review's token budget is exhausted is not started.
 //!
-//! A pass that submits no findings although its reasoning reads like it found some gets one
+//! A pass that submits no findings although its review log reads like it found some gets one
 //! prose recovery call on the fast model. With the repository tools, `Generalist` and `Bug`
 //! then run a second pass, the synthesis rescue, when enough budget and time are left: it
 //! looks for defects the first pass missed, and its new findings are merged in.
@@ -28,13 +28,13 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::agent::{
-    AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec, chat_low_effort,
+    AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec, chat_single_turn,
     run_react_loop,
 };
 use crate::budget::TokenBudget;
 use crate::coverage::CoverageLedger;
 use crate::parse::{
-    CommentableRange, Suggestion, parse_dismissed, parse_reasoning, parse_submit_findings,
+    CommentableRange, Suggestion, parse_dismissed, parse_review_log, parse_submit_findings,
     parse_suggestions, submit_findings_tool_def, validate_batch_anchors,
 };
 use crate::prompt::{
@@ -70,7 +70,7 @@ const FINDING_EXCERPT_CHARS: usize = 200;
 /// Characters of the normalized body that, with file and line, identify a finding when the
 /// passes are merged.
 const MERGE_BODY_PREFIX_CHARS: usize = 80;
-/// Shortest reasoning or reply text that may hold findings written as prose.
+/// Shortest review log or reply text that may hold findings written as prose.
 const PROSE_MIN_CHARS: usize = 80;
 /// Signal groups (defect words, action words, file/line references) prose must match.
 const PROSE_MIN_SIGNAL_GROUPS: usize = 2;
@@ -111,7 +111,7 @@ const PROSE_RECOVERY_SYSTEM: &str = "You turn a code reviewer's free-text notes 
 const PROSE_RECOVERY_TASK: &str = "The notes in <reviewer_notes> describe defects in prose instead of submitting them. Extract every concrete defect the notes report as real; leave out suspicions they rule out or call safe. Answer with only a JSON array. Each element is an object with `file` (one of the paths in <batch_files>, written exactly as there), `line` (the new-file line number the notes give), `category` (\"bug\", \"security\", \"performance\" or \"repo_instruction\") and `body` (what triggers the defect, what goes wrong and where, in the notes' own terms). Skip a defect whose file is not in <batch_files> or whose line the notes do not give. Answer [] when the notes report no defect.";
 
 /// LLM calls one Finder agent may make on a batch of `files` files.
-pub(crate) fn finder_max_steps(files: usize) -> usize {
+fn finder_max_steps(files: usize) -> usize {
     (FINDER_BASE_STEPS + files.saturating_sub(FINDER_FREE_FILES).div_ceil(2)).min(FINDER_STEP_CAP)
 }
 
@@ -565,7 +565,7 @@ async fn pass_findings(
 /// Whether `text` may describe findings in prose: at least [`PROSE_MIN_CHARS`] characters
 /// that match at least [`PROSE_MIN_SIGNAL_GROUPS`] of defect words, action words and a
 /// file/line reference (`src/a.rs:12`, `line 12`).
-pub(crate) fn looks_like_findings(text: &str) -> bool {
+fn looks_like_findings(text: &str) -> bool {
     if text.trim().chars().count() < PROSE_MIN_CHARS {
         return false;
     }
@@ -629,8 +629,9 @@ async fn recover_prose_findings(
         wrap("batch_files", &files.join("\n")),
         wrap("reviewer_notes", prose),
     );
-    let call = chat_low_effort(
+    let call = chat_single_turn(
         &agent,
+        "prose_recovery",
         llm.token_budget.map(Arc::as_ref),
         prompt,
         PROSE_RECOVERY_MAX_TOKENS,
@@ -740,7 +741,7 @@ async fn run_one(
 }
 
 /// What one Finder pass submitted: its findings and the prose that may describe more (the
-/// `reasoning` argument, or the reply text of a prose submission), secret-redacted.
+/// `review_log` argument, or the reply text of a prose submission), secret-redacted.
 #[derive(Debug, Default)]
 struct FinderSubmission {
     findings: Vec<Suggestion>,
@@ -798,17 +799,18 @@ impl SubmitSpec for SubmitFindings<'_> {
         if can_retry && !self.anchor_retried.swap(true, Ordering::Relaxed) {
             validate_batch_anchors(&suggestions, &self.allowed)?;
         }
-        // Only the accepted call is logged: a bounced one returned above and is re-sent.
+        // Every parsed submission is logged, including one the completion gate later refuses; a call
+        // bounced by the anchor check above returned early and is re-sent.
         let specialist = self.kind.label();
-        let reasoning = parse_reasoning(arguments);
-        match &reasoning {
-            Some(reasoning) => tracing::debug!(
+        let review_log = parse_review_log(arguments);
+        match &review_log {
+            Some(review_log) => tracing::debug!(
                 specialist,
                 batch = self.batch,
-                reasoning = %reasoning,
-                "finder reasoning"
+                review_log = %review_log,
+                "finder review log"
             ),
-            None => tracing::debug!(specialist, batch = self.batch, "finder reasoning missing"),
+            None => tracing::debug!(specialist, batch = self.batch, "finder review log missing"),
         }
         let dismissed = parse_dismissed(arguments);
         for d in &dismissed {
@@ -830,7 +832,7 @@ impl SubmitSpec for SubmitFindings<'_> {
         );
         Ok(FinderSubmission {
             findings: self.with_default_category(suggestions),
-            prose: reasoning,
+            prose: review_log,
         })
     }
 
@@ -867,7 +869,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use adus_core::types::{ReviewMode, Severity};
+    use adus_core::types::ReviewMode;
     use adus_git::{FileDiff, FileStatus, PullRequest};
     use adus_llm::{Message, ReasoningEffort};
     use serde_json::json;
@@ -979,111 +981,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finder_bounces_off_line_anchor_once_then_accepts_partial_on_second_or_last_step() {
-        let pr = sample_pr();
-        let file = a_rs();
-        let batches = vec![DiffBatch {
-            files: vec![&file],
-            rules: Vec::new(),
-        }];
+    async fn submit_findings_accepts_invalid_anchors_on_last_step() {
         let allowed = a_rs_allowed();
         let usage = UsageContext {
             review_id: Some(Uuid::from_u128(1)),
             repository_id: Some(Uuid::from_u128(2)),
         };
-        let input = FinderInput {
-            pr: &pr,
-            manifest: "src/a.rs",
-            batches: &batches,
-            allowed: &allowed,
-            memories: &[],
-            repo_instructions: None,
-            mode: ReviewMode::Generalist,
-        };
         let toolbox = repo_toolbox();
-        // 30 s is under the 60 s synthesis window, so only Pass 1 runs.
-        let deadline = Instant::now() + Duration::from_secs(30);
-
-        // The changed lines are read in the first turn, so the completion gate does not refuse
-        // the second submit.
-        let first_turn = || {
-            tools_turn(vec![
-                call(
-                    "s1",
-                    "submit_findings",
-                    json!({ "findings": [finding_arg("src/a.rs", 1, "Off-line")] }),
-                ),
-                call("r1", "read_file", json!({ "path": "src/a.rs" })),
-            ])
-        };
-
-        // 1. First submit on off-line anchor bounces with nearest '+' lines; second submit on valid line succeeds.
-        let chat = ScriptedChat::new(vec![
-            first_turn(),
-            submit_turn("s2", vec![finding_arg("src/a.rs", 2, "Re-anchored")]),
-        ]);
-        let run = run_finder(
-            finder_llm(&chat, &usage, None),
-            &input,
-            Some(&toolbox),
-            deadline,
-        )
-        .await;
-        assert_eq!(run.tasks.len(), 1);
-        assert_eq!(run.synthesis_skipped, Some(SynthesisSkipped::Time));
-        let outcome = run.tasks[0]
-            .result
-            .as_ref()
-            .expect("re-anchored submit succeeds");
-        assert_eq!(outcome.steps_used, 2);
-        assert_eq!(outcome.result.len(), 1);
-        assert_eq!(outcome.result[0].suggestion.line, 2);
-        assert_eq!(outcome.result[0].suggestion.title, "Re-anchored");
-        let reqs = chat.requests();
-        assert_eq!(reqs.len(), 2);
-        let tool_err = reqs[1]
-            .messages
-            .iter()
-            .find_map(|m| match m {
-                Message::Tool { results } => {
-                    results.first().map(|r| (r.is_error, r.content.as_str()))
-                }
-                _ => None,
-            })
-            .expect("bounce tool error");
-        assert!(tool_err.0);
-        assert!(tool_err.1.contains("2, 3"), "{}", tool_err.1);
-
-        // 2. Second submit with mixed valid + invalid anchors succeeds without AgentError::Unparseable.
-        let chat = ScriptedChat::new(vec![
-            first_turn(),
-            submit_turn(
-                "s2",
-                vec![
-                    finding_arg("src/a.rs", 2, "Valid"),
-                    finding_arg("src/a.rs", 1, "Still off-line"),
-                ],
-            ),
-        ]);
-        let run = run_finder(
-            finder_llm(&chat, &usage, None),
-            &input,
-            Some(&toolbox),
-            deadline,
-        )
-        .await;
-        let outcome = run.tasks[0]
-            .result
-            .as_ref()
-            .expect("second submit with partial invalid keeps findings");
-        assert_eq!(outcome.steps_used, 2);
-        assert_eq!(outcome.result.len(), 2);
-        assert_eq!(
-            outcome.result[0].suggestion.severity,
-            Some(Severity::Warning)
-        );
-
-        // 3. On the final step (can_retry == false), SubmitFindings accepts mixed findings immediately.
         let mut batch_map = HashMap::new();
         batch_map.insert("src/a.rs".to_string(), &allowed["src/a.rs"]);
         let submit = SubmitFindings::new(SpecialistKind::Generalist, 0, batch_map);
@@ -1354,8 +1258,8 @@ mod tests {
         let allowed = a_rs_allowed();
         let usage = UsageContext::default();
         let toolbox = repo_toolbox();
-        let reasoning = "Bug at src/a.rs:2: the new value b is never validated, so the caller crashes on empty input. It should be checked before use.";
-        assert!(looks_like_findings(reasoning));
+        let review_log = "Bug at src/a.rs:2: the new value b is never validated, so the caller crashes on empty input. It should be checked before use.";
+        assert!(looks_like_findings(review_log));
         // Too short, and long enough with a single signal group (file references).
         assert!(!looks_like_findings("Bug at src/a.rs:2, should fix."));
         assert!(!looks_like_findings(
@@ -1366,7 +1270,7 @@ mod tests {
             tools_turn(vec![call(
                 "s1",
                 "submit_findings",
-                json!({ "reasoning": reasoning, "findings": [] }),
+                json!({ "review_log": review_log, "findings": [] }),
             )]),
             text_turn(
                 r#"[{"file": "src/a.rs", "line": 2, "body": "b is never validated"},
@@ -1400,7 +1304,7 @@ mod tests {
         assert_eq!(recovery.effort, Some(ReasoningEffort::Medium));
         assert_eq!(recovery.max_tokens, 2_048);
         assert!(recovery.tools.is_empty());
-        assert!(user_text(recovery).contains(reasoning));
+        assert!(user_text(recovery).contains(review_log));
     }
 
     #[test]

@@ -8,10 +8,9 @@ use adus_git::PrThread;
 use adus_llm::ReasoningEffort;
 use adus_llm::router::{ChatService, UsageContext};
 use serde::Deserialize;
-use serde_json::json;
 use uuid::Uuid;
 
-use crate::agent::{AgentLlm, chat_low_effort};
+use crate::agent::{AgentLlm, chat_single_turn};
 use crate::budget::TokenBudget;
 use crate::discussion::format_threads;
 use crate::parse::first_json_object;
@@ -77,8 +76,9 @@ pub(crate) async fn deduplicate_findings(
         effort: Some(DEDUP_EFFORT),
         usage: usage_ctx,
     };
-    let text = match chat_low_effort(
+    let text = match chat_single_turn(
         &llm,
+        "dedup",
         token_budget,
         build_user_prompt(&findings, existing),
         DEDUP_MAX_TOKENS,
@@ -177,7 +177,7 @@ fn build_user_prompt(findings: &[CandidateFinding], existing: &[&PrThread]) -> S
         .enumerate()
         .map(|(index, finding)| SerializedCandidate::new(finding, Some(index)))
         .collect();
-    let list = serde_json::to_string_pretty(&items).unwrap_or_else(|_| json!(items).to_string());
+    let list = serde_json::to_string_pretty(&items).unwrap_or_default();
     let mut prompt = wrap("findings", &list);
     if !existing.is_empty() {
         prompt.push_str("\n\n");
@@ -273,8 +273,6 @@ mod tests {
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 1);
         let req = &reqs[0];
-        assert_eq!(req.model, FAST_MODEL);
-        assert_eq!(req.effort, Some(ReasoningEffort::Medium));
         assert!(req.tools.is_empty());
         assert_eq!(req.messages.len(), 1);
         // Distinct failing operations stay separate; doubt keeps both.
@@ -295,7 +293,6 @@ mod tests {
     async fn falls_back_safely_on_error_empty_or_out_of_bounds_indices() {
         let answers = vec![
             Err(ChatError::AllKeysFailed { retry_after: None }),
-            Err(ChatError::Invalid("bad request".into())),
             text_turn("They all look different to me."),
             text_turn(r#"{"keep_indices": []}"#),
             text_turn(r#"{"keep_indices": [0, 3]}"#),

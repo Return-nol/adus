@@ -49,6 +49,7 @@ Settings live in `.env` (copy of [`.env.example`](.env.example)).
 | `ADUS_DOMAIN` | `localhost` | Domain served by the `https` profile. |
 | `ADUS_WORKERS` | `2` | Review workers inside the process. |
 | `RUST_LOG` | `info` | Log level. |
+| `ADUS_TRACE` | (off) | `true` logs every LLM prompt and reply of a review, source code included. For debugging only. |
 
 To use an external database or Redis, set `COMPOSE_PROFILES=` (empty), fill `DATABASE_URL` and `REDIS_URL` in `.env`, and run `docker compose up -d`. Run `docker compose run --rm --no-deps adus check-config` to validate the variables.
 
@@ -154,6 +155,8 @@ pnpm -C web install && pnpm -C web build          # the server embeds web/build
 ADUS_PUBLIC_URL=http://localhost:8000 cargo run -p adus   # http://localhost:8000
 pnpm -C web dev                                   # dashboard with hot reload on :5173, proxies /api to :8000
 ```
+
+**Tracing a review.** `cargo run -p adus -- serve --trace` (or `ADUS_TRACE=true`) logs every LLM call a review makes: prompts, model reasoning, replies, tool calls and tool results, with secrets redacted but source code included, so keep it to development. Colours are dropped when the output is redirected, e.g. `cargo run -p adus -- serve --trace > review.log 2>&1`. To repeat a review of a pull request without pushing to it, run `cargo run -p adus -- rereview <repository_id> <pr_number>` in another terminal (`repository_id` appears in the review logs); Adus findings already posted on the PR are not posted again.
 
 The tests and the CI need Postgres and Redis, which the dev compose file provides. On Windows, `cargo test --workspace` can run out of paging file; use `cargo test --workspace -j 2`.
 

@@ -269,7 +269,13 @@ impl ReadOnlyCall {
         match self {
             Self::ReadFile(args) => {
                 let path = ws.resolve(args.path.trim())?;
-                let (start, end) = read_window(args.start_line, args.end_line)?;
+                let start = args.start_line.unwrap_or(1).max(1);
+                let last_allowed = start.saturating_add(READ_MAX_LINES - 1);
+                let end = match args.end_line {
+                    Some(end) if end < start => return Err(ToolError::BadRange),
+                    Some(end) => end.min(last_allowed),
+                    None => last_allowed,
+                };
                 let key = CacheKey::ReadFile {
                     path: path.rel().to_owned(),
                     start,
@@ -312,20 +318,6 @@ impl ReadOnlyCall {
             }
         }
     }
-}
-
-/// The inclusive line window a `read_file` call covers: `start_line` defaults to 1, the window
-/// holds at most [`READ_MAX_LINES`] lines, and an `end_line` before `start_line` is
-/// [`ToolError::BadRange`].
-fn read_window(start_line: Option<u32>, end_line: Option<u32>) -> Result<(u32, u32), ToolError> {
-    let start = start_line.unwrap_or(1).max(1);
-    let last_allowed = start.saturating_add(READ_MAX_LINES - 1);
-    let end = match end_line {
-        Some(end) if end < start => return Err(ToolError::BadRange),
-        Some(end) => end.min(last_allowed),
-        None => last_allowed,
-    };
-    Ok((start, end))
 }
 
 fn parse_args<T: DeserializeOwned>(tool: &'static str, args: &Value) -> Result<T, ToolError> {
@@ -389,26 +381,23 @@ impl Toolbox {
         }
     }
 
-    /// The `(path, start, end)` window a `read_file` call asks for, with `path` as
-    /// [`RepoWorkspace`] resolves it. `None` for any other tool, unparsable arguments, a path
-    /// that is not an existing file in the workspace, or an inverted range. The path is
-    /// resolved off the async runtime (`spawn_blocking`).
-    pub(crate) async fn read_file_range(&self, call: &ToolCall) -> Option<(String, u32, u32)> {
+    /// The path a `read_file` call opens, as [`RepoWorkspace`] resolves it. `None` for any other
+    /// tool, unparsable arguments, or a path that is not an existing file in the workspace. The
+    /// path is resolved off the async runtime (`spawn_blocking`).
+    pub(crate) async fn read_file_path(&self, call: &ToolCall) -> Option<String> {
         if call.name != "read_file" {
             return None;
         }
         let args: ReadFileArgs = ReadFileArgs::deserialize(&call.arguments).ok()?;
-        let (start, end) = read_window(args.start_line, args.end_line).ok()?;
         let ws = Arc::clone(&self.workspace);
-        let path = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             ws.resolve_existing_file(args.path.trim())
                 .ok()
                 .map(|path| path.rel().to_owned())
         })
         .await
         .ok()
-        .flatten()?;
-        Some((path, start, end))
+        .flatten()
     }
 
     /// [`read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
@@ -1100,7 +1089,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_range_resolves_dot_paths_and_header_ranges() {
+    async fn read_file_path_resolves_dot_paths_and_header_ranges() {
         let tb = toolbox(&[("src/a.rs", b"fn a() {}\n")]);
         let call = |name: &str, path: &str| ToolCall {
             id: "c1".into(),
@@ -1109,12 +1098,12 @@ mod tests {
             provider_meta: None,
         };
         assert_eq!(
-            tb.read_file_range(&call("read_file", "./src/a.rs")).await,
-            Some(("src/a.rs".to_owned(), 3, 202))
+            tb.read_file_path(&call("read_file", "./src/a.rs")).await,
+            Some("src/a.rs".to_owned())
         );
-        assert_eq!(tb.read_file_range(&call("grep", "src/a.rs")).await, None);
+        assert_eq!(tb.read_file_path(&call("grep", "src/a.rs")).await, None);
         assert_eq!(
-            tb.read_file_range(&call("read_file", "../src/a.rs")).await,
+            tb.read_file_path(&call("read_file", "../src/a.rs")).await,
             None
         );
         assert_eq!(

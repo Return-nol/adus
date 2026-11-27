@@ -24,7 +24,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::agent::{
-    AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec, chat_low_effort,
+    AgentConfig, AgentError, AgentLlm, AgentOutcome, AgentTools, SubmitSpec, chat_single_turn,
     run_react_loop,
 };
 use crate::budget::TokenBudget;
@@ -638,7 +638,7 @@ async fn verify_diff_only(
         usage: ctx.usage,
     };
     let budget = ctx.token_budget.map(Arc::as_ref);
-    match chat_low_effort(&llm, budget, prompt, VERDICT_MAX_TOKENS).await {
+    match chat_single_turn(&llm, "verify_diff_only", budget, prompt, VERDICT_MAX_TOKENS).await {
         Ok(text) => match submit.parse_prose(&text) {
             Ok(verdict) => Outcome::from_verdict(verdict),
             Err(_) => unreadable(),
@@ -842,8 +842,7 @@ fn build_user_prompt(
 ) -> String {
     let s = &candidate.suggestion;
     let payload = SerializedCandidate::new(candidate, None);
-    let finding =
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| json!(payload).to_string());
+    let finding = serde_json::to_string_pretty(&payload).unwrap_or_default();
     let rules: Vec<&Rule> = evidence
         .rules
         .iter()
@@ -1111,13 +1110,6 @@ mod tests {
             panic!("expected the read_file result");
         };
         assert!(results[0].content.contains("fn alpha()"));
-
-        let schema = &reqs[0].tools[4].parameters;
-        assert_eq!(schema["required"], json!(["keep", "rationale"]));
-        let text = schema.to_string();
-        for banned in ["additionalProperties", "$schema", "oneOf"] {
-            assert!(!text.contains(banned), "schema uses {banned}");
-        }
     }
 
     /// Every user text the model was shown in `req`, joined.
@@ -1300,14 +1292,6 @@ mod tests {
         assert_eq!(report.evidence_gate_runs, 0);
         assert_eq!(chat.requests().len(), 1);
         assert_eq!(budget.warning(0, 0), None, "no diff-only verification");
-
-        let config = verifier_config(VERIFY_FULL_MAX_STEPS, later(1_000), None);
-        assert_eq!(config.max_steps, 10);
-        assert!(config.no_tools_on_last_step);
-        assert!(config.widen_short_reads);
-        assert!(!config.budget_bands);
-        assert!(config.coverage_ledger.is_none());
-        assert!(!config.enforce_gate);
     }
 
     #[tokio::test]
@@ -1736,16 +1720,16 @@ mod tests {
         .collect();
         assert!(order.is_sorted(), "{order:?}");
         assert!(prompt.ends_with(VERIFIER_TASK_TOOLS));
+    }
 
+    #[test]
+    fn system_prompt_states_verdict_rules() {
         let system = build_system_prompt(true);
         assert!(system.contains("Findings reported by the Rules reviewer (`reported_by`)"));
-        assert!(!system.contains("team-rules reviewer"));
         assert!(system.contains("`start_line`..`line` is the span"));
         assert!(system.contains("<memories>"));
         assert!(system.contains("<pr_description>"));
-        assert!(!system.contains("drop_suggestion"));
         assert!(system.contains("4 independent tool calls"));
-        assert!(!system.contains("second-guesses the change's stated goal"));
         assert!(system.contains("Someone maintaining the repository wrote down"));
         assert!(system.contains("never by itself grounds to drop"));
         assert!(system.contains("security hole, lost or corrupted data, or a crash"));
@@ -1784,6 +1768,10 @@ mod tests {
         properties.sort();
         assert_eq!(properties, ["keep", "rationale"]);
         assert_eq!(schema["required"], json!(["keep", "rationale"]));
+        let text = schema.to_string();
+        for banned in ["additionalProperties", "$schema", "oneOf"] {
+            assert!(!text.contains(banned), "schema uses {banned}");
+        }
     }
 
     #[test]

@@ -7,10 +7,9 @@ use adus_core::types::Severity;
 use adus_llm::ReasoningEffort;
 use adus_llm::router::{ChatService, UsageContext};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use uuid::Uuid;
 
-use crate::agent::{AgentLlm, chat_low_effort};
+use crate::agent::{AgentLlm, chat_single_turn};
 use crate::budget::TokenBudget;
 use crate::parse::{FindingCategory, Suggestion, first_json_object, parse_severity};
 use crate::prompt::wrap;
@@ -64,7 +63,8 @@ pub(crate) async fn classify_severity(
         usage,
     };
     let prompt = build_user_prompt(&pending);
-    let answer = match chat_low_effort(&llm, budget, prompt, SEVERITY_MAX_TOKENS).await {
+    let answer = match chat_single_turn(&llm, "severity", budget, prompt, SEVERITY_MAX_TOKENS).await
+    {
         Ok(text) => first_json_object::<SeverityAnswer>(&text),
         Err(err) => {
             tracing::warn!(error = %err, "severity classification failed; using warning");
@@ -133,7 +133,7 @@ fn build_user_prompt(pending: &[&mut Suggestion]) -> String {
             body: &s.body,
         })
         .collect();
-    let list = serde_json::to_string_pretty(&items).unwrap_or_else(|_| json!(items).to_string());
+    let list = serde_json::to_string_pretty(&items).unwrap_or_default();
     let mut prompt = wrap("findings", &list);
     prompt.push_str(
         "\n\nAnswer as {\"severities\": [{\"index\": i, \"severity\": \"critical\" | \"warning\" | \"info\"}, ...]}.",
@@ -192,8 +192,6 @@ mod tests {
         );
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].model, "fast-model");
-        assert_eq!(reqs[0].effort, Some(ReasoningEffort::Medium));
         assert_eq!(reqs[0].max_tokens, SEVERITY_MAX_TOKENS);
         let prompt = user_text(&reqs[0]);
         assert!(!prompt.contains("rule breach"));

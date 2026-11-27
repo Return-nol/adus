@@ -28,13 +28,7 @@ use crate::coverage::{CoverageLedger, PendingSignature};
 use crate::prompt::truncate_with_marker;
 use crate::redact::redact_secrets;
 use crate::tools::{ToolOutput, Toolbox, parse_read_header_range};
-
-/// Target of the live agent trace, enabled with `RUST_LOG=...,adus_review::trace=trace`: each
-/// run's prompt, and per step the model's reasoning, reply text, tool calls and tool results
-/// (secrets redacted).
-const TRACE_TARGET: &str = "adus_review::trace";
-/// Most characters of one tool result shown in the trace.
-const TRACE_RESULT_CHARS: usize = 2_000;
+use crate::trace;
 
 /// Default `AgentConfig::compaction_char_limit`.
 const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 320_000;
@@ -58,7 +52,7 @@ const WRAP_UP_STEP_FACTOR: u32 = 2;
 const BUDGET_BANDS_MIN_STEPS: usize = 6;
 /// The completion gate only refuses while at least this many investigating steps remain after
 /// the current one, so the model can still read what it skipped.
-pub(crate) const GATE_MIN_STEPS_LEFT: usize = 2;
+const GATE_MIN_STEPS_LEFT: usize = 2;
 /// `read_file` calls spanning fewer lines than this are widened (`widen_short_reads`).
 const VERIFY_WIDEN_SPAN_THRESHOLD: u64 = 20;
 /// Lines added before a widened `read_file` window.
@@ -68,7 +62,7 @@ const VERIFY_WIDEN_AFTER: u64 = 10;
 /// Tool outputs kept after a context overflow are cut to this many chars.
 const OVERFLOW_TOOL_CHARS: usize = 500;
 /// Appended to a tool output cut after a context overflow.
-const TRUNCATED_MARKER: &str = "\n[output truncated]";
+pub(crate) const TRUNCATED_MARKER: &str = "\n[output truncated]";
 /// Tool calls kept in [`AgentOutcome::recent_tool_calls`].
 const RECENT_TOOL_CALLS: usize = 20;
 /// Most characters of a call's arguments kept in its summary.
@@ -228,19 +222,23 @@ pub(crate) struct AgentLlm<'a> {
     pub usage: &'a UsageContext,
 }
 
-/// Single-turn low-effort text call, recording `input_tokens` into `token_budget`.
-pub(crate) async fn chat_low_effort(
+/// Single-turn text call at `llm.effort` (default `Low`), recording `input_tokens` into
+/// `token_budget`. `call` names it in the live trace.
+pub(crate) async fn chat_single_turn(
     llm: &AgentLlm<'_>,
+    call: &'static str,
     token_budget: Option<&TokenBudget>,
     prompt: String,
     max_tokens: u32,
 ) -> Result<String, ChatError> {
+    trace::prompt(Some(call), llm.system, &prompt);
     let request = ChatRequest::text(llm.model, llm.system, prompt, max_tokens)
         .with_effort(llm.effort.unwrap_or(ReasoningEffort::Low));
     let response = llm
         .chat
         .chat(llm.provider_id, request, llm.usage.clone())
         .await?;
+    trace::response(1, &response);
     if let Some(budget) = token_budget {
         budget.add(
             response.input_tokens,
@@ -283,6 +281,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
     let submit_def = submit.tool_def();
     let submit_name = submit_def.name.as_str();
     let with_repo_tools = matches!(tools, AgentTools::Full(_));
+    trace::prompt(None, llm.system, &prompt);
     let mut messages = vec![user_message(prompt)];
     let mut tally = Tally::default();
     let mut overflow_retried = false;
@@ -293,7 +292,6 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
     let mut notes = Notes::default();
     let mut ledger = config.coverage_ledger.clone().filter(|_| with_repo_tools);
     let mut gate = CompletionGate::new(config.enforce_gate && ledger.is_some());
-    trace_prompt(llm.system, &messages);
 
     while tally.steps_used < config.max_steps {
         let starts_wrap_up = wrap_up.check(tally.steps_used, config);
@@ -352,7 +350,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             wrap_up = wrap_up.reason,
             "agent step"
         );
-        trace_response(tally.steps_used, &response);
+        trace::response(tally.steps_used, &response);
         let ChatResponse {
             text,
             tool_calls,
@@ -442,7 +440,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             .await;
         }
         tally.record_calls(&executed, submit_name);
-        trace_results(tally.steps_used, &results);
+        trace::results(tally.steps_used, &results);
         messages.push(Message::Tool { results });
         last_text = text;
         wrap_up.record(step_started.elapsed());
@@ -509,7 +507,7 @@ async fn record_reads(
         let Some((start, end)) = parse_read_header_range(&result.content) else {
             continue;
         };
-        let Some((path, _, _)) = toolbox.read_file_range(call).await else {
+        let Some(path) = toolbox.read_file_path(call).await else {
             continue;
         };
         if let Some(ledger) = ledger.as_deref_mut() {
@@ -912,73 +910,6 @@ async fn answer_call(
     }
 }
 
-fn trace_enabled() -> bool {
-    tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE)
-}
-
-/// Traces the system prompt and the run's first user message.
-fn trace_prompt(system: &str, messages: &[Message]) {
-    if !trace_enabled() {
-        return;
-    }
-    let prompt = messages
-        .iter()
-        .find_map(|m| match m {
-            Message::User { parts } => parts.iter().map(|UserPart::Text(t)| t.as_str()).next(),
-            _ => None,
-        })
-        .unwrap_or_default();
-    tracing::trace!(
-        target: TRACE_TARGET,
-        system = %redact_secrets(system),
-        prompt = %redact_secrets(prompt),
-        "agent prompt"
-    );
-}
-
-/// Traces what the model produced in one step: reasoning, reply text and every tool call.
-fn trace_response(step: usize, response: &ChatResponse) {
-    if !trace_enabled() {
-        return;
-    }
-    if let Some(reasoning) = response.reasoning() {
-        tracing::trace!(target: TRACE_TARGET, step, reasoning = %redact_secrets(&reasoning), "agent reasoning");
-    }
-    if !response.text.trim().is_empty() {
-        tracing::trace!(target: TRACE_TARGET, step, text = %redact_secrets(&response.text), "agent text");
-    }
-    for call in &response.tool_calls {
-        let args = call.arguments.to_string();
-        tracing::trace!(
-            target: TRACE_TARGET,
-            step,
-            tool = %call.name,
-            id = %call.id,
-            args = %redact_secrets(&args),
-            "agent tool call"
-        );
-    }
-}
-
-/// Traces the result of every tool call of one step, each cut to [`TRACE_RESULT_CHARS`].
-fn trace_results(step: usize, results: &[ToolResult]) {
-    if !trace_enabled() {
-        return;
-    }
-    for result in results {
-        let content = truncate_with_marker(&result.content, TRACE_RESULT_CHARS, TRUNCATED_MARKER);
-        tracing::trace!(
-            target: TRACE_TARGET,
-            step,
-            tool = %result.tool_name,
-            id = %result.call_id,
-            is_error = result.is_error,
-            content = %redact_secrets(&content),
-            "agent tool result"
-        );
-    }
-}
-
 fn user_message(text: String) -> Message {
     Message::User {
         parts: vec![UserPart::Text(text)],
@@ -1183,14 +1114,14 @@ mod tests {
         ])
     }
 
-    /// Toy findings tool shaped like `submit_findings`: `{"reasoning": "..", "findings": [..]}`.
+    /// Toy findings tool shaped like `submit_findings`: `{"review_log": "..", "findings": [..]}`.
     struct SubmitReport {
         def: ToolDef,
     }
 
     #[derive(Debug, Clone, PartialEq)]
     struct Report {
-        reasoning: String,
+        review_log: String,
         findings: Vec<String>,
     }
 
@@ -1219,8 +1150,8 @@ mod tests {
                 .and_then(Value::as_array)
                 .ok_or("missing array field `findings`")?;
             Ok(Report {
-                reasoning: arguments
-                    .get("reasoning")
+                review_log: arguments
+                    .get("review_log")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
@@ -1251,11 +1182,11 @@ mod tests {
         }
     }
 
-    fn report(id: &str, reasoning: &str, findings: &[&str]) -> ToolCall {
+    fn report(id: &str, review_log: &str, findings: &[&str]) -> ToolCall {
         call(
             id,
             REPORT,
-            json!({"reasoning": reasoning, "findings": findings}),
+            json!({"review_log": review_log, "findings": findings}),
         )
     }
 
@@ -2191,7 +2122,7 @@ mod tests {
         // (d) Early prose JSON is refused with a user message; (e) when the run then ends
         // unparseable, the held submission is returned.
         let chat = ScriptedChat::new(vec![
-            text_turn(r#"{"reasoning": "held", "findings": ["h1"]}"#),
+            text_turn(r#"{"review_log": "held", "findings": ["h1"]}"#),
             text_turn("no json"),
             text_turn("still no json"),
         ]);
@@ -2201,7 +2132,7 @@ mod tests {
         assert_eq!(
             out.result,
             Report {
-                reasoning: "held".into(),
+                review_log: "held".into(),
                 findings: vec!["h1".into()],
             }
         );
@@ -2266,7 +2197,7 @@ mod tests {
         assert_eq!(
             out.result,
             Report {
-                reasoning: "second".into(),
+                review_log: "second".into(),
                 findings: vec!["a".into(), "b".into()],
             }
         );

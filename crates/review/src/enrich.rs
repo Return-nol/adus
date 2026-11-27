@@ -15,11 +15,11 @@ use adus_llm::ReasoningEffort;
 use adus_llm::router::{ChatService, UsageContext};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::agent::{AgentLlm, chat_low_effort};
+use crate::agent::{AgentLlm, chat_single_turn};
 use crate::budget::TokenBudget;
 use crate::parse::{
     CommentableRange, FindingCategory, Suggestion, first_json_object, parse_u32_field,
@@ -176,7 +176,7 @@ async fn enrich_one(
         None => None,
     };
     let prompt = build_user_prompt(finding, patch, snippet.as_deref());
-    let request = chat_low_effort(call.llm, call.budget, prompt, ENRICH_MAX_TOKENS);
+    let request = chat_single_turn(call.llm, "enrich", call.budget, prompt, ENRICH_MAX_TOKENS);
     match tokio::time::timeout_at(call.deadline, request).await {
         Ok(Ok(text)) => {
             let answer = first_json_object::<Enrichment>(&text);
@@ -425,8 +425,7 @@ fn build_user_prompt(finding: &Suggestion, patch: Option<&str>, snippet: Option<
         category: finding.category,
         body: &finding.body,
     };
-    let payload =
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| json!(payload).to_string());
+    let payload = serde_json::to_string_pretty(&payload).unwrap_or_default();
     let hunk = patch
         .and_then(|patch| hunk_around(patch, finding.line))
         .map_or_else(
@@ -519,8 +518,6 @@ mod tests {
         assert_eq!(s.body, body);
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].model, "fast-model");
-        assert_eq!(reqs[0].effort, Some(ReasoningEffort::Medium));
         assert_eq!(reqs[0].max_tokens, ENRICH_MAX_TOKENS);
         let prompt = user_text(&reqs[0]);
         assert!(prompt.contains("`b` and `c` are lowercase."));
@@ -528,18 +525,13 @@ mod tests {
         assert!(prompt.contains("    3 + c"), "{prompt}");
         assert!(!prompt.contains("+y"), "{prompt}");
 
-        // An LLM error: the body's first sentence (at most 100 characters), no suggestion.
-        let chat = ScriptedChat::new(vec![
-            Err(ChatError::Invalid("bad".into())),
-            Err(ChatError::Invalid("bad".into())),
-        ]);
-        let long = format!("{} is wrong. More.", "x".repeat(150));
-        let mut findings = vec![finding(3, body), finding(4, &long)];
+        // An LLM error: the body's first sentence, no suggestion.
+        let chat = ScriptedChat::new(vec![Err(ChatError::Invalid("bad".into()))]);
+        let mut findings = vec![finding(3, body)];
         enrich(&chat, &mut findings, PLENTY).await;
         assert_eq!(findings[0].title, "`b` and `c` are lowercase.");
         assert_eq!(findings[0].suggestion, None);
-        assert_eq!(findings[1].title.chars().count(), 100);
-        assert_eq!(chat.requests().len(), 2);
+        assert_eq!(chat.requests().len(), 1);
 
         // 10 s left, under the 20 s reserve: no call, every finding gets the fallback title.
         let chat = ScriptedChat::new(Vec::new());

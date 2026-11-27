@@ -94,7 +94,7 @@ git commit -m "feat(review): add per-file sharded rule prompt builder, head read
 - Modify: `crates/review/src/lib.rs` (add `mod rules_evidence;`)
 
 **Interfaces:**
-- Consumes: `run_react_loop`, `chat_low_effort`, `AgentConfig::no_tools_on_last_step`, `SubmitSpec` (`agent.rs`); `Toolbox` (`tools.rs`); `TokenBudget` (`budget.rs`); `RawShardViolation` (`rules_judge.rs`).
+- Consumes: `run_react_loop`, `chat_single_turn`, `AgentConfig::no_tools_on_last_step`, `SubmitSpec` (`agent.rs`); `Toolbox` (`tools.rs`); `TokenBudget` (`budget.rs`); `RawShardViolation` (`rules_judge.rs`).
 - Produces:
   - `pub(crate) struct ReadExcerpt { pub path: String, pub content: String }`
   - `pub(crate) fn read_contains_line(excerpts: &[ReadExcerpt], path: &str, line: u32) -> bool` (matches normalized `path` and checks any line in `content` starts with `"{line}: "` with non-empty text after prefix).
@@ -103,7 +103,7 @@ git commit -m "feat(review): add per-file sharded rule prompt builder, head read
   - `pub(crate) async fn verify_rule_candidate(ctx: RuleEvidenceContext<'_>, rule: &Rule, file: &FileDiff, candidate: &RawShardViolation, all_files: &[FileDiff], deadline: Instant) -> EvidenceVerdict`
     - Step A: Runs 6-step `run_react_loop` on `fast_model` @ `ReasoningEffort::High` (`no_tools_on_last_step: true`, `budget_bands: false`), capturing successful `read_file` outputs (`!result.is_error`, numbered lines `^\d+: `) into `Vec<ReadExcerpt>` (also add a lightweight `AgentOutcome::tool_excerpts` or `Toolbox::excerpts` callback/capture — specifically `AgentOutcome::read_outputs: Vec<(String, String)>` populated in `agent.rs` from successful `read_file` results so `rules_evidence.rs` inspects the exact lines the collector read without changing `Toolbox`).
     - Short-circuits to `EvidenceVerdict::Refuted` if `has_source_refutation(...)` holds.
-    - Step B: Deduplicates excerpts within `MAX_RULE_EVIDENCE_CHARS = 24_000` (fails closed with `Rejected("no_excerpts")` if empty), gathers related patches from `all_files` capped at `RULE_RELATED_PATCH_CHARS = 8_000`, calls `chat_low_effort` (with `fast_model`, `ReasoningEffort::High`, `RULE_JUDGE_MAX_TOKENS = 1_024`), parses `{ verdict, path, line, rationale }`, and returns `Verified` ONLY when `verdict == "violated"` AND `read_contains_line(&excerpts, &path, line)` is true; otherwise `UnsupportedCitation` or `Rejected(verdict)`.
+    - Step B: Deduplicates excerpts within `MAX_RULE_EVIDENCE_CHARS = 24_000` (fails closed with `Rejected("no_excerpts")` if empty), gathers related patches from `all_files` capped at `RULE_RELATED_PATCH_CHARS = 8_000`, calls `chat_single_turn` (with `fast_model`, `ReasoningEffort::High`, `RULE_JUDGE_MAX_TOKENS = 1_024`), parses `{ verdict, path, line, rationale }`, and returns `Verified` ONLY when `verdict == "violated"` AND `read_contains_line(&excerpts, &path, line)` is true; otherwise `UnsupportedCitation` or `Rejected(verdict)`.
 
 - [ ] **Step 1: Write failing unit tests in `crates/review/src/rules_evidence.rs`**
 

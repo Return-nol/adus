@@ -16,6 +16,7 @@ mod severity;
 mod small_pr;
 mod specialists;
 mod tools;
+mod trace;
 mod verifier;
 pub mod workspace;
 
