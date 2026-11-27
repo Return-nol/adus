@@ -33,7 +33,7 @@ crates/db       sqlx Postgres: connect(), embedded migrations/, queries (users, 
 crates/git      GitProvider, GitProviderFactory, CloneSpec, diff utilities, GitHub & Azure clients
 crates/llm      LlmClient, OpenAI / Anthropic / Gemini / OpenAI-compatible clients, ReasoningEffort, LlmRouter (ChatService)
 crates/queue    Redis Streams job queue, delivery dedup, per-PR lock, worker heartbeats
-crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, specialists, finder, verifier, dedup, budget, small_pr, prompt, parse, command, engine
+crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, coverage, specialists, finder, rules_judge, rules_evidence, verifier, discussion, dedup, severity, enrich, budget, small_pr, prompt, parse, trace, command, learn, engine
 crates/server   axum: router(), state.rs, error.rs, auth.rs, spa.rs, webhooks.rs, doctor.rs, api/*
 crates/adus     binary (serve, gen-secret, check-config, doctor, healthcheck), worker loop & scheduler
 migrations/     sqlx migrations (0001..0008), embedded by crates/db
@@ -75,7 +75,7 @@ Use the trace, not guesses, to diagnose review quality, refusals, timeouts or to
 1. **Run:** `cargo run -p adus -- serve --trace > .superpowers/run.log 2>&1` (or set `ADUS_TRACE=true`; `--trace` adds `adus_review=debug,adus_review::trace=trace` to `RUST_LOG`; the log has no colour codes when redirected).
 2. **Trigger:** in a second terminal, `cargo run -q -p adus -- rereview <repository_id> <pr_number>` queues a full review on the running serve (`repository_id` is in the review logs). Findings Adus already posted on the PR are dropped by Dedup, so use a fresh PR (or count `finding already raised in an existing thread` lines) when measuring detections.
 3. **Read:** wait for `job finished`, then search `.superpowers/run.log` for these events:
-   - `agent prompt`, which carries `call=` on single-turn calls (dedup, severity, enrich, prose_recovery, verify_diff_only, learn);
+   - `agent prompt`, which carries `call=` on single-turn calls (dedup, severity, enrich, prose_recovery, rule_shard, rule_judge, verify_diff_only, learn);
    - `agent reasoning`, `agent text`, `agent tool call` and `agent tool result` for each step;
    - the `finder` / `verify` spans;
    - `finder review log`, `finder dismissed` and `review stages finished`, which hold the stage counts, budget and timings.

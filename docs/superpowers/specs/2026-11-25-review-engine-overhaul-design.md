@@ -1,6 +1,6 @@
 # Review Engine Overhaul (Core Loop & Sharded Rules) — Design Specification
 
-Date: 2026-11-25 · Status: approved
+Date: 2026-11-25 · Status: implemented
 
 > **Binding scope & policy:** Extends [docs/SPEC.md](../../SPEC.md) §3.1, §6.1, §7, §8.3, and §8.4, and supersedes the removed `2026-11-24-finder-completion-gate-and-verifier-effort-design.md`. Follows the `AGENTS.md` Clean-Room and No-Assumption Rule: Kodus community code (outside `libs/ee/**` and `*.ee.*`) was consulted as a behaviour reference and is cited in §10; `libs/ee/**` and `*.ee.*` were never opened. All Rust code, prompts, and schemas are written fresh for Adus.
 
@@ -229,6 +229,8 @@ Replaces `SpecialistKind::Rules` and stops putting `<rules>` into tool-enabled `
    - **Step B — Evidence Judge:** Single-turn `fast` at `High` (`RULE_JUDGE_MAX_TOKENS = 1_024`, plus the `High` reasoning reserve) receiving the rule, candidate claim, collected excerpts (deduped, capped at `MAX_RULE_EVIDENCE_CHARS = 24_000`), and related diff patches (capped at `8_000` chars). Outputs `{"verdict": "violated"|"satisfied"|"not_applicable"|"insufficient_evidence", "path": "...", "line": <u32>, "rationale": "..."}`.
    - **Deterministic Citation Gate (`read_contains_line`):** Keep the violation **only** if `verdict == "violated"` AND `line` of `path` literally appears in `excerpts` (prefix `{line}: ` with non-empty text).
 4. **Downstream Merge:** Verified rule violations enter the post-verify pipeline as `CandidateFinding` with `severity: Some(rule.severity)`, `needs_verify: false`, `rule_id: Some(rule.id)`, and rule citation in `body`, skipping the HV2 Verifier and proceeding directly to Semantic Dedup → Enrichment → `check_fix`.
+
+> **Implementation note (2026-11-27).** Where the build differs from the sketch above, `docs/SPEC.md` §8.4 (Sharded Rules) is binding: (R2) `Toolbox::read_head_file_capped` knows only size and binary limits, so the caller skips `Added` files; (R4) the collector gets all read-only tools (`AgentTools::Full`, `find_files` included); (R5) `AgentConfig::capture_reads` fills `AgentOutcome::read_outputs` only for the collector; (R7) there is no `rule_id` field and `needs_verify` is the method `CandidateFinding::needs_verify()`, true unless the origin is `FinderPass::ShardedRules`; rule findings carry `specialist: Generalist` as a placeholder and Dedup sees them as `reported_by: "Team rules"`; (R8) with no tools, `<rules>` go to the Finder that checks them, `Generalist` or `Bug` in `Specialists` mode, not only `Generalist`. `parse_shard_response` takes only the `CommentableRange` (it owns the hunks).
 
 ---
 

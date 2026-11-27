@@ -58,26 +58,26 @@
   - `pub(crate) fn parse_shard_response(raw: &str, rule_count: usize, range: &CommentableRange, hunks: &[(u32, u32)]) -> Vec<RawShardViolation>` in `crates/review/src/rules_judge.rs` (`hunks` = the file's right-side hunk ranges from `adus_git::diff::commentable_hunks`, context lines included). Accepts `{"violations": [...]}` or bare `[...]` or `{"findings": [...]}`, coerces numeric string `line` / `rule_id`, drops `rule_id == 0 || rule_id > rule_count`. Anchoring (spec §7.2): a `line` in `range.lines` (a `+` line) is kept with its `start_line` if `same_hunk` holds, else `start_line` is dropped; a `line` inside a hunk but not a `+` line moves to the nearest `+` line of that hunk (smallest distance, earlier line on a tie), `start_line` dropped, and `RawShardViolation.cited_line: Option<u32>` keeps the original line so the posted body can say where the problem is; a `line` outside every hunk, or in a hunk with no `+` line, is dropped.
   - `RawShardViolation` gains `pub cited_line: Option<u32>` (`Some(original)` only when the line was moved).
 
-- [ ] **Step 1: Write failing tests in `tools.rs` and `rules_judge.rs`**
+- [x] **Step 1: Write failing tests in `tools.rs` and `rules_judge.rs`**
 
 - `tools.rs`: `read_head_file_capped_skips_added_and_oversized_files` (verifies within-limit file returns `{n}: ...` numbered secret-redacted text, while >600 lines or >30,000 chars returns `None`).
 - `rules_judge.rs`: `lenient_shard_parser_handles_bare_array_string_lines_and_invalid_anchors` (tests `{"violations": [...]}`, bare `[{...}]`, empty `[]`, `{"findings": [...]}`, stringified `"line": "3"`, `rule_id: 0`, `rule_id: 99`, off-diff `line: 999` (dropped), a context line 2 lines below the only `+` line of its hunk (moved to that `+` line, `cited_line == Some(original)`, `start_line == None`), a context line equidistant from two `+` lines (moved to the earlier), and a hunk with no `+` line (dropped)).
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p adus-review -j 2 --lib -- read_head_file_capped lenient_shard_parser`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `Toolbox::read_head_file_capped` in `tools.rs` and `build_shard_prompts` + `parse_shard_response` in `rules_judge.rs`**
+- [x] **Step 3: Implement `Toolbox::read_head_file_capped` in `tools.rs` and `build_shard_prompts` + `parse_shard_response` in `rules_judge.rs`**
 
 Register `mod rules_judge;` in `crates/review/src/lib.rs`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p adus-review -j 2 --lib -- read_head_file_capped lenient_shard_parser`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git diff --cached --name-only   # must not list .cargo/config.toml
@@ -105,7 +105,7 @@ git commit -m "feat(review): add per-file sharded rule prompt builder, head read
     - Short-circuits to `EvidenceVerdict::Refuted` if `has_source_refutation(...)` holds.
     - Step B: Deduplicates excerpts within `MAX_RULE_EVIDENCE_CHARS = 24_000` (fails closed with `Rejected("no_excerpts")` if empty), gathers related patches from `all_files` capped at `RULE_RELATED_PATCH_CHARS = 8_000`, calls `chat_single_turn` (with `fast_model`, `ReasoningEffort::High`, `RULE_JUDGE_MAX_TOKENS = 1_024`), parses `{ verdict, path, line, rationale }`, and returns `Verified` ONLY when `verdict == "violated"` AND `read_contains_line(&excerpts, &path, line)` is true; otherwise `UnsupportedCitation` or `Rejected(verdict)`.
 
-- [ ] **Step 1: Write failing unit tests in `crates/review/src/rules_evidence.rs`**
+- [x] **Step 1: Write failing unit tests in `crates/review/src/rules_evidence.rs`**
 
 Add tests with `ScriptedChat` + `RepoWorkspace::from_files`:
 1. `evidence_judge_accepts_verified_citation_and_rejects_unverified`:
@@ -114,19 +114,19 @@ Add tests with `ScriptedChat` + `RepoWorkspace::from_files`:
 2. `collector_high_confidence_refutation_skips_judge`: Collector reads `src/a.rs` (line 4), returns `{"keep": false, "confidence": "high", "rationale": "Guard at src/a.rs:4 handles it"}` -> `Refuted` with only 2 LLM calls (0 Judge calls).
 3. `evidence_judge_rejects_violated_verdict_without_excerpt_line`: `read_contains_line` rejects empty/whitespace-only lines (`"4:   "`), wrong path, and non-matching line numbers.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p adus-review -j 2 --lib -- evidence_judge collector_high_confidence`
 Expected: FAIL.
 
-- [ ] **Step 3: Add `read_outputs: Vec<(String, String)>` to `AgentOutcome` in `agent.rs` and implement `crates/review/src/rules_evidence.rs` + `lib.rs`**
+- [x] **Step 3: Add `read_outputs: Vec<(String, String)>` to `AgentOutcome` in `agent.rs` and implement `crates/review/src/rules_evidence.rs` + `lib.rs`**
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p adus-review -j 2 --lib`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git diff --cached --name-only   # must not list .cargo/config.toml
@@ -156,22 +156,22 @@ git commit -m "feat(review): add 6-step rule evidence collector and citation-ver
     - Fans out `verify_rule_candidate` with `RULE_EVIDENCE_CONCURRENCY = 4` up to `deadline - RULE_EVIDENCE_DEADLINE_RESERVE (10s)`.
     - Produces `CandidateFinding` with `severity: Some(rule.severity)`, `category: None`, `needs_verify: false`, `rule_id: Some(rule.id)`, and `body` naming the rule title (`"Rule \"{title}\": {claim} (verified at {path}:{line}: {rationale})"`); when `cited_line` is `Some(n)`, the body says the problem is at line `n` (`"… (line {n}, outside the changed lines)"`) because the comment is posted on the nearest `+` line.
 
-- [ ] **Step 1: Write failing unit & integration tests in `rules_judge.rs`, `specialists.rs`, and `crates/review/tests/engine.rs`**
+- [x] **Step 1: Write failing unit & integration tests in `rules_judge.rs`, `specialists.rs`, and `crates/review/tests/engine.rs`**
 
 - `specialists.rs`: update `active_specialists` tests to verify `ReviewMode::Specialists` returns `[Bug, Security, Performance]` (no `Rules`), and that the `Bug` specialist's prompt (system Role + user prompt) carries `<repository_instructions>` and the instruction to check changed hunks against them, with `repo_instruction` accepted as its finding category, while `Security` and `Performance` keep `<repository_instructions>` as context only.
 - `rules_judge.rs`: `tool_enabled_finder_omits_rules_while_diff_only_keeps_them` (checks `build_finder_user_prompt` with `with_tools = true` contains no `<rules>` tag at all — and the system prompt's Scope no longer mentions `<rules>` for tool-enabled runs — while `with_tools = false` includes the matching rules) + `run_sharded_rules_evaluates_matching_files_and_skips_unmatched` (2 files, 1 rule with glob `"src/**"`: only 1 shard call runs, verified finding carries `severity: Some(rule.severity)` and `needs_verify: false`).
 - `crates/review/tests/engine.rs`: `review_runs_sharded_rules_in_parallel_and_skips_general_verifier` — repo with an active rule matching `src/a.rs`, cloned `Generalist` review runs Finder + Sharded Rules in parallel, verified rule finding skips general Verifier, enters Dedup → Enrich, and posts with the rule's `Severity` and rule title in the body.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p adus-review -j 2 -- run_sharded_rules review_runs_sharded_rules`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `run_sharded_rules` and integrate across `specialists.rs`, `prompt.rs`, `finder.rs`, `verifier.rs`, `engine.rs`, and `tests/engine.rs`**
+- [x] **Step 3: Implement `run_sharded_rules` and integrate across `specialists.rs`, `prompt.rs`, `finder.rs`, `verifier.rs`, `engine.rs`, and `tests/engine.rs`**
 
 - Partition `candidates` in `engine.rs` before `verify_candidates`: items with `needs_verify == true` go to `verify_candidates` (`primary` @ `High`); verified Sharded Rule items (`needs_verify == false`) merge into `verified` directly before `deduplicate_findings` → `classify_severity` (preserves their `Some(rule.severity)`) → `enrich_suggestions` → `check_fix`.
 
-- [ ] **Step 4: Run full workspace tests, clippy, and fmt**
+- [x] **Step 4: Run full workspace tests, clippy, and fmt**
 
 Run:
 ```sh
@@ -181,7 +181,7 @@ cargo fmt --all -- --check
 ```
 Expected: PASS with 0 errors and 0 warnings.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```sh
 git diff --cached --name-only   # must not list .cargo/config.toml
@@ -197,12 +197,12 @@ git commit -m "feat(review): run deterministic sharded team rules in parallel wi
 - Modify: `docs/SPEC.md` (§8.4, §10)
 - Modify: `docs/superpowers/specs/2026-11-25-review-engine-overhaul-design.md` (`Status: draft` → `Status: implemented`)
 
-- [ ] **Step 1: Update `docs/SPEC.md` and mark design spec implemented**
+- [x] **Step 1: Update `docs/SPEC.md` and mark design spec implemented**
 
 - Document the parallel Sharded Rules pipeline (per-file shards under `RULE_FILE_MAX_LINES = 600` / `RULE_FILE_MAX_CHARS = 30_000`, 6-step Evidence Collector with `has_source_refutation`, separate Evidence Judge with `read_contains_line` gate, `needs_verify: false` merge before Dedup/Enrichment, removal of `SpecialistKind::Rules` with repository-instruction checks moved to the `Bug` specialist in Specialists mode, `fast` @ `High` for shard/collector/judge, context-line violations moved to the nearest `+` line of their hunk, diff-only fallback retaining `<rules>` in Generalist).
 - Add Section 10 archive entry for `2026-11-25-review-engine-overhaul-design.md` and change its header to `Status: implemented`.
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```sh
 git diff --cached --name-only   # must not list .cargo/config.toml
