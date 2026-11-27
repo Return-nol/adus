@@ -144,7 +144,7 @@ fn optional_trimmed(
     };
     if value.chars().count() > max {
         return Err(ApiError::validation(format!(
-            "{field} must be between 1 and {max} characters"
+            "{field} must be at most {max} characters"
         )));
     }
     Ok(Some(value.to_string()))

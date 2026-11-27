@@ -52,6 +52,8 @@ pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(12 * 60);
 /// Budget of one Specialists review (`Engine::specialists_review_timeout`): up to four agents
 /// per batch at `High` effort need more time than one Generalist agent.
 pub const SPECIALISTS_REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Hard cap on push-validation before starting the review itself.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Summary note when the clone failed (not for auth) and the review saw only the diff.
 const CODEBASE_UNAVAILABLE: &str = "Codebase context unavailable — reviewed diff only";
@@ -284,31 +286,65 @@ impl Engine {
             .await
             .map_err(db_error)?;
         let settings = settings::get(&self.db).await.map_err(db_error)?;
-        let models = self.models(repo, &settings).await?;
+        let is_draft_skip = pr.is_draft && trigger != Trigger::Command;
+        let is_title_skip = trigger != Trigger::Command
+            && title_matches(&pr.title, &settings.ignored_title_keywords);
+        let models = if matches!(trigger, Trigger::Updated | Trigger::Command) {
+            match self.models(repo, &settings).await {
+                Ok(models) => models,
+                Err(err) if is_draft_skip || is_title_skip => {
+                    tracing::warn!(
+                        %review_id,
+                        error = %err,
+                        "skipping push validation on skipped PR: could not load models"
+                    );
+                    None
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            None
+        };
+        let validation_started = Instant::now();
         let confirmed_fixed = if matches!(trigger, Trigger::Updated | Trigger::Command)
             && let Some((provider_id, _, fast_model)) = &models
         {
-            self.validate_open_threads(
-                git.as_ref(),
-                &repo_ref,
-                repo,
-                &pr,
-                (*provider_id, fast_model.as_str()),
-                &settings,
+            match tokio::time::timeout(
+                VALIDATE_TIMEOUT,
+                self.validate_open_threads(
+                    git.as_ref(),
+                    &repo_ref,
+                    repo,
+                    &pr,
+                    (*provider_id, fast_model.as_str()),
+                    &settings,
+                ),
             )
             .await
+            {
+                Ok(count) => count,
+                Err(_) => {
+                    tracing::warn!(%review_id, "push validation timed out");
+                    0
+                }
+            }
         } else {
             0
         };
-        if pr.is_draft && trigger != Trigger::Command {
+        let validation_elapsed = validation_started.elapsed();
+        let start = start + validation_elapsed;
+        if is_draft_skip {
             return Ok(Outcome::Skipped("draft"));
         }
 
         // Sebelum cek model dan diff: PR yang dilewati tidak memicu komentar atau fetch diff.
-        if trigger != Trigger::Command && title_matches(&pr.title, &settings.ignored_title_keywords)
-        {
+        if is_title_skip {
             return Ok(Outcome::Skipped("ignored_title"));
         }
+        let models = match trigger {
+            Trigger::Updated | Trigger::Command => models,
+            Trigger::Opened => self.models(repo, &settings).await?,
+        };
         let Some((provider_id, primary_model, fast_model)) = models else {
             // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
             // atau diminta lewat `@adudu review`, supaya tidak spam.

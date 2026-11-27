@@ -36,6 +36,8 @@ const LEARN_MAX_TOKENS: u32 = 16_384;
 const MAX_MEMORIES_CHARS: usize = 20_000;
 /// Maximum evidence links stored per memory.
 const MAX_EVIDENCE: usize = 10;
+/// Maximum candidate threads considered for curator budget formatting.
+const MAX_CURATOR_CANDIDATES: usize = 100;
 
 const LEARN_SYSTEM: &str = r#"You read the discussion of a closed pull request and curate general, reusable lessons for this repository's memory.
 
@@ -59,7 +61,7 @@ Respond with ONLY a JSON object, no prose and no markdown fences:
 /// The model's answer.
 #[derive(Debug, Deserialize)]
 struct LearnAnswer {
-    memories: Vec<CuratedMemory>,
+    memories: Vec<Value>,
 }
 
 /// One proposed memory from the curator.
@@ -115,7 +117,8 @@ impl<'a> CuratorThread<'a> {
     }
 
     fn is_adus_fixed(&self) -> bool {
-        self.adus.is_some_and(|r| r.outcome == ThreadOutcome::Fixed)
+        self.adus
+            .is_some_and(|r| r.outcome == ThreadOutcome::Fixed && r.fix_sha.is_some())
     }
 }
 
@@ -212,9 +215,14 @@ impl Engine {
             return record(LearningOutcome::Failed, 0).await.map_err(db_error);
         };
 
+        let parsed_memories: Vec<CuratedMemory> = answer
+            .memories
+            .into_iter()
+            .filter_map(|v| serde_json::from_value::<CuratedMemory>(v).ok())
+            .collect();
         let max_learned = usize::try_from(settings.max_learned_per_pr).unwrap_or(10);
         let valid = valid_memories(
-            answer.memories,
+            parsed_memories,
             &qualifying,
             &known,
             repository_id,
@@ -394,16 +402,82 @@ fn build_curator_threads<'a>(
     out
 }
 
+fn format_curator_thread(index: usize, thread: &CuratorThread<'_>) -> Value {
+    let comments: Vec<Value> = thread
+        .comments()
+        .iter()
+        .enumerate()
+        .map(|(c_index, comment)| {
+            let author = if comment.by_adus {
+                "adus"
+            } else {
+                &comment.author
+            };
+            let body = redact_secrets(&comment.body);
+            let body = truncate_with_marker(&body, MAX_BODY_CHARS, " …");
+            json!({"index": c_index, "author": author, "body": body})
+        })
+        .collect();
+    let path = thread
+        .adus
+        .map(|r| r.path.as_str())
+        .or_else(|| thread.provider.and_then(|p| p.path.as_deref()));
+    let line = thread
+        .adus
+        .and_then(|r| r.line.and_then(|l| u32::try_from(l).ok()))
+        .or_else(|| thread.provider.and_then(|p| p.line));
+    let status = thread.provider.and_then(|p| p.status.as_deref());
+    let mut obj = json!({
+        "index": index,
+        "path": path,
+        "line": line,
+        "status": status,
+        "comments": comments,
+    });
+    if let Some(row) = thread.adus
+        && let Some(map) = obj.as_object_mut()
+    {
+        map.insert(
+            "adus_finding".to_string(),
+            json!({
+                "severity": row.severity,
+                "title": redact_secrets(&row.title),
+                "body": redact_secrets(&row.body),
+                "outcome": row.outcome,
+                "reason": row.reason.as_deref().map(redact_secrets),
+                "resolution": row.resolution.as_deref().map(redact_secrets),
+                "fix_sha": row.fix_sha,
+            }),
+        );
+    }
+    obj
+}
+
 /// Keeps threads in priority order within `MAX_THREADS_CHARS`, skipping oversized entries.
 fn within_curator_budget<'a>(
     threads: impl IntoIterator<Item = CuratorThread<'a>>,
 ) -> Vec<CuratorThread<'a>> {
+    // Pre-format each candidate once (capped at MAX_CURATOR_CANDIDATES) to avoid O(N^2)
+    // re-serialization and repeated `redact_secrets` calls.
+    let prepared: Vec<(CuratorThread<'a>, usize)> = threads
+        .into_iter()
+        .take(MAX_CURATOR_CANDIDATES)
+        .map(|thread| {
+            let val = format_curator_thread(99, &thread);
+            let pretty = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            let item_cost = pretty.chars().count() + pretty.lines().count() * 2;
+            (thread, item_cost)
+        })
+        .collect();
+
     let mut fitted = Vec::new();
-    for thread in threads {
-        fitted.push(thread);
-        if format_curator_threads(&fitted).chars().count() > MAX_THREADS_CHARS {
-            fitted.pop();
-            continue;
+    // Account for outer "[\n" + "\n]" (4 chars).
+    let mut used_chars = 4usize;
+    for (thread, item_cost) in prepared {
+        let separator = if fitted.is_empty() { 0 } else { 2 };
+        if used_chars + separator + item_cost <= MAX_THREADS_CHARS {
+            used_chars += separator + item_cost;
+            fitted.push(thread);
         }
     }
     fitted
@@ -413,56 +487,7 @@ fn format_curator_threads(threads: &[CuratorThread<'_>]) -> String {
     let items: Vec<Value> = threads
         .iter()
         .enumerate()
-        .map(|(index, thread)| {
-            let comments: Vec<Value> = thread
-                .comments()
-                .iter()
-                .enumerate()
-                .map(|(c_index, comment)| {
-                    let author = if comment.by_adus {
-                        "adus"
-                    } else {
-                        &comment.author
-                    };
-                    let body = redact_secrets(&comment.body);
-                    let body = truncate_with_marker(&body, MAX_BODY_CHARS, " …");
-                    json!({"index": c_index, "author": author, "body": body})
-                })
-                .collect();
-            let path = thread
-                .adus
-                .map(|r| r.path.as_str())
-                .or_else(|| thread.provider.and_then(|p| p.path.as_deref()));
-            let line = thread
-                .adus
-                .and_then(|r| r.line.and_then(|l| u32::try_from(l).ok()))
-                .or_else(|| thread.provider.and_then(|p| p.line));
-            let status = thread.provider.and_then(|p| p.status.as_deref());
-            let mut obj = json!({
-                "index": index,
-                "path": path,
-                "line": line,
-                "status": status,
-                "comments": comments,
-            });
-            if let Some(row) = thread.adus
-                && let Some(map) = obj.as_object_mut()
-            {
-                map.insert(
-                    "adus_finding".to_string(),
-                    json!({
-                        "severity": row.severity,
-                        "title": redact_secrets(&row.title),
-                        "body": redact_secrets(&row.body),
-                        "outcome": row.outcome,
-                        "reason": row.reason.as_deref().map(redact_secrets),
-                        "resolution": row.resolution.as_deref().map(redact_secrets),
-                        "fix_sha": row.fix_sha,
-                    }),
-                );
-            }
-            obj
-        })
+        .map(|(index, thread)| format_curator_thread(index, thread))
         .collect();
     serde_json::to_string_pretty(&items).unwrap_or_else(|_| Value::Array(items).to_string())
 }
@@ -480,6 +505,55 @@ fn clean_optional_text(raw: Option<String>) -> Option<Option<String>> {
         return None;
     }
     Some(Some(trimmed.to_string()))
+}
+
+fn normalize_exception_context(
+    context: Option<&str>,
+    reason: Option<&str>,
+    sources: &[CuratedSource],
+    threads: &[CuratorThread<'_>],
+) -> String {
+    if let Some(ctx) = context {
+        let by_design_len = "by design:".len();
+        let wont_fix_len = "won't fix:".len();
+        if ctx
+            .get(..by_design_len)
+            .is_some_and(|p| p.eq_ignore_ascii_case("by design:"))
+        {
+            return format!("By design:{}", &ctx[by_design_len..]);
+        }
+        if ctx
+            .get(..wont_fix_len)
+            .is_some_and(|p| p.eq_ignore_ascii_case("won't fix:"))
+        {
+            return format!("Won't fix:{}", &ctx[wont_fix_len..]);
+        }
+    }
+
+    let has_by_design = sources.iter().any(|s| {
+        threads[s.thread]
+            .adus
+            .is_some_and(|r| r.outcome == ThreadOutcome::ByDesign)
+    });
+    let has_wont_fix = sources.iter().any(|s| {
+        threads[s.thread]
+            .adus
+            .is_some_and(|r| r.outcome == ThreadOutcome::WontFix)
+    });
+    let prefix = if has_by_design && !has_wont_fix {
+        "By design:"
+    } else {
+        "Won't fix:"
+    };
+
+    let combined = match context {
+        Some(ctx) => format!("{prefix} {ctx}"),
+        None => match reason {
+            Some(r) => format!("{prefix} {r}"),
+            None => prefix.to_string(),
+        },
+    };
+    truncate_with_marker(&combined, MAX_MEMORY_CHARS, " …").into_owned()
 }
 
 fn valid_memories(
@@ -519,21 +593,13 @@ fn valid_memories(
                 return None;
             }
 
-            let updates = match item
+            let updates = item
                 .updates
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-            {
-                Some(raw_id) => {
-                    let id = Uuid::parse_str(raw_id).ok()?;
-                    if !eligible_targets.contains(&id) || claimed_updates.contains(&id) {
-                        return None;
-                    }
-                    Some(id)
-                }
-                None => None,
-            };
+                .and_then(|raw_id| Uuid::parse_str(raw_id).ok())
+                .filter(|id| eligible_targets.contains(id) && !claimed_updates.contains(id));
 
             let mut seen_threads = HashSet::new();
             let sources: Vec<CuratedSource> = item
@@ -560,6 +626,17 @@ fn valid_memories(
             if sources.is_empty() {
                 return None;
             }
+
+            let context = if item.kind == MemoryKind::Exception {
+                Some(normalize_exception_context(
+                    context.as_deref(),
+                    reason.as_deref(),
+                    &sources,
+                    threads,
+                ))
+            } else {
+                context
+            };
 
             if let Some(id) = updates {
                 claimed_updates.insert(id);

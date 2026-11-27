@@ -522,9 +522,20 @@ async fn updates_supersedes_existing_memory(pool: PgPool) {
         },
         {
             "kind": "convention",
-            "content": "Should be dropped (already superseded)",
+            "content": "Already superseded target ignored",
             "sources": [{"thread": 0, "comments": [1]}],
             "updates": superseded.id.to_string(),
+        },
+        {
+            "kind": "convention",
+            "content": "Malformed uuid target ignored",
+            "sources": [{"thread": 0, "comments": [1]}],
+            "updates": "not-a-uuid",
+        },
+        {
+            "kind": "unknown_kind",
+            "content": "Malformed item skipped",
+            "sources": [{"thread": 0, "comments": [1]}],
         }
     ])));
 
@@ -550,12 +561,16 @@ async fn updates_supersedes_existing_memory(pool: PgPool) {
             },
         ]
     );
-    // Duplicate claim and already-superseded target were dropped.
-    assert!(!all.iter().any(|m| m.content == "Duplicate claim on old"));
-    assert!(
-        !all.iter()
-            .any(|m| m.content == "Should be dropped (already superseded)")
-    );
+    // Duplicate claim, already-superseded target, and invalid UUID keep the memory with supersedes: None.
+    for content in [
+        "Duplicate claim on old",
+        "Already superseded target ignored",
+        "Malformed uuid target ignored",
+    ] {
+        let m = all.iter().find(|m| m.content == content).unwrap();
+        assert_eq!(m.supersedes, None, "{content}");
+    }
+    assert!(!all.iter().any(|m| m.content == "Malformed item skipped"));
     // Old memory is not superseded yet while replacement is pending.
     assert_eq!(
         memories::get(&pool, old.id)
@@ -690,4 +705,110 @@ async fn learn_pr_invalid_answer_records_failed(pool: PgPool) {
 
     assert!(learned(&pool, s.repository_id).await.is_empty());
     assert_eq!(runs(&pool).await, [("failed".to_string(), 0)]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn human_resolved_fixed_without_fix_sha_does_not_auto_activate(pool: PgPool) {
+    let adus_thread = PrThread {
+        id: Some("adus-human".into()),
+        resolved: true,
+        path: Some("src/db.rs".into()),
+        line: Some(10),
+        status: Some("fixed".into()),
+        url: Some("https://github.com/acme/api/pull/7#discussion_r30".into()),
+        comments: vec![comment("adudu-bot", true, "Missing `.await`.")],
+    };
+    let (s, chat) = setup(&pool, LearningMode::Auto, vec![adus_thread]).await;
+    review_threads::insert_many(
+        &pool,
+        &[NewReviewThread {
+            repository_id: s.repository_id,
+            review_id: None,
+            pr_number: 7,
+            provider_thread_id: "adus-human",
+            root_comment_id: "adus-human",
+            path: "src/db.rs",
+            line: Some(10),
+            severity: Severity::Critical,
+            title: "Unawaited query",
+            body: "SQLx query future is not awaited.",
+            posted_head_sha: "h0",
+        }],
+    )
+    .await
+    .unwrap();
+    let row = review_threads::find(&pool, s.repository_id, 7, "adus-human")
+        .await
+        .unwrap()
+        .unwrap();
+    review_threads::set_outcome(
+        &pool,
+        row.id,
+        ThreadUpdate {
+            outcome: ThreadOutcome::Fixed,
+            reason: None,
+            fix_sha: None,
+            resolution: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    chat.reply(&answer(json!([{
+        "kind": "fix_pattern",
+        "content": "Always await SQLx query futures.",
+        "resolution": "Add `.await`.",
+        "sources": [{"thread": 0, "comments": []}],
+    }])));
+
+    s.engine.learn_pr(s.repository_id, 7).await.unwrap();
+
+    assert!(learned(&pool, s.repository_id).await.is_empty());
+    assert_eq!(runs(&pool).await, [("nothing_to_learn".to_string(), 0)]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn exception_context_prefix_enforced_and_curator_effort_forwarded(pool: PgPool) {
+    let url = "https://github.com/acme/api/pull/7#discussion_r40";
+    let (s, chat) = setup(
+        &pool,
+        LearningMode::Approval,
+        vec![rebutted("octocat", url)],
+    )
+    .await;
+    let mut current = settings::get(&pool).await.unwrap();
+    current.curator_effort = "high".into();
+    settings::update(&pool, &current).await.unwrap();
+
+    chat.reply(&answer(json!([
+        {
+            "kind": "exception",
+            "content": "Immediate retries are intentional.",
+            "context": "Developer explained the retry requirement.",
+            "reason": "PRD requires immediate retries.",
+            "sources": [{"thread": 0, "comments": [1]}],
+        },
+        {
+            "kind": "exception",
+            "content": "Lowercase prefix is normalized.",
+            "context": "by design: already has prefix.",
+            "reason": "PRD requires immediate retries.",
+            "sources": [{"thread": 0, "comments": [1]}],
+        }
+    ])));
+
+    s.engine.learn_pr(s.repository_id, 7).await.unwrap();
+
+    let requests = chat.requests();
+    assert_eq!(requests[0].0.effort, Some(ReasoningEffort::High));
+    let memories = learned(&pool, s.repository_id).await;
+    assert_eq!(memories.len(), 2);
+    assert_eq!(
+        memories[0].context.as_deref(),
+        Some("Won't fix: Developer explained the retry requirement.")
+    );
+    assert_eq!(
+        memories[1].context.as_deref(),
+        Some("By design: already has prefix.")
+    );
 }

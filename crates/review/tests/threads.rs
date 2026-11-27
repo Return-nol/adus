@@ -647,3 +647,98 @@ async fn human_resolved_thread_is_synced_not_validated(pool: PgPool) {
     assert!(s.git.state().statuses.is_empty());
     assert!(replies(&s).is_empty());
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn push_validation_respects_max_thread_replies_cap(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    let mut current = settings::get(&pool).await.unwrap();
+    current.max_thread_replies = 0;
+    settings::update(&pool, &current).await.unwrap();
+
+    s.git.state().incremental = vec![FileDiff {
+        path: "src/a.rs".into(),
+        old_path: None,
+        status: FileStatus::Modified,
+        patch: Some("@@ -1,2 +1,3 @@\n fn retry() {\n+    sleep(backoff);\n }\n".into()),
+    }];
+    chat.reply(&validate_answer(
+        "fixed",
+        "Backoff added.",
+        "Confirmed fixed.",
+    ));
+    chat.reply("[]");
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap();
+
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Fixed);
+    assert_eq!(row.fix_sha.as_deref(), Some("h2"));
+    assert_eq!(row.validated_head_sha.as_deref(), Some("h2"));
+    assert_eq!(row.adus_replies, 0);
+    assert_eq!(
+        s.git.state().statuses,
+        [(thread_ref(), ThreadStatus::Fixed)]
+    );
+    assert!(replies(&s).is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn push_validation_respects_max_validate_threads_zero(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    let mut current = settings::get(&pool).await.unwrap();
+    current.max_validate_threads = 0;
+    settings::update(&pool, &current).await.unwrap();
+
+    s.git.state().incremental = vec![FileDiff {
+        path: "src/a.rs".into(),
+        old_path: None,
+        status: FileStatus::Modified,
+        patch: Some("@@ -1,2 +1,3 @@\n fn retry() {\n+    sleep(backoff);\n }\n".into()),
+    }];
+    chat.reply("[]");
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap();
+
+    let requests = chat.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0.model, "gpt-test");
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Open);
+    assert_eq!(row.validated_head_sha, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn command_trigger_runs_push_validation(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    s.git.state().incremental = vec![FileDiff {
+        path: "src/a.rs".into(),
+        old_path: None,
+        status: FileStatus::Modified,
+        patch: Some("@@ -1,2 +1,3 @@\n fn retry() {\n+    sleep(backoff);\n }\n".into()),
+    }];
+    chat.reply(&validate_answer(
+        "fixed",
+        "Backoff added.",
+        "Confirmed fixed on command.",
+    ));
+    chat.reply("[]");
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Command, None)
+        .await
+        .unwrap();
+
+    let requests = chat.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0.model, "gpt-fast");
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Fixed);
+    assert_eq!(row.fix_sha.as_deref(), Some("h2"));
+    assert_eq!(replies(&s), [format!("{LABEL}Confirmed fixed on command.")]);
+}

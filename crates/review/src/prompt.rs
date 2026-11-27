@@ -251,14 +251,7 @@ const MAX_MEMORY_FIELD_CHARS: usize = 500;
 const MEMORY_TRUNCATE_MARKER: &str = " …";
 
 fn format_memory_entry(index: usize, memory: &Memory) -> String {
-    let mut lines = vec![format!(
-        "- [{index}] {}",
-        truncate_with_marker(
-            &memory.content,
-            MAX_MEMORY_FIELD_CHARS,
-            MEMORY_TRUNCATE_MARKER
-        )
-    )];
+    let mut lines = vec![format!("- [{index}] {}", memory.content)];
     for (label, value) in [
         ("Reason", memory.reason.as_deref()),
         ("Resolution", memory.resolution.as_deref()),
@@ -320,11 +313,11 @@ pub(crate) fn apply_precedent(s: &mut Suggestion, memories: &[Memory]) {
         MemoryKind::Convention => return,
         MemoryKind::Exception => {
             s.severity = Severity::Info;
-            let label = if mem
-                .context
-                .as_deref()
-                .is_some_and(|c| c.starts_with("By design:"))
-            {
+            let label = if mem.context.as_deref().is_some_and(|c| {
+                c.trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("by design:")
+            }) {
                 "by design"
             } else {
                 "won't fix"
@@ -993,6 +986,7 @@ mod tests {
         assert_eq!(format_memories(&[]), "");
 
         let long = "x".repeat(510);
+        let long_res = "r".repeat(510);
         let memories = vec![
             exception_memory(
                 "skip check",
@@ -1004,7 +998,7 @@ mod tests {
             memory("always use parameterized SQL"),
             fix_pattern_memory(
                 &long,
-                Some("Use checked_add"),
+                Some(&long_res),
                 Some(19),
                 Some("https://example.com/19"),
             ),
@@ -1016,8 +1010,8 @@ mod tests {
             "### Exceptions\n- [0] skip check\n  Reason: Validated upstream\n  Context: By design: trusted caller"
         ));
         assert!(formatted.contains(&format!(
-            "### Fix patterns\n- [2] {} …\n  Resolution: Use checked_add",
-            "x".repeat(500)
+            "### Fix patterns\n- [2] {long}\n  Resolution: {} …",
+            "r".repeat(500)
         )));
         // Order: Conventions -> Exceptions -> Fix patterns
         let conv_pos = formatted.find("### Conventions").unwrap();
@@ -1079,6 +1073,21 @@ mod tests {
         assert_eq!(
             wont_fix.body,
             "Original body.\n\n**Precedent:** A similar case was declared won't fix: legacy path"
+        );
+
+        let memories_ci = vec![exception_memory(
+            "fallback content",
+            Some("  by design: internal endpoint"),
+            Some("Auth is enforced by gateway"),
+            None,
+            None,
+        )];
+        let mut by_design_ci = base_suggestion(Severity::Warning, Some(0));
+        apply_precedent(&mut by_design_ci, &memories_ci);
+        assert_eq!(by_design_ci.severity, Severity::Info);
+        assert_eq!(
+            by_design_ci.body,
+            "Original body.\n\n**Precedent:** A similar case was declared by design: Auth is enforced by gateway"
         );
     }
 

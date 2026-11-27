@@ -36,6 +36,8 @@ const MAX_CODE_CHARS: usize = 20_000;
 const MAX_PROMPT_COMMENTS: usize = 20;
 /// Maximum threads validated per fast-model batch on a push.
 const VALIDATE_BATCH_SIZE: usize = 10;
+/// Maximum input characters of serialized thread items per push-validation batch.
+const MAX_VALIDATE_BATCH_CHARS: usize = 40_000;
 /// Longest diff-since-posting patch per thread in push validation, in chars.
 const MAX_VALIDATE_PATCH_CHARS: usize = 10_000;
 /// Output cap of one push-validation batch.
@@ -409,7 +411,13 @@ impl Engine {
                         remaining.push(row);
                     }
                 }
-                Err(GitError::NotFound) => {}
+                Err(GitError::NotFound) => {
+                    if let Err(err) =
+                        review_threads::set_validated(&self.db, row.id, &pr.head_sha).await
+                    {
+                        tracing::warn!(repository_id = %repo.id, pr_number = pr.number, error = %err, "could not mark missing thread validated");
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(repository_id = %repo.id, pr_number = pr.number, error = %err, "get_thread failed during push validation");
                 }
@@ -497,12 +505,35 @@ impl Engine {
         };
 
         let mut confirmed_fixed = 0usize;
-        for batch in changed.chunks(VALIDATE_BATCH_SIZE) {
+        let mut batch_start = 0;
+        while batch_start < changed.len() {
+            let mut batch_end = batch_start + 1;
+            let mut batch_chars = validation_item_chars(&changed[batch_start], &pr_diff);
+            while batch_end < changed.len() && (batch_end - batch_start) < VALIDATE_BATCH_SIZE {
+                let next_chars = validation_item_chars(&changed[batch_end], &pr_diff);
+                if batch_chars + next_chars > MAX_VALIDATE_BATCH_CHARS {
+                    break;
+                }
+                batch_chars += next_chars;
+                batch_end += 1;
+            }
+            let batch = &changed[batch_start..batch_end];
+            batch_start = batch_end;
+
             let prompt = validation_prompt(batch, &pr_diff);
             let text = match chat_low_effort(&llm, None, prompt, VALIDATE_MAX_TOKENS).await {
                 Ok(text) => text,
                 Err(err) => {
                     tracing::warn!(repository_id = %repo.id, pr_number = pr.number, error = %err, "push validation LLM call failed");
+                    if !is_retryable(&err) {
+                        for (row, _) in batch {
+                            if let Err(db_err) =
+                                review_threads::set_validated(&self.db, row.id, &pr.head_sha).await
+                            {
+                                tracing::warn!(repository_id = %repo.id, pr_number = pr.number, error = %db_err, "could not mark failed validation thread validated");
+                            }
+                        }
+                    }
                     continue;
                 }
             };
@@ -516,7 +547,15 @@ impl Engine {
                         continue;
                     };
                     if self
-                        .apply_fixed_validation(git, repo_ref, repo.id, pr, row, &item)
+                        .apply_fixed_validation(
+                            git,
+                            repo_ref,
+                            repo.id,
+                            pr,
+                            row,
+                            &item,
+                            settings.max_thread_replies,
+                        )
                         .await
                     {
                         confirmed_fixed += 1;
@@ -536,6 +575,7 @@ impl Engine {
         confirmed_fixed
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_fixed_validation(
         &self,
         git: &dyn GitProvider,
@@ -544,6 +584,7 @@ impl Engine {
         pr: &PullRequest,
         row: &ReviewThread,
         item: &ValidationItem,
+        max_thread_replies: i32,
     ) -> bool {
         let thread_ref = ThreadRef {
             thread_id: row.provider_thread_id.clone(),
@@ -566,24 +607,26 @@ impl Engine {
         if let Err(err) = review_threads::set_outcome(&self.db, row.id, update).await {
             tracing::warn!(%repository_id, pr_number = pr.number, error = %err, "could not update fixed thread outcome");
         }
-        let reply = item
-            .reply
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Confirmed fixed in the latest push.");
-        let body = adus_body(REPLY_LABEL, &redact_secrets(reply));
-        match git
-            .reply_in_thread(repo_ref, pr.number, &thread_ref, &body)
-            .await
-        {
-            Ok(_) => {
-                if let Err(err) = review_threads::record_reply(&self.db, row.id).await {
-                    tracing::warn!(%repository_id, pr_number = pr.number, error = %err, "could not record validation reply");
+        if row.adus_replies < max_thread_replies {
+            let reply = item
+                .reply
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Confirmed fixed in the latest push.");
+            let body = adus_body(REPLY_LABEL, &redact_secrets(reply));
+            match git
+                .reply_in_thread(repo_ref, pr.number, &thread_ref, &body)
+                .await
+            {
+                Ok(_) => {
+                    if let Err(err) = review_threads::record_reply(&self.db, row.id).await {
+                        tracing::warn!(%repository_id, pr_number = pr.number, error = %err, "could not record validation reply");
+                    }
                 }
-            }
-            Err(err) => {
-                tracing::warn!(%repository_id, pr_number = pr.number, error = %err, "could not post validation reply");
+                Err(err) => {
+                    tracing::warn!(%repository_id, pr_number = pr.number, error = %err, "could not post validation reply");
+                }
             }
         }
         true
@@ -623,37 +666,51 @@ fn diff_status_label(status: FileStatus) -> &'static str {
     }
 }
 
+fn validation_item_json(
+    index: usize,
+    row: &ReviewThread,
+    diff: &FileDiff,
+    pr_diff: &[FileDiff],
+) -> serde_json::Value {
+    let deleted = diff.status == FileStatus::Deleted;
+    let diff_since = match diff.patch.as_deref() {
+        Some(patch) => {
+            let redacted = redact_secrets(patch);
+            truncate_with_marker(&redacted, MAX_VALIDATE_PATCH_CHARS, " …").into_owned()
+        }
+        None if deleted => "(file was deleted)".to_string(),
+        None => "(no patch available)".to_string(),
+    };
+    let current = if deleted {
+        "(file was deleted)".to_string()
+    } else {
+        code_context(pr_diff, &diff.path, row.line)
+    };
+    json!({
+        "index": index,
+        "path": row.path,
+        "line": row.line,
+        "severity": row.severity,
+        "title": redact_secrets(&row.title),
+        "body": redact_secrets(&row.body),
+        "file_status_since_posting": diff_status_label(diff.status),
+        "diff_since_posting": diff_since,
+        "current_pr_diff": current,
+    })
+}
+
+fn validation_item_chars((row, diff): &(ReviewThread, FileDiff), pr_diff: &[FileDiff]) -> usize {
+    validation_item_json(0, row, diff, pr_diff)
+        .to_string()
+        .chars()
+        .count()
+}
+
 fn validation_prompt(batch: &[(ReviewThread, FileDiff)], pr_diff: &[FileDiff]) -> String {
     let items: Vec<_> = batch
         .iter()
         .enumerate()
-        .map(|(index, (row, diff))| {
-            let deleted = diff.status == FileStatus::Deleted;
-            let diff_since = match diff.patch.as_deref() {
-                Some(patch) => {
-                    let redacted = redact_secrets(patch);
-                    truncate_with_marker(&redacted, MAX_VALIDATE_PATCH_CHARS, " …").into_owned()
-                }
-                None if deleted => "(file was deleted)".to_string(),
-                None => "(no patch available)".to_string(),
-            };
-            let current = if deleted {
-                "(file was deleted)".to_string()
-            } else {
-                code_context(pr_diff, &row.path, row.line)
-            };
-            json!({
-                "index": index,
-                "path": row.path,
-                "line": row.line,
-                "severity": row.severity,
-                "title": redact_secrets(&row.title),
-                "body": redact_secrets(&row.body),
-                "file_status_since_posting": diff_status_label(diff.status),
-                "diff_since_posting": diff_since,
-                "current_pr_diff": current,
-            })
-        })
+        .map(|(index, (row, diff))| validation_item_json(index, row, diff, pr_diff))
         .collect();
     format!(
         "{}\n\nValidate each finding in <threads> and respond with JSON only.",
