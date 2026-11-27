@@ -124,7 +124,7 @@ struct ReviewOutput {
 const FINDER_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
 /// When each stage must be done, as fractions of the run's budget (`review_timeout` or
-/// `specialists_review_timeout`) from the run's start (spec 4.11): Finder (clone included)
+/// `specialists_review_timeout`) from the run's start (SPEC.md §8.4): Finder (clone included)
 /// 55 %, Verifier 80 %, post-verify funnel 93 %; the rest is for posting.
 #[derive(Debug, Clone, Copy)]
 struct Deadlines {

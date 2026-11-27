@@ -198,7 +198,7 @@ Stage order for surviving findings after Verification:
    - **The verified `body` is never rewritten.** The Verifier checked the Finder's `body`; a rewrite after verification could add claims nobody checked. Enrichment only adds a title and, when the fix is clear from the code shown, a suggestion. The prompt says the title must restate the body's problem and add nothing the body does not say. The posted comment body is the Finder's `body` (secret-redacted as today).
    - On failure: derives `title` from the body's first sentence (capped at 100 chars) with `suggestion: None`.
 4. **Deterministic Fix Gate (`check_fix` in `enrich.rs`):** Before formatting inline comments, validate any `suggestion`:
-   - Strip `suggestion` and `start_line` (downgrading to a plain comment — never dropping the finding!) if: empty/whitespace-only, identical (ignoring trailing whitespace) to the existing lines it replaces, outside the file's `CommentableRange` hunk (`!spans_one_hunk`), contains markdown fence markers (`` ``` ``), or has unbalanced `()`, `[]`, `{}`.
+   - Strip `suggestion` and `start_line` (downgrading to a plain comment — never dropping the finding!) if: empty/whitespace-only, identical (ignoring trailing whitespace) to the existing lines it replaces, outside the file's `CommentableRange` hunk (`!spans_one_hunk`), contains markdown fence markers (`` ``` ``), or its net `()`, `[]`, `{}` balance (outside string and char literals) differs from that of the lines it replaces (it must be zero when the replaced lines are unknown). Comparing with the replaced lines keeps a fix of a line that opens or closes a block.
 
 ---
 
