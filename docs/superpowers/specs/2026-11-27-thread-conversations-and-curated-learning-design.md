@@ -1,6 +1,6 @@
 # Bot-Labelled Comments, Thread Conversations & Curated Learning — Design Specification
 
-Date: 2026-11-27 · Status: approved (2026-11-27), not implemented
+Date: 2026-11-27 · Status: implemented (consolidated into [docs/SPEC.md](../../SPEC.md) §1, §2.1, §3.1, §4.3, §5, §7, §8.1, §8.4–§8.6, §9, §10)
 
 > **Binding scope & policy:** Extends [docs/SPEC.md](../../SPEC.md), the agentic review engine spec ([2026-11-21-agentic-review-engine-design.md](2026-11-21-agentic-review-engine-design.md)) and the PR discussion spec ([2026-11-23-pr-discussion-awareness-and-learning-design.md](2026-11-23-pr-discussion-awareness-and-learning-design.md)). Where this spec contradicts the 2026-11-23 spec (silent learning, no replies, memories suppress findings), this spec wins. The clean-room and no-assumption rule in `AGENTS.md` applies: Kodus community code may be read as a behaviour reference only (cite it), Kodus enterprise code (`libs/ee/**`, `*.ee.*`) is never opened. All prompts, schemas and code are written fresh for Adus.
 
@@ -75,7 +75,7 @@ The user picked **A** (2026-11-27). Decisions from the conversation (2026-11-27)
 ### 4.1 Label
 
 - Every Adus comment body is `MARKER + "\n" + LABEL + …`. `LABEL` is a short visible line, e.g. `🤖 **Adudu**` followed on the same line by what the comment is:
-  - inline finding: `🤖 **Adudu** · ⚠️ **Warning:** <title>`
+  - inline finding: `🤖 **Adudu** · **⚠️ Warning:** <title>`
   - summary: `🤖 **Adudu** reviewed this PR` (replaces `### Adudu reviewed this PR`)
   - command reply / thread reply: `🤖 **Adudu**` on its own line, then the text.
 - One helper in `crates/review/src/prompt.rs` builds every body so the marker-then-label order is enforced in one place; `format_inline`, `format_summary`, the command reply and the no-model notice use it.
@@ -166,7 +166,7 @@ async fn get_thread(&self, repo: &RepoRef, pr_number: i64, thread: &ThreadRef) -
 
 ### 6.3 Trigger 1: a human reply in an Adus thread
 
-- **Webhook:** GitHub `pull_request_review_comment` (`created`, has `in_reply_to_id`); Azure `ms.vss-code.git-pullrequest-comment-event` with a non-root comment. If the comment is from Adus (§4.2), ignore. If it contains an `@adudu` command, the command path wins (today's behaviour). Otherwise enqueue `Job::ThreadReply { repository_id, pr_number, thread_id, comment_id, author }`; the engine decides whether the thread is Adus's (row in `review_threads`) — not the webhook, which has no DB access beyond the repo lookup it does today.
+- **Webhook:** GitHub `pull_request_review_comment` (`created`, has `in_reply_to_id`); Azure `ms.vss-code.git-pullrequest-comment-event` with a non-root comment. If the comment is from Adus (§4.2), ignore. If it contains an `@adudu` command, the command path wins (today's behaviour). Otherwise enqueue `Job::ThreadReply { repository_id, pr_number, thread_id, comment_id }`; the engine decides whether the thread is Adus's (row in `review_threads`) — not the webhook, which has no DB access beyond the repo lookup it does today.
 - **Engine (`ThreadReply`):** skip silently if no `review_threads` row, the repo is disabled, or the thread's `adus_replies` ≥ `MAX_THREAD_REPLIES` (5). Fetch the thread (`get_thread`) and the PR; one fast-model call (`ReasoningEffort::Low`) with: the finding, the thread so far (redacted, author `adus` for marker comments), and the current code around the finding's path/line at PR head (from a shallow workspace when available, else the PR diff of that file). Output JSON:
 
   ```json
