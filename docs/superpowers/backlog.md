@@ -98,3 +98,16 @@ Cause unknown: harness or model. Kodus has not been run on Sonnet 5.5 here, so t
 ## Verifier refutes on "the caller copes" (2026-11-27, DeepSeek run on PR #21)
 
 - The Verifier refuted `cache.go:124` (transient S3 `Exists` error read as a cache miss) with "the error-swallow is real, but the described harm is refuted … returning the error would fall into the exact same regeneration". That is the "a caller recovers" argument the Finder may no longer use for dismissals; the Verifier's "None of these refutes a finding" list has no such clause. Option: add that a caller coping with the outcome afterwards does not refute a hidden error, an error read as a miss, or a skipped fallback. Kodus's Verifier has no such clause either, so check its behaviour on the same finding first.
+
+## Sharded Rules (plan 2026-11-25-review-engine-sharded-rules, final review 2026-11-27)
+
+- Rule evidence has no per-review cap on candidates: the Finder deadline and the token budget bound it, but a broad rule over a large PR can still start many collectors before the budget runs out.
+- Evidence loops start only after every shard finishes (`run_sharded_rules` collects shards before the evidence stream); pipelining would overlap them.
+- `TokenBudget::wrap_ups()` (read as `finder_wrap_ups` for the summary) now also counts budget-driven rule-collector wrap-ups; a separate counter would keep the Finder note exact.
+- On a `ToolsUnsupported` Finder re-run, shards and collectors that already started still run and fail closed (wasted calls); the diff-only re-run checks `<rules>`.
+- Verified rule findings are lost when every Finder task fails (the review fails and is retried, as with the old Rules specialist).
+- `capped_excerpts` keeps the original `[path: lines X-Y of Z]` header on a truncated excerpt and drops later small excerpts after the first one that crosses the 24,000-char cap.
+- `rules_evidence.rs` `first_object` / `loose_submission` are a third copy of the scan-and-deserialize loop (`parse::first_json_object`, the Verifier's `loose_verdict`); share one helper in `parse.rs`.
+- Tests: no case for collector error / unparseable submission / `no_excerpts` / unparseable judge (fail-closed branches); the shard parser's invalid-entries block never mixes in a valid item; no test pins diff-unredacted vs `<file_content>`-redacted; `evidence_judge_rejects_violated_verdict_without_excerpt_line` actually tests `read_contains_line`; `run_sharded_rules_evaluates_matching_files_and_skips_unmatched` repeats body/severity/model asserts the engine test pins; the tool-less-fast-model case asserts `1..=4` collector calls (proves only that the fifth loop is skipped).
+- The sharded-rules parallelism engine test relies on a 300 ms hold of the Finder; watch it for flakes on a loaded CI runner.
+- Small polish: the shard rule formatter (`[n] (sev) title`) lacks a comment on why it does not reuse `prompt::format_rules`; rule body ends with two parentheticals in a row when `cited_line` is set; `body.push_str(&format!(..))` allocates twice; the first collector that hits `ToolsUnsupported` logs the variant name rather than a reason string; SPEC's fail-closed item does not list the skipped-start reasons (`token_budget`, `no_time_left`, `tools_unsupported`), which the evidence-loop bullet does; `queue_key` keeps an unreachable `ShardedRules` arm for exhaustiveness.
