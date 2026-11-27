@@ -450,6 +450,7 @@ pub(crate) fn format_summary(
     skipped: &[(String, &'static str)],
     ignored: usize,
     warnings: &[String],
+    confirmed_fixed: usize,
 ) -> String {
     let mut out = String::new();
     let rows: Vec<String> = counts
@@ -462,6 +463,11 @@ pub(crate) fn format_summary(
         out.push_str("No issues found.");
     } else {
         out.push_str(&rows.join("\n"));
+    }
+    if confirmed_fixed > 0 {
+        out.push_str(&format!(
+            "\n\n{confirmed_fixed} earlier finding(s) confirmed fixed."
+        ));
     }
     match ignored {
         0 => {}
@@ -620,9 +626,13 @@ mod tests {
             "Codebase context unavailable — reviewed diff only".to_string(),
             "Performance reviewer did not complete".to_string(),
         ];
-        let summary = format_summary(&counts, &skipped, 3, &warnings);
+        let summary = format_summary(&counts, &skipped, 3, &warnings, 2);
         assert!(summary.starts_with("<!-- adudu -->\n🤖 **Adudu** reviewed this PR\n\n"));
-        assert!(summary.contains("- 🚨 Critical: 2\n- ℹ️ Info: 1\n\n3 files ignored\n\n"));
+        assert!(summary.contains(
+            "- 🚨 Critical: 2\n- ℹ️ Info: 1\n\n\
+             2 earlier finding(s) confirmed fixed.\n\n\
+             3 files ignored\n\n"
+        ));
         assert!(!summary.contains("Warning"));
         assert!(summary.ends_with(
             "**Skipped files**\n\
@@ -633,10 +643,10 @@ mod tests {
              - Performance reviewer did not complete"
         ));
 
-        let one = format_summary(&BTreeMap::new(), &[], 1, &[]);
+        let one = format_summary(&BTreeMap::new(), &[], 1, &[], 0);
         assert!(one.ends_with("No issues found.\n\n1 file ignored"));
 
-        let empty = format_summary(&BTreeMap::from([(Severity::Info, 0)]), &[], 0, &[]);
+        let empty = format_summary(&BTreeMap::from([(Severity::Info, 0)]), &[], 0, &[], 0);
         assert!(empty.contains(MARKER));
         assert!(empty.contains("No issues found."));
         assert!(!empty.contains("Skipped"));

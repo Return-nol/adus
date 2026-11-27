@@ -283,18 +283,33 @@ impl Engine {
         reviews::set_running(&self.db, review_id, &pr.base_sha, &pr.head_sha)
             .await
             .map_err(db_error)?;
+        let settings = settings::get(&self.db).await.map_err(db_error)?;
+        let models = self.models(repo, &settings).await?;
+        let confirmed_fixed = if matches!(trigger, Trigger::Updated | Trigger::Command)
+            && let Some((provider_id, _, fast_model)) = &models
+        {
+            self.validate_open_threads(
+                git.as_ref(),
+                &repo_ref,
+                repo,
+                &pr,
+                (*provider_id, fast_model.as_str()),
+                &settings,
+            )
+            .await
+        } else {
+            0
+        };
         if pr.is_draft && trigger != Trigger::Command {
             return Ok(Outcome::Skipped("draft"));
         }
 
-        let settings = settings::get(&self.db).await.map_err(db_error)?;
         // Sebelum cek model dan diff: PR yang dilewati tidak memicu komentar atau fetch diff.
         if trigger != Trigger::Command && title_matches(&pr.title, &settings.ignored_title_keywords)
         {
             return Ok(Outcome::Skipped("ignored_title"));
         }
-        let Some((provider_id, primary_model, fast_model)) = self.models(repo, &settings).await?
-        else {
+        let Some((provider_id, primary_model, fast_model)) = models else {
             // Azure mengirim `updated` juga untuk vote/reviewer: komentar hanya saat PR dibuka
             // atau diminta lewat `@adudu review`, supaya tidak spam.
             // Bukan kegagalan: tanpa baris failed atau dead letter untuk setiap push.
@@ -485,7 +500,13 @@ impl Engine {
                     )
                     .await?
                 };
-                let summary = format_summary(&output.counts, &skipped, ignored, &warnings);
+                let summary = format_summary(
+                    &output.counts,
+                    &skipped,
+                    ignored,
+                    &warnings,
+                    confirmed_fixed,
+                );
                 let (summary, summary_redacted) = redact_owned(summary);
                 tracing::debug!(
                     redacted_tool_outputs = output.redacted_tool_outputs,

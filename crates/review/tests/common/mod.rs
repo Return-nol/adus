@@ -267,9 +267,16 @@ impl GitProvider for FakeGit {
         &self,
         _repo: &RepoRef,
         _pr_number: i64,
-        _thread: &ThreadRef,
+        thread: &ThreadRef,
     ) -> Result<PrThread, GitError> {
-        self.state().thread.clone().ok_or(GitError::NotFound)
+        let state = self.state();
+        state
+            .threads
+            .iter()
+            .find(|t| t.id.as_deref() == Some(thread.thread_id.as_str()))
+            .cloned()
+            .or_else(|| state.thread.clone())
+            .ok_or(GitError::NotFound)
     }
 
     async fn post_comment(
@@ -379,6 +386,10 @@ pub struct FakeChat {
 impl FakeChat {
     pub fn reply(&self, text: &str) {
         self.replies.lock().unwrap().push_back(Ok(text.into()));
+    }
+
+    pub fn reply_error(&self, err: ChatError) {
+        self.replies.lock().unwrap().push_back(Err(err));
     }
 
     pub fn requests(&self) -> Vec<(ChatRequest, UsageContext)> {

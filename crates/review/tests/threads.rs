@@ -4,12 +4,15 @@ mod common;
 
 use std::sync::Arc;
 
+use adus_core::job::Trigger;
 use adus_core::types::Severity;
 use adus_db::review_threads::{self, NewReviewThread, ReviewThread, ThreadOutcome, ThreadUpdate};
+use adus_db::reviews::{self, ReviewStatus};
 use adus_db::settings;
 use adus_db::users::{self, Role};
 use adus_git::{FileDiff, FileStatus, PrThread, PrThreadComment, ThreadRef, ThreadStatus};
 use adus_llm::ReasoningEffort;
+use adus_llm::router::ChatError;
 use common::{FakeChat, FakeGit, NoopCloner, Setup, pr};
 use serde_json::json;
 use sqlx::PgPool;
@@ -382,4 +385,265 @@ async fn comment_with_secret_is_redacted_in_prompt(pool: PgPool) {
     let posted = replies(&s);
     assert_eq!(posted.len(), 1);
     assert!(!posted[0].contains(&token));
+}
+
+fn validate_answer(verdict: &str, resolution: &str, reply: &str) -> String {
+    json!({
+        "threads": [{
+            "index": 0,
+            "verdict": verdict,
+            "resolution": resolution,
+            "reply": reply,
+        }]
+    })
+    .to_string()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn push_confirms_fixed_thread(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    s.git.state().incremental = vec![FileDiff {
+        path: "src/a.rs".into(),
+        old_path: None,
+        status: FileStatus::Modified,
+        patch: Some("@@ -1,2 +1,3 @@\n fn retry() {\n+    sleep(backoff);\n }\n".into()),
+    }];
+    chat.reply(&validate_answer(
+        "fixed",
+        "Added backoff sleep in retry loop.",
+        "Confirmed fixed in the latest push.",
+    ));
+    chat.reply("[]");
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap();
+
+    let requests = chat.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].0.model, "gpt-fast");
+    assert_eq!(requests[0].0.effort, Some(ReasoningEffort::Low));
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Fixed);
+    assert_eq!(row.fix_sha.as_deref(), Some("h2"));
+    assert_eq!(
+        row.resolution.as_deref(),
+        Some("Added backoff sleep in retry loop.")
+    );
+    assert_eq!(row.validated_head_sha.as_deref(), Some("h2"));
+    assert_eq!(row.adus_replies, 1);
+    assert_eq!(
+        s.git.state().statuses,
+        [(thread_ref(), ThreadStatus::Fixed)]
+    );
+    assert_eq!(
+        replies(&s),
+        [format!("{LABEL}Confirmed fixed in the latest push.")]
+    );
+    let reviews = s.git.state().reviews.clone();
+    assert_eq!(reviews.len(), 1);
+    assert!(
+        reviews[0]
+            .summary
+            .contains("1 earlier finding(s) confirmed fixed."),
+        "{}",
+        reviews[0].summary
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn unchanged_head_makes_no_llm_call(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    s.git.state().pr.head_sha = "h1".into();
+    let prev = reviews::insert(
+        &pool,
+        reviews::NewReview {
+            repository_id: s.repository_id,
+            pr_number: 7,
+            trigger: Trigger::Opened,
+        },
+    )
+    .await
+    .unwrap();
+    reviews::set_running(&pool, prev.id, "base", "h1")
+        .await
+        .unwrap();
+    reviews::finish(&pool, prev.id, ReviewStatus::Done, 1, None, None)
+        .await
+        .unwrap();
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap();
+
+    assert!(chat.requests().is_empty());
+    assert!(replies(&s).is_empty());
+    assert!(s.git.state().statuses.is_empty());
+    assert_eq!(row(&pool, s.repository_id).await.validated_head_sha, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn not_fixed_on_push_does_not_reply(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    s.git.state().incremental = vec![FileDiff {
+        path: "src/a.rs".into(),
+        old_path: None,
+        status: FileStatus::Modified,
+        patch: Some("@@ -1,2 +1,2 @@\n fn retry() {\n+    // unrelated comment\n }\n".into()),
+    }];
+    chat.reply(&validate_answer("not_fixed", "", "Still missing backoff."));
+    chat.reply("[]");
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap();
+
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Open);
+    assert_eq!(row.fix_sha, None);
+    assert_eq!(row.validated_head_sha.as_deref(), Some("h2"));
+    assert_eq!(row.adus_replies, 0);
+    assert!(s.git.state().statuses.is_empty());
+    assert!(replies(&s).is_empty());
+    assert!(
+        !s.git.state().reviews[0]
+            .summary
+            .contains("earlier finding(s) confirmed fixed.")
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn validation_runs_when_review_is_skipped_as_draft(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    {
+        let mut state = s.git.state();
+        state.pr.is_draft = true;
+        state.incremental = vec![FileDiff {
+            path: "src/a.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            patch: Some("@@ -1,2 +1,3 @@\n fn retry() {\n+    sleep(backoff);\n }\n".into()),
+        }];
+    }
+    chat.reply(&validate_answer(
+        "fixed",
+        "Backoff added.",
+        "Confirmed fixed.",
+    ));
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap();
+
+    assert_eq!(chat.requests().len(), 1);
+    assert_eq!(chat.requests()[0].0.model, "gpt-fast");
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Fixed);
+    assert_eq!(row.fix_sha.as_deref(), Some("h2"));
+    assert_eq!(row.validated_head_sha.as_deref(), Some("h2"));
+    assert_eq!(replies(&s), [format!("{LABEL}Confirmed fixed.")]);
+    assert!(s.git.state().reviews.is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn deleted_file_fix_is_confirmed(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    let deleted = FileDiff {
+        path: "src/a.rs".into(),
+        old_path: None,
+        status: FileStatus::Deleted,
+        patch: Some("@@ -1,2 +0,0 @@\n-fn retry() {\n-}\n".into()),
+    };
+    {
+        let mut state = s.git.state();
+        state.full = vec![deleted.clone()];
+        state.incremental = vec![deleted];
+    }
+    chat.reply(&validate_answer(
+        "fixed",
+        "File was deleted.",
+        "Confirmed fixed: the file was removed.",
+    ));
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap();
+
+    let prompt = chat.prompt();
+    assert!(prompt.contains("\"deleted\""), "{prompt}");
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Fixed);
+    assert_eq!(row.fix_sha.as_deref(), Some("h2"));
+    assert_eq!(
+        replies(&s),
+        [format!("{LABEL}Confirmed fixed: the file was removed.")]
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn validation_error_does_not_fail_review(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    s.git.state().incremental = vec![FileDiff {
+        path: "src/a.rs".into(),
+        old_path: None,
+        status: FileStatus::Modified,
+        patch: Some("@@ -1,2 +1,3 @@\n fn retry() {\n+    sleep(backoff);\n }\n".into()),
+    }];
+    chat.reply_error(ChatError::AllKeysFailed { retry_after: None });
+    chat.reply("[]");
+
+    let review_id = s
+        .engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let review = reviews::last_done(&pool, s.repository_id, 7)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(review.id, review_id);
+    assert_eq!(review.status, ReviewStatus::Done);
+    assert_eq!(s.git.state().reviews.len(), 1);
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Open);
+    assert_eq!(row.validated_head_sha, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn human_resolved_thread_is_synced_not_validated(pool: PgPool) {
+    let (s, chat) = setup(&pool).await;
+    {
+        let mut state = s.git.state();
+        state.incremental = vec![FileDiff {
+            path: "src/a.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            patch: Some("@@ -1,2 +1,3 @@\n fn retry() {\n+    sleep(backoff);\n }\n".into()),
+        }];
+        state.thread.as_mut().unwrap().resolved = true;
+    }
+    chat.reply("[]");
+
+    s.engine
+        .review_pr(s.repository_id, 7, Trigger::Updated, None)
+        .await
+        .unwrap();
+
+    let requests = chat.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0.model, "gpt-test");
+    let row = row(&pool, s.repository_id).await;
+    assert_eq!(row.outcome, ThreadOutcome::Fixed);
+    assert_eq!(row.fix_sha, None);
+    assert_eq!(row.resolution, None);
+    assert_eq!(row.validated_head_sha, None);
+    assert!(s.git.state().statuses.is_empty());
+    assert!(replies(&s).is_empty());
 }
