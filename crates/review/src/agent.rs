@@ -1,6 +1,7 @@
 //! Reusable ReAct agent loop: the model calls read-only repository tools until it submits its
 //! result through one terminal tool. Context compaction and a one-shot context-overflow
-//! recovery keep long runs within the model's window. Used by the Finder and the Verifier.
+//! recovery keep long runs within the model's window. Used by the Finder, the Verifier and the
+//! rule evidence collector.
 //!
 //! Loop policies, each switched on through [`AgentConfig`]: coverage debt notes and the one-shot
 //! completion gate (gated Finder runs), step-budget band notes (Finder runs), a tool-free final
@@ -102,6 +103,9 @@ pub(crate) struct AgentConfig {
     /// `read_file` calls spanning fewer than [`VERIFY_WIDEN_SPAN_THRESHOLD`] lines are widened
     /// by [`VERIFY_WIDEN_BEFORE`] lines before and [`VERIFY_WIDEN_AFTER`] after.
     pub widen_short_reads: bool,
+    /// Keep the output of every successful `read_file` call in
+    /// [`AgentOutcome::read_outputs`] (rule evidence collector runs only).
+    pub capture_reads: bool,
 }
 
 impl AgentConfig {
@@ -119,6 +123,7 @@ impl AgentConfig {
             no_tools_on_last_step: false,
             budget_bands: false,
             widen_short_reads: false,
+            capture_reads: false,
         }
     }
 }
@@ -142,6 +147,10 @@ pub(crate) struct AgentOutcome<T> {
     /// first, each as `tool(arguments)` with secrets redacted and the arguments cut to
     /// [`TOOL_CALL_ARGS_CHARS`] characters.
     pub recent_tool_calls: Vec<String>,
+    /// `(normalized path, output)` of every successful `read_file` call with a
+    /// `[path: lines X-Y of Z]` header, in call order. Empty unless
+    /// [`AgentConfig::capture_reads`] is set.
+    pub read_outputs: Vec<(String, String)>,
 }
 
 impl<T> AgentOutcome<T> {
@@ -155,6 +164,7 @@ impl<T> AgentOutcome<T> {
             opened_files: self.opened_files,
             mean_step: self.mean_step,
             recent_tool_calls: self.recent_tool_calls,
+            read_outputs: self.read_outputs,
         }
     }
 }
@@ -436,6 +446,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
                 &results,
                 ledger.as_mut(),
                 &mut tally.opened_files,
+                config.capture_reads.then_some(&mut tally.read_outputs),
             )
             .await;
         }
@@ -490,13 +501,15 @@ fn widen_short_read(call: &ToolCall) -> Option<ToolCall> {
 }
 
 /// Records every successful `read_file` of a turn whose output has a `[path: lines X-Y of Z]`
-/// header: the lines shown go into `ledger`, and its file into `opened`. Path resolution runs off the async runtime.
+/// header: the lines shown go into `ledger`, its file into `opened`, and the output into
+/// `outputs` when given. Path resolution runs off the async runtime.
 async fn record_reads(
     toolbox: &Toolbox,
     calls: &[ToolCall],
     results: &[ToolResult],
     mut ledger: Option<&mut CoverageLedger>,
     opened: &mut HashSet<String>,
+    mut outputs: Option<&mut Vec<(String, String)>>,
 ) {
     for (call, result) in calls.iter().zip(results) {
         if result.is_error {
@@ -512,6 +525,9 @@ async fn record_reads(
         };
         if let Some(ledger) = ledger.as_deref_mut() {
             ledger.record_read(&path, start, end);
+        }
+        if let Some(outputs) = outputs.as_deref_mut() {
+            outputs.push((path.clone(), result.content.clone()));
         }
         opened.insert(path);
     }
@@ -661,7 +677,7 @@ impl WrapUp {
     }
 }
 
-/// Steps, LLM time, opened files and recent tool calls of one run.
+/// Steps, LLM time, opened files, recent tool calls and captured reads of one run.
 #[derive(Default)]
 struct Tally {
     steps_used: usize,
@@ -669,6 +685,7 @@ struct Tally {
     llm_time: Duration,
     opened_files: HashSet<String>,
     recent_calls: VecDeque<String>,
+    read_outputs: Vec<(String, String)>,
 }
 
 impl Tally {
@@ -700,6 +717,7 @@ impl Tally {
             opened_files: std::mem::take(&mut self.opened_files),
             mean_step,
             recent_tool_calls: std::mem::take(&mut self.recent_calls).into(),
+            read_outputs: std::mem::take(&mut self.read_outputs),
         }
     }
 }

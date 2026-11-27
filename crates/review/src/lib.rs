@@ -12,6 +12,7 @@ mod parse;
 mod prompt;
 mod redact;
 mod repo_instructions;
+mod rules_evidence;
 mod rules_judge;
 mod severity;
 mod small_pr;
