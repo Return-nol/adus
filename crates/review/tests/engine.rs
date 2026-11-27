@@ -59,6 +59,12 @@ mod support {
         Dedup,
         Severity,
         Enrich,
+        /// One Sharded Rules call on one changed file.
+        RuleShard,
+        /// A step of the evidence collector of one rule violation.
+        RuleEvidenceCollector,
+        /// The evidence judge of one rule violation.
+        RuleEvidenceJudge,
     }
 
     fn stage_of(system: &str, user: &str) -> Stage {
@@ -76,6 +82,12 @@ mod support {
             Stage::Severity
         } else if system.contains("You write the headline of one verified finding") {
             Stage::Enrich
+        } else if system.starts_with("You check one changed file against the team's rules") {
+            Stage::RuleShard
+        } else if system.starts_with("You gather evidence for one team-rule violation") {
+            Stage::RuleEvidenceCollector
+        } else if system.starts_with("You judge one team-rule violation from collected evidence") {
+            Stage::RuleEvidenceJudge
         } else {
             panic!("unexpected chat system prompt: {system}");
         }
@@ -249,6 +261,20 @@ mod support {
             self.calls_of(Stage::Enrich)
         }
 
+        pub fn stage_calls(&self, stage: Stage) -> Vec<ChatCall> {
+            self.calls_of(stage)
+        }
+
+        /// Index in [`FakeChat::calls`] of each call of `stage`.
+        pub fn positions(&self, stage: Stage) -> Vec<usize> {
+            self.calls()
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.stage == stage)
+                .map(|(i, _)| i)
+                .collect()
+        }
+
         /// Finder calls that contain `needle` answer after `delay`.
         pub fn delay(&self, needle: &str, delay: Duration) {
             self.delays
@@ -286,7 +312,12 @@ mod support {
                 None => {
                     let reply = match stage {
                         Stage::Verifier => Reply::text(r#"{"keep": true, "rationale": "fake"}"#),
-                        Stage::Dedup | Stage::Severity | Stage::Enrich => Reply::text("no answer"),
+                        Stage::Dedup
+                        | Stage::Severity
+                        | Stage::Enrich
+                        | Stage::RuleEvidenceCollector
+                        | Stage::RuleEvidenceJudge => Reply::text("no answer"),
+                        Stage::RuleShard => Reply::text(r#"{"violations": []}"#),
                         Stage::Finder | Stage::Synthesis => Reply::text("[]"),
                     };
                     (reply, None)
@@ -653,7 +684,6 @@ const GENERALIST_ROLE: &str = "You are the generalist reviewer";
 const BUG_ROLE: &str = "You are the correctness reviewer";
 const SECURITY_ROLE: &str = "You are the security reviewer";
 const PERFORMANCE_ROLE: &str = "You are the performance reviewer";
-const RULES_ROLE: &str = "You are the team-rules reviewer";
 
 const CODEBASE_NOTE: &str = "Codebase context unavailable — reviewed diff only";
 const TOOLS_NOTE: &str = "Model does not support tool calling — reviewed diff only";
@@ -1362,16 +1392,10 @@ async fn review_mode_precedence_command_overrides_repo_overrides_settings(pool: 
         s.chat.finder_calls()[from..]
             .iter()
             .map(|c| {
-                [
-                    GENERALIST_ROLE,
-                    BUG_ROLE,
-                    SECURITY_ROLE,
-                    PERFORMANCE_ROLE,
-                    RULES_ROLE,
-                ]
-                .into_iter()
-                .find(|role| c.system.contains(role))
-                .expect("a Finder role")
+                [GENERALIST_ROLE, BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE]
+                    .into_iter()
+                    .find(|role| c.system.contains(role))
+                    .expect("a Finder role")
             })
             .collect()
     };
@@ -1917,7 +1941,7 @@ Off by one when the list is empty."
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(pool: PgPool) {
+async fn specialists_mode_runs_bug_security_performance_and_dedups(pool: PgPool) {
     let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
     insert_rule(&pool).await;
     s.chat.finder_role(
@@ -1950,19 +1974,20 @@ async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(poo
     assert_eq!(row.comments_posted, 1);
 
     let finder = s.chat.finder_calls();
-    assert_eq!(finder.len(), 4, "Bug, Security, Performance and Rules");
-    for role in [BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE, RULES_ROLE] {
+    assert_eq!(finder.len(), 3, "Bug, Security and Performance");
+    for role in [BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE] {
+        let calls: Vec<_> = finder.iter().filter(|c| c.system.contains(role)).collect();
+        assert_eq!(calls.len(), 1, "{role}");
+        assert_eq!(calls[0].model, "gpt-test");
+        assert_eq!(calls[0].effort, Some(ReasoningEffort::High));
+        // Without the clone no Sharded Rules run: the rules go to Bug, which checks them.
         assert_eq!(
-            finder.iter().filter(|c| c.system.contains(role)).count(),
-            1,
+            calls[0].user.contains("No unwrap"),
+            role == BUG_ROLE,
             "{role}"
         );
     }
-    for call in &finder {
-        assert_eq!(call.model, "gpt-test");
-        assert_eq!(call.effort, Some(ReasoningEffort::High));
-        assert!(call.user.contains("No unwrap"));
-    }
+    assert!(s.chat.stage_calls(Stage::RuleShard).is_empty());
 
     // The Verifier keeps both findings; dedup merges them into one.
     let verifier = s.chat.verifier_calls();
@@ -2304,17 +2329,29 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
         .await
         .unwrap();
     let finder = &s.chat.finder_calls()[before..];
-    // Bug, Security, Performance and Rules, plus Bug's second call (the completion gate
-    // refuses its first submission because `a.rs` is unread); then Bug's synthesis rescue.
-    assert_eq!(finder.len(), 5);
+    // Bug, Security and Performance, plus Bug's second call (the completion gate refuses its
+    // first submission because `a.rs` is unread); then Bug's synthesis rescue.
+    assert_eq!(finder.len(), 4);
     assert_eq!(s.chat.synthesis_calls().len(), 2);
-    assert_eq!(
-        finder
+    // Every specialist sees the instructions; Bug is the one told to check the hunks against
+    // them.
+    for role in [BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE] {
+        let call = finder
             .iter()
-            .filter(|c| c.system.contains(RULES_ROLE))
-            .count(),
-        1
-    );
+            .find(|c| c.system.contains(role))
+            .expect("a call of each role");
+        assert!(
+            call.user
+                .contains("<repository_instructions>\n--- AGENTS.md ---\nAlways log with tracing"),
+            "{role}"
+        );
+        assert_eq!(
+            call.system
+                .contains("check the changed hunks against <repository_instructions>"),
+            role == BUG_ROLE,
+            "{role}"
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -2884,4 +2921,108 @@ async fn finder_anchor_bounce_then_mixed_final_submission_posts_valid_finding(po
     assert_eq!(posted.comments[0].line, 2);
     assert!(posted.comments[0].body.contains("Valid bug"));
     assert!(!posted.summary.contains("review output could not be parsed"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_runs_sharded_rules_in_parallel_and_skips_general_verifier(pool: PgPool) {
+    let logs = captured_logs();
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    insert_rule(&pool).await;
+    s.enable_clone(&[("src/a.rs", "let a = x.unwrap();\nb\nc\nd\n")]);
+    s.chat
+        .finder(Reply::tool("read_file", json!({"path": "src/a.rs"})));
+    s.chat.finder(Reply::finding("src/a.rs", 3, "Finder bug"));
+    // The shard cites context line 1, which moves to the nearest `+` line, 2.
+    s.chat.push_stage(
+        Stage::RuleShard,
+        Reply::text(
+            r#"{"violations": [{"rule_id": 1, "line": 1, "claim": "`x.unwrap()` panics"}]}"#,
+        ),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceCollector,
+        Reply::tool("read_file", json!({"path": "src/a.rs"})),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceCollector,
+        Reply::tool(
+            "submit_evidence",
+            json!({"keep": true, "confidence": "high", "rationale": "src/a.rs:1 unwraps"}),
+        ),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceJudge,
+        Reply::text(
+            r#"{"verdict": "violated", "path": "src/a.rs", "line": 1, "rationale": "it calls unwrap"}"#,
+        ),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 2);
+
+    // The tool-enabled Finder is not shown the rules; the shard is, on the fast model at High.
+    let finder = s.chat.finder_calls();
+    assert!(finder.iter().all(|c| !c.user.contains("No unwrap")));
+    let shards = s.chat.stage_calls(Stage::RuleShard);
+    assert_eq!(shards.len(), 1);
+    assert!(shards[0].user.contains("[1] (critical) No unwrap"));
+    assert!(
+        shards[0]
+            .user
+            .contains("<file_content>\n1: let a = x.unwrap();")
+    );
+    assert_eq!(shards[0].model, "gpt-fast");
+    assert_eq!(shards[0].effort, Some(ReasoningEffort::High));
+    // Run alongside the Finder: the shard starts before the Finder's last call.
+    let last_finder = *s
+        .chat
+        .positions(Stage::Finder)
+        .last()
+        .expect("finder calls");
+    assert!(s.chat.positions(Stage::RuleShard)[0] < last_finder);
+    assert_eq!(s.chat.stage_calls(Stage::RuleEvidenceCollector).len(), 2);
+    assert_eq!(s.chat.stage_calls(Stage::RuleEvidenceJudge).len(), 1);
+
+    // Only the Finder's finding goes to the general Verifier.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 1);
+    assert!(verifier[0].user.contains("Finder bug"));
+    // Both findings meet in Dedup; the rule finding is reported by the team rules.
+    let dedup = s.chat.dedup_calls();
+    assert_eq!(dedup.len(), 1);
+    assert!(dedup[0].user.contains("\"reported_by\": \"Team rules\""));
+    assert!(dedup[0].user.contains("Finder bug"));
+    assert_eq!(s.chat.enrich_calls().len(), 2);
+
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    let rule_comment = posted
+        .comments
+        .iter()
+        .find(|c| c.body.contains("Rule \"No unwrap\""))
+        .expect("the rule finding is posted");
+    assert_eq!(rule_comment.line, 2);
+    assert!(rule_comment.body.contains("**🚨 Critical:**"));
+    assert!(rule_comment.body.contains(
+        "Rule \"No unwrap\": `x.unwrap()` panics (verified at src/a.rs:1: it calls unwrap) \
+         (line 1, outside the changed lines)"
+    ));
+    assert!(posted.summary.contains("Critical: 1"));
+
+    let review_id = format!("review_id={id}");
+    let line = logs
+        .line(&["review stages finished", &review_id])
+        .expect("stage log");
+    for field in [
+        "verify_candidates=1",
+        "rule_shards=1",
+        "rule_candidates=1",
+        "rule_verified=1",
+        "kept_by_origin=pass1=1 synthesis_rescue=0 prose_recovery=0 sharded_rules=1",
+    ] {
+        assert!(line.contains(field), "{field} missing: {line}");
+    }
 }

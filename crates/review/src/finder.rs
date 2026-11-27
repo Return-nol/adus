@@ -156,7 +156,7 @@ pub(crate) fn batch_allowed<'a>(
         .collect()
 }
 
-/// Which Finder pass produced a finding.
+/// Which pass produced a finding: one of the Finder's, or the Sharded Rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FinderPass {
     Pass1,
@@ -164,6 +164,9 @@ pub(crate) enum FinderPass {
     SynthesisRescue,
     /// Recovered from a pass's prose by the fast model.
     ProseRecovery,
+    /// A team-rule violation the Sharded Rules verified with evidence (`rules_judge.rs`); it
+    /// skips the Verifier.
+    ShardedRules,
 }
 
 impl FinderPass {
@@ -172,6 +175,7 @@ impl FinderPass {
             Self::Pass1 => "pass1",
             Self::SynthesisRescue => "synthesis_rescue",
             Self::ProseRecovery => "prose_recovery",
+            Self::ShardedRules => "sharded_rules",
         }
     }
 }
@@ -302,18 +306,7 @@ async fn run_all(
         .iter()
         .enumerate()
         .map(|(index, batch)| {
-            let prompt = build_finder_user_prompt(
-                input.pr,
-                input.manifest,
-                batch,
-                input.memories,
-                input.repo_instructions,
-                with_tools,
-            );
-            let kinds = active_specialists(
-                input.mode,
-                !batch.rules.is_empty() || input.repo_instructions.is_some(),
-            );
+            let kinds = active_specialists(input.mode);
             let allowed = batch_allowed(batch, input.allowed);
             async move {
                 // Checked when the batch starts (the stream polls it), not when it is built.
@@ -327,9 +320,18 @@ async fn run_all(
                 let agents: Vec<_> = kinds
                     .into_iter()
                     .map(|kind| {
+                        let prompt = build_finder_user_prompt(
+                            input.pr,
+                            input.manifest,
+                            batch,
+                            input.memories,
+                            input.repo_instructions,
+                            kind,
+                            with_tools,
+                        );
                         let job = FinderJob {
                             kind,
-                            prompt: prompt.clone(),
+                            prompt,
                             files: &batch.files,
                             max_steps: finder_max_steps(batch.files.len()),
                             rescue: false,

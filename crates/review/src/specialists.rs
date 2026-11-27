@@ -1,4 +1,6 @@
 //! Finder roles: the generalist reviewer and the focused specialists of `ReviewMode::Specialists`.
+//! Team rules are checked by the Sharded Rules (`rules_judge.rs`) whenever the repository tools
+//! are available; only diff-only Finder runs check them, in the Generalist or Bug role.
 
 use adus_core::types::ReviewMode;
 
@@ -13,14 +15,12 @@ pub(crate) enum SpecialistKind {
     Bug,
     Security,
     Performance,
-    /// Team rules and repository instructions only. Runs when a rule matches the batch or repository instructions are loaded.
-    Rules,
 }
 
-const GENERALIST_ROLE: &str = "<Role>
-You are the generalist reviewer. Challenge every changed function through all three lenses below, \
-then check the matching <rules> and <repository_instructions> against the changed hunks.
-Bug lens:
+/// The three lenses of the Generalist role, shared by its tool-enabled and diff-only blocks.
+macro_rules! generalist_lenses {
+    () => {
+        "Bug lens:
 - swallowed errors: an error logged and dropped, replaced by a default value, or never returned;
 - an error treated as a miss: a failed lookup read as a cache miss or not-found, so the caller \
 carries on with missing data;
@@ -46,45 +46,73 @@ Performance lens:
 - queries or network calls inside loops, queries without a limit, loops and collections that \
 grow without bound with the input;
 - blocking calls on async or hot paths, expensive work repeated where it could run once.
-Give each finding the \"category\" of the lens it belongs to, or \"repo_instruction\" when it \
+"
+    };
+}
+
+/// The correctness checklist of the Bug role, shared by its tool-enabled and diff-only blocks.
+macro_rules! bug_checklist {
+    () => {
+        "You are the correctness reviewer. Challenge every changed function for code that does the wrong \
+thing:
+- swallowed errors, errors treated as a cache miss or not-found, dropped fallbacks and defaults;
+- for every branch the change adds or reroutes (a new mode, location, provider or flag value): \
+what happens when that branch's own dependency is missing, disabled or fails, and whether it \
+still reaches a correct fallback instead of a generic default;
+- wrong conditions, off-by-one errors, missing None/null cases, empty/zero/very large/unicode \
+inputs, SQL NULL propagation (CONCAT, outer joins, NOT IN);
+- broken invariants or contracts that callers rely on, wrappers that drop or swap an argument;
+- races and check-then-act windows, partial updates, resource leaks, stale cache or index state, \
+migrations or ORM mappings that disagree with the code.
+"
+    };
+}
+
+const GENERALIST_ROLE: &str = concat!(
+    "<Role>
+You are the generalist reviewer. Challenge every changed function through all three lenses below, \
+then check the changed hunks against <repository_instructions>.
+",
+    generalist_lenses!(),
+    "Give each finding the \"category\" of the lens it belongs to, or \"repo_instruction\" when it \
+breaks a repository instruction. The team rules are checked separately; leave them out.
+</Role>"
+);
+
+const GENERALIST_ROLE_DIFF_ONLY: &str = concat!(
+    "<Role>
+You are the generalist reviewer. Challenge every changed function through all three lenses below, \
+then check the changed hunks against the matching <rules> and <repository_instructions>.
+",
+    generalist_lenses!(),
+    "Give each finding the \"category\" of the lens it belongs to, or \"repo_instruction\" when it \
 breaks a team rule or repository instruction.
-</Role>";
+</Role>"
+);
 
-const BUG_ROLE: &str = "<Role>
-You are the correctness reviewer. Challenge every changed function for code that does the wrong \
-thing:
-- swallowed errors, errors treated as a cache miss or not-found, dropped fallbacks and defaults;
-- for every branch the change adds or reroutes (a new mode, location, provider or flag value): \
-what happens when that branch's own dependency is missing, disabled or fails, and whether it \
-still reaches a correct fallback instead of a generic default;
-- wrong conditions, off-by-one errors, missing None/null cases, empty/zero/very large/unicode \
-inputs, SQL NULL propagation (CONCAT, outer joins, NOT IN);
-- broken invariants or contracts that callers rely on, wrappers that drop or swap an argument;
-- races and check-then-act windows, partial updates, resource leaks, stale cache or index state, \
-migrations or ORM mappings that disagree with the code.
-Use grep and read_file on callers, callees and sibling implementations to find contract drift \
+const BUG_ROLE: &str = concat!(
+    "<Role>\n",
+    bug_checklist!(),
+    "Use grep and read_file on callers, callees and sibling implementations to find contract drift \
 before promoting or dismissing a suspicion.
-Other reviewers cover security, performance and the team rules. Leave those and unrequested style \
-to them.
-</Role>";
+Then check the changed hunks against <repository_instructions>, and give a finding that breaks \
+one the category \"repo_instruction\".
+Other reviewers cover security, performance and the team rules. Leave those, and style no \
+repository instruction asks for, to them.
+</Role>"
+);
 
-const BUG_ROLE_DIFF_ONLY: &str = "<Role>
-You are the correctness reviewer. Challenge every changed function for code that does the wrong \
-thing:
-- swallowed errors, errors treated as a cache miss or not-found, dropped fallbacks and defaults;
-- for every branch the change adds or reroutes (a new mode, location, provider or flag value): \
-what happens when that branch's own dependency is missing, disabled or fails, and whether it \
-still reaches a correct fallback instead of a generic default;
-- wrong conditions, off-by-one errors, missing None/null cases, empty/zero/very large/unicode \
-inputs, SQL NULL propagation (CONCAT, outer joins, NOT IN);
-- broken invariants or contracts that callers rely on, wrappers that drop or swap an argument;
-- races and check-then-act windows, partial updates, resource leaks, stale cache or index state, \
-migrations or ORM mappings that disagree with the code.
-Compare the callers, callees and sibling implementations visible in the diff for contract drift \
+const BUG_ROLE_DIFF_ONLY: &str = concat!(
+    "<Role>\n",
+    bug_checklist!(),
+    "Compare the callers, callees and sibling implementations visible in the diff for contract drift \
 before promoting or dismissing a suspicion.
-Other reviewers cover security, performance and the team rules. Leave those and unrequested style \
-to them.
-</Role>";
+Then check the changed hunks against the matching <rules> and <repository_instructions>, and give \
+a finding that breaks one the category \"repo_instruction\".
+Other reviewers cover security and performance. Leave those, and style no rule or instruction \
+asks for, to them.
+</Role>"
+);
 
 const SECURITY_ROLE: &str = "<Role>
 You are the security reviewer. Challenge every changed function as an attacker would:
@@ -95,6 +123,7 @@ template, path, URL fetches (SSRF), deserialization;
 an error or a missing value;
 - look for secrets in code or logs, weak or misused cryptography, and sensitive data exposed in \
 responses or error messages.
+<repository_instructions> is context only: the correctness reviewer checks the code against it.
 Other reviewers cover general bugs, performance and the team rules. Leave those to them, and do \
 not report pure style or convention issues.
 </Role>";
@@ -108,20 +137,9 @@ copies or allocations inside loops;
 - blocking calls on async or hot paths, and expensive work repeated where it could run once.
 Establish how large the input and how hot the call site really are before reporting; small, \
 bounded data is not a finding.
+<repository_instructions> is context only: the correctness reviewer checks the code against it.
 Other reviewers cover general bugs, security and the team rules. Leave those to them, and do \
 not report pure style or convention issues.
-</Role>";
-
-const RULES_ROLE: &str = "<Role>
-You are the team-rules reviewer. Check the changed code only against the numbered team rules in \
-<rules> and the repository instructions in <repository_instructions>.
-Playbook:
-1. Check every changed hunk strictly against matching <rules> and <repository_instructions>.
-2. Verify local patterns and documented exemptions in the codebase before flagging a violation.
-3. Cite the exact rule or instruction in the body and use the rule's severity. Style and \
-convention issues are in scope when a rule or instruction asks for them.
-Other reviewers cover bugs, security and performance. Do not report anything that no rule or \
-instruction asks for.
 </Role>";
 
 impl SpecialistKind {
@@ -132,19 +150,18 @@ impl SpecialistKind {
             Self::Bug => "Bug",
             Self::Security => "Security",
             Self::Performance => "Performance",
-            Self::Rules => "Rules",
         }
     }
 
     /// The category of a finding this Finder reports without one. `None` for the generalist,
-    /// which covers every category and must name it.
+    /// which covers every category and must name it. Bug names `repo_instruction` itself for a
+    /// finding that breaks a repository instruction or (diff-only) a team rule.
     pub(crate) fn category(&self) -> Option<FindingCategory> {
         match self {
             Self::Generalist => None,
             Self::Bug => Some(FindingCategory::Bug),
             Self::Security => Some(FindingCategory::Security),
             Self::Performance => Some(FindingCategory::Performance),
-            Self::Rules => Some(FindingCategory::RepoInstruction),
         }
     }
 
@@ -158,34 +175,31 @@ impl SpecialistKind {
     /// (`with_tools = false`) Finder runs.
     pub(crate) fn role_block_for(&self, with_tools: bool) -> &'static str {
         match (self, with_tools) {
-            (Self::Generalist, _) => GENERALIST_ROLE,
+            (Self::Generalist, true) => GENERALIST_ROLE,
+            (Self::Generalist, false) => GENERALIST_ROLE_DIFF_ONLY,
             (Self::Bug, true) => BUG_ROLE,
             (Self::Bug, false) => BUG_ROLE_DIFF_ONLY,
             (Self::Security, _) => SECURITY_ROLE,
             (Self::Performance, _) => PERFORMANCE_ROLE,
-            (Self::Rules, _) => RULES_ROLE,
         }
+    }
+
+    /// Whether a diff-only run of this Finder is given the matching team rules to check. With
+    /// the repository tools no Finder is: the Sharded Rules check them.
+    pub(crate) fn checks_rules_diff_only(&self) -> bool {
+        matches!(self, Self::Generalist | Self::Bug)
     }
 }
 
 /// The Finder agents that review one batch, in a fixed order.
-pub(crate) fn active_specialists(
-    mode: ReviewMode,
-    has_rules_or_instructions: bool,
-) -> Vec<SpecialistKind> {
+pub(crate) fn active_specialists(mode: ReviewMode) -> Vec<SpecialistKind> {
     match mode {
         ReviewMode::Generalist => vec![SpecialistKind::Generalist],
-        ReviewMode::Specialists => {
-            let mut kinds = vec![
-                SpecialistKind::Bug,
-                SpecialistKind::Security,
-                SpecialistKind::Performance,
-            ];
-            if has_rules_or_instructions {
-                kinds.push(SpecialistKind::Rules);
-            }
-            kinds
-        }
+        ReviewMode::Specialists => vec![
+            SpecialistKind::Bug,
+            SpecialistKind::Security,
+            SpecialistKind::Performance,
+        ],
     }
 }
 
@@ -195,38 +209,44 @@ mod tests {
     use SpecialistKind::*;
 
     #[test]
-    fn active_specialists_omits_rules_when_none_match() {
+    fn specialists_mode_runs_bug_security_performance_and_bug_checks_repository_instructions() {
         assert_eq!(
-            active_specialists(ReviewMode::Specialists, false),
+            active_specialists(ReviewMode::Specialists),
             vec![Bug, Security, Performance]
         );
-        assert_eq!(
-            active_specialists(ReviewMode::Specialists, true),
-            vec![Bug, Security, Performance, Rules]
-        );
-        assert_eq!(
-            active_specialists(ReviewMode::Generalist, true),
-            vec![Generalist]
-        );
-        assert_eq!(
-            active_specialists(ReviewMode::Generalist, false),
-            vec![Generalist]
-        );
-        assert!(SpecialistKind::Bug.role_block().contains("grep"));
-        assert!(SpecialistKind::Security.role_block().contains("validation"));
-        assert!(SpecialistKind::Performance.role_block().contains("scale"));
-        assert!(
-            SpecialistKind::Rules
-                .role_block()
-                .contains("<repository_instructions>")
-        );
-        assert!(!SpecialistKind::Bug.role_block_for(false).contains("grep"));
+        assert_eq!(active_specialists(ReviewMode::Generalist), vec![Generalist]);
+        assert!(Bug.role_block().contains("grep"));
+        assert!(Security.role_block().contains("validation"));
+        assert!(Performance.role_block().contains("scale"));
+        assert!(!Bug.role_block_for(false).contains("grep"));
         for with_tools in [true, false] {
-            let bug = SpecialistKind::Bug.role_block_for(with_tools);
+            let bug = Bug.role_block_for(with_tools);
             assert!(bug.contains("promoting or dismissing"));
             assert!(bug.contains("swallowed errors"));
+            // Bug and Generalist check the changed hunks against the repository instructions,
+            // and against the team rules only when no Sharded Rules run (diff-only).
+            for kind in [Generalist, Bug] {
+                let role = kind.role_block_for(with_tools);
+                assert!(
+                    role.contains("check the changed hunks against"),
+                    "{kind:?} {with_tools}"
+                );
+                assert!(role.contains("<repository_instructions>"), "{kind:?}");
+                assert!(role.contains("\"repo_instruction\""), "{kind:?}");
+                assert_eq!(role.contains("<rules>"), !with_tools, "{kind:?}");
+            }
+            // Security and Performance read the instructions as context only.
+            for kind in [Security, Performance] {
+                let role = kind.role_block_for(with_tools);
+                assert!(
+                    role.contains("<repository_instructions> is context only"),
+                    "{kind:?}"
+                );
+                assert!(!role.contains("repo_instruction\""), "{kind:?}");
+                assert!(!role.contains("<rules>"), "{kind:?}");
+            }
         }
         assert_eq!(Generalist.category(), None);
-        assert_eq!(Rules.category(), Some(FindingCategory::RepoInstruction));
+        assert_eq!(Bug.category(), Some(FindingCategory::Bug));
     }
 }

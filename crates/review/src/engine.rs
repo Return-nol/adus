@@ -1,7 +1,8 @@
 //! Mesin review: ambil diff PR, jalankan Finder → Verifier → Dedup → Severity → Enrichment,
-//! posting temuan, catat di `reviews`. The Finder stage lives in `finder.rs`; this file keeps
-//! the review-row lifecycle, the clone and its fallback, the stage sequencing and the deadlines,
-//! and posting.
+//! posting temuan, catat di `reviews`. With the clone, the Sharded Rules (`rules_judge.rs`) run
+//! next to the Finder and their verified findings join the Verifier's before Dedup. The Finder
+//! stage lives in `finder.rs`; this file keeps the review-row lifecycle, the clone and its
+//! fallback, the stage sequencing and the deadlines, and posting.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -46,6 +47,8 @@ use crate::prompt::{
 };
 use crate::redact::{REDACTED, contains_secret, redact_secrets};
 use crate::repo_instructions::load_repo_instructions;
+use crate::rules_evidence::RuleEvidenceContext;
+use crate::rules_judge::{ShardedRulesOutput, run_sharded_rules};
 use crate::severity::{classify_severity, fill_unclassified};
 use crate::small_pr::is_small_pr;
 use crate::tools::Toolbox;
@@ -56,8 +59,8 @@ use crate::workspace::{RepoCloner, WorkspaceError};
 
 /// Budget of one Generalist review (`Engine::review_timeout`), small PRs included.
 pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-/// Budget of one Specialists review (`Engine::specialists_review_timeout`): up to four agents
-/// per batch at `High` effort need more time than one Generalist agent.
+/// Budget of one Specialists review (`Engine::specialists_review_timeout`): three agents per
+/// batch at `High` effort need more time than one Generalist agent.
 pub const SPECIALISTS_REVIEW_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Summary note when the clone failed (not for auth) and the review saw only the diff.
@@ -156,8 +159,8 @@ struct Stages<'a> {
     provider_id: Uuid,
     /// Finder and Verifier model.
     primary_model: &'a str,
-    /// Fast model (`effective_fast_model()`): Finder Prose Recovery and the post-verify funnel
-    /// (Dedup, Severity and Enrichment).
+    /// Fast model (`effective_fast_model()`): Finder Prose Recovery, the Sharded Rules and the
+    /// post-verify funnel (Dedup, Severity and Enrichment).
     fast_model: &'a str,
     rules: &'a [Rule],
     memories: &'a [Memory],
@@ -500,7 +503,8 @@ impl Engine {
         }
     }
 
-    /// Clone, Finder, Verifier and the post-verify funnel for `targets`. Returns the findings to
+    /// Clone, Finder (with the Sharded Rules next to it when the clone has tools and a rule is
+    /// enabled), Verifier and the post-verify funnel for `targets`. Returns the findings to
     /// post; files of a batch no Finder agent reviewed go to `skipped`, and every degradation
     /// adds a note to `warnings`.
     async fn review_targets(
@@ -577,7 +581,37 @@ impl Engine {
             usage: s.usage,
             token_budget: Some(&s.token_budget),
         };
-        let finder = run_finder(llm, &input, toolbox.as_ref(), s.deadlines.finder).await;
+        // The Sharded Rules check the team rules only with the repository tools; diff-only,
+        // the Finder prompt carries `<rules>` instead.
+        let rules_ctx = toolbox
+            .as_ref()
+            .filter(|_| s.rules.iter().any(|rule| rule.enabled))
+            .map(|toolbox| RuleEvidenceContext {
+                chat: self.chat.as_ref(),
+                provider_id: s.provider_id,
+                fast_model: s.fast_model,
+                usage: s.usage,
+                token_budget: Some(&s.token_budget),
+                toolbox,
+            });
+        let sharded_rules = async {
+            match rules_ctx {
+                Some(ctx) => {
+                    run_sharded_rules(ctx, &files, &allowed, s.rules, s.deadlines.finder).await
+                }
+                None => ShardedRulesOutput::default(),
+            }
+        };
+        let (finder, sharded_rules) = tokio::join!(
+            run_finder(llm, &input, toolbox.as_ref(), s.deadlines.finder),
+            sharded_rules
+        );
+        let ShardedRulesOutput {
+            findings: rule_findings,
+            shards_run: rule_shards,
+            candidates: rule_candidates,
+            verified: rule_verified,
+        } = sharded_rules;
         // Read now: the summary names Finder wrap-ups only, not the Verifier's.
         let finder_wrap_ups = s.token_budget.wrap_ups();
         // From the final tasks, so a re-run without tools does not count a batch twice.
@@ -602,7 +636,12 @@ impl Engine {
         let (finder_steps, gate_refusals) = finder_steps_and_refusals(&finder.tasks);
         let (candidates, filtered_dropped) =
             collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
-        // Every candidate is queued for the Verifier (no count cap, spec §5).
+        // Every Finder candidate is queued for the Verifier (no count cap, spec §5); verified
+        // rule findings skip it.
+        let (candidates, verified_rules): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .chain(rule_findings)
+            .partition(CandidateFinding::needs_verify);
         let queued = candidates.len();
 
         let mut report = if candidates.is_empty() {
@@ -640,8 +679,10 @@ impl Engine {
                 report.dropped_unverified
             ));
         }
-        let verified = std::mem::take(&mut report.kept);
+        let mut verified = std::mem::take(&mut report.kept);
         let verified_kept = verified.len();
+        verified.extend(verified_rules);
+        let dedup_input = verified.len();
 
         // Post-verify funnel (spec §6), all by `deadlines.post_verify`: Semantic Dedup,
         // severity, enrichment (which ends with `check_fix`).
@@ -727,13 +768,16 @@ impl Engine {
             filtered_dropped,
             synthesis_candidates,
             synthesis_skipped,
+            rule_shards,
+            rule_candidates,
+            rule_verified,
             verify_candidates = queued,
             verified_kept,
             verifier_kept_unreadable = report.kept_unreadable,
             dropped_refuted = report.dropped_refuted,
             dropped_unverified = report.dropped_unverified,
             evidence_gate_runs = report.evidence_gate_runs,
-            dedup_dropped = verified_kept.saturating_sub(found.len() + already_raised),
+            dedup_dropped = dedup_input.saturating_sub(found.len() + already_raised),
             already_raised,
             posted = found.len(),
             kept_by_origin = %kept_by_origin,
@@ -904,12 +948,13 @@ fn redact_owned(text: String) -> (String, bool) {
     (text, false)
 }
 
-/// Findings per Finder pass, as `pass1=N synthesis_rescue=N prose_recovery=N`.
+/// Findings per origin, as `pass1=N synthesis_rescue=N prose_recovery=N sharded_rules=N`.
 fn count_by_origin(candidates: &[CandidateFinding]) -> String {
     [
         FinderPass::Pass1,
         FinderPass::SynthesisRescue,
         FinderPass::ProseRecovery,
+        FinderPass::ShardedRules,
     ]
     .iter()
     .map(|&pass| {
