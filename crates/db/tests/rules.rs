@@ -1,7 +1,7 @@
 use adus_core::types::{ConnectionKind, Severity};
 use adus_db::{
     connections, memories,
-    memories::{MemorySource, MemoryStatus, NewMemory},
+    memories::{MemoryKind, MemorySource, MemoryStatus, NewMemory},
     repositories::{self, NewRepository},
     rules::{self, KnowledgeScope, NewRule, Rule},
 };
@@ -117,6 +117,12 @@ async fn add_memory(pool: &PgPool, repo: Option<Uuid>, content: &str) -> memorie
             source_url: None,
             created_by: None,
             status: MemoryStatus::Active,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes: None,
         },
     )
     .await
@@ -216,6 +222,12 @@ async fn check_constraint_rejects_scope_mismatch(pool: PgPool) {
             source_url: None,
             created_by: None,
             status: MemoryStatus::Active,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes: None,
         },
     )
     .await;

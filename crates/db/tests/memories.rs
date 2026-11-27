@@ -1,7 +1,7 @@
 use adus_core::types::ConnectionKind;
 use adus_db::{
     connections,
-    memories::{self, Memory, MemorySource, MemoryStatus, NewMemory},
+    memories::{self, Memory, MemoryKind, MemorySource, MemoryStatus, NewMemory},
     repositories::{self, NewRepository},
     rules::KnowledgeScope,
 };
@@ -40,6 +40,16 @@ async fn add_repo(pool: &PgPool) -> Uuid {
 }
 
 async fn add(pool: &PgPool, repo: Uuid, content: &str, status: MemoryStatus) -> Memory {
+    add_superseding(pool, repo, content, status, None).await
+}
+
+async fn add_superseding(
+    pool: &PgPool,
+    repo: Uuid,
+    content: &str,
+    status: MemoryStatus,
+    supersedes: Option<Uuid>,
+) -> Memory {
     memories::insert(
         pool,
         NewMemory {
@@ -50,6 +60,12 @@ async fn add(pool: &PgPool, repo: Uuid, content: &str, status: MemoryStatus) -> 
             source_url: None,
             created_by: None,
             status,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes,
         },
     )
     .await
@@ -121,4 +137,32 @@ async fn list_hides_rejected_unless_asked(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(contents(&got), ["pending"]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn superseded_memory_leaves_prompts(pool: PgPool) {
+    let repo = add_repo(&pool).await;
+    let a = add(&pool, repo, "A", MemoryStatus::Active).await;
+    let b = add_superseding(&pool, repo, "B", MemoryStatus::Pending, Some(a.id)).await;
+    assert_eq!(b.supersedes, Some(a.id));
+    let got = memories::applicable(&pool, repo).await.unwrap();
+    assert_eq!(contents(&got), ["A"]);
+
+    memories::approve(&pool, b.id, None).await.unwrap().unwrap();
+    let got = memories::applicable(&pool, repo).await.unwrap();
+    assert_eq!(contents(&got), ["B"]);
+    let a = memories::get(&pool, a.id).await.unwrap().unwrap();
+    assert_eq!(a.superseded_by, Some(b.id));
+
+    // Rejecting a replacement leaves the memory it targets in use.
+    let c = add_superseding(&pool, repo, "C", MemoryStatus::Pending, Some(b.id)).await;
+    memories::reject(&pool, c.id).await.unwrap().unwrap();
+    let got = memories::applicable(&pool, repo).await.unwrap();
+    assert_eq!(contents(&got), ["B"]);
+
+    // Auto mode inserts the replacement active, then activates it.
+    let d = add_superseding(&pool, repo, "D", MemoryStatus::Active, Some(b.id)).await;
+    memories::activate_superseding(&pool, d.id).await.unwrap();
+    let got = memories::applicable(&pool, repo).await.unwrap();
+    assert_eq!(contents(&got), ["D"]);
 }

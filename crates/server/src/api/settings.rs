@@ -195,6 +195,7 @@ async fn replace(
         max_review_input_tokens: body
             .max_review_input_tokens
             .unwrap_or(current.max_review_input_tokens),
+        ..current
     };
     Ok(Json(settings::update(&state.db, &new).await?.into()))
 }

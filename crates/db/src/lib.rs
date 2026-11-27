@@ -6,6 +6,7 @@ pub mod ignore;
 pub mod learning_runs;
 pub mod memories;
 pub mod repositories;
+pub mod review_threads;
 pub mod reviews;
 pub mod rules;
 pub mod sessions;

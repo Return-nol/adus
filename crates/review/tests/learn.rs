@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use adus_core::types::{LearningMode, ProviderKind};
-use adus_db::memories::{self, Memory, MemorySource, MemoryStatus, NewMemory};
+use adus_db::memories::{self, Memory, MemoryKind, MemorySource, MemoryStatus, NewMemory};
 use adus_db::repositories::{self, RepoPatch};
 use adus_db::rules::KnowledgeScope;
 use adus_db::users::{self, Role, UserPatch};
@@ -351,6 +351,12 @@ async fn learn_pr_prompt_lists_rejected_and_redacts_secrets(pool: PgPool) {
             source_url: None,
             created_by: None,
             status,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes: None,
         };
         memories::insert(&pool, new).await.unwrap();
     }

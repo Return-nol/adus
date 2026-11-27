@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, types::Json};
 use uuid::Uuid;
 
 use crate::{Result, rules::KnowledgeScope};
@@ -27,6 +27,25 @@ pub enum MemoryStatus {
     Rejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "memory_kind", rename_all = "snake_case")]
+pub enum MemoryKind {
+    /// A team convention: follow it, flag violations.
+    Convention,
+    /// A case declared by design or won't fix.
+    Exception,
+    /// A problem this repo had before, with its fix.
+    FixPattern,
+}
+
+/// A thread a memory was learned from; stored in `memories.evidence` (jsonb).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evidence {
+    pub url: String,
+    pub pr_number: Option<i64>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct Memory {
     pub id: Uuid,
@@ -40,6 +59,16 @@ pub struct Memory {
     pub created_by_email: Option<String>,
     pub enabled: bool,
     pub status: MemoryStatus,
+    pub kind: MemoryKind,
+    pub context: Option<String>,
+    pub reason: Option<String>,
+    pub resolution: Option<String>,
+    #[sqlx(json)]
+    pub evidence: Vec<Evidence>,
+    /// The memory this one replaces once it is active.
+    pub supersedes: Option<Uuid>,
+    /// Set when a replacement became active; a superseded memory no longer reaches prompts.
+    pub superseded_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -51,6 +80,12 @@ pub struct NewMemory<'a> {
     pub source_url: Option<&'a str>,
     pub created_by: Option<Uuid>,
     pub status: MemoryStatus,
+    pub kind: MemoryKind,
+    pub context: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub resolution: Option<&'a str>,
+    pub evidence: &'a [Evidence],
+    pub supersedes: Option<Uuid>,
 }
 
 /// Perubahan parsial; `None` = biarkan. Scope dan repo tidak bisa diubah setelah dibuat.
@@ -58,13 +93,18 @@ pub struct NewMemory<'a> {
 pub struct MemoryPatch {
     pub content: Option<String>,
     pub enabled: Option<bool>,
+    pub kind: Option<MemoryKind>,
+    pub context: Option<String>,
+    pub reason: Option<String>,
+    pub resolution: Option<String>,
 }
 
 // `email` bertipe citext; cast ke text supaya cocok dengan String.
 const COLUMNS: &str = "id, scope, repository_id, content, source, source_url, created_by, \
                        (SELECT email::text FROM users WHERE users.id = memories.created_by) \
                          AS created_by_email, \
-                       enabled, status, created_at";
+                       enabled, status, kind, context, reason, resolution, evidence, \
+                       supersedes, superseded_by, created_at";
 
 // Memory milik repo yang sudah dihapus (soft delete) dianggap tidak ada.
 const ACTIVE_REPO: &str = "(repository_id IS NULL \
@@ -77,8 +117,9 @@ fn status_filter(param: &str) -> String {
 
 pub async fn insert(pool: &PgPool, new: NewMemory<'_>) -> Result<Memory> {
     sqlx::query_as(&format!(
-        "INSERT INTO memories (scope, repository_id, content, source, source_url, created_by, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {COLUMNS}"
+        "INSERT INTO memories (scope, repository_id, content, source, source_url, created_by, \
+         status, kind, context, reason, resolution, evidence, supersedes) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING {COLUMNS}"
     ))
     .bind(new.scope)
     .bind(new.repository_id)
@@ -87,6 +128,12 @@ pub async fn insert(pool: &PgPool, new: NewMemory<'_>) -> Result<Memory> {
     .bind(new.source_url)
     .bind(new.created_by)
     .bind(new.status)
+    .bind(new.kind)
+    .bind(new.context)
+    .bind(new.reason)
+    .bind(new.resolution)
+    .bind(Json(new.evidence))
+    .bind(new.supersedes)
     .fetch_one(pool)
     .await
 }
@@ -132,22 +179,36 @@ pub async fn update(pool: &PgPool, id: Uuid, patch: MemoryPatch) -> Result<Optio
     sqlx::query_as(&format!(
         "UPDATE memories SET \
            content = COALESCE($2, content), \
-           enabled = COALESCE($3, enabled) \
+           enabled = COALESCE($3, enabled), \
+           kind = COALESCE($4, kind), \
+           context = COALESCE($5, context), \
+           reason = COALESCE($6, reason), \
+           resolution = COALESCE($7, resolution) \
          WHERE id = $1 RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(patch.content)
     .bind(patch.enabled)
+    .bind(patch.kind)
+    .bind(patch.context)
+    .bind(patch.reason)
+    .bind(patch.resolution)
     .fetch_optional(pool)
     .await
 }
 
 /// `pending` → `active`, sekaligus mengganti isi jika `content` diberikan.
+/// The memory it `supersedes` gets `superseded_by` in the same statement.
 /// `None` jika memory tidak ada atau tidak `pending`.
 pub async fn approve(pool: &PgPool, id: Uuid, content: Option<&str>) -> Result<Option<Memory>> {
     sqlx::query_as(&format!(
-        "UPDATE memories SET status = 'active', content = COALESCE($2, content) \
-         WHERE id = $1 AND status = 'pending' RETURNING {COLUMNS}"
+        "WITH approved AS ( \
+           UPDATE memories SET status = 'active', content = COALESCE($2, content) \
+           WHERE id = $1 AND status = 'pending' RETURNING {COLUMNS}), \
+         replaced AS ( \
+           UPDATE memories SET superseded_by = approved.id FROM approved \
+           WHERE memories.id = approved.supersedes) \
+         SELECT * FROM approved"
     ))
     .bind(id)
     .bind(content)
@@ -166,6 +227,19 @@ pub async fn reject(pool: &PgPool, id: Uuid) -> Result<Option<Memory>> {
     .await
 }
 
+/// For a memory inserted `active` (auto mode): marks the memory it `supersedes` as superseded.
+/// Does nothing when `new_id` is not active or supersedes nothing.
+pub async fn activate_superseding(pool: &PgPool, new_id: Uuid) -> Result<()> {
+    sqlx::query(
+        "UPDATE memories SET superseded_by = r.id FROM memories r \
+         WHERE r.id = $1 AND r.status = 'active' AND memories.id = r.supersedes",
+    )
+    .bind(new_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// `false` jika memory tidak ada.
 pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool> {
     let done = sqlx::query("DELETE FROM memories WHERE id = $1")
@@ -176,11 +250,11 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool> {
 }
 
 /// Memory aktif untuk satu repo: semua memory global ditambah memory repo itu (jika repo masih aktif).
-/// Hanya yang `enabled` dan berstatus `active`.
+/// Hanya yang `enabled`, berstatus `active`, dan belum digantikan (`superseded_by`).
 pub async fn applicable(pool: &PgPool, repository_id: Uuid) -> Result<Vec<Memory>> {
     sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM memories \
-         WHERE enabled AND status = 'active' \
+         WHERE enabled AND status = 'active' AND superseded_by IS NULL \
            AND (repository_id IS NULL OR repository_id = $1) AND {ACTIVE_REPO} \
          ORDER BY created_at, id"
     ))

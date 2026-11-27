@@ -60,6 +60,10 @@ async fn healthy_world(pool: PgPool) -> World {
             review_mode: Default::default(),
             small_pr_max_lines: 100,
             max_review_input_tokens: 2_000_000,
+            max_thread_replies: 5,
+            max_validate_threads: 30,
+            max_learned_per_pr: 10,
+            curator_effort: "medium".into(),
         },
     )
     .await

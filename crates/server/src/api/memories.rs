@@ -1,5 +1,5 @@
 use adus_db::{
-    memories::{self, Memory, MemoryPatch, MemorySource, MemoryStatus, NewMemory},
+    memories::{self, Memory, MemoryKind, MemoryPatch, MemorySource, MemoryStatus, NewMemory},
     rules::KnowledgeScope,
     users::{Role, User},
 };
@@ -142,6 +142,12 @@ async fn create(
             source_url: None,
             created_by: Some(user.id),
             status: MemoryStatus::Active,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes: None,
         },
     )
     .await?;
@@ -213,6 +219,7 @@ async fn update(
             .map(|c| trimmed("content", &c, CONTENT_MAX))
             .transpose()?,
         enabled: body.enabled,
+        ..Default::default()
     };
     let memory = memories::update(&state.db, id, patch)
         .await?

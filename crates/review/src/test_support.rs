@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use adus_core::types::Severity;
-use adus_db::memories::{Memory, MemorySource, MemoryStatus};
+use adus_db::memories::{Memory, MemoryKind, MemorySource, MemoryStatus};
 use adus_db::rules::{KnowledgeScope, Rule};
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use adus_llm::{ChatRequest, ChatResponse, Message, StopReason, ToolCall, UserPart};
@@ -250,6 +250,13 @@ pub(crate) fn memory(content: &str) -> Memory {
         created_by_email: None,
         enabled: true,
         status: MemoryStatus::Active,
+        kind: MemoryKind::Convention,
+        context: None,
+        reason: None,
+        resolution: None,
+        evidence: Vec::new(),
+        supersedes: None,
+        superseded_by: None,
         created_at: Utc::now(),
     }
 }

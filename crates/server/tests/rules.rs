@@ -3,7 +3,7 @@ mod common;
 use adus_core::types::ConnectionKind;
 use adus_db::{
     connections,
-    memories::{self, MemorySource, MemoryStatus, NewMemory},
+    memories::{self, MemoryKind, MemorySource, MemoryStatus, NewMemory},
     repositories::{self, NewRepository},
     rules::KnowledgeScope,
 };
@@ -412,6 +412,12 @@ async fn learned_memory(pool: &PgPool, content: &str, status: MemoryStatus) -> S
             source_url: Some("https://example.com/pr/1"),
             created_by: None,
             status,
+            kind: MemoryKind::Convention,
+            context: None,
+            reason: None,
+            resolution: None,
+            evidence: &[],
+            supersedes: None,
         },
     )
     .await

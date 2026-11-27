@@ -18,6 +18,10 @@ async fn settings_defaults_and_round_trip(pool: PgPool) {
     assert_eq!(current.review_mode, ReviewMode::Generalist);
     assert_eq!(current.ignore_paths, None);
     assert!(current.ignored_title_keywords.is_empty());
+    assert_eq!(current.max_thread_replies, 5);
+    assert_eq!(current.max_validate_threads, 30);
+    assert_eq!(current.max_learned_per_pr, 10);
+    assert_eq!(current.curator_effort, "medium");
     assert_eq!(effective_ignore_paths(&current), DEFAULT_IGNORE_PATHS);
 
     let updated = Settings {
@@ -29,6 +33,10 @@ async fn settings_defaults_and_round_trip(pool: PgPool) {
         review_mode: ReviewMode::Specialists,
         small_pr_max_lines: 120,
         max_review_input_tokens: 0,
+        max_thread_replies: 0,
+        max_validate_threads: 3,
+        max_learned_per_pr: 1,
+        curator_effort: "high".into(),
     };
     let saved = settings::update(&pool, &updated).await.unwrap();
     assert_eq!(saved, updated);

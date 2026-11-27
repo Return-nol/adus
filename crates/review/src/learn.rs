@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use adus_core::job::CommentAuthor;
 use adus_core::types::{ConnectionKind, LearningMode};
 use adus_db::learning_runs::{self, LearningOutcome, NewLearningRun};
-use adus_db::memories::{self, Memory, MemorySource, MemoryStatus, NewMemory};
+use adus_db::memories::{self, Memory, MemoryKind, MemorySource, MemoryStatus, NewMemory};
 use adus_db::rules::KnowledgeScope;
 use adus_db::{repositories, settings};
 use adus_git::{GitError, PrThread};
@@ -178,6 +178,12 @@ impl Engine {
                 } else {
                     MemoryStatus::Pending
                 },
+                kind: MemoryKind::Convention,
+                context: None,
+                reason: None,
+                resolution: None,
+                evidence: &[],
+                supersedes: None,
             };
             memories::insert(&self.db, new).await.map_err(db_error)?;
         }
