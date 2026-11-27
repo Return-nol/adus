@@ -45,7 +45,7 @@ use crate::redact::redact_secrets;
 use crate::specialists::{SpecialistKind, active_specialists};
 use crate::tools::Toolbox;
 
-/// Diff batches reviewed at the same time (spec 4.7).
+/// Diff batches reviewed at the same time (SPEC.md §8.4).
 const BATCH_CONCURRENCY: usize = 2;
 /// LLM calls a Finder agent may make on a batch of up to `FINDER_FREE_FILES` files.
 const FINDER_BASE_STEPS: usize = 20;
