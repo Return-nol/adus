@@ -132,6 +132,8 @@ pub(crate) struct VerificationReport {
     pub dropped_unverified: usize,
     /// Evidence Gate tool runs that finished before the deadline, with or without a verdict.
     pub evidence_gate_runs: usize,
+    /// Kept findings whose `precedent` the Verifier said names the wrong memory; it was cleared.
+    pub precedents_cleared: usize,
     /// Set when no candidate got a verdict and every failure was a retryable chat error
     /// (`AllKeysFailed`, `NoKeys`, `Internal`): the review should be retried, not posted.
     pub all_retryable_error: Option<ChatError>,
@@ -378,16 +380,20 @@ pub(crate) struct Verdict {
     pub keep: bool,
     /// The model's stated evidence as [`log_rationale`] returns it; only logged.
     pub rationale: Option<String>,
+    /// `Some(false)`: the memory the candidate's `precedent` names is not the same case.
+    /// `None` when the model gave no (readable) answer.
+    pub precedent_matches: Option<bool>,
 }
 
 /// The verdict for one candidate, or why there is none.
 #[derive(Debug)]
 enum Outcome {
     /// Posted. `unreadable` marks a run that replied without a verdict that could be read (kept
-    /// by default).
+    /// by default); `precedent_rejected`, a verdict that the finding's `precedent` is wrong.
     Kept {
         rationale: Option<String>,
         unreadable: bool,
+        precedent_rejected: bool,
     },
     Refuted {
         rationale: Option<String>,
@@ -419,11 +425,16 @@ impl Outcome {
     }
 
     fn from_verdict(verdict: Verdict) -> Self {
-        let Verdict { keep, rationale } = verdict;
+        let Verdict {
+            keep,
+            rationale,
+            precedent_matches,
+        } = verdict;
         if keep {
             Self::Kept {
                 rationale,
                 unreadable: false,
+                precedent_rejected: precedent_matches == Some(false),
             }
         } else {
             Self::Refuted { rationale }
@@ -446,7 +457,9 @@ fn summarize(results: Vec<Verified>) -> VerificationReport {
     let mut first_retryable = None;
     let mut only_retryable_failures = true;
     for Verified {
-        candidate, outcome, ..
+        mut candidate,
+        outcome,
+        ..
     } in results
     {
         tracing::debug!(
@@ -459,8 +472,17 @@ fn summarize(results: Vec<Verified>) -> VerificationReport {
             "verifier verdict"
         );
         match outcome {
-            Outcome::Kept { unreadable, .. } => {
+            Outcome::Kept {
+                unreadable,
+                precedent_rejected,
+                ..
+            } => {
                 report.kept_unreadable += usize::from(unreadable);
+                // Only the link to the memory goes: the finding itself was kept.
+                if precedent_rejected && candidate.suggestion.precedent.take().is_some() {
+                    tracing::debug!("verifier rejected the precedent; cleared");
+                    report.precedents_cleared += 1;
+                }
                 report.kept.push(candidate);
             }
             Outcome::Refuted { .. } => report.dropped_refuted += 1,
@@ -617,6 +639,7 @@ fn unreadable() -> Outcome {
     Outcome::Kept {
         rationale: None,
         unreadable: true,
+        precedent_rejected: false,
     }
 }
 
@@ -631,8 +654,9 @@ fn chat_failure(err: ChatError) -> Outcome {
 }
 
 /// Reads a verdict from `submit_verdict` arguments or a JSON object in reply text, loosely:
-/// `keep` (required) may be a boolean or the string `"true"` / `"false"`. `rationale` makes the
-/// model state its evidence; a non-blank one is kept (redacted, cut) for the log only.
+/// `keep` (required) and `precedent_matches` (optional) may be a boolean or the string
+/// `"true"` / `"false"`. `rationale` makes the model state its evidence; a non-blank one is kept
+/// (redacted, cut) for the log only.
 fn loose_verdict(value: &Value) -> Option<Verdict> {
     let keep = parse_bool_field(value.get("keep")?)?;
     let rationale = value
@@ -641,7 +665,12 @@ fn loose_verdict(value: &Value) -> Option<Verdict> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(log_rationale);
-    Some(Verdict { keep, rationale })
+    let precedent_matches = value.get("precedent_matches").and_then(parse_bool_field);
+    Some(Verdict {
+        keep,
+        rationale,
+        precedent_matches,
+    })
 }
 
 /// The verdict in reply text: the first JSON object [`loose_verdict`] reads, else a bare
@@ -661,6 +690,7 @@ fn verdict_in_text(text: &str) -> Option<Verdict> {
             .map(|keep| Verdict {
                 keep,
                 rationale: None,
+                precedent_matches: None,
             })
         })
     })
@@ -706,6 +736,10 @@ fn submit_verdict_tool_def() -> ToolDef {
                 "rationale": {
                     "type": "string",
                     "description": "One or two sentences naming the evidence behind the verdict."
+                },
+                "precedent_matches": {
+                    "type": "boolean",
+                    "description": "Only when <candidate> has a `precedent`: false when the memory with that [index] in <memories> is not the same case. Leave it out otherwise."
                 }
             },
             "required": ["keep", "rationale"]
@@ -733,6 +767,7 @@ None of these refutes a finding, so never drop one for them:
 - The flawed code is older than the pull request, but this change makes it reachable or worse.
 - You expect a library, the runtime or the timing to prevent the failure, yet nothing you read shows it: no lock, guard or check, and not the library's own code. Reasoning that a failure "should not happen" is not evidence that it cannot.
 - An exception or a fix pattern in <memories> matches it. Keep it: Adus attaches the precedent and adjusts the severity.
+When <candidate> has a `precedent`, it names the memory with that `[index]` in <memories>. If that memory does not describe the same case, add "precedent_matches": false to your answer, and judge keep or drop on the finding alone; Adus then posts it without the precedent. Leave the field out when the precedent fits or there is none.
 Findings that cite a team rule or a repository instruction are never dropped as style. Check instead whether that rule or instruction applies to this file and whether the changed line breaks it: drop such a finding only when the rule or instruction does not apply to this file, or the changed line does not break it.
 When the evidence is not enough to refute the finding, keep it. You only decide keep or drop; you never rewrite the finding.
 </Verdict>"#;
@@ -1060,6 +1095,55 @@ mod tests {
         assert!(results[0].content.contains("fn alpha()"));
     }
 
+    #[tokio::test]
+    async fn verifier_clears_a_precedent_it_rejects() {
+        let tb = toolbox();
+        let verdict = |id: &str, matches: bool| {
+            call(
+                id,
+                SUBMIT_VERDICT,
+                json!({"keep": true, "precedent_matches": matches, "rationale": "checked"}),
+            )
+        };
+        let chat = RoutedChat::new(vec![
+            (
+                "wrong-precedent",
+                vec![answer(tools_turn(vec![verdict("w1", false)]))],
+            ),
+            (
+                "right-precedent",
+                vec![answer(tools_turn(vec![verdict("r1", true)]))],
+            ),
+        ]);
+        let with_precedent = |title: &str, index: usize| {
+            let mut c = bug(title);
+            c.suggestion.precedent = Some(index);
+            c
+        };
+        let candidates = vec![
+            with_precedent("wrong-precedent", 0),
+            with_precedent("right-precedent", 1),
+        ];
+
+        let report = verify(&chat, candidates, Some(&tb), later(30_000), None).await;
+
+        // Both stay posted; only the rejected link to the memory is removed.
+        let mut kept: Vec<(&str, Option<usize>)> = report
+            .kept
+            .iter()
+            .map(|c| (c.suggestion.title.as_str(), c.suggestion.precedent))
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [("right-precedent", Some(1)), ("wrong-precedent", None)]
+        );
+        assert_eq!(report.precedents_cleared, 1);
+        let requests = chat.requests_for("wrong-precedent");
+        let prompt = user_text(&requests[0]);
+        assert!(prompt.contains("\"precedent\": 0"), "{prompt}");
+    }
+
     /// Every user text the model was shown in `req`, joined.
     fn conversation(req: &ChatRequest) -> String {
         req.messages
@@ -1205,6 +1289,7 @@ mod tests {
             outcome: Outcome::Kept {
                 rationale: None,
                 unreadable: false,
+                precedent_rejected: false,
             },
             with_tools,
         };
@@ -1689,10 +1774,12 @@ mod tests {
         assert!(system.contains("in another function or file than the flagged line"));
         assert!(system.contains("a library, the runtime or the timing"));
         assert!(system.contains("admits which premise its author could not confirm"));
+        // A candidate's `precedent` is checked against the memory it names.
+        assert!(system.contains("\"precedent_matches\": false"));
     }
 
     #[test]
-    fn verdict_keeps_a_redacted_cut_rationale_and_the_schema_has_only_keep_and_rationale() {
+    fn verdict_keeps_a_redacted_cut_rationale_and_reads_precedent_matches() {
         let secret = "AKIAIOSFODNN7EXAMPLE";
         let long = format!("{secret} {}", "x".repeat(RATIONALE_LOG_CHARS * 2));
         let verdict = loose_verdict(&json!({"keep": "true", "rationale": long})).unwrap();
@@ -1707,16 +1794,26 @@ mod tests {
             blank,
             Verdict {
                 keep: false,
-                rationale: None
+                rationale: None,
+                precedent_matches: None,
             }
         );
         assert_eq!(loose_verdict(&json!({"keep": false})), Some(blank));
+        // `precedent_matches` is read loosely like `keep`; anything else is no answer.
+        for (raw, expected) in [
+            (json!(false), Some(false)),
+            (json!("true"), Some(true)),
+            (json!("maybe"), None),
+        ] {
+            let verdict = loose_verdict(&json!({"keep": true, "precedent_matches": raw}));
+            assert_eq!(verdict.unwrap().precedent_matches, expected);
+        }
 
         let schema = submit_verdict_tool_def().parameters;
         let mut properties: Vec<&String> =
             schema["properties"].as_object().unwrap().keys().collect();
         properties.sort();
-        assert_eq!(properties, ["keep", "rationale"]);
+        assert_eq!(properties, ["keep", "precedent_matches", "rationale"]);
         assert_eq!(schema["required"], json!(["keep", "rationale"]));
         let text = schema.to_string();
         for banned in ["additionalProperties", "$schema", "oneOf"] {

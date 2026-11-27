@@ -1933,6 +1933,7 @@ Off by one when the list is empty."
         "synthesis_candidates=1",
         "verify_candidates=3",
         "verifier_kept_unreadable=0",
+        "precedents_cleared=0",
         "dropped_unverified=0",
         "evidence_gate_runs=1",
         "kept_by_origin=pass1=2 synthesis_rescue=1 prose_recovery=0",

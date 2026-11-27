@@ -959,6 +959,7 @@ impl Engine {
             verify_candidates = queued,
             verified_kept,
             verifier_kept_unreadable = report.kept_unreadable,
+            precedents_cleared = report.precedents_cleared,
             dropped_refuted = report.dropped_refuted,
             dropped_unverified = report.dropped_unverified,
             evidence_gate_runs = report.evidence_gate_runs,
