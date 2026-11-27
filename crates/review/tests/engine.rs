@@ -1,3 +1,5 @@
+// Not every harness helper is used here.
+#[allow(dead_code)]
 mod common;
 
 use std::time::{Duration, Instant};

@@ -1,19 +1,21 @@
 //! Shared test harness for review integration tests.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use adus_core::crypto::Cipher;
-use adus_core::types::ConnectionKind;
+use adus_core::types::{ConnectionKind, ProviderKind};
 use adus_db::connections::{self, ConnectionStatus};
-use adus_db::{repositories, settings};
+use adus_db::{ai, repositories, settings};
 use adus_git::{
     CloneSpec, FileDiff, GitError, GitProvider, GitProviderFactory, InlineComment, PatOwner,
     PostedComment, PrThread, PullRequest, RemoteRepo, RepoRef, ThreadRef, ThreadStatus,
 };
-use adus_llm::router::ChatService;
+use adus_llm::router::{ChatError, ChatService, UsageContext};
+use adus_llm::{ChatRequest, ChatResponse, Message, StopReason, UserPart};
 use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
-use adus_review::workspace::RepoCloner;
+use adus_review::workspace::{RepoCloner, RepoWorkspace, WorkspaceError};
 use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -365,4 +367,88 @@ pub async fn conn_status(pool: &PgPool, connection_id: Uuid) -> ConnectionStatus
         .unwrap()
         .unwrap()
         .status
+}
+
+/// Answers with the scripted texts in order and records every request.
+#[derive(Default)]
+pub struct FakeChat {
+    replies: Mutex<VecDeque<Result<String, ChatError>>>,
+    requests: Mutex<Vec<(ChatRequest, UsageContext)>>,
+}
+
+impl FakeChat {
+    pub fn reply(&self, text: &str) {
+        self.replies.lock().unwrap().push_back(Ok(text.into()));
+    }
+
+    pub fn requests(&self) -> Vec<(ChatRequest, UsageContext)> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// The user message of the first request.
+    pub fn prompt(&self) -> String {
+        let requests = self.requests();
+        let (req, _) = requests.first().expect("one LLM call");
+        match &req.messages[0] {
+            Message::User { parts } => match &parts[0] {
+                UserPart::Text(text) => text.clone(),
+            },
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatService for FakeChat {
+    async fn chat(
+        &self,
+        _provider_id: Uuid,
+        req: ChatRequest,
+        ctx: UsageContext,
+    ) -> Result<ChatResponse, ChatError> {
+        self.requests.lock().unwrap().push((req, ctx));
+        let text = self
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unscripted LLM call")?;
+        Ok(ChatResponse {
+            text,
+            tool_calls: Vec::new(),
+            stop_reason: StopReason::EndTurn,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            provider_meta: None,
+        })
+    }
+}
+
+/// A cloner for engine paths that never clone.
+pub struct NoopCloner;
+
+#[async_trait]
+impl RepoCloner for NoopCloner {
+    async fn clone_pr(&self, _spec: &CloneSpec) -> Result<RepoWorkspace, WorkspaceError> {
+        unreachable!("this path never clones")
+    }
+}
+
+/// Makes an OpenAI provider (review model `gpt-test`, fast model `gpt-fast`) the default.
+pub async fn default_fast_provider(pool: &PgPool) {
+    let provider = ai::insert_provider(
+        pool,
+        ProviderKind::Openai,
+        "openai",
+        None,
+        "gpt-test",
+        Some("gpt-fast"),
+    )
+    .await
+    .unwrap();
+    let mut current = settings::get(pool).await.unwrap();
+    current.default_provider_id = Some(provider.id);
+    settings::update(pool, &current).await.unwrap();
 }

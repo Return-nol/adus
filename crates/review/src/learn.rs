@@ -233,7 +233,7 @@ impl Engine {
 
     /// The registered, active Adus user who wrote as `author` (login, or email on Azure, where
     /// the author is the `uniqueName`).
-    async fn registered(
+    pub(crate) async fn registered(
         &self,
         kind: ConnectionKind,
         author: &str,

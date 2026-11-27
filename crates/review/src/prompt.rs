@@ -71,7 +71,7 @@ pub(crate) fn truncate_with_marker<'a>(text: &'a str, max: usize, marker: &str) 
 
 /// Awali tiap baris `+` dan ` ` di hunk dengan nomor baris file baru, mis. `   42 + let x = 1;`,
 /// supaya model bisa menyebut nomor baris yang benar. Baris `-` diberi spasi sebagai ganti nomor.
-fn annotate_patch(patch: &str) -> String {
+pub(crate) fn annotate_patch(patch: &str) -> String {
     let mut out = Vec::new();
     let mut right: Option<u32> = None;
     for line in patch.lines() {

@@ -18,7 +18,7 @@ use crate::prompt::{REPLY_LABEL, adus_body};
 const MENTION: &str = "@adudu";
 /// Batas panjang isi `remember`, dalam karakter.
 pub(crate) const MAX_MEMORY_CHARS: usize = 2000;
-const HELP: &str = "I didn't understand that. I know these commands:\n\n\
+pub(crate) const HELP: &str = "I didn't understand that. I know these commands:\n\n\
                     - `@adudu review` — run a full review of this pull request\n\
                     - `@adudu review deep` — run a multi-specialist deep review (Bug, Security, Performance, Rules)\n\
                     - `@adudu remember: <text>` — save a convention for this repository";
@@ -229,7 +229,7 @@ impl Engine {
     }
 
     /// Token ditolak → connection `invalid` dan fatal; rate limit / HTTP → boleh diulang.
-    async fn reply_error(&self, conn: &Connection, err: GitError) -> EngineError {
+    pub(crate) async fn reply_error(&self, conn: &Connection, err: GitError) -> EngineError {
         let message = format!("posting the reply failed: {err}");
         match err {
             GitError::Unauthorized => self.unauthorized(conn).await,

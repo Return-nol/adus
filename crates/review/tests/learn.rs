@@ -2,89 +2,19 @@
 #[allow(dead_code)]
 mod common;
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use adus_core::types::{LearningMode, ProviderKind};
+use adus_core::types::LearningMode;
 use adus_db::memories::{self, Memory, MemoryKind, MemorySource, MemoryStatus, NewMemory};
 use adus_db::repositories::{self, RepoPatch};
 use adus_db::rules::KnowledgeScope;
 use adus_db::users::{self, Role, UserPatch};
-use adus_db::{ai, settings};
-use adus_git::{CloneSpec, PrThread, PrThreadComment};
-use adus_llm::router::{ChatError, ChatService, UsageContext};
-use adus_llm::{ChatRequest, ChatResponse, Message, ReasoningEffort, StopReason, UserPart};
-use adus_review::workspace::{RepoCloner, RepoWorkspace, WorkspaceError};
-use async_trait::async_trait;
-use common::{FakeGit, Setup, pr};
+use adus_git::{PrThread, PrThreadComment};
+use adus_llm::ReasoningEffort;
+use common::{FakeChat, FakeGit, NoopCloner, Setup, pr};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-/// Answers with the scripted texts in order and records every request.
-#[derive(Default)]
-struct FakeChat {
-    replies: Mutex<VecDeque<Result<String, ChatError>>>,
-    requests: Mutex<Vec<(ChatRequest, UsageContext)>>,
-}
-
-impl FakeChat {
-    fn reply(&self, text: &str) {
-        self.replies.lock().unwrap().push_back(Ok(text.into()));
-    }
-
-    fn requests(&self) -> Vec<(ChatRequest, UsageContext)> {
-        self.requests.lock().unwrap().clone()
-    }
-
-    fn prompt(&self) -> String {
-        let requests = self.requests();
-        let (req, _) = requests.first().expect("one LLM call");
-        match &req.messages[0] {
-            Message::User { parts } => match &parts[0] {
-                UserPart::Text(text) => text.clone(),
-            },
-            other => panic!("unexpected message {other:?}"),
-        }
-    }
-}
-
-#[async_trait]
-impl ChatService for FakeChat {
-    async fn chat(
-        &self,
-        _provider_id: Uuid,
-        req: ChatRequest,
-        ctx: UsageContext,
-    ) -> Result<ChatResponse, ChatError> {
-        self.requests.lock().unwrap().push((req, ctx));
-        let text = self
-            .replies
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("unscripted LLM call")?;
-        Ok(ChatResponse {
-            text,
-            tool_calls: Vec::new(),
-            stop_reason: StopReason::EndTurn,
-            input_tokens: 10,
-            output_tokens: 10,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            provider_meta: None,
-        })
-    }
-}
-
-struct NoopCloner;
-
-#[async_trait]
-impl RepoCloner for NoopCloner {
-    async fn clone_pr(&self, _spec: &CloneSpec) -> Result<RepoWorkspace, WorkspaceError> {
-        unreachable!("learning never clones")
-    }
-}
 
 /// Engine over a GitHub repo in `mode`, with a provider whose fast model is `gpt-fast`.
 async fn setup(
@@ -101,19 +31,7 @@ async fn setup(
     )
     .await;
     s.git.state().threads = threads;
-    let provider = ai::insert_provider(
-        pool,
-        ProviderKind::Openai,
-        "openai",
-        None,
-        "gpt-test",
-        Some("gpt-fast"),
-    )
-    .await
-    .unwrap();
-    let mut current = settings::get(pool).await.unwrap();
-    current.default_provider_id = Some(provider.id);
-    settings::update(pool, &current).await.unwrap();
+    common::default_fast_provider(pool).await;
     let patch = RepoPatch {
         learning_mode: Some(mode),
         ..RepoPatch::default()

@@ -1,3 +1,5 @@
+// Not every harness helper is used here.
+#[allow(dead_code)]
 mod common;
 
 use std::collections::HashMap;
@@ -266,7 +268,7 @@ async fn remember_creates_repo_memory_and_replies(pool: PgPool) {
 
     let comments = s.git.state().comments.clone();
     assert_eq!(comments.len(), 1);
-    assert!(comments[0].starts_with(ADUDU_MARKER));
+    assert!(comments[0].starts_with("<!-- adudu -->\n🤖 **Adudu**\n\n"));
     assert!(comments[0].contains("> Use `thiserror` for library errors.\n> Never `anyhow`."));
     assert!(queue.jobs().await.is_empty());
 
