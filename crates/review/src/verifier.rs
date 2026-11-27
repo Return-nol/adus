@@ -33,9 +33,9 @@ use crate::finder::FinderPass;
 use crate::parse::{FindingCategory, Suggestion};
 use crate::prompt::{
     MAX_DESCRIPTION_CHARS_DIFF_ONLY, diff_block, format_memories, format_pr_description,
-    format_rules, or_none, truncate_with_marker, wrap,
+    format_rules, or_none, wrap,
 };
-use crate::redact::redact_secrets;
+use crate::redact::log_rationale;
 use crate::specialists::SpecialistKind;
 use crate::tools::Toolbox;
 
@@ -67,14 +67,6 @@ pub(crate) struct CandidateFinding {
     pub investigated_by_finder: bool,
     /// The pass that produced it.
     pub origin: FinderPass,
-}
-
-impl CandidateFinding {
-    /// Whether the Verifier must check it. Sharded Rules findings already passed their own
-    /// evidence loop and its citation gate, so they go straight to Semantic Dedup.
-    pub(crate) fn needs_verify(&self) -> bool {
-        self.origin != FinderPass::ShardedRules
-    }
 }
 
 impl AsRef<Suggestion> for CandidateFinding {
@@ -386,21 +378,17 @@ fn queue_key(index: usize, candidate: &CandidateFinding) -> (u8, u8, usize) {
         FinderPass::Pass1 => 0,
         FinderPass::ProseRecovery => 1,
         FinderPass::SynthesisRescue => 2,
-        // Never queued: Sharded Rules findings skip the Verifier.
+        // Never queued: the engine merges Sharded Rules findings after the Verifier.
         FinderPass::ShardedRules => 3,
     };
     (category_rank, origin_rank, index)
 }
 
-/// Most characters of a verdict's rationale kept for the per-candidate log line.
-const RATIONALE_LOG_CHARS: usize = 300;
-
 /// Parsed verdict from `submit_verdict` or diff-only JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Verdict {
     pub keep: bool,
-    /// The model's stated evidence, secret-redacted and cut to [`RATIONALE_LOG_CHARS`]; only
-    /// logged.
+    /// The model's stated evidence as [`log_rationale`] returns it; only logged.
     pub rationale: Option<String>,
 }
 
@@ -694,9 +682,7 @@ fn loose_verdict(value: &Value) -> Option<Verdict> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .map(|text| {
-            truncate_with_marker(&redact_secrets(text), RATIONALE_LOG_CHARS, "…").into_owned()
-        });
+        .map(log_rationale);
     Some(Verdict { keep, rationale })
 }
 
@@ -910,6 +896,7 @@ mod tests {
     use adus_llm::{ChatRequest, Message, ToolCall};
 
     use super::*;
+    use crate::redact::RATIONALE_LOG_CHARS;
     use crate::test_support::{
         Reply, RoutedChat, answer, call, is_for, memory, msg_text, rule, text_turn, tool_names,
         tools_turn, user_text,
@@ -1305,7 +1292,7 @@ mod tests {
         assert_eq!(report.kept, unopened(&["late"]));
         assert_eq!(report.evidence_gate_runs, 0);
         assert_eq!(chat.requests().len(), 1);
-        assert_eq!(budget.warning(0, 0), None, "no diff-only verification");
+        assert_eq!(budget.warning(0, 0, 0), None, "no diff-only verification");
     }
 
     #[tokio::test]
@@ -1676,7 +1663,7 @@ mod tests {
             assert!(user_text(req).contains("<code_context>"));
         }
         assert_eq!(
-            budget.warning(0, 0).as_deref(),
+            budget.warning(0, 0, 0).as_deref(),
             Some(
                 "Token budget reached (301 of 1 input tokens): 3 findings verified from the diff only."
             )
@@ -1689,7 +1676,7 @@ mod tests {
         let report = verify(&chat, bugs(&["a", "b"]), None, later(30_000), Some(&budget)).await;
         assert_eq!(titles(&report.kept), ["a", "b"]);
         assert_eq!(
-            budget.warning(0, 0),
+            budget.warning(0, 0, 0),
             None,
             "diff-only exhaustion leaves warning empty"
         );
@@ -1742,7 +1729,6 @@ mod tests {
         assert!(system.contains(
             "Findings that cite a team rule or a repository instruction are never dropped as style"
         ));
-        assert!(!system.contains("Rules reviewer"));
         assert!(system.contains("`start_line`..`line` is the span"));
         assert!(system.contains("<memories>"));
         assert!(system.contains("<pr_description>"));

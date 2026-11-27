@@ -175,8 +175,23 @@ struct Stages<'a> {
     /// `Generalist`).
     small: bool,
     /// Input tokens this run may send (`settings.max_review_input_tokens`), shared by every
-    /// Finder, Verifier and post-verify call.
+    /// Finder, Sharded Rules, Verifier and post-verify call.
     token_budget: Arc<TokenBudget>,
+}
+
+/// What the Finder stage leaves for the stage log and the budget warning.
+struct FinderStats {
+    /// The Finder re-ran diff-only because the primary model rejected tool calling.
+    tools_unsupported: bool,
+    /// [`TokenBudget::wrap_ups`] read when the Finder finished.
+    wrap_ups: usize,
+    /// Batches never started because the token budget was exhausted.
+    budget_skipped_batches: usize,
+    tasks: usize,
+    steps: usize,
+    gate_refusals: usize,
+    synthesis_skipped: Option<&'static str>,
+    synthesis_candidates: usize,
 }
 
 impl Engine {
@@ -563,7 +578,8 @@ impl Engine {
             None => None,
         };
         let batches = batch_targets(&files, s.rules, MAX_BATCH_CHARS);
-        // One cache for every agent of this review, Finder and Verifier alike.
+        // One cache for every agent of this review: the Finder, the Verifier and the rule
+        // collectors (the shard calls read their head file past it).
         let toolbox = workspace.map(Toolbox::new);
 
         let input = FinderInput {
@@ -605,92 +621,112 @@ impl Engine {
                 None => ShardedRulesOutput::default(),
             }
         };
-        let (finder, sharded_rules) = tokio::join!(
-            run_finder(llm, &input, toolbox.as_ref(), s.deadlines.finder),
-            sharded_rules
-        );
+        // The Verifier starts as soon as the Finder is done and checks the Finder's candidates
+        // only; the Sharded Rules run beside both by their own deadline, and their verified
+        // findings join the Verifier's after both finish.
+        let finder_and_verifier = async {
+            let finder = run_finder(llm, &input, toolbox.as_ref(), s.deadlines.finder).await;
+            // Read now: the summary names Finder wrap-ups only, not the Verifier's.
+            let finder_wrap_ups = s.token_budget.wrap_ups();
+            // From the final tasks, so a re-run without tools does not count a batch twice.
+            let budget_skipped_batches = finder
+                .tasks
+                .iter()
+                .filter(|task| matches!(task.result, Err(FinderFailure::TokenBudget)))
+                .map(|task| task.batch)
+                .collect::<HashSet<_>>()
+                .len();
+            // Without tool support the Verifier works from the diff as well.
+            let verifier_toolbox = if finder.tools_unsupported {
+                warnings.push(TOOLS_UNSUPPORTED.into());
+                fallback_reason = Some("tools_unsupported");
+                None
+            } else {
+                toolbox.as_ref()
+            };
+            let (finder_steps, gate_refusals) = finder_steps_and_refusals(&finder.tasks);
+            let stats = FinderStats {
+                tools_unsupported: finder.tools_unsupported,
+                wrap_ups: finder_wrap_ups,
+                budget_skipped_batches,
+                tasks: finder.tasks.len(),
+                steps: finder_steps,
+                gate_refusals,
+                synthesis_skipped: finder.synthesis_skipped.map(SynthesisSkipped::label),
+                synthesis_candidates: finder.synthesis_candidates,
+            };
+            let (candidates, filtered_dropped) =
+                collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
+            // Every Finder candidate is queued for the Verifier (no count cap, spec §5).
+            let queued = candidates.len();
+            let mut report = if candidates.is_empty() {
+                VerificationReport::default()
+            } else {
+                let ctx = VerifyContext {
+                    chat: self.chat.as_ref(),
+                    provider_id: s.provider_id,
+                    model: s.primary_model,
+                    usage: s.usage,
+                    token_budget: Some(&s.token_budget),
+                };
+                verify_candidates(
+                    ctx,
+                    VerifyInput {
+                        pr: s.pr,
+                        manifest,
+                        candidates,
+                        targets: &files,
+                        rules: s.rules,
+                        memories: s.memories,
+                        repo_instructions: repo_instructions.as_deref(),
+                        toolbox: verifier_toolbox,
+                        deadline: s.deadlines.verifier,
+                    },
+                )
+                .await
+            };
+            if let Some(err) = report.all_retryable_error.take() {
+                return Err(chat_error(err));
+            }
+            if report.dropped_unverified > 0 {
+                warnings.push(format!(
+                    "{} candidate finding(s) could not be verified and were omitted",
+                    report.dropped_unverified
+                ));
+            }
+            Ok((stats, filtered_dropped, queued, report))
+        };
+        let (finder_and_verifier, sharded_rules) = tokio::join!(finder_and_verifier, sharded_rules);
+        let (finder, filtered_dropped, queued, mut report) = finder_and_verifier?;
         let ShardedRulesOutput {
             findings: rule_findings,
             shards_run: rule_shards,
             candidates: rule_candidates,
             verified: rule_verified,
+            budget_skipped: rules_budget_skipped,
             tools_unsupported: rules_tools_unsupported,
         } = sharded_rules;
-        // Read now: the summary names Finder wrap-ups only, not the Verifier's.
-        let finder_wrap_ups = s.token_budget.wrap_ups();
-        // From the final tasks, so a re-run without tools does not count a batch twice.
-        let budget_skipped_batches = finder
-            .tasks
-            .iter()
-            .filter(|task| matches!(task.result, Err(FinderFailure::TokenBudget)))
-            .map(|task| task.batch)
-            .collect::<HashSet<_>>()
-            .len();
-        // Without tool support the Verifier works from the diff as well, and the diff-only
-        // Finder re-run checks `<rules>`; otherwise rules a tool-less fast model could not
-        // check stay unchecked.
-        let verifier_toolbox = if finder.tools_unsupported {
-            warnings.push(TOOLS_UNSUPPORTED.into());
-            fallback_reason = Some("tools_unsupported");
-            None
+        // A Finder without tool support re-ran diff-only with `<rules>` in its prompt, so it
+        // owns the team rules: rule findings would repeat its violations, and Dedup keeps both
+        // copies when unsure. Otherwise rules a tool-less fast model could not check stay
+        // unchecked.
+        let (rule_findings, rules_budget_skipped) = if finder.tools_unsupported {
+            if !rule_findings.is_empty() {
+                tracing::debug!(
+                    dropped = rule_findings.len(),
+                    "rule findings dropped: the diff-only Finder re-run checked the team rules"
+                );
+            }
+            (Vec::new(), 0)
         } else {
             if rules_tools_unsupported {
                 warnings.push(RULES_TOOLS_UNSUPPORTED.into());
             }
-            toolbox.as_ref()
+            (rule_findings, rules_budget_skipped)
         };
-        let finder_tasks = finder.tasks.len();
-        let synthesis_skipped = finder.synthesis_skipped.map(SynthesisSkipped::label);
-        let synthesis_candidates = finder.synthesis_candidates;
-        let (finder_steps, gate_refusals) = finder_steps_and_refusals(&finder.tasks);
-        let (candidates, filtered_dropped) =
-            collect_candidates(finder.tasks, mode, &batches, &allowed, skipped, warnings)?;
-        // Every Finder candidate is queued for the Verifier (no count cap, spec §5); verified
-        // rule findings skip it.
-        let (candidates, verified_rules): (Vec<_>, Vec<_>) = candidates
-            .into_iter()
-            .chain(rule_findings)
-            .partition(CandidateFinding::needs_verify);
-        let queued = candidates.len();
-
-        let mut report = if candidates.is_empty() {
-            VerificationReport::default()
-        } else {
-            let ctx = VerifyContext {
-                chat: self.chat.as_ref(),
-                provider_id: s.provider_id,
-                model: s.primary_model,
-                usage: s.usage,
-                token_budget: Some(&s.token_budget),
-            };
-            verify_candidates(
-                ctx,
-                VerifyInput {
-                    pr: s.pr,
-                    manifest,
-                    candidates,
-                    targets: &files,
-                    rules: s.rules,
-                    memories: s.memories,
-                    repo_instructions: repo_instructions.as_deref(),
-                    toolbox: verifier_toolbox,
-                    deadline: s.deadlines.verifier,
-                },
-            )
-            .await
-        };
-        if let Some(err) = report.all_retryable_error.take() {
-            return Err(chat_error(err));
-        }
-        if report.dropped_unverified > 0 {
-            warnings.push(format!(
-                "{} candidate finding(s) could not be verified and were omitted",
-                report.dropped_unverified
-            ));
-        }
         let mut verified = std::mem::take(&mut report.kept);
         let verified_kept = verified.len();
-        verified.extend(verified_rules);
+        verified.extend(rule_findings);
         let dedup_input = verified.len();
 
         // Post-verify funnel (spec §6), all by `deadlines.post_verify`: Semantic Dedup,
@@ -763,7 +799,11 @@ impl Engine {
 
         let budget = s.token_budget.as_ref();
         // Only when the ceiling changed something (spec decision 15).
-        if let Some(warning) = budget.warning(budget_skipped_batches, finder_wrap_ups) {
+        if let Some(warning) = budget.warning(
+            finder.budget_skipped_batches,
+            finder.wrap_ups,
+            rules_budget_skipped,
+        ) {
             warnings.push(warning);
         }
         tracing::info!(
@@ -771,12 +811,12 @@ impl Engine {
             review_mode = ?mode,
             clone_ms,
             fallback_reason,
-            finder_tasks,
-            finder_steps,
-            gate_refusals,
+            finder_tasks = finder.tasks,
+            finder_steps = finder.steps,
+            gate_refusals = finder.gate_refusals,
             filtered_dropped,
-            synthesis_candidates,
-            synthesis_skipped,
+            synthesis_candidates = finder.synthesis_candidates,
+            synthesis_skipped = finder.synthesis_skipped,
             rule_shards,
             rule_candidates,
             rule_verified,

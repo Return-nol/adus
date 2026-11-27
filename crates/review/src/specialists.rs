@@ -165,12 +165,6 @@ impl SpecialistKind {
         }
     }
 
-    /// The `<Role>...</Role>` block placed at the end of the Finder system prompt (tool-enabled).
-    #[cfg(test)]
-    pub(crate) fn role_block(&self) -> &'static str {
-        self.role_block_for(true)
-    }
-
     /// The `<Role>...</Role>` block for either tool-enabled (`with_tools = true`) or diff-only
     /// (`with_tools = false`) Finder runs.
     pub(crate) fn role_block_for(&self, with_tools: bool) -> &'static str {
@@ -215,16 +209,16 @@ mod tests {
             vec![Bug, Security, Performance]
         );
         assert_eq!(active_specialists(ReviewMode::Generalist), vec![Generalist]);
-        assert!(Bug.role_block().contains("grep"));
-        assert!(Security.role_block().contains("validation"));
-        assert!(Performance.role_block().contains("scale"));
+        assert!(Bug.role_block_for(true).contains("grep"));
+        assert!(Security.role_block_for(true).contains("validation"));
+        assert!(Performance.role_block_for(true).contains("scale"));
         assert!(!Bug.role_block_for(false).contains("grep"));
         for with_tools in [true, false] {
             let bug = Bug.role_block_for(with_tools);
             assert!(bug.contains("promoting or dismissing"));
             assert!(bug.contains("swallowed errors"));
             // Bug and Generalist check the changed hunks against the repository instructions,
-            // and against the team rules only when no Sharded Rules run (diff-only).
+            // and diff-only against the team rules too.
             for kind in [Generalist, Bug] {
                 let role = kind.role_block_for(with_tools);
                 assert!(
@@ -233,7 +227,9 @@ mod tests {
                 );
                 assert!(role.contains("<repository_instructions>"), "{kind:?}");
                 assert!(role.contains("\"repo_instruction\""), "{kind:?}");
-                assert_eq!(role.contains("<rules>"), !with_tools, "{kind:?}");
+                if !with_tools {
+                    assert!(role.contains("<rules>"), "{kind:?}");
+                }
             }
             // Security and Performance read the instructions as context only.
             for kind in [Security, Performance] {
@@ -243,7 +239,9 @@ mod tests {
                     "{kind:?}"
                 );
                 assert!(!role.contains("repo_instruction\""), "{kind:?}");
-                assert!(!role.contains("<rules>"), "{kind:?}");
+                if !with_tools {
+                    assert!(!role.contains("<rules>"), "{kind:?}");
+                }
             }
         }
         assert_eq!(Generalist.category(), None);

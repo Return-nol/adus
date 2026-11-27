@@ -408,9 +408,10 @@ impl Toolbox {
         max_chars: usize,
     ) -> Option<String> {
         let ws = Arc::clone(&self.workspace);
+        let cache = Arc::clone(&self.cache);
         let rel = rel_path.to_owned();
         tokio::task::spawn_blocking(move || {
-            read_head_file_capped_sync(&ws, &rel, max_lines, max_chars)
+            read_head_file_capped_sync(&ws, &cache, &rel, max_lines, max_chars)
         })
         .await
         .ok()
@@ -464,25 +465,40 @@ fn read_file_snippet_sync(
 
 /// The whole of `rel_path` as `{n}: {line}` rows with secrets masked, or `None` when the path is
 /// not a readable text file in the workspace, the file is empty, or it has more than `max_lines`
-/// lines or `max_chars` characters. Blocking.
+/// lines or its raw text (before numbering) more than `max_chars` characters. It bypasses
+/// `cache`, but a masked secret counts in its `redacted`. Blocking.
 fn read_head_file_capped_sync(
     ws: &RepoWorkspace,
+    cache: &ToolCache,
     rel_path: &str,
     max_lines: usize,
     max_chars: usize,
 ) -> Option<String> {
     let target = ws.resolve_existing_file(rel_path.trim()).ok()?;
     let text = read_text(target.abs()).ok()?;
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() || lines.len() > max_lines || text.chars().count() > max_chars {
+    let line_count = text.lines().count();
+    if line_count == 0 || line_count > max_lines || text.chars().count() > max_chars {
         return None;
     }
-    let numbered: Vec<String> = lines
-        .iter()
-        .enumerate()
-        .map(|(i, line)| format!("{}: {line}", i + 1))
-        .collect();
-    Some(redact_secrets(&numbered.join("\n")).into_owned())
+    let mut numbered = String::with_capacity(text.len() + line_count * 6);
+    for (n, line) in (1..).zip(text.lines()) {
+        if n > 1 {
+            numbered.push('\n');
+        }
+        push_numbered_row(&mut numbered, n, line);
+    }
+    if let Cow::Owned(redacted) = redact_secrets(&numbered) {
+        cache.redacted.fetch_add(1, Ordering::Relaxed);
+        return Some(redacted);
+    }
+    Some(numbered)
+}
+
+/// Appends `line` as a `{n}: {line}` row of `read_file` output, without a newline.
+fn push_numbered_row(out: &mut String, n: usize, line: &str) {
+    out.push_str(&n.to_string());
+    out.push_str(": ");
+    out.push_str(line);
 }
 
 /// Runs `call` through the cache. Fresh content is redacted before it is cached, so cached
@@ -620,8 +636,7 @@ fn read_file(path: &RepoPath, start: u32, end: u32) -> Result<String, ToolError>
             break;
         }
         budget -= needed;
-        body.push_str(&prefix);
-        body.push_str(line);
+        push_numbered_row(&mut body, n, line);
         body.push('\n');
         shown = n;
     }
@@ -1865,6 +1880,7 @@ mod tests {
                 .as_deref(),
             Some("1: fn main() {}\n2: const KEY = \"[REDACTED]\";")
         );
+        assert_eq!(tb.redacted_outputs(), 1, "the masked secret is counted");
         // The limits are inclusive.
         assert_eq!(
             tb.read_head_file_capped("src/many.rs", 601, 30_000)

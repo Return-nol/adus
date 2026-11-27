@@ -23,7 +23,7 @@ use crate::agent::{
 use crate::budget::TokenBudget;
 use crate::parse::parse_u32_field;
 use crate::prompt::{diff_block, severity_name, truncate_with_marker, wrap};
-use crate::redact::redact_secrets;
+use crate::redact::{log_rationale, redact_secrets};
 use crate::rules_judge::RawShardViolation;
 use crate::tools::Toolbox;
 
@@ -41,20 +41,18 @@ const RULE_EVIDENCE_EFFORT: ReasoningEffort = ReasoningEffort::High;
 const RULE_JUDGE_CALL: &str = "rule_judge";
 /// The collector's terminal tool.
 const SUBMIT_EVIDENCE: &str = "submit_evidence";
-/// Characters of a rationale kept in a debug log.
-const RATIONALE_LOG_CHARS: usize = 300;
 
 /// One successful `read_file` output of the collector.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReadExcerpt {
+#[derive(Debug, PartialEq, Eq)]
+struct ReadExcerpt {
     /// Normalized repository path.
-    pub path: String,
+    path: String,
     /// The tool output: a `[path: lines X-Y of Z]` header, then `{n}: {line}` rows.
-    pub content: String,
+    content: String,
 }
 
 /// What the evidence loop decided about one candidate violation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EvidenceVerdict {
     /// The judge found the rule violated and cited a line the collector read.
     Verified {
@@ -87,7 +85,7 @@ pub(crate) struct RuleEvidenceContext<'a> {
 }
 
 /// Whether some excerpt of `path` shows `line` as a `{line}: ` row with non-blank text.
-pub(crate) fn read_contains_line(excerpts: &[ReadExcerpt], path: &str, line: u32) -> bool {
+fn read_contains_line(excerpts: &[ReadExcerpt], path: &str, line: u32) -> bool {
     let path = normalized(path);
     let prefix = format!("{line}: ");
     excerpts
@@ -103,7 +101,7 @@ pub(crate) fn read_contains_line(excerpts: &[ReadExcerpt], path: &str, line: u32
 
 /// The collector refuted the violation: `keep` is false at `high` confidence and the
 /// rationale cites at least one `path:line` that [`read_contains_line`] finds in `excerpts`.
-pub(crate) fn has_source_refutation(
+fn has_source_refutation(
     keep: bool,
     confidence: Option<&str>,
     rationale: &str,
@@ -145,7 +143,7 @@ pub(crate) async fn verify_rule_candidate(
         tracing::debug!(
             keep = submission.keep,
             confidence = submission.confidence,
-            rationale = %log_text(&submission.rationale),
+            rationale = %log_rationale(&submission.rationale),
             excerpts = excerpts.len(),
             "rule evidence collected"
         );
@@ -255,7 +253,7 @@ async fn judge(ctx: RuleEvidenceContext<'_>, prompt: String) -> Result<String, &
 /// that appears in `excerpts`.
 fn judge_verdict(reply: &str, excerpts: &[ReadExcerpt]) -> EvidenceVerdict {
     let Some(value) = first_object(reply, |value| {
-        value.get("verdict").is_some().then(|| value.clone())
+        value.get("verdict").is_some().then_some(value)
     }) else {
         return EvidenceVerdict::Rejected("unparseable");
     };
@@ -281,7 +279,7 @@ fn judge_verdict(reply: &str, excerpts: &[ReadExcerpt]) -> EvidenceVerdict {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    tracing::debug!(rationale = %log_text(rationale), "rule evidence judge verdict");
+    tracing::debug!(rationale = %log_rationale(rationale), "rule evidence judge verdict");
     match (path, line) {
         (Some(path), Some(line)) if read_contains_line(excerpts, path, line) => {
             EvidenceVerdict::Verified {
@@ -364,19 +362,14 @@ fn normalized(path: &str) -> String {
     normalize_path(path.trim().trim_start_matches("./"))
 }
 
-/// Secret-redacted text cut for a debug log.
-fn log_text(text: &str) -> String {
-    truncate_with_marker(&redact_secrets(text), RATIONALE_LOG_CHARS, "…").into_owned()
-}
-
 /// The first JSON object in `text` that `read` accepts.
-fn first_object<T>(text: &str, read: impl Fn(&Value) -> Option<T>) -> Option<T> {
+fn first_object<T>(text: &str, read: impl Fn(Value) -> Option<T>) -> Option<T> {
     text.match_indices('{').find_map(|(start, _)| {
         let value = serde_json::Deserializer::from_str(&text[start..])
             .into_iter::<Value>()
             .next()?
             .ok()?;
-        read(&value)
+        read(value)
     })
 }
 
@@ -449,7 +442,6 @@ fn judge_prompt(
 }
 
 /// The collector's submission.
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct EvidenceSubmission {
     keep: bool,
     confidence: Option<&'static str>,
@@ -513,7 +505,8 @@ impl SubmitSpec for SubmitEvidence {
     }
 
     fn parse_prose(&self, text: &str) -> Result<EvidenceSubmission, String> {
-        first_object(text, loose_submission).ok_or_else(|| "no \"keep\" found".to_string())
+        first_object(text, |value| loose_submission(&value))
+            .ok_or_else(|| "no \"keep\" found".to_string())
     }
 }
 
@@ -682,6 +675,7 @@ mod tests {
                 EvidenceVerdict::Rejected("satisfied"),
             ),
         ];
+        let mut last_chat = None;
         for (judge_reply, expected) in cases {
             let chat = ScriptedChat::new(vec![
                 read_a(),
@@ -689,28 +683,30 @@ mod tests {
                 text_turn(judge_reply),
             ]);
             assert_eq!(verify(&chat).await, expected, "judge reply {judge_reply}");
-
-            let requests = chat.requests();
-            assert_eq!(requests.len(), 3);
-            assert!(
-                requests[0]
-                    .system
-                    .starts_with("You gather evidence for one team-rule violation")
-            );
-            let judge = &requests[2];
-            assert!(
-                judge
-                    .system
-                    .starts_with("You judge one team-rule violation from collected evidence")
-            );
-            assert!(judge.tools.is_empty());
-            assert_eq!(judge.model, FAST_MODEL);
-            assert_eq!(judge.effort, Some(ReasoningEffort::High));
-            assert_eq!(judge.max_tokens, RULE_JUDGE_MAX_TOKENS);
-            // The judge sees the excerpt the collector read in its first step.
-            assert!(user_text(judge).contains("4:     let value = input.unwrap();"));
-            assert!(user_text(judge).contains("=== src/a.rs (modified) ==="));
+            last_chat = Some(chat);
         }
+
+        // The request shape is the same for every reply: check it once.
+        let requests = last_chat.expect("at least one case").requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[0]
+                .system
+                .starts_with("You gather evidence for one team-rule violation")
+        );
+        let judge = &requests[2];
+        assert!(
+            judge
+                .system
+                .starts_with("You judge one team-rule violation from collected evidence")
+        );
+        assert!(judge.tools.is_empty());
+        assert_eq!(judge.model, FAST_MODEL);
+        assert_eq!(judge.effort, Some(ReasoningEffort::High));
+        assert_eq!(judge.max_tokens, RULE_JUDGE_MAX_TOKENS);
+        // The judge sees the excerpt the collector read in its first step.
+        assert!(user_text(judge).contains("4:     let value = input.unwrap();"));
+        assert!(user_text(judge).contains("=== src/a.rs (modified) ==="));
     }
 
     #[tokio::test]

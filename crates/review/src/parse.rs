@@ -239,7 +239,7 @@ pub(crate) fn submit_findings_tool_def(is_generalist: bool) -> ToolDef {
                             "category": {
                                 "type": "string",
                                 "enum": ["bug", "security", "performance", "repo_instruction"],
-                                "description": "The lens the finding belongs to; repo_instruction when it breaks a team rule or repository instruction."
+                                "description": "The lens the finding belongs to; repo_instruction when it breaks a repository instruction (or a team rule, when <rules> is given)."
                             },
                             "body": {
                                 "type": "string",

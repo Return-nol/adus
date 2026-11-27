@@ -1,7 +1,8 @@
 //! Per-review input-token ceiling (`settings.max_review_input_tokens`). One [`TokenBudget`] is
-//! shared by every Finder, Verifier and post-verify call of a review run. It is a soft cap: calls
-//! already in flight finish, each running agent may send one more submit-only call, and the
-//! Verifier still checks the remaining candidates diff-only, so a review may pass the limit.
+//! shared by every Finder, Sharded Rules, Verifier and post-verify call of a review run. It is
+//! a soft cap: calls already in flight finish, each running agent may send one more submit-only
+//! call, and the Verifier still checks the remaining candidates diff-only, so a review may pass
+//! the limit.
 //!
 //! It also counts what the ceiling changed inside the stages (agent runs that wrapped up early,
 //! candidates verified diff-only) so the summary names it only when something was cut.
@@ -121,8 +122,14 @@ impl TokenBudget {
     /// The summary note, or `None` when the ceiling changed nothing. `batches_skipped` counts
     /// the Finder batches never started (taken from the Finder's final tasks, so a re-run
     /// without tools is not counted twice); `finder_wrap_ups` is [`Self::wrap_ups`] read when
-    /// the Finder finished, so Verifier wrap-ups are not named.
-    pub(crate) fn warning(&self, batches_skipped: usize, finder_wrap_ups: usize) -> Option<String> {
+    /// the Finder finished, so Verifier wrap-ups are not named; `rules_skipped` counts the
+    /// rule shards and evidence loops never started.
+    pub(crate) fn warning(
+        &self,
+        batches_skipped: usize,
+        finder_wrap_ups: usize,
+        rules_skipped: usize,
+    ) -> Option<String> {
         let mut details = Vec::new();
         match batches_skipped {
             0 => {}
@@ -131,6 +138,9 @@ impl TokenBudget {
         }
         if finder_wrap_ups > 0 {
             details.push("some reviewers stopped early".to_string());
+        }
+        if rules_skipped > 0 {
+            details.push("team rules partly unchecked".to_string());
         }
         match self.diff_only_verifications.load(Ordering::Relaxed) {
             0 => {}
@@ -217,11 +227,11 @@ mod tests {
         budget.add(12, 0, 0);
         assert!(budget.exhausted());
         // Crossed, but nothing was skipped, stopped or switched: no warning.
-        assert_eq!(budget.warning(0, 0), None);
+        assert_eq!(budget.warning(0, 0, 0), None);
 
         budget.note_diff_only();
         assert_eq!(
-            budget.warning(0, 0).as_deref(),
+            budget.warning(0, 0, 0).as_deref(),
             Some(
                 "Token budget reached (12 of 10 input tokens): 1 finding verified from the diff only."
             )
@@ -232,14 +242,14 @@ mod tests {
         assert_eq!(budget.wrap_ups(), 1);
         assert_eq!(budget.diff_only_verifications(), 2);
         assert_eq!(
-            budget.warning(2, 1).as_deref(),
+            budget.warning(2, 1, 3).as_deref(),
             Some(
-                "Token budget reached (12 of 10 input tokens): 2 batches not reviewed, some reviewers stopped early, 2 findings verified from the diff only."
+                "Token budget reached (12 of 10 input tokens): 2 batches not reviewed, some reviewers stopped early, team rules partly unchecked, 2 findings verified from the diff only."
             )
         );
         // Only the Finder's wrap-ups (the count the caller passes) are named.
         assert_eq!(
-            budget.warning(2, 0).as_deref(),
+            budget.warning(2, 0, 0).as_deref(),
             Some(
                 "Token budget reached (12 of 10 input tokens): 2 batches not reviewed, 2 findings verified from the diff only."
             )
@@ -248,8 +258,13 @@ mod tests {
         let one = TokenBudget::new(1);
         one.add(1, 0, 0);
         assert_eq!(
-            one.warning(1, 0).as_deref(),
+            one.warning(1, 0, 0).as_deref(),
             Some("Token budget reached (1 of 1 input tokens): 1 batch not reviewed.")
+        );
+        // Rule work skipped for the budget is named on its own.
+        assert_eq!(
+            one.warning(0, 0, 1).as_deref(),
+            Some("Token budget reached (1 of 1 input tokens): team rules partly unchecked.")
         );
     }
 }

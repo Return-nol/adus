@@ -230,7 +230,7 @@ mod support {
             self.calls.lock().unwrap().clone()
         }
 
-        fn calls_of(&self, stage: Stage) -> Vec<ChatCall> {
+        pub fn calls_of(&self, stage: Stage) -> Vec<ChatCall> {
             self.calls()
                 .into_iter()
                 .filter(|c| c.stage == stage)
@@ -259,10 +259,6 @@ mod support {
 
         pub fn enrich_calls(&self) -> Vec<ChatCall> {
             self.calls_of(Stage::Enrich)
-        }
-
-        pub fn stage_calls(&self, stage: Stage) -> Vec<ChatCall> {
-            self.calls_of(stage)
         }
 
         /// Index in [`FakeChat::calls`] of each call of `stage`.
@@ -1987,7 +1983,7 @@ async fn specialists_mode_runs_bug_security_performance_and_dedups(pool: PgPool)
             "{role}"
         );
     }
-    assert!(s.chat.stage_calls(Stage::RuleShard).is_empty());
+    assert!(s.chat.calls_of(Stage::RuleShard).is_empty());
 
     // The Verifier keeps both findings; dedup merges them into one.
     let verifier = s.chat.verifier_calls();
@@ -2968,7 +2964,7 @@ async fn review_runs_sharded_rules_in_parallel_and_skips_general_verifier(pool: 
     // The tool-enabled Finder is not shown the rules; the shard is, on the fast model at High.
     let finder = s.chat.finder_calls();
     assert!(finder.iter().all(|c| !c.user.contains("No unwrap")));
-    let shards = s.chat.stage_calls(Stage::RuleShard);
+    let shards = s.chat.calls_of(Stage::RuleShard);
     assert_eq!(shards.len(), 1);
     assert!(shards[0].user.contains("[1] (critical) No unwrap"));
     assert!(
@@ -2987,8 +2983,8 @@ async fn review_runs_sharded_rules_in_parallel_and_skips_general_verifier(pool: 
         finder_at[0] < shard_at && shard_at < finder_at[1],
         "{finder_at:?} {shard_at}"
     );
-    assert_eq!(s.chat.stage_calls(Stage::RuleEvidenceCollector).len(), 2);
-    assert_eq!(s.chat.stage_calls(Stage::RuleEvidenceJudge).len(), 1);
+    assert_eq!(s.chat.calls_of(Stage::RuleEvidenceCollector).len(), 2);
+    assert_eq!(s.chat.calls_of(Stage::RuleEvidenceJudge).len(), 1);
 
     // Only the Finder's finding goes to the general Verifier.
     let verifier = s.chat.verifier_calls();
@@ -3027,6 +3023,70 @@ async fn review_runs_sharded_rules_in_parallel_and_skips_general_verifier(pool: 
         "rule_verified=1",
         "kept_by_origin=pass1=1 synthesis_rescue=0 prose_recovery=0 sharded_rules=1",
     ] {
+        assert!(line.contains(field), "{field} missing: {line}");
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn tool_less_finder_owns_rules_and_drops_verified_rule_findings(pool: PgPool) {
+    let logs = captured_logs();
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    insert_rule(&pool).await;
+    s.enable_clone(&[("src/a.rs", "a\nlet b = x.unwrap();\nc\nd\n")]);
+    // The primary model rejects tools; the fast model running the Sharded Rules does not.
+    s.chat.push(Err(ChatError::ToolsUnsupported(
+        "model does not support tools".into(),
+    )));
+    s.chat
+        .finder(Reply::finding("src/a.rs", 2, "Breaks No unwrap"));
+    s.chat.push_stage(
+        Stage::RuleShard,
+        Reply::text(r#"{"violations": [{"rule_id": 1, "line": 2, "claim": "it unwraps"}]}"#),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceCollector,
+        Reply::tool("read_file", json!({"path": "src/a.rs"})),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceCollector,
+        Reply::tool(
+            "submit_evidence",
+            json!({"keep": true, "confidence": "high", "rationale": "src/a.rs:2 unwraps"}),
+        ),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceJudge,
+        Reply::text(
+            r#"{"verdict": "violated", "path": "src/a.rs", "line": 2, "rationale": "it calls unwrap"}"#,
+        ),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    // The diff-only re-run checked `<rules>`; the rule finding verified meanwhile is dropped so
+    // the violation is not posted twice.
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 2, "tool attempt, then the diff-only re-run");
+    assert!(finder[1].user.contains("<rules>\n1. [critical] No unwrap"));
+    assert_eq!(s.chat.calls_of(Stage::RuleEvidenceJudge).len(), 1);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert!(posted.comments[0].body.contains("Breaks No unwrap"));
+    assert!(
+        posted
+            .comments
+            .iter()
+            .all(|c| !c.body.contains("Rule \"No unwrap\""))
+    );
+
+    let review_id = format!("review_id={id}");
+    let line = logs
+        .line(&["review stages finished", &review_id])
+        .expect("stage log");
+    for field in ["rule_verified=1", "sharded_rules=0"] {
         assert!(line.contains(field), "{field} missing: {line}");
     }
 }

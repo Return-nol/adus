@@ -64,7 +64,7 @@ rule is broken and how, naming the code>\"}]}
 Use an empty list when no rule is violated. `line` should be a \"+\" row of the diff.";
 
 /// A rule violation claimed by a shard call, anchored to a line of the file's diff.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RawShardViolation {
     /// Zero-based index into the `matching_rules` slice given to [`build_shard_prompts`].
     pub rule_index: usize,
@@ -82,7 +82,7 @@ pub(crate) struct RawShardViolation {
 /// numbered `[1]..[n]` in slice order, which is what `rule_id` in the reply refers to.
 /// `head_content` is the file after the change, already numbered and redacted; the diff is
 /// passed as it is, so a secret the PR adds can be reported.
-pub(crate) fn build_shard_prompts(
+fn build_shard_prompts(
     file: &FileDiff,
     matching_rules: &[&Rule],
     head_content: Option<&str>,
@@ -120,7 +120,7 @@ pub(crate) fn build_shard_prompts(
 /// the earlier one on a tie, losing its `start_line` and recording the cited line. A `line`
 /// outside every hunk of `range`, or in a hunk without a `+` line, drops the entry. After
 /// anchoring, only the first entry of each `(rule, line)` pair is kept.
-pub(crate) fn parse_shard_response(
+fn parse_shard_response(
     raw: &str,
     rule_count: usize,
     range: &CommentableRange,
@@ -146,14 +146,14 @@ fn shard_items(raw: &str) -> Option<Vec<Value>> {
         else {
             continue;
         };
-        let items = match &value {
+        let items = match value {
             Value::Object(_) => {
                 match array_arg(&value, "violations").or_else(|| array_arg(&value, "findings")) {
                     Some(items) => items.into_owned(),
                     None => continue,
                 }
             }
-            Value::Array(items) if items.iter().all(Value::is_object) => items.clone(),
+            Value::Array(items) if items.iter().all(Value::is_object) => items,
             _ => continue,
         };
         if !items.is_empty() {
@@ -210,7 +210,7 @@ fn anchor(
 /// What the Sharded Rules produced for one review.
 #[derive(Debug, Default)]
 pub(crate) struct ShardedRulesOutput {
-    /// Verified violations, ready for Semantic Dedup (`needs_verify()` is false).
+    /// Verified violations, ready for Semantic Dedup: they never go to the Verifier.
     pub findings: Vec<CandidateFinding>,
     /// Shard calls planned: changed files with at least one matching enabled rule (shards
     /// skipped for the token budget or the deadline included).
@@ -219,6 +219,8 @@ pub(crate) struct ShardedRulesOutput {
     pub candidates: usize,
     /// Violations the evidence loop verified.
     pub verified: usize,
+    /// Shards and evidence loops never started because the token budget was exhausted.
+    pub budget_skipped: usize,
     /// A collector failed because the fast model does not support tool calling, so the
     /// violations not yet checked were dropped unchecked.
     pub tools_unsupported: bool,
@@ -226,11 +228,12 @@ pub(crate) struct ShardedRulesOutput {
 
 /// Judges every changed file of `files` that has a commentable line in `allowed` (keyed by
 /// normalized path) and at least one matching enabled rule of `rules`, then runs the evidence
-/// loop on each violation the shards claim. Shards run [`SHARD_CONCURRENCY`] at a time by
-/// `deadline`; evidence loops [`RULE_EVIDENCE_CONCURRENCY`] at a time by `deadline` minus
-/// [`RULE_EVIDENCE_DEADLINE_RESERVE`]. A shard or a violation that fails or runs out of time is
-/// dropped (and logged at debug); it never fails the review. No evidence loop starts once the
-/// token budget is exhausted, or once a collector found the fast model without tool support.
+/// loop on each violation the shards claim. Shards run [`SHARD_CONCURRENCY`] at a time and
+/// evidence loops [`RULE_EVIDENCE_CONCURRENCY`] at a time, all by `deadline` minus
+/// [`RULE_EVIDENCE_DEADLINE_RESERVE`], since a violation claimed later could not be checked.
+/// A shard or a violation that fails or runs out of time is dropped (and logged at debug); it
+/// never fails the review. No shard or evidence loop starts once the token budget is
+/// exhausted, and no evidence loop once a collector found the fast model without tool support.
 pub(crate) async fn run_sharded_rules(
     ctx: RuleEvidenceContext<'_>,
     files: &[FileDiff],
@@ -252,76 +255,83 @@ pub(crate) async fn run_sharded_rules(
         })
         .collect();
     let shards_run = shards.len();
+    let evidence_deadline = deadline
+        .checked_sub(RULE_EVIDENCE_DEADLINE_RESERVE)
+        .unwrap_or(deadline);
 
     // Futures are built up front, as in `finder.rs`, so the stream's future stays `Send`.
     let shard_runs: Vec<_> = shards
         .into_iter()
         .map(|(file, range, matching)| async move {
-            run_shard(ctx, file, range, &matching, deadline)
-                .await
+            let violations = run_shard(ctx, file, range, &matching, evidence_deadline).await?;
+            let claimed: Vec<_> = violations
                 .into_iter()
                 .filter_map(|violation| {
                     let rule = *matching.get(violation.rule_index)?;
                     Some((file, rule, violation))
                 })
-                .collect::<Vec<_>>()
+                .collect();
+            Some(claimed)
         })
         .collect();
-    let claimed: Vec<(&FileDiff, &Rule, RawShardViolation)> = stream::iter(shard_runs)
-        .buffered(SHARD_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
+    let shard_results: Vec<Option<Vec<_>>> = stream::iter(shard_runs)
+        .buffer_unordered(SHARD_CONCURRENCY)
+        .collect()
+        .await;
+    let mut budget_skipped = shard_results
+        .iter()
+        .filter(|result| result.is_none())
+        .count();
+    let claimed: Vec<(&FileDiff, &Rule, RawShardViolation)> =
+        shard_results.into_iter().flatten().flatten().collect();
     let candidates = claimed.len();
 
-    let evidence_deadline = deadline
-        .checked_sub(RULE_EVIDENCE_DEADLINE_RESERVE)
-        .unwrap_or(deadline);
     // Relaxed: the flag only skips work and orders nothing else.
     let tools_unsupported = AtomicBool::new(false);
     let tools_unsupported_ref = &tools_unsupported;
     let checks: Vec<_> = claimed
-        .iter()
+        .into_iter()
         .map(|(file, rule, violation)| async move {
-            if tools_unsupported_ref.load(Ordering::Relaxed) {
-                return EvidenceVerdict::Rejected("tools_unsupported");
-            }
-            if ctx.token_budget.is_some_and(|budget| budget.exhausted()) {
-                return EvidenceVerdict::Rejected("token_budget");
-            }
-            if Instant::now() >= evidence_deadline {
-                return EvidenceVerdict::Rejected("no_time_left");
-            }
-            let verdict =
-                verify_rule_candidate(ctx, rule, file, violation, files, evidence_deadline).await;
+            let verdict = if tools_unsupported_ref.load(Ordering::Relaxed) {
+                EvidenceVerdict::Rejected("tools_unsupported")
+            } else if ctx.token_budget.is_some_and(|budget| budget.exhausted()) {
+                EvidenceVerdict::Rejected("token_budget")
+            } else if Instant::now() >= evidence_deadline {
+                EvidenceVerdict::Rejected("no_time_left")
+            } else {
+                verify_rule_candidate(ctx, rule, file, &violation, files, evidence_deadline).await
+            };
             if verdict == EvidenceVerdict::ToolsUnsupported {
                 tools_unsupported_ref.store(true, Ordering::Relaxed);
             }
-            verdict
+            (file, rule, violation, verdict)
         })
         .collect();
-    let verdicts: Vec<EvidenceVerdict> = stream::iter(checks)
-        .buffered(RULE_EVIDENCE_CONCURRENCY)
+    let checked: Vec<_> = stream::iter(checks)
+        .buffer_unordered(RULE_EVIDENCE_CONCURRENCY)
         .collect()
         .await;
 
     let mut findings = Vec::new();
-    for ((file, rule, violation), verdict) in claimed.iter().zip(verdicts) {
+    for (file, rule, violation, verdict) in checked {
         match verdict {
             EvidenceVerdict::Verified {
                 path,
                 line,
                 rationale,
-            } => findings.push(rule_finding(rule, file, violation, &path, line, &rationale)),
-            other => tracing::debug!(
-                rule = %rule.title,
-                file = %file.path,
-                line = violation.line,
-                reason = ?other,
-                "rule violation dropped"
-            ),
+            } => findings.push(rule_finding(
+                rule, file, &violation, &path, line, &rationale,
+            )),
+            other => {
+                budget_skipped += usize::from(other == EvidenceVerdict::Rejected("token_budget"));
+                tracing::debug!(
+                    rule = %rule.title,
+                    file = %file.path,
+                    line = violation.line,
+                    reason = ?other,
+                    "rule violation dropped"
+                );
+            }
         }
     }
     ShardedRulesOutput {
@@ -329,23 +339,29 @@ pub(crate) async fn run_sharded_rules(
         findings,
         shards_run,
         candidates,
+        budget_skipped,
         tools_unsupported: tools_unsupported.into_inner(),
     }
 }
 
-/// One shard call: the violations of `matching` it claims in `file`, empty on any failure.
+/// One shard call: the violations of `matching` it claims in `file`, empty on any failure or
+/// when no time is left; `None` when it did not start because the token budget was exhausted.
 async fn run_shard(
     ctx: RuleEvidenceContext<'_>,
     file: &FileDiff,
     range: &CommentableRange,
     matching: &[&Rule],
     deadline: Instant,
-) -> Vec<RawShardViolation> {
+) -> Option<Vec<RawShardViolation>> {
     let span = tracing::debug_span!("rule_shard", file = %file.path, rules = matching.len());
     async {
         if ctx.token_budget.is_some_and(|budget| budget.exhausted()) {
             tracing::debug!("token budget exhausted; rule shard not started");
-            return Vec::new();
+            return None;
+        }
+        if Instant::now() >= deadline {
+            tracing::debug!("no time left; rule shard not started");
+            return Some(Vec::new());
         }
         let judged = tokio::time::timeout_at(deadline, async {
             // An added file is whole in its diff already.
@@ -376,7 +392,7 @@ async fn run_shard(
             .await
         })
         .await;
-        match judged {
+        let violations = match judged {
             Ok(Ok(reply)) => {
                 let violations = parse_shard_response(&reply, matching.len(), range);
                 tracing::debug!(violations = violations.len(), "rule shard judged");
@@ -390,7 +406,8 @@ async fn run_shard(
                 tracing::debug!("rule shard cut by the deadline");
                 Vec::new()
             }
-        }
+        };
+        Some(violations)
     }
     .instrument(span)
     .await
@@ -651,7 +668,6 @@ mod tests {
         let [finding] = out.findings.as_slice() else {
             panic!("one verified finding: {:?}", out.findings);
         };
-        assert!(!finding.needs_verify());
         assert_eq!(finding.origin, FinderPass::ShardedRules);
         let s = &finding.suggestion;
         assert_eq!(
@@ -704,6 +720,7 @@ mod tests {
                 vec![shard_reply()],
                 0..=0,
                 false,
+                5,
             ),
             (
                 "tool-less fast model",
@@ -713,9 +730,18 @@ mod tests {
                     .collect(),
                 1..=RULE_EVIDENCE_CONCURRENCY,
                 true,
+                0,
             ),
         ];
-        for (name, token_budget, script, collector_calls, expect_tools_unsupported) in cases {
+        for (
+            name,
+            token_budget,
+            script,
+            collector_calls,
+            expect_tools_unsupported,
+            budget_skipped,
+        ) in cases
+        {
             let chat = ScriptedChat::new(script);
             let ctx = RuleEvidenceContext {
                 chat: &chat,
@@ -741,6 +767,8 @@ mod tests {
                 "{name}"
             );
             assert_eq!(out.tools_unsupported, expect_tools_unsupported, "{name}");
+            // Evidence loops skipped for the budget feed the budget warning.
+            assert_eq!(out.budget_skipped, budget_skipped, "{name}");
             // Every call after the shard is a collector; the fifth violation never starts one.
             let collectors = chat.requests().len() - 1;
             assert!(
