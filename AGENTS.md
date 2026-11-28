@@ -12,6 +12,7 @@ Repo: https://github.com/Return-nol/adus · GHCR image: `ghcr.io/return-nol/adus
 4. **System architecture overview:** [ARCHITECTURE.md](docs/ARCHITECTURE.md) (crate topology, worker/queue flow, Generalist & Specialists review flows, and ReAct loop)
 5. **Existing Adus code** and this file
 6. **Backlog of deferred minor findings:** [docs/superpowers/backlog.md](docs/superpowers/backlog.md)
+7. **Check for remote updates** on `main` branch before starting plan or checking-out to feature branch.
 
 Historical dated specs and plans live under `docs/superpowers/specs/` and `docs/superpowers/plans/`. If a spec and a plan conflict, the spec wins.
 
