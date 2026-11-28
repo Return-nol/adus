@@ -202,7 +202,7 @@ impl Queue {
     /// Entri yang belum di-ack lebih dari `RECLAIM_IDLE` (35 menit) dianggap milik worker yang
     /// mati dan diambil alih lebih dulu. Tiap pengambilalihan menambah `attempt` satu; lewat dari
     /// `MAX_ATTEMPTS` job masuk stream dead. Artinya job wajib di-`ack`, di-`retry` atau
-    /// di-`dead_letter` dalam 35 menit (`JOB_TIMEOUT` worker, 31 menit, ada di bawah batas itu;
+    /// di-`dead_letter` dalam 35 menit (`JOB_TIMEOUT` worker, 33 menit, ada di bawah batas itu;
     /// TTL lock sama, 35 menit), kalau tidak worker lain ikut mengerjakannya.
     ///
     /// Jika future ini dibatalkan tepat saat Redis sudah mengirim entri, entri itu tetap di

@@ -14,7 +14,7 @@ use adus_git::{
 };
 use adus_llm::router::{ChatError, ChatService, UsageContext};
 use adus_llm::{ChatRequest, ChatResponse, Message, StopReason, UserPart};
-use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
+use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT, VALIDATE_TIMEOUT};
 use adus_review::workspace::{RepoCloner, RepoWorkspace, WorkspaceError};
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -349,6 +349,7 @@ pub async fn setup(
             cloner,
             review_timeout: REVIEW_TIMEOUT,
             specialists_review_timeout: SPECIALISTS_REVIEW_TIMEOUT,
+            validate_timeout: VALIDATE_TIMEOUT,
         },
         git,
         connection_id: conn.id,

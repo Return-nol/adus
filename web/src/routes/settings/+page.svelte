@@ -19,7 +19,7 @@
 
 	const reviewModeLabels: Record<ReviewMode, string> = {
 		generalist: 'Generalist — balanced single-pass review',
-		specialists: 'Specialists — parallel Bug, Security, Performance & Rules'
+		specialists: 'Specialists — parallel Bug, Security & Performance'
 	};
 	const curatorEffortLabels: Record<CuratorEffort, string> = {
 		low: 'Low',

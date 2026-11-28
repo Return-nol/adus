@@ -307,16 +307,32 @@ async fn anthropic_parses_text_and_usage() {
 }
 
 #[tokio::test]
-async fn anthropic_no_text_blocks_is_invalid() {
-    let server = serve(
-        ANTHROPIC_PATH,
-        ok(json!({"content": [{"type": "thinking", "thinking": "hmm"}]})),
-    )
-    .await;
-    assert_eq!(
-        chat(ProviderKind::Anthropic, &server).await.unwrap_err(),
-        LlmError::Invalid("empty response".into())
-    );
+async fn anthropic_empty_reply_or_refusal_is_invalid() {
+    for (body, expected) in [
+        (
+            json!({"content": [{"type": "thinking", "thinking": "hmm"}], "stop_reason": "end_turn"}),
+            "empty response (stop_reason end_turn)",
+        ),
+        // A refusal's partial output is never a reply.
+        (
+            json!({
+                "content": [{"type": "text", "text": "Looking at"}],
+                "stop_reason": "refusal",
+                "stop_details": {"type": "refusal", "category": "cyber"},
+            }),
+            "request declined (stop_reason refusal, category cyber)",
+        ),
+        (
+            json!({"content": [], "stop_reason": "refusal", "stop_details": null}),
+            "request declined (stop_reason refusal, category none)",
+        ),
+    ] {
+        let server = serve(ANTHROPIC_PATH, ok(body)).await;
+        assert_eq!(
+            chat(ProviderKind::Anthropic, &server).await.unwrap_err(),
+            LlmError::Invalid(expected.into())
+        );
+    }
 }
 
 // ---------- Gemini ----------
@@ -997,6 +1013,9 @@ async fn anthropic_empty_system_and_no_tools_are_omitted() {
     chat_with(ProviderKind::Anthropic, &server, &req)
         .await
         .unwrap();
+    // A model without server-side fallback gets neither the beta header nor `fallbacks`.
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("anthropic-beta").is_none());
     assert_eq!(
         sent_body(&server).await,
         json!({
@@ -1311,6 +1330,7 @@ async fn retries_without_effort_when_provider_rejects_reasoning_param() {
     let first: Value = requests[0].body_json().unwrap();
     let second: Value = requests[1].body_json().unwrap();
     assert_eq!(first["reasoning_effort"], "high");
+    assert!(first.get("reasoning").is_none() && first.get("provider").is_none());
     assert_eq!(first["max_completion_tokens"], 100 + 23_000);
     assert!(second.get("reasoning_effort").is_none());
     assert_eq!(second["max_completion_tokens"], 100);
@@ -1431,26 +1451,46 @@ async fn anthropic_sends_thinking_budget_and_replays_thinking_blocks_on_tool_tur
 }
 
 #[tokio::test]
-async fn anthropic_current_model_sends_adaptive_thinking_and_effort() {
-    let server = serve(
-        ANTHROPIC_PATH,
-        ok(json!({
-            "content": [{"type": "text", "text": "ok"}],
-            "stop_reason": "end_turn"
-        })),
-    )
-    .await;
+async fn anthropic_current_model_sends_adaptive_thinking_effort_and_server_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ANTHROPIC_PATH))
+        .and(header("anthropic-beta", "server-side-fallback-2026-07-01"))
+        .respond_with(ok(json!({
+            "model": "claude-opus-5",
+            "content": [
+                {"type": "thinking", "thinking": "declined attempt", "signature": "s0"},
+                {"type": "text", "text": "partial"},
+                {"type": "tool_use", "id": "t0", "name": "grep", "input": {}},
+                {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-5"}},
+                {"type": "thinking", "thinking": "fallback", "signature": "s1"},
+                {"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "a"}},
+            ],
+            "stop_reason": "tool_use"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let req =
         ChatRequest::text("claude-opus-5-5", "sys", "hi", 8192).with_effort(ReasoningEffort::High);
     let resp = chat_with(ProviderKind::Anthropic, &server, &req)
         .await
         .unwrap();
-    assert_eq!(resp.text, "ok");
+    // Only what the fallback model produced after the switch point is kept.
+    assert_eq!(resp.text, "");
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert_eq!(resp.tool_calls[0].id, "t1");
+    let meta = resp.tool_calls[0].provider_meta.as_deref().unwrap();
+    assert!(meta.contains("s1") && !meta.contains("s0"));
 
     let body = sent_body(&server).await;
-    assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(
+        body["thinking"],
+        json!({"type": "adaptive", "display": "summarized"})
+    );
     assert_eq!(body["output_config"], json!({"effort": "high"}));
+    assert_eq!(body["fallbacks"], json!("default"));
     assert_eq!(body["max_tokens"], 8192 + 23_000);
     assert!(!body.to_string().contains("budget_tokens"));
 }

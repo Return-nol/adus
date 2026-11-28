@@ -186,6 +186,60 @@ pub struct ChatResponse {
     pub provider_meta: Option<String>,
 }
 
+impl ChatResponse {
+    /// The model's visible reasoning for this turn, for debug logging: OpenAI-compatible
+    /// `reasoning_content` / `reasoning` / `reasoning_details` (kept in `provider_meta`) and
+    /// Anthropic thinking blocks (kept on the first tool call). `None` when the provider returned
+    /// none (Gemini thoughts are not requested).
+    pub fn reasoning(&self) -> Option<String> {
+        let metas = self.provider_meta.iter().chain(
+            self.tool_calls
+                .iter()
+                .filter_map(|c| c.provider_meta.as_ref()),
+        );
+        let mut out: Vec<String> = Vec::new();
+        for meta in metas {
+            if let Ok(value) = serde_json::from_str::<Value>(meta) {
+                collect_reasoning(&value, &mut out);
+            }
+        }
+        out.dedup();
+        (!out.is_empty()).then(|| out.join("\n"))
+    }
+}
+
+/// Reasoning strings in one provider-meta value (see [`ChatResponse::reasoning`]).
+fn collect_reasoning(value: &Value, out: &mut Vec<String>) {
+    let mut push = |s: Option<&str>| {
+        if let Some(s) = s.map(str::trim).filter(|s| !s.is_empty()) {
+            out.push(s.to_owned());
+        }
+    };
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                // Anthropic `{"type":"thinking","thinking":..}`; OpenRouter `reasoning_details`
+                // entries carry `text` or `summary`.
+                push(item.get("thinking").and_then(Value::as_str));
+                push(item.get("text").and_then(Value::as_str));
+                push(item.get("summary").and_then(Value::as_str));
+            }
+        }
+        Value::Object(map) => {
+            // `reasoning` usually repeats `reasoning_content`; `dedup` drops the copy.
+            push(map.get("reasoning_content").and_then(Value::as_str));
+            push(map.get("reasoning").and_then(Value::as_str));
+            if map.get("reasoning_content").is_none()
+                && map.get("reasoning").is_none()
+                && let Some(details) = map.get("reasoning_details")
+            {
+                collect_reasoning(details, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum LlmError {
     #[error("rate limited")]
@@ -459,5 +513,68 @@ pub(crate) fn non_empty(text: String, tool_calls: &[ToolCall]) -> Result<String,
         Err(LlmError::Invalid("empty response".into()))
     } else {
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn response(meta: Option<Value>, call_meta: Option<Value>) -> ChatResponse {
+        ChatResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+                provider_meta: call_meta.map(|v| v.to_string()),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            provider_meta: meta.map(|v| v.to_string()),
+        }
+    }
+
+    #[test]
+    fn reasoning_reads_each_provider_format() {
+        let cases = [
+            // OpenAI-compatible: `reasoning` repeating `reasoning_content` is shown once.
+            (
+                response(
+                    Some(json!({"reasoning_content": "a", "reasoning": "a"})),
+                    None,
+                ),
+                Some("a"),
+            ),
+            // OpenRouter with only `reasoning_details`.
+            (
+                response(
+                    Some(json!({"reasoning_details": [{"type": "reasoning.text", "text": "b"}]})),
+                    None,
+                ),
+                Some("b"),
+            ),
+            // Anthropic thinking blocks on the first tool call; redacted blocks have no text.
+            (
+                response(
+                    None,
+                    Some(json!([
+                        {"type": "thinking", "thinking": "c", "signature": "s"},
+                        {"type": "redacted_thinking", "data": "x"}
+                    ])),
+                ),
+                Some("c"),
+            ),
+            // Gemini `thoughtSignature` is an opaque string, not reasoning.
+            (response(None, None), None),
+        ];
+        for (resp, expected) in cases {
+            assert_eq!(resp.reasoning().as_deref(), expected);
+        }
     }
 }

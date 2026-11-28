@@ -81,6 +81,40 @@ Task numbers below are this plan's tasks. Sources: the per-task reviews, final r
 - Semantic Dedup's `already_raised` citation is not checked against the finding's file (only the prompt-level data guard stops an injected thread from suppressing an unrelated finding)
 - Memory prompt injection has no cap or relevance selection, so prompts grow with the number of active memories
 
+## Anthropic safety-classifier refusals (2026-11-27, live run on better-booru PR #15)
+
+- Resolved 2026-11-27 (Finder field renamed to `review_log`, worded as a work record; confirmed by live Sonnet 5.5 runs on PR #18 and #20, no refusal): Sonnet 5.5 declines the first Finder request with `stop_reason: "refusal"`, `category reasoning_extraction`. The likely trigger is the Finder prompt asking the model to write out its reasoning: the required, first-listed `submit_findings.reasoning` field, "Write \"reasoning\" first ... why each suspicion was reported or dismissed" (`prompt.rs` FINDER_OUTPUT_TOOLS, workflow step 4) and "they record your reasoning" (FINDER_DISMISSED_TOOLS). Server-side `fallbacks: "default"` never retries this category. Options: rename the field to a work log that never asks for reasoning (keeps prose recovery), or drop it and rely on summarized thinking; either changes the Task 3 decision, so update the change spec and SPEC.md. A refusal is `Invalid`, so the whole job goes dead on one Finder refusal.
+- Uncommitted with this note: `anthropic.rs` reports refusals as `request declined (stop_reason refusal, category …)`, discards output before a `fallback` block, and opts Sonnet 5.5+/Opus 5+/Fable into `fallbacks: "default"` (SPEC.md §8.4 updated).
+
+## Finder recall on Claude Sonnet 5.5 (2026-11-27, live runs on better-booru PR #18 and #20)
+
+Cause unknown: harness or model. Kodus has not been run on Sonnet 5.5 here, so there is no baseline; run Kodus on the same PR with Sonnet 5.5 before changing Adus for it.
+
+- Sonnet's first Finder pass stops after 4 to 6 of its steps with zero or one candidate (PR #20: two read rounds, one grep round, submit); the coverage gate lets it through because every changed file was read. The Synthesis Rescue pass adds one finding. PR #20 covered 2 of Kodus's 4 PR #14 problems (`posts.go:165`, the migration hash leak); DeepSeek on the same prompts (PR #21) covered all 4.
+- It overrides the Finder's dismissal rules in its own thinking: its review log calls the S3 `Exists` error read as a miss "acceptable" because the caller regenerates (PR #20), and the discarded `_, _ =` update errors "only affect orphan bookkeeping" (PR #18); both are excuses the prompt forbids.
+- It never fills `dismissed` (`dismissed=0` in every pass); dismissals go into `review_log` only, so the per-dismissal debug lines are missing.
+- Levers to try once a baseline exists: Finder effort `xhigh` for Sonnet 5.5 (Anthropic recalibrated its effort levels and recommends `xhigh` for agentic coding); a required `dismissed` entry per suspicion in the forbidden-excuse categories (beyond Kodus, which has no `dismissed` list).
+
+## Verifier refutes on "the caller copes" (2026-11-27, DeepSeek run on PR #21)
+
+- The Verifier refuted `cache.go:124` (transient S3 `Exists` error read as a cache miss) with "the error-swallow is real, but the described harm is refuted … returning the error would fall into the exact same regeneration". That is the "a caller recovers" argument the Finder may no longer use for dismissals; the Verifier's "None of these refutes a finding" list has no such clause. Option: add that a caller coping with the outcome afterwards does not refute a hidden error, an error read as a miss, or a skipped fallback. Kodus's Verifier has no such clause either, so check its behaviour on the same finding first.
+
+## Sharded Rules (plan 2026-11-25-review-engine-sharded-rules, final review 2026-11-27)
+
+- Rule evidence has no per-review cap on candidates: the Finder deadline and the token budget bound it, but a broad rule over a large PR can still start many collectors before the budget runs out.
+- Evidence loops start only after every shard finishes (`run_sharded_rules` collects shards before the evidence stream); pipelining would overlap them.
+- `TokenBudget::wrap_ups()` (read as `finder_wrap_ups` for the summary) now also counts budget-driven rule-collector wrap-ups; a separate counter would keep the Finder note exact.
+- On a `ToolsUnsupported` Finder re-run, every shard and collector (started or not) still runs and its findings are discarded (wasted calls); the diff-only re-run checks `<rules>`. Stopping rule work once the Finder reports `ToolsUnsupported` would save the calls.
+- Verified rule findings are lost when every Finder task fails (the review fails and is retried, as with the old Rules specialist).
+- `capped_excerpts` keeps the original `[path: lines X-Y of Z]` header on a truncated excerpt and drops later small excerpts after the first one that crosses the 24,000-char cap.
+- `rules_evidence.rs` `first_object` / `loose_submission` are a third copy of the scan-and-deserialize loop (`parse::first_json_object`, the Verifier's `loose_verdict`); share one helper in `parse.rs`.
+- Tests: no case for collector error / unparseable submission / `no_excerpts` / unparseable judge (fail-closed branches); the shard parser's invalid-entries block never mixes in a valid item; no test pins diff-unredacted vs `<file_content>`-redacted; `evidence_judge_rejects_violated_verdict_without_excerpt_line` actually tests `read_contains_line`; `run_sharded_rules_evaluates_matching_files_and_skips_unmatched` repeats body/severity/model asserts the engine test pins; the tool-less-fast-model case asserts `1..=4` collector calls (proves only that the fifth loop is skipped).
+- The sharded-rules parallelism engine test relies on a 300 ms hold of the Finder; watch it for flakes on a loaded CI runner.
+- No test pins that the Verifier starts before slow rule work finishes (the parallelism test proves only rules-during-Finder concurrency): delay the `RuleEvidenceJudge` stage and assert the Verifier call comes first.
+- Rule-collector wrap-ups after the Finder finishes are not counted in `finder_wrap_ups`, and `budget_skipped` counts only rule work that never started, so a collector cut by the budget mid-run is not named in the summary warning.
+- `read_file` formats each row number twice (`prefix` for the budget check, then `push_numbered_row`).
+- Small polish: the shard rule formatter (`[n] (sev) title`) lacks a comment on why it does not reuse `prompt::format_rules`; rule body ends with two parentheticals in a row when `cited_line` is set; `body.push_str(&format!(..))` allocates twice; the first collector that hits `ToolsUnsupported` logs the variant name rather than a reason string; SPEC's fail-closed item does not list the skipped-start reasons (`token_budget`, `no_time_left`, `tools_unsupported`), which the evidence-loop bullet does; `queue_key` keeps an unreachable `ShardedRules` arm for exhaustiveness.
+
 ## Thread conversations & curated learning (plan 2026-11-27)
 
 - `web/src/lib/components/memory-dialog.svelte`: edit-and-approve makes 2 sequential requests (`PATCH` then `POST /approve`)

@@ -20,8 +20,8 @@ use common::{FakeGit, PAT, conn_status, pr};
 use serde_json::json;
 use sqlx::PgPool;
 use support::{
-    Reply, Setup, Stage, clone_spec, diff_header, file, finding_json, patch_repo, setup, setup_big,
-    setup_files, setup_one, update_settings,
+    Reply, Setup, Stage, captured_logs, clone_spec, diff_header, file, finding_json, patch_repo,
+    setup, setup_big, setup_files, setup_one, update_settings,
 };
 use uuid::Uuid;
 
@@ -29,7 +29,7 @@ mod support {
     use std::collections::HashMap;
     use std::ops::{Deref, DerefMut};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
     use adus_core::types::ProviderKind;
@@ -50,21 +50,47 @@ mod support {
     use crate::PATCH_2;
     use crate::common::{self, FakeGit, pr};
 
-    /// Which review stage sent a chat request, read from its system prompt.
+    /// Which review stage sent a chat request, read from its system prompt (and, for the
+    /// Finder's Pass 2, its first user message).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum Stage {
+        /// Finder Pass 1.
         Finder,
+        /// Finder Pass 2, the synthesis rescue.
+        Synthesis,
         Verifier,
         Dedup,
+        Severity,
+        Enrich,
+        /// One Sharded Rules call on one changed file.
+        RuleShard,
+        /// A step of the evidence collector of one rule violation.
+        RuleEvidenceCollector,
+        /// The evidence judge of one rule violation.
+        RuleEvidenceJudge,
     }
 
-    fn stage_of(system: &str) -> Stage {
+    fn stage_of(system: &str, user: &str) -> Stage {
         if system.contains("<ReviewInstructions>") {
-            Stage::Finder
+            if user.contains("<already_inspected_files>") {
+                Stage::Synthesis
+            } else {
+                Stage::Finder
+            }
         } else if system.contains("Adudu's verifier") {
             Stage::Verifier
         } else if system.contains("You merge duplicate findings") {
             Stage::Dedup
+        } else if system.contains("You rate how severe each finding") {
+            Stage::Severity
+        } else if system.contains("You write the headline of one verified finding") {
+            Stage::Enrich
+        } else if system.starts_with("You check one changed file against the team's rules") {
+            Stage::RuleShard
+        } else if system.starts_with("You gather evidence for one team-rule violation") {
+            Stage::RuleEvidenceCollector
+        } else if system.starts_with("You judge one team-rule violation from collected evidence") {
+            Stage::RuleEvidenceJudge
         } else {
             panic!("unexpected chat system prompt: {system}");
         }
@@ -139,7 +165,8 @@ mod support {
     }
 
     /// Scripted fake LLM. Consumes the first matching scripted reply per stage; defaults to
-    /// Finder `[]`, Verifier `{"keep": true}`, Dedup invalid (keeps all).
+    /// Finder and Synthesis `[]`, Verifier `{"keep": true}`, Dedup, Severity and Enrich invalid
+    /// (keep all, `warning`, the body's first sentence as the title).
     #[derive(Default)]
     pub struct FakeChat {
         script: Mutex<Vec<Scripted>>,
@@ -206,7 +233,7 @@ mod support {
             self.calls.lock().unwrap().clone()
         }
 
-        fn calls_of(&self, stage: Stage) -> Vec<ChatCall> {
+        pub fn calls_of(&self, stage: Stage) -> Vec<ChatCall> {
             self.calls()
                 .into_iter()
                 .filter(|c| c.stage == stage)
@@ -223,6 +250,28 @@ mod support {
 
         pub fn dedup_calls(&self) -> Vec<ChatCall> {
             self.calls_of(Stage::Dedup)
+        }
+
+        pub fn synthesis_calls(&self) -> Vec<ChatCall> {
+            self.calls_of(Stage::Synthesis)
+        }
+
+        pub fn severity_calls(&self) -> Vec<ChatCall> {
+            self.calls_of(Stage::Severity)
+        }
+
+        pub fn enrich_calls(&self) -> Vec<ChatCall> {
+            self.calls_of(Stage::Enrich)
+        }
+
+        /// Index in [`FakeChat::calls`] of each call of `stage`.
+        pub fn positions(&self, stage: Stage) -> Vec<usize> {
+            self.calls()
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.stage == stage)
+                .map(|(i, _)| i)
+                .collect()
         }
 
         /// Finder calls that contain `needle` answer after `delay`.
@@ -262,8 +311,13 @@ mod support {
                 None => {
                     let reply = match stage {
                         Stage::Verifier => Reply::text(r#"{"keep": true, "rationale": "fake"}"#),
-                        Stage::Dedup => Reply::text("no answer"),
-                        Stage::Finder => Reply::text("[]"),
+                        Stage::Dedup
+                        | Stage::Severity
+                        | Stage::Enrich
+                        | Stage::RuleEvidenceCollector
+                        | Stage::RuleEvidenceJudge => Reply::text("no answer"),
+                        Stage::RuleShard => Reply::text(r#"{"violations": []}"#),
+                        Stage::Finder | Stage::Synthesis => Reply::text("[]"),
                     };
                     (reply, None)
                 }
@@ -279,7 +333,6 @@ mod support {
             req: ChatRequest,
             ctx: UsageContext,
         ) -> Result<ChatResponse, ChatError> {
-            let stage = stage_of(&req.system);
             let user = req
                 .messages
                 .iter()
@@ -288,6 +341,7 @@ mod support {
                     _ => None,
                 })
                 .unwrap_or_default();
+            let stage = stage_of(&req.system, &user);
             let tool_results = req
                 .messages
                 .iter()
@@ -301,7 +355,7 @@ mod support {
             let haystack = format!("{}\n{user}", req.system);
             let offered: Vec<String> = req.tools.iter().map(|t| t.name.clone()).collect();
             let sticky_delay = match stage {
-                Stage::Finder => self
+                Stage::Finder | Stage::Synthesis => self
                     .delays
                     .lock()
                     .unwrap()
@@ -351,7 +405,9 @@ mod support {
                 input_tokens: 1,
                 output_tokens: 1,
                 cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                // One per call, so the stage log's review-wide cache count is visible; writes
+                // do not change the budget's weighting.
+                cache_write_tokens: 1,
                 provider_meta: None,
             };
             match reply {
@@ -557,6 +613,61 @@ mod support {
         format!("=== {path} (")
     }
 
+    /// Log output captured by [`captured_logs`].
+    #[derive(Clone, Default)]
+    pub struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        /// The first captured line that contains every one of `needles`.
+        pub fn line(&self, needles: &[&str]) -> Option<String> {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .find(|line| needles.iter().all(|needle| line.contains(needle)))
+                .map(str::to_string)
+        }
+    }
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    static LOGS: OnceLock<LogBuffer> = OnceLock::new();
+
+    /// Every `info` log of this test binary from now on, by one global subscriber installed on
+    /// first use. Tests run in parallel, so a caller picks its own lines (by review id). A
+    /// scoped subscriber is not enough: tracing caches a callsite's interest globally, so it
+    /// misses a log line another test reached first.
+    pub fn captured_logs() -> LogBuffer {
+        LOGS.get_or_init(|| {
+            let buffer = LogBuffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(buffer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other global subscriber in this test binary");
+            buffer
+        })
+        .clone()
+    }
+
     /// One finding as a JSON object for `submit_findings`.
     pub fn finding_json(path: &str, line: u32, severity: &str, title: &str) -> serde_json::Value {
         json!({"file": path, "line": line, "severity": severity, "title": title, "body": "why"})
@@ -572,7 +683,6 @@ const GENERALIST_ROLE: &str = "You are the generalist reviewer";
 const BUG_ROLE: &str = "You are the correctness reviewer";
 const SECURITY_ROLE: &str = "You are the security reviewer";
 const PERFORMANCE_ROLE: &str = "You are the performance reviewer";
-const RULES_ROLE: &str = "You are the team-rules reviewer";
 
 const CODEBASE_NOTE: &str = "Codebase context unavailable — reviewed diff only";
 const TOOLS_NOTE: &str = "Model does not support tool calling — reviewed diff only";
@@ -662,17 +772,20 @@ async fn full_review_posts_valid_comments_and_summary(pool: PgPool) {
     assert_eq!(finder[0].model, "gpt-test");
     assert_eq!(finder[0].max_tokens, 8192);
     assert!(finder[0].user.contains("No unwrap"));
-    // The one valid finding is verified with the fast model; one finding needs no dedup.
+    // The one valid finding is verified; one finding needs no dedup.
     let verifier = s.chat.verifier_calls();
     assert_eq!(verifier.len(), 1);
     assert_eq!(verifier[0].provider_id, s.provider_id);
-    assert_eq!(verifier[0].model, "gpt-fast");
-    assert_eq!(verifier[0].effort, Some(ReasoningEffort::Low));
     assert!(verifier[0].user.contains("\"title\": \"Bug\""));
     assert!(s.chat.dedup_calls().is_empty());
+    // The Finder named a severity, so only the title is left to the fast model.
+    assert!(s.chat.severity_calls().is_empty());
+    let enrich = s.chat.enrich_calls();
+    assert_eq!(enrich.len(), 1);
+    assert_eq!(enrich[0].model, "gpt-fast");
 
     let calls = s.chat.calls();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 3);
     for call in calls {
         assert_eq!(call.ctx.review_id, Some(id));
         assert_eq!(call.ctx.repository_id, Some(s.repository_id));
@@ -1253,9 +1366,9 @@ async fn repo_provider_override_wins(pool: PgPool) {
     run(&s, Trigger::Opened).await.unwrap();
 
     let calls = s.chat.calls();
-    assert_eq!(calls.len(), 2, "Finder and Verifier");
+    assert_eq!(calls.len(), 3, "Finder, Verifier and Enrich");
     assert!(calls.iter().all(|c| c.provider_id == other.id));
-    // No fast model: the Verifier falls back to the primary model.
+    // Every stage runs on the primary model: this provider has no fast model.
     assert!(calls.iter().all(|c| c.model == "claude-test"));
 }
 
@@ -1278,16 +1391,10 @@ async fn review_mode_precedence_command_overrides_repo_overrides_settings(pool: 
         s.chat.finder_calls()[from..]
             .iter()
             .map(|c| {
-                [
-                    GENERALIST_ROLE,
-                    BUG_ROLE,
-                    SECURITY_ROLE,
-                    PERFORMANCE_ROLE,
-                    RULES_ROLE,
-                ]
-                .into_iter()
-                .find(|role| c.system.contains(role))
-                .expect("a Finder role")
+                [GENERALIST_ROLE, BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE]
+                    .into_iter()
+                    .find(|role| c.system.contains(role))
+                    .expect("a Finder role")
             })
             .collect()
     };
@@ -1315,13 +1422,6 @@ async fn review_mode_precedence_command_overrides_repo_overrides_settings(pool: 
         .await
         .unwrap();
     assert_eq!(roles_since(7), vec![GENERALIST_ROLE]);
-
-    let efforts: Vec<_> = s.chat.finder_calls().iter().map(|c| c.effort).collect();
-    let (medium, high) = (Some(ReasoningEffort::Medium), Some(ReasoningEffort::High));
-    let mut expected = vec![medium];
-    expected.extend([high; 6]);
-    expected.push(medium);
-    assert_eq!(efforts, expected);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1472,8 +1572,16 @@ async fn slow_review_times_out_and_is_marked_failed(pool: PgPool) {
     s.git.state().get_pr_delay = Duration::from_secs(5);
     s.engine.review_timeout = Duration::from_millis(100);
     s.engine.specialists_review_timeout = Duration::from_millis(100);
+    s.engine.validate_timeout = Duration::from_millis(100);
+    let started = Instant::now();
 
     let err = run(&s, Trigger::Opened).await.unwrap_err();
+
+    // The backstop (the larger budget plus the push-validation cap) cuts the slow PR fetch.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cut by the backstop"
+    );
 
     assert_eq!(err, EngineError::Fatal("review timed out".into()));
     let row = latest(&pool).await;
@@ -1607,14 +1715,17 @@ async fn invalid_stored_ignore_list_falls_back_to_defaults(pool: PgPool) {
 async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
     let s = setup_files(&pool, vec![file("src/login.rs", PATCH_234)]).await;
     s.enable_clone(&[
-        ("src/login.rs", "a\nb\nc\nd\n"),
+        ("src/login.rs", "a\nb\nc\nd\nfn after_hunk() {}\n"),
         (
             "src/helper.rs",
             "pub fn is_admin() -> bool {\n    false\n}\n",
         ),
     ]);
-    s.chat
-        .finder(Reply::tool("read_file", json!({"path": "src/helper.rs"})));
+    // Reading the changed file too keeps the completion gate open.
+    s.chat.finder(Reply::Tools(vec![
+        ("read_file".into(), json!({"path": "src/helper.rs"})),
+        ("read_file".into(), json!({"path": "src/login.rs"})),
+    ]));
     s.chat.finder(Reply::submit(json!([
         finding_json("src/login.rs", 2, "critical", "Real bug"),
         finding_json("src/login.rs", 3, "warning", "False alarm"),
@@ -1631,12 +1742,15 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
     assert_eq!(row.status, ReviewStatus::Done);
     assert_eq!(row.comments_posted, 1);
 
-    // Finder: primary model at Medium, repository tools, then the helper file's content.
-    let finder = s.chat.finder_calls();
+    // Finder: primary model at High, repository tools, then the helper file's content; Pass 2
+    // (the synthesis rescue, answering the default `[]`) follows with what Pass 1 opened.
+    let mut finder = s.chat.finder_calls();
     assert_eq!(finder.len(), 2);
+    finder.extend(s.chat.synthesis_calls());
+    assert_eq!(finder.len(), 3);
     for call in &finder {
         assert_eq!(call.model, "gpt-test");
-        assert_eq!(call.effort, Some(ReasoningEffort::Medium));
+        assert_eq!(call.effort, Some(ReasoningEffort::High));
         assert!(call.system.contains(GENERALIST_ROLE));
         assert!(call.system.contains("You can read the repository"));
     }
@@ -1651,15 +1765,26 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
         ]
     );
     assert!(finder[0].tool_results.is_empty());
-    assert_eq!(finder[1].tool_results.len(), 1);
+    // Raw hunks only: the code around them is read with the tools.
+    assert!(!finder[0].user.contains("after_hunk"), "{}", finder[0].user);
+    assert_eq!(finder[1].tool_results.len(), 2);
     assert!(finder[1].tool_results[0].contains("pub fn is_admin() -> bool"));
+    assert!(
+        finder[2].user.starts_with(&finder[0].user)
+            && finder[2].user.contains(
+                "<already_inspected_files>
+src/helper.rs
+src/login.rs
+"
+            ),
+        "{}",
+        finder[2].user
+    );
 
-    // Verifier: fast model at Low, with tools, one call per candidate.
+    // Verifier: with tools, one call per candidate.
     let verifier = s.chat.verifier_calls();
     assert_eq!(verifier.len(), 2);
     for call in &verifier {
-        assert_eq!(call.model, "gpt-fast");
-        assert_eq!(call.effort, Some(ReasoningEffort::Low));
         assert!(call.tools.contains(&"read_file".to_string()));
         assert!(call.tools.contains(&"submit_verdict".to_string()));
     }
@@ -1680,8 +1805,151 @@ async fn agentic_generalist_uses_tools_and_verifies(pool: PgPool) {
     assert!(!root.exists(), "the workspace is deleted after the review");
 }
 
+/// The whole Generalist pipeline on lean Finder output: Pass 1 (gated once), Pass 2, the
+/// Verifier with one Evidence Gate run, Semantic Dedup, Severity and Enrichment. The posted
+/// body is the Finder's (redacted); severity and title come from the post-verify funnel.
 #[sqlx::test(migrations = "../../migrations")]
-async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(pool: PgPool) {
+async fn generalist_pipeline_runs_post_verify_funnel_and_posts_finder_bodies(pool: PgPool) {
+    let s = setup_files(
+        &pool,
+        vec![file("src/a.rs", PATCH_234), file("src/b.rs", PATCH_234)],
+    )
+    .await;
+    s.enable_clone(&[
+        (
+            "src/a.rs", "a
+b
+c
+d
+",
+        ),
+        (
+            "src/b.rs", "a
+b
+c
+d
+",
+        ),
+    ]);
+    let token = format!("ghp_{}", "a1".repeat(18));
+    let secret_body = format!("Logs the token {token} in plain text. Anyone can reuse it.");
+    let lean = |file: &str, line: u32, body: &str| json!({"file": file, "line": line, "category": "bug", "body": body});
+    let pass1 = json!([
+        lean("src/a.rs", 2, &secret_body),
+        lean("src/b.rs", 3, "Off by one when the list is empty."),
+    ]);
+    // Pass 1 reads a.rs only: its first submission is refused once (b.rs is unread), the
+    // second is accepted. The b.rs finding therefore goes to the Evidence Gate.
+    s.chat
+        .finder(Reply::tool("read_file", json!({"path": "src/a.rs"})));
+    s.chat.finder(Reply::submit(pass1.clone()));
+    s.chat.finder(Reply::submit(pass1));
+    s.chat.push_stage(
+        Stage::Synthesis,
+        Reply::submit(json!([lean("src/a.rs", 4, "`d` is never freed!")])),
+    );
+    s.chat
+        .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1, 2]}"#));
+    s.chat.push_stage(
+        Stage::Severity,
+        Reply::text(
+            r#"{"severities": [{"index": 0, "severity": "critical"}, {"index": 1, "severity": "info"}]}"#,
+        ),
+    );
+    s.chat.push_for(
+        Stage::Enrich,
+        "Logs the token",
+        Reply::text(
+            r#"{"title": "Token written to the log", "suggestion": "log_redacted(b);", "body": "A rewritten, unchecked claim."}"#,
+        ),
+    );
+    let logs = captured_logs();
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    assert_eq!(review(&pool, id).await.comments_posted, 3);
+    assert_eq!(s.chat.finder_calls().len(), 3);
+    assert_eq!(s.chat.synthesis_calls().len(), 1);
+    // Three light runs and one Evidence Gate run, all on the primary model at High.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 4);
+    assert!(
+        verifier
+            .iter()
+            .all(|c| c.model == "gpt-test" && c.effort == Some(ReasoningEffort::High))
+    );
+    // Dedup, Severity and Enrich run on the fast model at Medium.
+    let funnel = [
+        s.chat.dedup_calls(),
+        s.chat.severity_calls(),
+        s.chat.enrich_calls(),
+    ];
+    assert_eq!(funnel.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1, 3]);
+    for call in funnel.iter().flatten() {
+        assert_eq!(call.model, "gpt-fast");
+        assert_eq!(call.effort, Some(ReasoningEffort::Medium));
+    }
+
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    let bodies: Vec<&str> = posted.comments.iter().map(|c| c.body.as_str()).collect();
+    let redacted_body = secret_body.replace(&token, "[REDACTED]");
+    assert_eq!(
+        bodies,
+        vec![
+            format!(
+                "{ADUDU_MARKER}
+🤖 **Adudu** · **🚨 Critical:** Token written to the log
+
+{redacted_body}
+
+```suggestion
+log_redacted(b);
+```"
+            ),
+            format!(
+                "{ADUDU_MARKER}
+🤖 **Adudu** · **ℹ️ Info:** Off by one when the list is empty.
+
+Off by one when the list is empty."
+            ),
+            format!(
+                "{ADUDU_MARKER}
+🤖 **Adudu** · **⚠️ Warning:** `d` is never freed!
+
+`d` is never freed!"
+            ),
+        ]
+    );
+    assert!(posted.summary.contains("Critical: 1"));
+
+    let review_id = format!("review_id={id}");
+    let line = logs
+        .line(&["review stages finished", &review_id])
+        .expect("stage log");
+    for field in [
+        "finder_steps=4",
+        "gate_refusals=1",
+        "synthesis_candidates=1",
+        "verify_candidates=3",
+        "verifier_kept_unreadable=0",
+        "precedents_cleared=0",
+        "dropped_unverified=0",
+        "evidence_gate_runs=1",
+        "kept_by_origin=pass1=2 synthesis_rescue=1 prose_recovery=0",
+        "budget_used=13",
+        "input_tokens=13",
+        "cache_read_tokens=0",
+        // Every call of the review, not only the Finder's: 4 Finder, 4 Verifier, 5 funnel.
+        "cache_write_tokens=13",
+        "token_budget_reached=false",
+    ] {
+        assert!(line.contains(field), "{field} missing: {line}");
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn specialists_mode_runs_bug_security_performance_and_dedups(pool: PgPool) {
     let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
     insert_rule(&pool).await;
     s.chat.finder_role(
@@ -1714,28 +1982,26 @@ async fn specialists_mode_runs_bug_security_performance_and_rules_and_dedups(poo
     assert_eq!(row.comments_posted, 1);
 
     let finder = s.chat.finder_calls();
-    assert_eq!(finder.len(), 4, "Bug, Security, Performance and Rules");
-    for role in [BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE, RULES_ROLE] {
+    assert_eq!(finder.len(), 3, "Bug, Security and Performance");
+    for role in [BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE] {
+        let calls: Vec<_> = finder.iter().filter(|c| c.system.contains(role)).collect();
+        assert_eq!(calls.len(), 1, "{role}");
+        assert_eq!(calls[0].model, "gpt-test");
+        assert_eq!(calls[0].effort, Some(ReasoningEffort::High));
+        // Without the clone no Sharded Rules run: the rules go to Bug, which checks them.
         assert_eq!(
-            finder.iter().filter(|c| c.system.contains(role)).count(),
-            1,
+            calls[0].user.contains("No unwrap"),
+            role == BUG_ROLE,
             "{role}"
         );
     }
-    for call in &finder {
-        assert_eq!(call.model, "gpt-test");
-        assert_eq!(call.effort, Some(ReasoningEffort::High));
-        assert!(call.user.contains("No unwrap"));
-    }
+    assert!(s.chat.calls_of(Stage::RuleShard).is_empty());
 
     // The Verifier keeps both findings; dedup merges them into one.
     let verifier = s.chat.verifier_calls();
     assert_eq!(verifier.len(), 2);
-    assert!(verifier.iter().all(|c| c.model == "gpt-fast"));
     let dedup = s.chat.dedup_calls();
     assert_eq!(dedup.len(), 1);
-    assert_eq!(dedup[0].model, "gpt-fast");
-    assert_eq!(dedup[0].effort, Some(ReasoningEffort::Low));
     assert!(dedup[0].user.contains("Missing null check"));
     assert!(dedup[0].user.contains("Unvalidated input"));
     assert!(dedup[0].user.contains("Bug reviewer"));
@@ -1858,7 +2124,7 @@ async fn enable_small_pr(pool: &PgPool) {
 async fn small_pr_skips_clone_and_tools_but_still_verifies(pool: PgPool) {
     let s = setup_one(&pool).await;
     enable_small_pr(&pool).await;
-    s.enable_clone(&[]);
+    s.enable_clone(&[("a.rs", "a\nb\nextra_context\n")]);
     s.chat.finder(Reply::finding("a.rs", 2, "Bug"));
 
     let id = run(&s, Trigger::Opened).await.unwrap();
@@ -1867,6 +2133,11 @@ async fn small_pr_skips_clone_and_tools_but_still_verifies(pool: PgPool) {
     assert!(s.cloner.urls().is_empty(), "no clone for a small PR");
     let finder = s.chat.finder_calls();
     assert_eq!(finder.len(), 1);
+    assert!(
+        !finder[0].user.contains(" : ") && !finder[0].user.contains("extra_context"),
+        "{}",
+        finder[0].user
+    );
     assert_eq!(
         finder[0].tools,
         vec!["submit_findings"],
@@ -2040,12 +2311,16 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
         ("a.rs", "a\nb\n"),
         ("AGENTS.md", "Always log with tracing, never println."),
     ]);
+    s.chat
+        .finder(Reply::tool("read_file", json!({"path": "a.rs"})));
     s.chat.finder(Reply::finding("a.rs", 2, "Bug"));
 
     run(&s, Trigger::Opened).await.unwrap();
 
+    // Pass 1 (two calls), then the synthesis rescue.
     let finder = s.chat.finder_calls();
-    assert_eq!(finder.len(), 1);
+    assert_eq!(finder.len(), 2);
+    assert_eq!(s.chat.synthesis_calls().len(), 1);
     assert!(finder[0].user.contains("<repository_instructions>"));
     assert!(
         finder[0]
@@ -2059,12 +2334,41 @@ async fn repo_instructions_loaded_from_clone_into_prompt(pool: PgPool) {
             .user
             .contains("Always log with tracing, never println.")
     );
+
+    let before = s.chat.finder_calls().len();
+    run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
+        .await
+        .unwrap();
+    let finder = &s.chat.finder_calls()[before..];
+    // Bug, Security and Performance, plus Bug's second call (the completion gate refuses its
+    // first submission because `a.rs` is unread); then Bug's synthesis rescue.
+    assert_eq!(finder.len(), 4);
+    assert_eq!(s.chat.synthesis_calls().len(), 2);
+    // Every specialist sees the instructions; Bug is the one told to check the hunks against
+    // them.
+    for role in [BUG_ROLE, SECURITY_ROLE, PERFORMANCE_ROLE] {
+        let call = finder
+            .iter()
+            .find(|c| c.system.contains(role))
+            .expect("a call of each role");
+        assert!(
+            call.user
+                .contains("<repository_instructions>\n--- AGENTS.md ---\nAlways log with tracing"),
+            "{role}"
+        );
+        assert_eq!(
+            call.system
+                .contains("check the changed hunks against <repository_instructions>"),
+            role == BUG_ROLE,
+            "{role}"
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn finder_deadline_cuts_slow_specialist_and_posts_survivors_with_note(pool: PgPool) {
     let mut s = setup_one(&pool).await;
-    // Finder deadline at 60 % = 900 ms; the Performance reviewer would answer after 30 s.
+    // Finder deadline at 55 % = 825 ms; the Performance reviewer would answer after 30 s.
     s.engine.specialists_review_timeout = Duration::from_millis(1500);
     s.chat.delay(PERFORMANCE_ROLE, Duration::from_secs(30));
     s.chat
@@ -2092,7 +2396,7 @@ async fn finder_deadline_cuts_slow_specialist_and_posts_survivors_with_note(pool
 #[sqlx::test(migrations = "../../migrations")]
 async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
     let mut s = setup_one(&pool).await;
-    // Finder deadline at 60 % = 270 ms, well before the 450 ms review timeout.
+    // Finder deadline at 55 % = 247.5 ms, well before the 450 ms review timeout.
     s.engine.review_timeout = Duration::from_millis(450);
     s.chat
         .delay("<ReviewInstructions>", Duration::from_secs(30));
@@ -2113,7 +2417,7 @@ async fn finder_deadline_with_no_finished_task_fails_timed_out(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn finder_deadline_lists_the_unfinished_batch_as_skipped(pool: PgPool) {
     let mut s = setup_big(&pool, &["a.rs", "b.rs"]).await;
-    // Finder deadline at 60 % = 900 ms; the b.rs batch would answer after 30 s.
+    // Finder deadline at 55 % = 825 ms; the b.rs batch would answer after 30 s.
     s.engine.review_timeout = Duration::from_millis(1500);
     s.chat.delay(&diff_header("b.rs"), Duration::from_secs(30));
     s.chat.finder_file("a.rs", Reply::finding("a.rs", 2, "Bug"));
@@ -2142,7 +2446,7 @@ async fn finder_deadline_lists_the_unfinished_batch_as_skipped(pool: PgPool) {
 async fn clone_is_bounded_by_the_finder_deadline(pool: PgPool) {
     let mut s = setup_one(&pool).await;
     s.enable_clone(&[]);
-    // Finder deadline at 60 % = 270 ms; the clone would take 30 s.
+    // Finder deadline at 55 % = 247.5 ms; the clone would take 30 s.
     s.engine.review_timeout = Duration::from_millis(450);
     s.cloner.delay(Duration::from_secs(30));
     let started = Instant::now();
@@ -2166,7 +2470,7 @@ async fn clone_is_bounded_by_the_finder_deadline(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn review_timeout_matches_effective_mode(pool: PgPool) {
-    assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(12 * 60));
+    assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(20 * 60));
     assert_eq!(SPECIALISTS_REVIEW_TIMEOUT, Duration::from_secs(30 * 60));
 
     // Part 1: only the Specialists budget is non-zero.
@@ -2208,7 +2512,7 @@ async fn review_timeout_matches_effective_mode(pool: PgPool) {
         .unwrap();
     assert_eq!(review(&pool, id).await.status, ReviewStatus::Done);
 
-    // Small PR under Specialists default is forced to Generalist (effort and budget included).
+    // Small PR under Specialists default is forced to Generalist (budget included).
     enable_small_pr(&pool).await;
     let before = s.chat.finder_calls().len();
     let before_v = s.chat.verifier_calls().len();
@@ -2218,7 +2522,6 @@ async fn review_timeout_matches_effective_mode(pool: PgPool) {
     let finder = s.chat.finder_calls();
     assert_eq!(finder.len() - before, 1, "one Generalist pass");
     assert!(finder[before].system.contains(GENERALIST_ROLE));
-    assert_eq!(finder[before].effort, Some(ReasoningEffort::Medium));
     assert_eq!(s.chat.verifier_calls().len() - before_v, 1);
 
     let err = run_mode(&s, Trigger::Command, Some(ReviewMode::Specialists))
@@ -2234,12 +2537,12 @@ async fn review_timeout_matches_effective_mode(pool: PgPool) {
 async fn slow_specialist_submits_before_the_finder_deadline(pool: PgPool) {
     let mut s = setup_one(&pool).await;
     s.enable_clone(&[("a.rs", "a\nb\n")]);
-    // Finder deadline at 60 % = 540 ms. Turn 1 takes 250 ms; with <= 290 ms left
-    // (< 2 * 250 ms), turn 2 offers only `submit_findings` and finishes well before 540 ms.
-    s.engine.specialists_review_timeout = Duration::from_millis(900);
+    // Finder deadline at 55 % = 1650 ms. Turn 1 takes 830 ms; with <= 820 ms left
+    // (< 2 * 830 ms), turn 2 offers only `submit_findings` and finishes well before 1650 ms.
+    s.engine.specialists_review_timeout = Duration::from_secs(3);
     s.chat.finder_role_delayed(
         BUG_ROLE,
-        Duration::from_millis(250),
+        Duration::from_millis(830),
         Reply::tool("read_file", json!({"path": "a.rs"})),
     );
     s.chat.finder_role(
@@ -2343,7 +2646,8 @@ async fn multiline_finding_keeps_same_hunk_span_and_drops_cross_hunk_start_line(
     );
 }
 
-/// Sets `settings.max_review_input_tokens`. Every `FakeChat` answer reports 1 input token.
+/// Sets `settings.max_review_input_tokens`. Every `FakeChat` answer reports 1 input token (and
+/// 1 cache write, which the budget does not weigh).
 async fn set_token_limit(pool: &PgPool, limit: i32) {
     update_settings(pool, |st| st.max_review_input_tokens = limit).await;
 }
@@ -2442,7 +2746,7 @@ async fn finder_wrap_up_for_token_budget_is_named_in_the_warning(pool: PgPool) {
     let summary = &git.reviews[0].summary;
     assert!(
         summary.contains(&budget_warning(
-            3,
+            4,
             1,
             "some reviewers stopped early, 1 finding verified from the diff only"
         )),
@@ -2568,8 +2872,8 @@ async fn finder_still_sees_the_raw_diff(pool: PgPool) {
         "{}",
         finder[0].system
     );
-    // Tool output is masked.
-    let last = finder.last().unwrap();
+    // Tool output is masked (Pass 1's second call; Pass 2 follows it).
+    let last = &finder[1];
     assert!(
         last.tool_results
             .iter()
@@ -2594,6 +2898,212 @@ async fn finder_still_sees_the_raw_diff(pool: PgPool) {
     // The posted comment never carries the key.
     let git = s.git.state();
     assert!(!git.reviews[0].comments[0].body.contains(FAKE_AWS_KEY));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn finder_anchor_bounce_then_mixed_final_submission_posts_valid_finding(pool: PgPool) {
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    s.chat.finder(Reply::submit(json!([finding_json(
+        "src/a.rs", 1, "warning", "Off-line"
+    )])));
+    s.chat.finder(Reply::submit(json!([
+        finding_json("src/a.rs", 2, "critical", "Valid bug"),
+        finding_json("src/a.rs", 1, "warning", "Still off-line"),
+    ])));
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 1);
+
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 2);
+    assert_eq!(finder[1].tool_results.len(), 1);
+    assert!(
+        finder[1].tool_results[0].contains("2, 3, 4"),
+        "{}",
+        finder[1].tool_results[0]
+    );
+
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert_eq!(posted.comments.len(), 1);
+    assert_eq!(posted.comments[0].line, 2);
+    assert!(posted.comments[0].body.contains("Valid bug"));
+    assert!(!posted.summary.contains("review output could not be parsed"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn review_runs_sharded_rules_in_parallel_and_skips_general_verifier(pool: PgPool) {
+    let logs = captured_logs();
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    insert_rule(&pool).await;
+    s.enable_clone(&[("src/a.rs", "let a = x.unwrap();\nb\nc\nd\n")]);
+    s.chat
+        .finder(Reply::tool("read_file", json!({"path": "src/a.rs"})));
+    s.chat.finder(Reply::finding("src/a.rs", 3, "Finder bug"));
+    s.chat
+        .delay("<ReviewInstructions>", Duration::from_millis(300));
+    // The shard cites context line 1, which moves to the nearest `+` line, 2.
+    s.chat.push_stage(
+        Stage::RuleShard,
+        Reply::text(
+            r#"{"violations": [{"rule_id": 1, "line": 1, "claim": "`x.unwrap()` panics"}]}"#,
+        ),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceCollector,
+        Reply::tool("read_file", json!({"path": "src/a.rs"})),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceCollector,
+        Reply::tool(
+            "submit_evidence",
+            json!({"keep": true, "confidence": "high", "rationale": "src/a.rs:1 unwraps"}),
+        ),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceJudge,
+        Reply::text(
+            r#"{"verdict": "violated", "path": "src/a.rs", "line": 1, "rationale": "it calls unwrap"}"#,
+        ),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    assert_eq!(row.comments_posted, 2);
+
+    // The tool-enabled Finder is not shown the rules; the shard is, on the fast model at High.
+    let finder = s.chat.finder_calls();
+    assert!(finder.iter().all(|c| !c.user.contains("No unwrap")));
+    let shards = s.chat.calls_of(Stage::RuleShard);
+    assert_eq!(shards.len(), 1);
+    assert!(shards[0].user.contains("[1] (critical) No unwrap"));
+    assert!(
+        shards[0]
+            .user
+            .contains("<file_content>\n1: let a = x.unwrap();")
+    );
+    assert_eq!(shards[0].model, "gpt-fast");
+    assert_eq!(shards[0].effort, Some(ReasoningEffort::High));
+    // Run alongside the Finder: every Finder call is held 300 ms, so the shard (a quick head
+    // read, then its call) is recorded while the Finder's first call is still in flight.
+    let finder_at = s.chat.positions(Stage::Finder);
+    assert_eq!(finder_at.len(), 2);
+    let shard_at = s.chat.positions(Stage::RuleShard)[0];
+    assert!(
+        finder_at[0] < shard_at && shard_at < finder_at[1],
+        "{finder_at:?} {shard_at}"
+    );
+    assert_eq!(s.chat.calls_of(Stage::RuleEvidenceCollector).len(), 2);
+    assert_eq!(s.chat.calls_of(Stage::RuleEvidenceJudge).len(), 1);
+
+    // Only the Finder's finding goes to the general Verifier.
+    let verifier = s.chat.verifier_calls();
+    assert_eq!(verifier.len(), 1);
+    assert!(verifier[0].user.contains("Finder bug"));
+    // Both findings meet in Dedup; the rule finding is reported by the team rules.
+    let dedup = s.chat.dedup_calls();
+    assert_eq!(dedup.len(), 1);
+    assert!(dedup[0].user.contains("\"reported_by\": \"Team rules\""));
+    assert!(dedup[0].user.contains("Finder bug"));
+    assert_eq!(s.chat.enrich_calls().len(), 2);
+
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    let rule_comment = posted
+        .comments
+        .iter()
+        .find(|c| c.body.contains("Rule \"No unwrap\""))
+        .expect("the rule finding is posted");
+    assert_eq!(rule_comment.line, 2);
+    assert!(rule_comment.body.contains("**🚨 Critical:**"));
+    assert!(rule_comment.body.contains(
+        "Rule \"No unwrap\": `x.unwrap()` panics (verified at src/a.rs:1: it calls unwrap) \
+         (line 1, outside the changed lines)"
+    ));
+    assert!(posted.summary.contains("Critical: 1"));
+
+    let review_id = format!("review_id={id}");
+    let line = logs
+        .line(&["review stages finished", &review_id])
+        .expect("stage log");
+    for field in [
+        "verify_candidates=1",
+        "rule_shards=1",
+        "rule_candidates=1",
+        "rule_verified=1",
+        "kept_by_origin=pass1=1 synthesis_rescue=0 prose_recovery=0 sharded_rules=1",
+    ] {
+        assert!(line.contains(field), "{field} missing: {line}");
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn tool_less_finder_owns_rules_and_drops_verified_rule_findings(pool: PgPool) {
+    let logs = captured_logs();
+    let s = setup_files(&pool, vec![file("src/a.rs", PATCH_234)]).await;
+    insert_rule(&pool).await;
+    s.enable_clone(&[("src/a.rs", "a\nlet b = x.unwrap();\nc\nd\n")]);
+    // The primary model rejects tools; the fast model running the Sharded Rules does not.
+    s.chat.push(Err(ChatError::ToolsUnsupported(
+        "model does not support tools".into(),
+    )));
+    s.chat
+        .finder(Reply::finding("src/a.rs", 2, "Breaks No unwrap"));
+    s.chat.push_stage(
+        Stage::RuleShard,
+        Reply::text(r#"{"violations": [{"rule_id": 1, "line": 2, "claim": "it unwraps"}]}"#),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceCollector,
+        Reply::tool("read_file", json!({"path": "src/a.rs"})),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceCollector,
+        Reply::tool(
+            "submit_evidence",
+            json!({"keep": true, "confidence": "high", "rationale": "src/a.rs:2 unwraps"}),
+        ),
+    );
+    s.chat.push_stage(
+        Stage::RuleEvidenceJudge,
+        Reply::text(
+            r#"{"verdict": "violated", "path": "src/a.rs", "line": 2, "rationale": "it calls unwrap"}"#,
+        ),
+    );
+
+    let id = run(&s, Trigger::Opened).await.unwrap();
+
+    let row = review(&pool, id).await;
+    assert_eq!(row.status, ReviewStatus::Done);
+    // The diff-only re-run checked `<rules>`; the rule finding verified meanwhile is dropped so
+    // the violation is not posted twice.
+    let finder = s.chat.finder_calls();
+    assert_eq!(finder.len(), 2, "tool attempt, then the diff-only re-run");
+    assert!(finder[1].user.contains("<rules>\n1. [critical] No unwrap"));
+    assert_eq!(s.chat.calls_of(Stage::RuleEvidenceJudge).len(), 1);
+    assert_eq!(row.comments_posted, 1);
+    let git = s.git.state();
+    let posted = &git.reviews[0];
+    assert!(posted.comments[0].body.contains("Breaks No unwrap"));
+    assert!(
+        posted
+            .comments
+            .iter()
+            .all(|c| !c.body.contains("Rule \"No unwrap\""))
+    );
+
+    let review_id = format!("review_id={id}");
+    let line = logs
+        .line(&["review stages finished", &review_id])
+        .expect("stage log");
+    for field in ["rule_verified=1", "sharded_rules=0"] {
+        assert!(line.contains(field), "{field} missing: {line}");
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -2694,16 +3204,14 @@ async fn review_applies_precedents_to_comments_counts_and_threads(pool: PgPool) 
         {
             "file": "src/a.rs",
             "line": 2,
-            "severity": "critical",
-            "title": "Unauthenticated route",
+            "category": "security",
             "body": "Missing auth check.",
             "precedent": 0
         },
         {
             "file": "src/a.rs",
             "line": 4,
-            "severity": "warning",
-            "title": "Possible overflow",
+            "category": "bug",
             "body": "Counter can wrap.",
             "precedent": 1
         }
@@ -2711,8 +3219,31 @@ async fn review_applies_precedents_to_comments_counts_and_threads(pool: PgPool) 
     s.chat.push(Ok(&findings.to_string()));
     s.chat
         .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1]}"#));
+    s.chat.push_stage(
+        Stage::Severity,
+        Reply::text(
+            r#"{"severities": [{"index": 0, "severity": "critical"}, {"index": 1, "severity": "warning"}]}"#,
+        ),
+    );
+    s.chat.push_for(
+        Stage::Enrich,
+        "Missing auth check.",
+        Reply::text(r#"{"title": "Unauthenticated route"}"#),
+    );
+    s.chat.push_for(
+        Stage::Enrich,
+        "Counter can wrap.",
+        Reply::text(r#"{"title": "Possible overflow"}"#),
+    );
 
     run(&s, Trigger::Opened).await.unwrap();
+
+    // Enrichment must run before `apply_precedent`, so it sees only the verified Finder body.
+    let enrich = s.chat.enrich_calls();
+    assert_eq!(enrich.len(), 2);
+    for call in &enrich {
+        assert!(!call.user.contains("**Precedent:**"), "{}", call.user);
+    }
 
     {
         let git = s.git.state();

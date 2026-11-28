@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::ops::ControlFlow;
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use adus_llm::ToolDef;
+use adus_llm::{ToolCall, ToolDef};
 use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
@@ -381,6 +382,43 @@ impl Toolbox {
         }
     }
 
+    /// The path a `read_file` call opens, as [`RepoWorkspace`] resolves it. `None` for any other
+    /// tool, unparsable arguments, or a path that is not an existing file in the workspace. The
+    /// path is resolved off the async runtime (`spawn_blocking`).
+    pub(crate) async fn read_file_path(&self, call: &ToolCall) -> Option<String> {
+        if call.name != "read_file" {
+            return None;
+        }
+        let args: ReadFileArgs = ReadFileArgs::deserialize(&call.arguments).ok()?;
+        let ws = Arc::clone(&self.workspace);
+        tokio::task::spawn_blocking(move || {
+            ws.resolve_existing_file(args.path.trim())
+                .ok()
+                .map(|path| path.rel().to_owned())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// [`read_head_file_capped_sync`] run off the async runtime (`spawn_blocking`).
+    pub(crate) async fn read_head_file_capped(
+        &self,
+        rel_path: &str,
+        max_lines: usize,
+        max_chars: usize,
+    ) -> Option<String> {
+        let ws = Arc::clone(&self.workspace);
+        let cache = Arc::clone(&self.cache);
+        let rel = rel_path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            read_head_file_capped_sync(&ws, &cache, &rel, max_lines, max_chars)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// [`read_file_snippet_sync`] run off the async runtime (`spawn_blocking`).
     pub(crate) async fn read_file_snippet(
         &self,
@@ -395,6 +433,16 @@ impl Toolbox {
             .ok()
             .flatten()
     }
+}
+
+/// The `(first, shown)` line range from the `[<path>: lines X-Y of Z]` header of a successful
+/// `read_file` result; `(0, 0)` for an empty file. `None` when the output has no such header.
+pub(crate) fn parse_read_header_range(output: &str) -> Option<(u32, u32)> {
+    let header = output.lines().next()?.strip_suffix(']')?;
+    let (head, _total) = header.rsplit_once(" of ")?;
+    let (_, range) = head.rsplit_once(": lines ")?;
+    let (first, shown) = range.split_once('-')?;
+    Some((first.parse().ok()?, shown.parse().ok()?))
 }
 
 /// Lines `center_line ± radius` of `path` in the `read_file` format, or `None` on any
@@ -414,6 +462,42 @@ fn read_file_snippet_sync(
         .saturating_add(radius)
         .min(start.saturating_add(READ_MAX_LINES - 1));
     read_file(&target, start, end).ok()
+}
+
+/// The whole of `rel_path` as `{n}: {line}` rows with secrets masked, or `None` when the path is
+/// not a readable text file in the workspace, the file is empty, or it has more than `max_lines`
+/// lines or its raw text (before numbering) more than `max_chars` characters. It bypasses
+/// `cache`, but a masked secret counts in its `redacted`. Blocking.
+fn read_head_file_capped_sync(
+    ws: &RepoWorkspace,
+    cache: &ToolCache,
+    rel_path: &str,
+    max_lines: usize,
+    max_chars: usize,
+) -> Option<String> {
+    let target = ws.resolve_existing_file(rel_path.trim()).ok()?;
+    let text = read_text(target.abs()).ok()?;
+    let line_count = text.lines().count();
+    if line_count == 0 || line_count > max_lines || text.chars().count() > max_chars {
+        return None;
+    }
+    let mut numbered = String::with_capacity(text.len() + line_count * 6);
+    for (n, line) in (1..).zip(text.lines()) {
+        if n > 1 {
+            numbered.push('\n');
+        }
+        push_numbered_row(&mut numbered, n, line);
+    }
+    if let Cow::Owned(redacted) = redact_secrets(&numbered) {
+        cache.redacted.fetch_add(1, Ordering::Relaxed);
+        return Some(redacted);
+    }
+    Some(numbered)
+}
+
+/// Appends `line` as a `{n}: {line}` row of `read_file` output, without a newline.
+fn push_numbered_row(out: &mut String, n: usize, line: &str) {
+    let _ = write!(out, "{n}: {line}");
 }
 
 /// Runs `call` through the cache. Fresh content is redacted before it is cached, so cached
@@ -536,13 +620,13 @@ fn read_file(path: &RepoPath, start: u32, end: u32) -> Result<String, ToolError>
     let mut body = String::new();
     let mut shown = first - 1;
     for (n, line) in (first..=last).zip(&lines[first - 1..last]) {
-        let prefix = format!("{n}: ");
-        let needed = prefix.chars().count() + line.chars().count() + 1;
+        let prefix_chars = n.checked_ilog10().unwrap_or(0) as usize + 3;
+        let needed = prefix_chars + line.chars().count() + 1;
         if needed > budget {
             if body.is_empty() {
                 // A single huge line (minified code): show its start rather than nothing.
-                let room = budget.saturating_sub(prefix.chars().count() + LINE_TRUNCATED.len() + 1);
-                body.push_str(&prefix);
+                let room = budget.saturating_sub(prefix_chars + LINE_TRUNCATED.len() + 1);
+                let _ = write!(body, "{n}: ");
                 body.extend(line.chars().take(room));
                 body.push_str(LINE_TRUNCATED);
                 body.push('\n');
@@ -551,8 +635,7 @@ fn read_file(path: &RepoPath, start: u32, end: u32) -> Result<String, ToolError>
             break;
         }
         budget -= needed;
-        body.push_str(&prefix);
-        body.push_str(line);
+        push_numbered_row(&mut body, n, line);
         body.push('\n');
         shown = n;
     }
@@ -730,20 +813,22 @@ fn grep(
         result = format!("No matches for `{pattern}` in {place}.\n");
     }
     if search.skipped > 0 {
-        result.push_str(&format!(
-            "[{} file(s) skipped: binary, unreadable or larger than 2 MB]\n",
+        let _ = writeln!(
+            result,
+            "[{} file(s) skipped: binary, unreadable or larger than 2 MB]",
             search.skipped
-        ));
+        );
     }
     if search.long_lines > 0 {
         let kib = limits.line_window / 1024;
-        result.push_str(&format!(
-            "[search truncated: {} line(s) longer than {kib} KiB were only searched in their first {kib} KiB]\n",
+        let _ = writeln!(
+            result,
+            "[search truncated: {} line(s) longer than {kib} KiB were only searched in their first {kib} KiB]",
             search.long_lines
-        ));
+        );
     }
     if let Some(reason) = search.truncated {
-        result.push_str(&format!("[search truncated: {reason}]\n"));
+        let _ = writeln!(result, "[search truncated: {reason}]");
     }
     result.pop();
     Ok(ToolText {
@@ -880,9 +965,10 @@ fn list_dir(dir: &RepoPath) -> Result<String, ToolError> {
     }
     let mut result = out.text;
     if shown < total {
-        result.push_str(&format!(
-            "[listing truncated: showing {shown} of {total} entries]\n"
-        ));
+        let _ = writeln!(
+            result,
+            "[listing truncated: showing {shown} of {total} entries]"
+        );
     }
     result.pop();
     Ok(result)
@@ -925,9 +1011,10 @@ fn find_files(
     }
     let mut result = out.text;
     if more || shown < found.len() {
-        result.push_str(&format!(
-            "[results truncated: showing {shown} matches; narrow the pattern or path]\n"
-        ));
+        let _ = writeln!(
+            result,
+            "[results truncated: showing {shown} matches; narrow the pattern or path]"
+        );
     }
     if timed_out {
         result.push_str("[results truncated: time limit reached; narrow the pattern or path]\n");
@@ -1057,6 +1144,30 @@ mod tests {
 
     fn headers(content: &str, path: &str) -> usize {
         content.lines().filter(|l| *l == path).count()
+    }
+
+    #[tokio::test]
+    async fn read_file_path_resolves_dot_paths_and_header_ranges() {
+        let tb = toolbox(&[("src/a.rs", b"fn a() {}\n")]);
+        let call = |name: &str, path: &str| ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: json!({"path": path, "start_line": 3}),
+            provider_meta: None,
+        };
+        assert_eq!(
+            tb.read_file_path(&call("read_file", "./src/a.rs")).await,
+            Some("src/a.rs".to_owned())
+        );
+        assert_eq!(tb.read_file_path(&call("grep", "src/a.rs")).await, None);
+        assert_eq!(
+            tb.read_file_path(&call("read_file", "../src/a.rs")).await,
+            None
+        );
+        assert_eq!(
+            parse_read_header_range("[src/a.rs: lines 10-45 of 100]\n10: x"),
+            Some((10, 45))
+        );
     }
 
     #[tokio::test]
@@ -1750,6 +1861,49 @@ mod tests {
             }
             assert!(!def.description.is_empty());
             assert_portable_schema(&def.parameters);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_head_file_capped_numbers_redacts_and_skips_oversized() {
+        let small = format!("fn main() {{}}\nconst KEY = \"{FAKE_AWS_KEY}\";\n");
+        let many_lines = numbered(601);
+        let long_line = "x".repeat(30_001);
+        let tb = toolbox(&[
+            ("src/small.rs", small.as_bytes()),
+            ("src/many.rs", many_lines.as_bytes()),
+            ("src/long.rs", long_line.as_bytes()),
+            ("src/empty.rs", b""),
+            ("src/blob.bin", b"\0\x01binary"),
+        ]);
+
+        assert_eq!(
+            tb.read_head_file_capped("src/small.rs", 600, 30_000)
+                .await
+                .as_deref(),
+            Some("1: fn main() {}\n2: const KEY = \"[REDACTED]\";")
+        );
+        assert_eq!(tb.redacted_outputs(), 1, "the masked secret is counted");
+        // The limits are inclusive.
+        assert_eq!(
+            tb.read_head_file_capped("src/many.rs", 601, 30_000)
+                .await
+                .map(|text| text.lines().count()),
+            Some(601)
+        );
+        for skipped in [
+            "src/many.rs",
+            "src/long.rs",
+            "src/empty.rs",
+            "src/blob.bin",
+            "src/gone.rs",
+            "../etc/passwd",
+        ] {
+            assert_eq!(
+                tb.read_head_file_capped(skipped, 600, 30_000).await,
+                None,
+                "{skipped}"
+            );
         }
     }
 }

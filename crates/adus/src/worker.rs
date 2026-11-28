@@ -8,20 +8,27 @@ use std::time::Duration;
 use adus_core::job::Job;
 use adus_db::reviews::{self, NewReview};
 use adus_queue::{Delivery, MAX_ATTEMPTS, Queue, QueueError, RECLAIM_IDLE, backoff};
-use adus_review::engine::{Engine, EngineError, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
+use adus_review::engine::{
+    Engine, EngineError, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT, VALIDATE_TIMEOUT,
+};
 use async_trait::async_trait;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-/// Backstop of one job. The engine already bounds a review by its budget (12 min Generalist,
-/// 30 min Specialists) so its `reviews` row is recorded as failed; this guards the rest. It is
-/// below the lock TTL and the queue's take-over limit (both 35 min), so a stuck job is never
-/// worked on by two workers at once.
-pub const JOB_TIMEOUT: Duration = Duration::from_secs(31 * 60);
+/// Backstop of one job. The engine already bounds a review by its budget (20 min Generalist,
+/// 30 min Specialists), which starts after push validation (`VALIDATE_TIMEOUT`, 2 min), so its
+/// `reviews` row is recorded as failed; this guards the rest. It is below the lock TTL and the
+/// queue's take-over limit (both 35 min), so a stuck job is never worked on by two workers at
+/// once.
+pub const JOB_TIMEOUT: Duration = Duration::from_secs(33 * 60);
 const LOCK_TTL: Duration = Duration::from_secs(35 * 60);
-const _: () = assert!(REVIEW_TIMEOUT.as_secs() < JOB_TIMEOUT.as_secs());
-const _: () = assert!(SPECIALISTS_REVIEW_TIMEOUT.as_secs() < JOB_TIMEOUT.as_secs());
+// The engine's backstop: the larger review budget plus push validation.
+const _: () = assert!(
+    REVIEW_TIMEOUT.as_secs() + VALIDATE_TIMEOUT.as_secs() < JOB_TIMEOUT.as_secs()
+        && SPECIALISTS_REVIEW_TIMEOUT.as_secs() + VALIDATE_TIMEOUT.as_secs()
+            < JOB_TIMEOUT.as_secs()
+);
 const _: () = assert!(JOB_TIMEOUT.as_secs() < LOCK_TTL.as_secs());
 const _: () = assert!(JOB_TIMEOUT.as_secs() < RECLAIM_IDLE.as_secs());
 const _: () = assert!(JOB_TIMEOUT.as_secs() < reviews::STALE_AFTER.as_secs());

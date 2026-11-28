@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::agent::{AgentLlm, chat_low_effort};
+use crate::agent::LlmContext;
 use crate::command::{MAX_MEMORY_CHARS, authorize};
 use crate::discussion::{MAX_BODY_CHARS, MAX_THREADS_CHARS};
 use crate::engine::{Engine, EngineError, chat_error, db_error, is_retryable};
@@ -193,16 +193,24 @@ impl Engine {
             review_id: None,
             repository_id: Some(repository_id),
         };
-        let llm = AgentLlm {
+        let llm = LlmContext {
             chat: self.chat.as_ref(),
             provider_id,
             model: &primary_model,
-            system: LEARN_SYSTEM,
-            effort: Some(parse_curator_effort(&settings.curator_effort)),
             usage: &usage,
+            token_budget: None,
         };
         let prompt = build_user_prompt(&qualifying, &known);
-        let text = match chat_low_effort(&llm, None, prompt, LEARN_MAX_TOKENS).await {
+        let text = match llm
+            .single_turn(
+                "learn",
+                LEARN_SYSTEM,
+                Some(parse_curator_effort(&settings.curator_effort)),
+                prompt,
+                LEARN_MAX_TOKENS,
+            )
+            .await
+        {
             Ok(text) => text,
             Err(err) if is_retryable(&err) => return Err(chat_error(err)),
             Err(err) => {
@@ -739,7 +747,7 @@ fn build_user_prompt(threads: &[CuratorThread<'_>], known: &[Memory]) -> String 
                 length <= MAX_MEMORIES_CHARS
             })
             .collect();
-        serde_json::to_string_pretty(&contents).unwrap_or_else(|_| json!(contents).to_string())
+        serde_json::to_string_pretty(&contents).unwrap_or_default()
     };
     format!(
         "{}\n\n{}\n\n{}\n\nAnswer as {{\"memories\": [{{\"kind\": \"...\", \"content\": \"...\", \"context\": \"...\", \"reason\": \"...\", \"resolution\": \"...\", \"sources\": [{{\"thread\": i, \"comments\": [j, ...]}}], \"updates\": null}}]}}.",

@@ -1,8 +1,16 @@
 //! Reusable ReAct agent loop: the model calls read-only repository tools until it submits its
 //! result through one terminal tool. Context compaction and a one-shot context-overflow
-//! recovery keep long runs within the model's window. Used by the Finder and the Verifier.
+//! recovery keep long runs within the model's window. Used by the Finder, the Verifier and the
+//! rule evidence collector.
+//!
+//! Loop policies, each switched on through [`AgentConfig`]: coverage debt notes and the one-shot
+//! completion gate (gated Finder runs), step-budget band notes (Finder runs), a tool-free final
+//! step with a verdict-due note, and widening of short `read_file` calls (Verifier runs). Every
+//! note is appended to the conversation and kept there: the history is append-only, so the
+//! prompt-cache prefix stays valid and providers that check preserved thinking accept it.
 
 use std::borrow::Cow;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,43 +20,59 @@ use adus_llm::{
     ToolResult, UserPart,
 };
 use futures::{StreamExt, stream};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::budget::TokenBudget;
+use crate::coverage::{CoverageLedger, PendingSignature};
 use crate::prompt::truncate_with_marker;
-use crate::tools::{ToolOutput, Toolbox};
+use crate::redact::redact_secrets;
+use crate::tools::{ToolOutput, Toolbox, parse_read_header_range};
+use crate::trace;
 
 /// Default `AgentConfig::compaction_char_limit`.
-const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 160_000;
+const DEFAULT_COMPACTION_CHAR_LIMIT: usize = 320_000;
 const MAX_OUTPUT_TOKENS: u32 = 8_192;
 /// Default `AgentConfig::max_concurrent_tools`.
 const DEFAULT_MAX_CONCURRENT_TOOLS: usize = 4;
 /// Default `AgentConfig::wrap_up_steps`: only the final step is a wrap-up step.
 const DEFAULT_WRAP_UP_STEPS: usize = 1;
 
-/// Replaces old tool output when the conversation grows past the compaction limit.
-const OMITTED_TOOL_OUTPUT: &str = "[earlier tool output omitted to save context]";
-/// Only tool outputs longer than this are compacted.
-const COMPACT_MIN_CHARS: usize = 120;
+/// Prefix length preserved when shortening older tool outputs during compaction.
+const COMPACT_EXCERPT_CHARS: usize = 400;
+/// Appended to a shortened tool output during compaction.
+const COMPACTED_MARKER: &str = "\n[older tool output shortened to save context]";
 /// The newest messages (two turns) are never compacted.
 const COMPACT_KEEP_TAIL: usize = 4;
 /// A run with a `deadline` wraps up once the time left is less than this many times its
 /// slowest whole step (LLM call plus tools). With 2, at least one such step is left when
 /// wrap-up starts, enough for the submit step.
 const WRAP_UP_STEP_FACTOR: u32 = 2;
-/// The halfway budget note is only sent to runs with at least this many steps.
-const BUDGET_NOTE_MIN_STEPS: usize = 4;
+/// Budget band notes are only sent to runs with at least this many steps.
+const BUDGET_BANDS_MIN_STEPS: usize = 6;
+/// The completion gate only refuses while at least this many investigating steps remain after
+/// the current one, so the model can still read what it skipped.
+const GATE_MIN_STEPS_LEFT: usize = 2;
+/// `read_file` calls spanning fewer lines than this are widened (`widen_short_reads`).
+const VERIFY_WIDEN_SPAN_THRESHOLD: u64 = 20;
+/// Lines added before a widened `read_file` window.
+const VERIFY_WIDEN_BEFORE: u64 = 20;
+/// Lines added after a widened `read_file` window.
+const VERIFY_WIDEN_AFTER: u64 = 10;
 /// Tool outputs kept after a context overflow are cut to this many chars.
 const OVERFLOW_TOOL_CHARS: usize = 500;
 /// Appended to a tool output cut after a context overflow.
-const TRUNCATED_MARKER: &str = "\n[output truncated]";
+pub(crate) const TRUNCATED_MARKER: &str = "\n[output truncated]";
+/// Tool calls kept in [`AgentOutcome::recent_tool_calls`].
+const RECENT_TOOL_CALLS: usize = 20;
+/// Most characters of a call's arguments kept in its summary.
+const TOOL_CALL_ARGS_CHARS: usize = 150;
 
-/// Limits of one agent run.
+/// Limits and policies of one agent run.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentConfig {
-    /// LLM calls allowed in one run (Finder 20, Verifier 6).
+    /// LLM calls allowed in one run (Finder 20 to 30, Verifier 7, Evidence Gate 10).
     pub max_steps: usize,
     /// Old tool outputs are compacted while the conversation is longer than this (chars).
     pub compaction_char_limit: usize,
@@ -63,10 +87,29 @@ pub(crate) struct AgentConfig {
     /// The review's shared input-token budget. Every successful response adds its
     /// `input_tokens`; once the budget is exhausted the run wraps up (after its first step).
     pub token_budget: Option<Arc<TokenBudget>>,
+    /// The changed hunks the run should read. With the repository tools and outside wrap-up,
+    /// a coverage debt note is appended whenever the set of unread qualifying hunks changes
+    /// (never on the first request). Only gated Finder runs carry one.
+    pub coverage_ledger: Option<CoverageLedger>,
+    /// Refuse the first submission once while qualifying hunks of `coverage_ledger` are unread
+    /// and at least [`GATE_MIN_STEPS_LEFT`] investigating steps remain.
+    pub enforce_gate: bool,
+    /// The final step offers no tools and asks for the result as JSON text; one step earlier a
+    /// verdict-due note says one reading step is left.
+    pub no_tools_on_last_step: bool,
+    /// Escalating step-budget notes (`Encourage`, then `Urgent`). Finder runs only: the texts
+    /// speak of findings and dismissals.
+    pub budget_bands: bool,
+    /// `read_file` calls spanning fewer than [`VERIFY_WIDEN_SPAN_THRESHOLD`] lines are widened
+    /// by [`VERIFY_WIDEN_BEFORE`] lines before and [`VERIFY_WIDEN_AFTER`] after.
+    pub widen_short_reads: bool,
+    /// Keep the output of every successful `read_file` call in
+    /// [`AgentOutcome::read_outputs`] (rule evidence collector runs only).
+    pub capture_reads: bool,
 }
 
 impl AgentConfig {
-    /// `max_steps` with the default limits for everything else.
+    /// `max_steps` with the default limits for everything else and every policy off.
     pub(crate) fn new(max_steps: usize) -> Self {
         Self {
             max_steps,
@@ -75,6 +118,58 @@ impl AgentConfig {
             wrap_up_steps: DEFAULT_WRAP_UP_STEPS,
             deadline: None,
             token_budget: None,
+            coverage_ledger: None,
+            enforce_gate: false,
+            no_tools_on_last_step: false,
+            budget_bands: false,
+            widen_short_reads: false,
+            capture_reads: false,
+        }
+    }
+
+    pub(crate) fn finder(
+        max_steps: usize,
+        wrap_up_steps: usize,
+        deadline: Instant,
+        token_budget: Option<&Arc<TokenBudget>>,
+        coverage_ledger: Option<CoverageLedger>,
+    ) -> Self {
+        Self {
+            enforce_gate: coverage_ledger.is_some(),
+            budget_bands: true,
+            wrap_up_steps,
+            deadline: Some(deadline),
+            token_budget: token_budget.cloned(),
+            coverage_ledger,
+            ..Self::new(max_steps)
+        }
+    }
+
+    pub(crate) fn verifier(
+        max_steps: usize,
+        deadline: Instant,
+        token_budget: Option<&Arc<TokenBudget>>,
+    ) -> Self {
+        Self {
+            no_tools_on_last_step: true,
+            widen_short_reads: true,
+            deadline: Some(deadline),
+            token_budget: token_budget.cloned(),
+            ..Self::new(max_steps)
+        }
+    }
+
+    pub(crate) fn rule_collector(
+        max_steps: usize,
+        deadline: Instant,
+        token_budget: Option<&Arc<TokenBudget>>,
+    ) -> Self {
+        Self {
+            no_tools_on_last_step: true,
+            capture_reads: true,
+            deadline: Some(deadline),
+            token_budget: token_budget.cloned(),
+            ..Self::new(max_steps)
         }
     }
 }
@@ -85,10 +180,39 @@ pub(crate) struct AgentOutcome<T> {
     pub result: T,
     /// LLM calls made (the overflow retry repeats a step and is not counted twice).
     pub steps_used: usize,
-    pub cache_read_tokens: u32,
-    pub cache_write_tokens: u32,
-    /// The step budget ran out and `result` was recovered from the last reply's prose.
+    /// The step budget ran out and `result` was recovered from the last reply's prose, or the
+    /// run ended unparseable and `result` is the submission the completion gate held.
     pub cut_short: bool,
+    /// The completion gate refused a submission in this run.
+    pub gate_refused: bool,
+    /// Normalized paths of every file a `read_file` call of this run showed successfully.
+    pub opened_files: HashSet<String>,
+    /// Mean wall time of the run's LLM calls; `None` when none completed.
+    pub mean_step: Option<Duration>,
+    /// The last [`RECENT_TOOL_CALLS`] executed calls other than the terminal tool, oldest
+    /// first, each as `tool(arguments)` with secrets redacted and the arguments cut to
+    /// [`TOOL_CALL_ARGS_CHARS`] characters.
+    pub recent_tool_calls: Vec<String>,
+    /// `(normalized path, output)` of every successful `read_file` call with a
+    /// `[path: lines X-Y of Z]` header, in call order. Empty unless
+    /// [`AgentConfig::capture_reads`] is set.
+    pub read_outputs: Vec<(String, String)>,
+}
+
+impl<T> AgentOutcome<T> {
+    /// The same outcome with `result` replaced by `f(result)`.
+    pub(crate) fn map<U>(self, f: impl FnOnce(T) -> U) -> AgentOutcome<U> {
+        AgentOutcome {
+            result: f(self.result),
+            steps_used: self.steps_used,
+            cut_short: self.cut_short,
+            gate_refused: self.gate_refused,
+            opened_files: self.opened_files,
+            mean_step: self.mean_step,
+            recent_tool_calls: self.recent_tool_calls,
+            read_outputs: self.read_outputs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -110,11 +234,25 @@ pub(crate) trait SubmitSpec: Send + Sync {
     /// Definition sent to the model (for example `submit_findings`).
     fn tool_def(&self) -> &ToolDef;
 
-    /// Reads the terminal tool's arguments. The error text is shown to the model.
-    fn parse_arguments(&self, arguments: &Value) -> Result<Self::Output, String>;
+    /// Reads the terminal tool's arguments. The error text is shown to the model;
+    /// `can_retry` is `true` when at least one step remains after this turn.
+    fn parse_arguments(&self, arguments: &Value, can_retry: bool) -> Result<Self::Output, String>;
 
     /// Recovers the result from a reply that did not call the terminal tool.
     fn parse_prose(&self, text: &str) -> Result<Self::Output, String>;
+
+    /// Whether `output` reports findings. An accepted result without any falls back to the
+    /// findings of the latest earlier submission the completion gate refused. Results that
+    /// carry no findings (the default) never fall back.
+    fn has_findings(&self, _output: &Self::Output) -> bool {
+        true
+    }
+
+    /// `accepted` with the findings of `earlier` (a refused submission that had some); every
+    /// other part of `accepted` is kept. Only called when `has_findings(accepted)` is false.
+    fn with_findings_of(&self, accepted: Self::Output, _earlier: Self::Output) -> Self::Output {
+        accepted
+    }
 }
 
 /// Which tools the model gets.
@@ -126,6 +264,68 @@ pub(crate) enum AgentTools<'a> {
     SubmitOnly,
     /// No tools at all (the model rejected tool calling); results come from prose.
     NoTools,
+}
+
+/// Shared LLM call context carried by review stages before binding a system prompt and effort.
+#[derive(Clone, Copy)]
+pub(crate) struct LlmContext<'a> {
+    pub chat: &'a dyn ChatService,
+    pub provider_id: Uuid,
+    pub model: &'a str,
+    pub usage: &'a UsageContext,
+    pub token_budget: Option<&'a Arc<TokenBudget>>,
+}
+
+impl<'a> LlmContext<'a> {
+    /// Returns a copy targeting `model` while keeping the same provider, usage, and budget.
+    pub(crate) fn with_model<'b>(self, model: &'b str) -> LlmContext<'b>
+    where
+        'a: 'b,
+    {
+        LlmContext {
+            chat: self.chat,
+            provider_id: self.provider_id,
+            model,
+            usage: self.usage,
+            token_budget: self.token_budget,
+        }
+    }
+
+    /// Binds `system` and `effort` for a ReAct loop or single-turn call.
+    pub(crate) fn for_agent(
+        self,
+        system: &'a str,
+        effort: Option<ReasoningEffort>,
+    ) -> AgentLlm<'a> {
+        AgentLlm {
+            chat: self.chat,
+            provider_id: self.provider_id,
+            model: self.model,
+            system,
+            effort,
+            usage: self.usage,
+        }
+    }
+
+    /// Runs a single-turn text call and records its input tokens in `self.token_budget`.
+    pub(crate) async fn single_turn(
+        self,
+        call: &'static str,
+        system: &str,
+        effort: Option<ReasoningEffort>,
+        prompt: String,
+        max_tokens: u32,
+    ) -> Result<String, ChatError> {
+        let llm = LlmContext::for_agent(self, system, effort);
+        chat_single_turn(
+            &llm,
+            call,
+            self.token_budget.map(Arc::as_ref),
+            prompt,
+            max_tokens,
+        )
+        .await
+    }
 }
 
 /// Where and how the agent talks to the model.
@@ -140,21 +340,29 @@ pub(crate) struct AgentLlm<'a> {
     pub usage: &'a UsageContext,
 }
 
-/// Single-turn low-effort text call, recording `input_tokens` into `token_budget`.
-pub(crate) async fn chat_low_effort(
+/// Single-turn text call at `llm.effort` (default `Low`), recording `input_tokens` into
+/// `token_budget`. `call` names it in the live trace.
+pub(crate) async fn chat_single_turn(
     llm: &AgentLlm<'_>,
+    call: &'static str,
     token_budget: Option<&TokenBudget>,
     prompt: String,
     max_tokens: u32,
 ) -> Result<String, ChatError> {
+    trace::prompt(Some(call), llm.system, &prompt);
     let request = ChatRequest::text(llm.model, llm.system, prompt, max_tokens)
         .with_effort(llm.effort.unwrap_or(ReasoningEffort::Low));
     let response = llm
         .chat
         .chat(llm.provider_id, request, llm.usage.clone())
         .await?;
+    trace::response(1, &response);
     if let Some(budget) = token_budget {
-        budget.add(response.input_tokens);
+        budget.add(
+            response.input_tokens,
+            response.cache_read_tokens,
+            response.cache_write_tokens,
+        );
     }
     Ok(response.text)
 }
@@ -168,9 +376,16 @@ pub(crate) async fn chat_low_effort(
 /// **Wrap-up:** from the last `wrap_up_steps` steps on, or earlier once `deadline` is closer
 /// than 2 × the slowest whole step of this run (never before one step was measured), or once
 /// the review's `token_budget` is exhausted (also not before the first step), only the
-/// terminal tool is offered, and one reminder to submit is sent when that starts. Halfway
-/// through a budget of at least 4 steps with the repository tools, one note tells the model
-/// how many steps it has used.
+/// terminal tool is offered, and one reminder to submit is sent when that starts. With
+/// `no_tools_on_last_step` the final step offers no tools at all and asks for the JSON result.
+///
+/// **Notes** (with the repository tools, outside wrap-up, appended and kept): the coverage
+/// debt note when the unread hunks change, the budget band notes, and the verdict-due note.
+///
+/// **Completion gate** (`enforce_gate` with a `coverage_ledger`): the first parsed submission,
+/// tool call or prose, is refused once while qualifying hunks are unread and enough steps
+/// remain; the refused submission is held and returned (`cut_short`) if the run later ends
+/// without a parsable result.
 ///
 /// Cancel-safe: all state is local to the future, so dropping it (a deadline) ends the run.
 /// Tool work already handed to `spawn_blocking` finishes on its own.
@@ -183,6 +398,8 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
 ) -> Result<AgentOutcome<S::Output>, AgentError> {
     let submit_def = submit.tool_def();
     let submit_name = submit_def.name.as_str();
+    let with_repo_tools = matches!(tools, AgentTools::Full(_));
+    trace::prompt(None, llm.system, &prompt);
     let mut messages = vec![user_message(prompt)];
     let mut tally = Tally::default();
     let mut overflow_retried = false;
@@ -190,27 +407,38 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
     let mut nudged_last_step = false;
     let mut last_text = String::new();
     let mut wrap_up = WrapUp::default();
+    let mut notes = Notes::default();
+    let mut ledger = config.coverage_ledger.clone().filter(|_| with_repo_tools);
+    let mut gate = CompletionGate::new(config.enforce_gate && ledger.is_some());
 
     while tally.steps_used < config.max_steps {
         let starts_wrap_up = wrap_up.check(tally.steps_used, config);
-        let with_repo_tools = matches!(tools, AgentTools::Full(_));
-        // A nudge sent just before already asks for the result; one request is enough.
-        if starts_wrap_up && !nudged_last_step && !matches!(tools, AgentTools::NoTools) {
-            messages.push(user_message(format!(
-                "You are near the end of your budget. Submit your final result now using {submit_name}."
-            )));
-        } else if with_repo_tools
-            && !wrap_up.active()
-            && config.max_steps >= BUDGET_NOTE_MIN_STEPS
-            && tally.steps_used == config.max_steps / 2
-        {
-            messages.push(user_message(format!(
-                "Step budget: {} of {} steps used. Gather only the evidence you still need, then call {submit_name}.",
-                tally.steps_used, config.max_steps
-            )));
+        let text_only_step =
+            config.no_tools_on_last_step && tally.steps_used + 1 == config.max_steps;
+        if !matches!(tools, AgentTools::NoTools) {
+            if text_only_step {
+                messages.push(user_message(format!(
+                    "This is your last step and no tools are available. Reply with only your final result as the JSON object you would pass to {submit_name}, based on what you have read."
+                )));
+            } else if starts_wrap_up && !nudged_last_step {
+                // A nudge sent just before already asks for the result; one request is enough.
+                messages.push(user_message(format!(
+                    "You are near the end of your budget. Submit your final result now using {submit_name}."
+                )));
+            }
+        }
+        if with_repo_tools && !wrap_up.active() {
+            notes.append(
+                &mut messages,
+                config,
+                tally.steps_used,
+                ledger.as_ref(),
+                submit_name,
+            );
         }
         nudged_last_step = false;
         let (read_only, offered) = match (tools, wrap_up.active()) {
+            _ if text_only_step => (None, Vec::new()),
             (AgentTools::NoTools, _) => (None, Vec::new()),
             (AgentTools::Full(toolbox), false) => {
                 let mut defs = toolbox.read_only_tool_defs().to_vec();
@@ -225,9 +453,13 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
         let step_started = Instant::now();
         compact(&mut messages, config.compaction_char_limit);
         let response = request(llm, &mut messages, offered, &mut overflow_retried).await?;
-        tally.add(&response);
+        tally.add(step_started.elapsed());
         if let Some(budget) = &config.token_budget {
-            budget.add(response.input_tokens);
+            budget.add(
+                response.input_tokens,
+                response.cache_read_tokens,
+                response.cache_write_tokens,
+            );
         }
         tracing::debug!(
             step = tally.steps_used,
@@ -236,6 +468,7 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             wrap_up = wrap_up.reason,
             "agent step"
         );
+        trace::response(tally.steps_used, &response);
         let ChatResponse {
             text,
             tool_calls,
@@ -243,13 +476,22 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
             ..
         } = response;
         messages.push(assistant_message(&text, &tool_calls, provider_meta));
+        let pending = gate.pending(config, wrap_up.active(), tally.steps_used, ledger.as_ref());
 
         if tool_calls.is_empty() {
             if let Ok(result) = submit.parse_prose(&text) {
-                return Ok(tally.finish(result, false));
+                match pending {
+                    Some(files) => {
+                        messages.push(user_message(gate_refusal(&files, submit_name)));
+                        gate.hold(result);
+                        wrap_up.record(step_started.elapsed());
+                        continue;
+                    }
+                    None => return Ok(gate.accept(submit, result, &mut tally)),
+                }
             }
             if nudged || tally.steps_used >= config.max_steps {
-                return Err(unparseable(submit_name, tally.steps_used));
+                return gate.give_up(submit_name, &mut tally);
             }
             nudged = true;
             nudged_last_step = true;
@@ -261,33 +503,229 @@ pub(crate) async fn run_react_loop<S: SubmitSpec>(
         }
 
         // The first valid submit ends the run; other calls of that turn are not executed.
-        let mut submit_errors = Vec::with_capacity(tool_calls.len());
+        // A submit the gate refuses is held, and any later submit of that turn is refused too.
+        let can_retry = tally.steps_used < config.max_steps;
+        let mut plans = Vec::with_capacity(tool_calls.len());
+        let mut refusal: Option<String> = None;
         for call in &tool_calls {
             if call.name != submit_name {
-                submit_errors.push(None);
+                plans.push(CallPlan::Run);
                 continue;
             }
-            match submit.parse_arguments(&call.arguments) {
-                Ok(result) => return Ok(tally.finish(result, false)),
-                Err(err) => submit_errors.push(Some(err)),
+            if let Some(text) = &refusal {
+                plans.push(CallPlan::Refused(text.clone()));
+                continue;
+            }
+            match submit.parse_arguments(&call.arguments, can_retry) {
+                Ok(result) => match &pending {
+                    Some(files) => {
+                        let text = gate_refusal(files, submit_name);
+                        gate.hold(result);
+                        plans.push(CallPlan::Refused(text.clone()));
+                        refusal = Some(text);
+                    }
+                    None => return Ok(gate.accept(submit, result, &mut tally)),
+                },
+                Err(err) => plans.push(CallPlan::Invalid(err)),
             }
         }
+        let executed: Cow<'_, [ToolCall]> = if config.widen_short_reads {
+            Cow::Owned(
+                tool_calls
+                    .iter()
+                    .map(|call| widen_short_read(call).unwrap_or_else(|| call.clone()))
+                    .collect(),
+            )
+        } else {
+            Cow::Borrowed(&tool_calls)
+        };
         let results = run_tool_calls(
-            &tool_calls,
-            submit_errors,
+            &executed,
+            plans,
             read_only,
             submit_name,
             config.max_concurrent_tools,
         )
         .await;
+        if let Some(toolbox) = read_only {
+            record_reads(
+                toolbox,
+                &executed,
+                &results,
+                ledger.as_mut(),
+                &mut tally.opened_files,
+                config.capture_reads.then_some(&mut tally.read_outputs),
+            )
+            .await;
+        }
+        tally.record_calls(&executed, submit_name);
+        trace::results(tally.steps_used, &results);
         messages.push(Message::Tool { results });
         last_text = text;
         wrap_up.record(step_started.elapsed());
     }
 
     match submit.parse_prose(&last_text) {
-        Ok(result) => Ok(tally.finish(result, true)),
-        Err(_) => Err(unparseable(submit_name, tally.steps_used)),
+        Ok(result) => {
+            let mut outcome = gate.accept(submit, result, &mut tally);
+            outcome.cut_short = true;
+            Ok(outcome)
+        }
+        Err(_) => gate.give_up(submit_name, &mut tally),
+    }
+}
+
+/// The gate's one refusal: which files to read and that the next submit is accepted.
+fn gate_refusal(files: &[String], submit_name: &str) -> String {
+    format!(
+        "Not submitted yet. Before you submit, open these changed files with read_file and check the code around each change: {}. Then call {submit_name} again with every finding you confirmed. This is asked only once; your next {submit_name} call will be accepted.",
+        files.join(", ")
+    )
+}
+
+/// A `read_file` call spanning fewer than [`VERIFY_WIDEN_SPAN_THRESHOLD`] lines, widened by
+/// [`VERIFY_WIDEN_BEFORE`] / [`VERIFY_WIDEN_AFTER`] lines; `None` for any other call. The
+/// tool's own line and character caps still apply to the widened window.
+fn widen_short_read(call: &ToolCall) -> Option<ToolCall> {
+    if call.name != "read_file" {
+        return None;
+    }
+    let start = call.arguments.get("start_line")?.as_u64()?;
+    let end = call.arguments.get("end_line")?.as_u64()?;
+    if end < start || end - start >= VERIFY_WIDEN_SPAN_THRESHOLD {
+        return None;
+    }
+    let mut widened = call.clone();
+    let args = widened.arguments.as_object_mut()?;
+    args.insert(
+        "start_line".into(),
+        json!(start.saturating_sub(VERIFY_WIDEN_BEFORE).max(1)),
+    );
+    args.insert(
+        "end_line".into(),
+        json!(end.saturating_add(VERIFY_WIDEN_AFTER)),
+    );
+    Some(widened)
+}
+
+/// Records every successful `read_file` of a turn whose output has a `[path: lines X-Y of Z]`
+/// header: the lines shown go into `ledger`, its file into `opened`, and the output into
+/// `outputs` when given. Path resolution runs off the async runtime.
+async fn record_reads(
+    toolbox: &Toolbox,
+    calls: &[ToolCall],
+    results: &[ToolResult],
+    mut ledger: Option<&mut CoverageLedger>,
+    opened: &mut HashSet<String>,
+    mut outputs: Option<&mut Vec<(String, String)>>,
+) {
+    for (call, result) in calls.iter().zip(results) {
+        if result.is_error {
+            continue;
+        }
+        // Only the lines the output header says were shown count; without a header nothing
+        // is credited.
+        let Some((start, end)) = parse_read_header_range(&result.content) else {
+            continue;
+        };
+        let Some(path) = toolbox.read_file_path(call).await else {
+            continue;
+        };
+        if let Some(ledger) = ledger.as_deref_mut() {
+            ledger.record_read(&path, start, end);
+        }
+        if let Some(outputs) = outputs.as_deref_mut() {
+            outputs.push((path.clone(), result.content.clone()));
+        }
+        opened.insert(path);
+    }
+}
+
+/// How far into its step budget a Finder run is; each band's note is sent once on entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum BudgetBand {
+    #[default]
+    Free,
+    Encourage,
+    Urgent,
+}
+
+impl BudgetBand {
+    /// The band after `steps_used` steps. `Urgent` starts three steps before wrap-up (but not
+    /// before step 3), `Encourage` four steps earlier (but not before step 2).
+    fn at(steps_used: usize, config: &AgentConfig) -> Self {
+        let urgent_from = force_start(config).saturating_sub(3).max(3);
+        let encourage_from = urgent_from.saturating_sub(4).max(2);
+        if steps_used >= urgent_from {
+            Self::Urgent
+        } else if steps_used >= encourage_from {
+            Self::Encourage
+        } else {
+            Self::Free
+        }
+    }
+}
+
+/// The step count at which step-budget wrap-up starts.
+fn force_start(config: &AgentConfig) -> usize {
+    config.max_steps.saturating_sub(config.wrap_up_steps.max(1))
+}
+
+/// Notes already appended to the conversation of one run.
+#[derive(Default)]
+struct Notes {
+    /// Pending hunks named by the last debt note sent.
+    debt: Option<PendingSignature>,
+    band: BudgetBand,
+    verdict_due: bool,
+}
+
+impl Notes {
+    /// Appends the notes due before the next step. Called only with the repository tools and
+    /// outside wrap-up; each note stays in the conversation.
+    fn append(
+        &mut self,
+        messages: &mut Vec<Message>,
+        config: &AgentConfig,
+        steps_used: usize,
+        ledger: Option<&CoverageLedger>,
+        submit_name: &str,
+    ) {
+        // Placed right after the step's tool results; the first request has none.
+        if steps_used > 0
+            && let Some(ledger) = ledger
+            && let Some(note) = ledger.debt_note(submit_name)
+        {
+            let signature = ledger.pending_signature();
+            if self.debt.as_ref() != Some(&signature) {
+                messages.push(user_message(note));
+                self.debt = Some(signature);
+            }
+        }
+        if config.budget_bands && config.max_steps >= BUDGET_BANDS_MIN_STEPS {
+            let band = BudgetBand::at(steps_used, config);
+            if band > self.band {
+                self.band = band;
+                let max_steps = config.max_steps;
+                let note = match band {
+                    BudgetBand::Free => None,
+                    BudgetBand::Encourage => Some(format!(
+                        "Step budget: {steps_used} of {max_steps} steps used. Keep going through the changed code you have not checked yet, and batch independent lookups in one turn."
+                    )),
+                    BudgetBand::Urgent => Some(format!(
+                        "Step budget: {} steps left before only {submit_name} is offered. Finish the check you are on, then call {submit_name} with every finding and dismissal so far.",
+                        force_start(config).saturating_sub(steps_used)
+                    )),
+                };
+                messages.extend(note.map(user_message));
+            }
+        }
+        if config.no_tools_on_last_step && !self.verdict_due && steps_used + 2 == config.max_steps {
+            self.verdict_due = true;
+            messages.push(user_message(
+                "One step left for reading. After it you must answer with your final JSON verdict, without tools, based on what you have read.".to_owned(),
+            ));
+        }
     }
 }
 
@@ -347,34 +785,143 @@ impl WrapUp {
     }
 }
 
-/// Steps and cache tokens of one run.
+/// Steps, LLM time, opened files, recent tool calls and captured reads of one run.
 #[derive(Default)]
 struct Tally {
     steps_used: usize,
-    cache_read_tokens: u32,
-    cache_write_tokens: u32,
+    /// Summed wall time of the LLM calls.
+    llm_time: Duration,
+    opened_files: HashSet<String>,
+    recent_calls: VecDeque<String>,
+    read_outputs: Vec<(String, String)>,
 }
 
 impl Tally {
-    fn add(&mut self, response: &ChatResponse) {
+    fn add(&mut self, llm_time: Duration) {
         self.steps_used += 1;
-        self.cache_read_tokens = self
-            .cache_read_tokens
-            .saturating_add(response.cache_read_tokens);
-        self.cache_write_tokens = self
-            .cache_write_tokens
-            .saturating_add(response.cache_write_tokens);
+        self.llm_time = self.llm_time.saturating_add(llm_time);
     }
 
-    fn finish<T>(&self, result: T, cut_short: bool) -> AgentOutcome<T> {
+    /// Keeps a summary of every executed call of a turn except `submit_name`.
+    fn record_calls(&mut self, calls: &[ToolCall], submit_name: &str) {
+        for call in calls.iter().filter(|call| call.name != submit_name) {
+            if self.recent_calls.len() == RECENT_TOOL_CALLS {
+                self.recent_calls.pop_front();
+            }
+            self.recent_calls.push_back(tool_call_summary(call));
+        }
+    }
+
+    fn finish<T>(&mut self, result: T, cut_short: bool, gate_refused: bool) -> AgentOutcome<T> {
+        let mean_step = u32::try_from(self.steps_used)
+            .ok()
+            .filter(|&steps| steps > 0)
+            .map(|steps| self.llm_time / steps);
         AgentOutcome {
             result,
             steps_used: self.steps_used,
-            cache_read_tokens: self.cache_read_tokens,
-            cache_write_tokens: self.cache_write_tokens,
             cut_short,
+            gate_refused,
+            opened_files: std::mem::take(&mut self.opened_files),
+            mean_step,
+            recent_tool_calls: std::mem::take(&mut self.recent_calls).into(),
+            read_outputs: std::mem::take(&mut self.read_outputs),
         }
     }
+}
+
+/// `tool(arguments)`, secrets redacted before the arguments are cut to
+/// [`TOOL_CALL_ARGS_CHARS`] characters (a cut keeps `...` as its last three).
+fn tool_call_summary(call: &ToolCall) -> String {
+    let args = call.arguments.to_string();
+    let args = redact_secrets(&args);
+    let excerpt = if args.chars().count() > TOOL_CALL_ARGS_CHARS {
+        truncate_with_marker(&args, TOOL_CALL_ARGS_CHARS - 3, "...")
+    } else {
+        Cow::Borrowed(args.as_ref())
+    };
+    format!("{}({excerpt})", call.name)
+}
+
+/// The one-shot completion gate and the submissions it refused, oldest first.
+struct CompletionGate<T> {
+    enabled: bool,
+    /// Parsed submissions the gate refused; the first is the held one.
+    refused: Vec<T>,
+}
+
+impl<T> CompletionGate<T> {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            refused: Vec::new(),
+        }
+    }
+
+    /// The qualifying files still unread when a submission parsed in this step must be refused:
+    /// the gate has not refused yet, the run is not wrapping up, at least
+    /// [`GATE_MIN_STEPS_LEFT`] investigating steps remain after this one, and a qualifying hunk
+    /// is unread. Reads of the current turn are not recorded yet, so they do not count.
+    fn pending(
+        &self,
+        config: &AgentConfig,
+        wrap_up_active: bool,
+        steps_used: usize,
+        ledger: Option<&CoverageLedger>,
+    ) -> Option<Vec<String>> {
+        if !self.enabled || !self.refused.is_empty() || wrap_up_active {
+            return None;
+        }
+        if force_start(config).saturating_sub(steps_used) < GATE_MIN_STEPS_LEFT {
+            return None;
+        }
+        let files = ledger?.pending_qualifying_files();
+        (!files.is_empty()).then_some(files)
+    }
+
+    fn hold(&mut self, submission: T) {
+        self.refused.push(submission);
+    }
+
+    /// The outcome for an accepted `result`. When it has no findings, it takes those of the
+    /// latest refused submission that had some (a model refused once often resubmits `[]`
+    /// meaning "already sent").
+    fn accept<S: SubmitSpec<Output = T>>(
+        mut self,
+        submit: &S,
+        result: T,
+        tally: &mut Tally,
+    ) -> AgentOutcome<T> {
+        let gate_refused = !self.refused.is_empty();
+        let result = if submit.has_findings(&result) {
+            result
+        } else {
+            match self.refused.iter().rposition(|r| submit.has_findings(r)) {
+                Some(index) => submit.with_findings_of(result, self.refused.swap_remove(index)),
+                None => result,
+            }
+        };
+        tally.finish(result, false, gate_refused)
+    }
+
+    /// The run ended without a parsable result: the held submission (`cut_short`) if the gate
+    /// refused one, otherwise [`AgentError::Unparseable`].
+    fn give_up(self, submit_name: &str, tally: &mut Tally) -> Result<AgentOutcome<T>, AgentError> {
+        match self.refused.into_iter().next() {
+            Some(held) => Ok(tally.finish(held, true, true)),
+            None => Err(unparseable(submit_name, tally.steps_used)),
+        }
+    }
+}
+
+/// How one call of a turn that did not end the run is answered.
+enum CallPlan {
+    /// A read-only call, executed when the repository tools are available.
+    Run,
+    /// A terminal-tool call whose arguments were rejected; the text is shown to the model.
+    Invalid(String),
+    /// A terminal-tool call the completion gate refused (not an error).
+    Refused(String),
 }
 
 /// Safe error text: names the terminal tool and the step count, nothing else.
@@ -400,6 +947,13 @@ async fn request(
         max_tokens: MAX_OUTPUT_TOKENS,
         effort: llm.effort,
     };
+    if *overflow_retried {
+        return llm
+            .chat
+            .chat(llm.provider_id, build(messages, tools), llm.usage.clone())
+            .await
+            .map_err(agent_error);
+    }
     let first = llm
         .chat
         .chat(
@@ -409,7 +963,7 @@ async fn request(
         )
         .await;
     match first {
-        Err(ChatError::ContextOverflow(_)) if !*overflow_retried => {
+        Err(ChatError::ContextOverflow(_)) => {
             *overflow_retried = true;
             tracing::debug!("context overflow; retrying once with a compacted conversation");
             compact_for_overflow(messages);
@@ -433,7 +987,7 @@ fn agent_error(err: ChatError) -> AgentError {
 /// available; otherwise they get an error telling the model to submit.
 async fn run_tool_calls(
     calls: &[ToolCall],
-    submit_errors: Vec<Option<String>>,
+    plans: Vec<CallPlan>,
     read_only: Option<&Toolbox>,
     submit_name: &str,
     max_concurrent: usize,
@@ -442,8 +996,8 @@ async fn run_tool_calls(
     // lose `Send` (higher-ranked lifetime inference).
     let pending: Vec<_> = calls
         .iter()
-        .zip(submit_errors)
-        .map(|(call, submit_error)| answer_call(call, submit_error, read_only, submit_name))
+        .zip(plans)
+        .map(|(call, plan)| answer_call(call, plan, read_only, submit_name))
         .collect();
     stream::iter(pending)
         // `buffered` keeps the results in call order; 0 would never poll anything.
@@ -455,19 +1009,25 @@ async fn run_tool_calls(
 /// The result for one call of a turn that did not end the run.
 async fn answer_call(
     call: &ToolCall,
-    submit_error: Option<String>,
+    plan: CallPlan,
     read_only: Option<&Toolbox>,
     submit_name: &str,
 ) -> ToolResult {
-    let output = match (submit_error, read_only) {
-        (Some(err), _) => ToolOutput {
+    let output = match (plan, read_only) {
+        (CallPlan::Refused(content), _) => ToolOutput {
+            content,
+            is_error: false,
+        },
+        (CallPlan::Invalid(err), _) => ToolOutput {
             content: format!(
                 "Error: invalid {submit_name} arguments: {err}. Call {submit_name} again with corrected arguments."
             ),
             is_error: true,
         },
-        (None, Some(toolbox)) => toolbox.execute_read_only(&call.name, &call.arguments).await,
-        (None, None) => ToolOutput {
+        (CallPlan::Run, Some(toolbox)) => {
+            toolbox.execute_read_only(&call.name, &call.arguments).await
+        }
+        (CallPlan::Run, None) => ToolOutput {
             content: format!(
                 "Error: tool {} is not available now; call {submit_name} with your result",
                 call.name
@@ -501,10 +1061,11 @@ fn assistant_message(text: &str, calls: &[ToolCall], provider_meta: Option<Strin
     Message::Assistant { parts }
 }
 
-/// Replaces the oldest tool outputs longer than `COMPACT_MIN_CHARS`, oldest first, until the
-/// conversation fits `limit`. The prompt and the last `COMPACT_KEEP_TAIL` messages are never
-/// touched, and only `ToolResult.content` changes, so call/result pairing holds. One pass:
-/// when nothing is left to replace it stops, even above the limit.
+/// Shortens the oldest tool outputs longer than `COMPACT_EXCERPT_CHARS` plus
+/// `COMPACTED_MARKER` (saving at least one character), oldest first, until the conversation fits
+/// `limit`. The prompt and the last `COMPACT_KEEP_TAIL` messages are never touched, and only
+/// `ToolResult.content` changes, so call/result pairing holds. One pass: when nothing is left to
+/// shorten it stops, even above the limit.
 fn compact(messages: &mut [Message], limit: usize) {
     let mut total = messages_char_len(messages);
     if total <= limit {
@@ -514,7 +1075,7 @@ fn compact(messages: &mut [Message], limit: usize) {
     let Some(candidates) = messages.get_mut(1..protected_from) else {
         return;
     };
-    let omitted_len = OMITTED_TOOL_OUTPUT.chars().count();
+    let min_compact_chars = COMPACT_EXCERPT_CHARS + COMPACTED_MARKER.chars().count();
     for message in candidates {
         let Message::Tool { results } = message else {
             continue;
@@ -524,9 +1085,15 @@ fn compact(messages: &mut [Message], limit: usize) {
                 return;
             }
             let len = result.content.chars().count();
-            if len > COMPACT_MIN_CHARS {
-                total = total.saturating_sub(len) + omitted_len;
-                OMITTED_TOOL_OUTPUT.clone_into(&mut result.content);
+            if len <= min_compact_chars || result.content.ends_with(COMPACTED_MARKER) {
+                continue;
+            }
+            if let Cow::Owned(short) =
+                truncate_with_marker(&result.content, COMPACT_EXCERPT_CHARS, COMPACTED_MARKER)
+            {
+                let new_len = short.chars().count();
+                result.content = short;
+                total = total.saturating_sub(len.saturating_sub(new_len));
             }
         }
     }
@@ -595,6 +1162,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use adus_git::{FileDiff, FileStatus};
     use adus_llm::{
         AssistantPart, ChatRequest, ChatResponse, ReasoningEffort, ToolCall, ToolResult, UserPart,
     };
@@ -605,6 +1173,9 @@ mod tests {
     use crate::workspace::RepoWorkspace;
 
     const SUBMIT: &str = "submit_answer";
+    const REPORT: &str = "submit_findings";
+    const GATE_REFUSAL: &str = "Not submitted yet. Before you submit, open these changed files with read_file and check the code around each change: src/a.rs. Then call submit_findings again with every finding you confirmed. This is asked only once; your next submit_findings call will be accepted.";
+    const VERDICT_DUE: &str = "One step left for reading. After it you must answer with your final JSON verdict, without tools, based on what you have read.";
     const NUDGE: &str =
         "Please submit your result by calling submit_answer (or return the JSON directly).";
     const WRAP_UP: &str =
@@ -639,7 +1210,7 @@ mod tests {
             &self.def
         }
 
-        fn parse_arguments(&self, arguments: &Value) -> Result<String, String> {
+        fn parse_arguments(&self, arguments: &Value, _can_retry: bool) -> Result<String, String> {
             arguments
                 .get("answer")
                 .and_then(Value::as_str)
@@ -652,7 +1223,7 @@ mod tests {
             let end = text.rfind('}').ok_or("no JSON object")?;
             let value: Value = serde_json::from_str(text.get(start..=end).ok_or("no JSON object")?)
                 .map_err(|e| e.to_string())?;
-            self.parse_arguments(&value)
+            self.parse_arguments(&value, false)
         }
     }
 
@@ -676,11 +1247,163 @@ mod tests {
         ])
     }
 
-    async fn run(
+    /// Toy findings tool shaped like `submit_findings`: `{"review_log": "..", "findings": [..]}`.
+    struct SubmitReport {
+        def: ToolDef,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Report {
+        review_log: String,
+        findings: Vec<String>,
+    }
+
+    impl SubmitReport {
+        fn new() -> Self {
+            Self {
+                def: ToolDef {
+                    name: REPORT.into(),
+                    description: "Submit the findings.".into(),
+                    parameters: json!({"type": "object"}),
+                },
+            }
+        }
+    }
+
+    impl SubmitSpec for SubmitReport {
+        type Output = Report;
+
+        fn tool_def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        fn parse_arguments(&self, arguments: &Value, _can_retry: bool) -> Result<Report, String> {
+            let findings = arguments
+                .get("findings")
+                .and_then(Value::as_array)
+                .ok_or("missing array field `findings`")?;
+            Ok(Report {
+                review_log: arguments
+                    .get("review_log")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                findings: findings
+                    .iter()
+                    .filter_map(|f| f.as_str().map(str::to_owned))
+                    .collect(),
+            })
+        }
+
+        fn parse_prose(&self, text: &str) -> Result<Report, String> {
+            let start = text.find('{').ok_or("no JSON object")?;
+            let end = text.rfind('}').ok_or("no JSON object")?;
+            let value: Value = serde_json::from_str(text.get(start..=end).ok_or("no JSON object")?)
+                .map_err(|e| e.to_string())?;
+            self.parse_arguments(&value, false)
+        }
+
+        fn has_findings(&self, output: &Report) -> bool {
+            !output.findings.is_empty()
+        }
+
+        fn with_findings_of(&self, accepted: Report, earlier: Report) -> Report {
+            Report {
+                findings: earlier.findings,
+                ..accepted
+            }
+        }
+    }
+
+    fn report(id: &str, review_log: &str, findings: &[&str]) -> ToolCall {
+        call(
+            id,
+            REPORT,
+            json!({"review_log": review_log, "findings": findings}),
+        )
+    }
+
+    fn read_lines(id: &str, path: &str, start: u32, end: u32) -> ToolCall {
+        call(
+            id,
+            "read_file",
+            json!({"path": path, "start_line": start, "end_line": end}),
+        )
+    }
+
+    /// A coverage ledger over `(path, hunks)` files.
+    fn ledger(files: &[(&str, &[(u32, u32)])]) -> CoverageLedger {
+        let diffs: Vec<FileDiff> = files
+            .iter()
+            .map(|(path, hunks)| FileDiff {
+                path: (*path).to_owned(),
+                old_path: None,
+                status: FileStatus::Modified,
+                patch: Some(
+                    hunks
+                        .iter()
+                        .map(|&(start, end)| {
+                            let count = end - start + 1;
+                            format!(
+                                "@@ -{start},0 +{start},{count} @@
+{}",
+                                "+x
+"
+                                .repeat(count as usize)
+                            )
+                        })
+                        .collect(),
+                ),
+            })
+            .collect();
+        CoverageLedger::from_files(&diffs.iter().collect::<Vec<_>>())
+    }
+
+    /// A toolbox holding `src/a.rs` with 100 numbered lines.
+    fn hundred_line_toolbox() -> Toolbox {
+        let body: String = (1..=100)
+            .map(|i| {
+                format!(
+                    "line {i}
+"
+                )
+            })
+            .collect();
+        toolbox(&[("src/a.rs", &body)])
+    }
+
+    /// Gated config: a ledger over `src/a.rs` lines 50-52 and the completion gate on.
+    fn gated(max_steps: usize) -> AgentConfig {
+        AgentConfig {
+            coverage_ledger: Some(ledger(&[("src/a.rs", &[(50, 52)])])),
+            enforce_gate: true,
+            ..AgentConfig::new(max_steps)
+        }
+    }
+
+    fn debt_notes(req: &ChatRequest) -> Vec<&str> {
+        req.messages
+            .iter()
+            .filter_map(msg_text)
+            .filter(|t| t.starts_with("Unread changed code."))
+            .collect()
+    }
+
+    /// Every request repeats the previous request's messages unchanged, then appends.
+    fn assert_append_only(reqs: &[ChatRequest]) {
+        for pair in reqs.windows(2) {
+            let (before, after) = (&pair[0].messages, &pair[1].messages);
+            assert!(after.len() > before.len());
+            assert_eq!(&after[..before.len()], &before[..], "history was rewritten");
+        }
+    }
+
+    async fn run_with<S: SubmitSpec>(
         chat: &ScriptedChat,
         tools: AgentTools<'_>,
+        submit: &S,
         config: &AgentConfig,
-    ) -> Result<AgentOutcome<String>, AgentError> {
+    ) -> Result<AgentOutcome<S::Output>, AgentError> {
         let usage = UsageContext {
             review_id: Some(Uuid::from_u128(7)),
             repository_id: Some(Uuid::from_u128(8)),
@@ -693,7 +1416,15 @@ mod tests {
             effort: Some(ReasoningEffort::Medium),
             usage: &usage,
         };
-        run_react_loop(&llm, tools, &SubmitAnswer::new(), config, "PROMPT".into()).await
+        run_react_loop(&llm, tools, submit, config, "PROMPT".into()).await
+    }
+
+    async fn run(
+        chat: &ScriptedChat,
+        tools: AgentTools<'_>,
+        config: &AgentConfig,
+    ) -> Result<AgentOutcome<String>, AgentError> {
+        run_with(chat, tools, &SubmitAnswer::new(), config).await
     }
 
     fn tool_results(msg: &Message) -> &[ToolResult] {
@@ -786,13 +1517,17 @@ mod tests {
             with_cache(tools_turn(vec![read("c1", "src/a.rs")])),
             with_cache(tools_turn(vec![submit("c2", "done")])),
         ]);
-        let out = run(&chat, AgentTools::Full(&tb), &AgentConfig::new(20))
-            .await
-            .unwrap();
+        // Unlimited: the review's budget still sums every step's cache reads and writes.
+        let budget = Arc::new(TokenBudget::new(0));
+        let config = AgentConfig {
+            token_budget: Some(Arc::clone(&budget)),
+            ..AgentConfig::new(20)
+        };
+        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
         assert_eq!(out.result, "done");
         assert_eq!(out.steps_used, 2);
         assert!(!out.cut_short);
-        assert_eq!((out.cache_read_tokens, out.cache_write_tokens), (14, 6));
+        assert_eq!((budget.cache_read(), budget.cache_write()), (14, 6));
 
         let reqs = chat.requests();
         assert_eq!(reqs.len(), 2);
@@ -1123,14 +1858,21 @@ mod tests {
         assert_eq!(msgs.len(), 7);
         assert_eq!(msgs[0], user("PROMPT"));
         assert_paired(msgs);
-        // The oldest output is omitted; the last 4 messages (2 turns) stay whole.
-        assert_eq!(tool_results(&msgs[2])[0].content, OMITTED_TOOL_OUTPUT);
+        // The oldest output is shortened to a 400-char excerpt; the last 4 messages stay whole.
+        let excerpt: String = tool_results(&msgs[4])[0]
+            .content
+            .chars()
+            .take(COMPACT_EXCERPT_CHARS)
+            .collect();
+        let expected_short = format!("{excerpt}{COMPACTED_MARKER}");
+        assert_eq!(tool_results(&msgs[2])[0].content, expected_short);
         assert!(tool_results(&msgs[4])[0].content.contains(&big));
         assert!(tool_results(&msgs[6])[0].content.contains(&big));
     }
 
     #[test]
     fn compact_respects_limit_protects_tail_and_terminates() {
+        assert_eq!(AgentConfig::new(20).compaction_char_limit, 320_000);
         let long = "y".repeat(1_000);
         let mut msgs = vec![
             user(&"p".repeat(500)),
@@ -1145,18 +1887,42 @@ mod tests {
         ];
         let before = msgs.clone();
         compact(&mut msgs, messages_char_len(&before) - 100);
-        assert_eq!(tool_results(&msgs[2])[0].content, OMITTED_TOOL_OUTPUT);
+        let expected_short = format!("{}{COMPACTED_MARKER}", "y".repeat(COMPACT_EXCERPT_CHARS));
+        assert_eq!(tool_results(&msgs[2])[0].content, expected_short);
         assert_eq!(msgs[3..], before[3..]);
         assert_eq!(msgs[0], before[0]);
 
+        let at_guard = "z".repeat(446);
+        let already_marked = format!("{}{COMPACTED_MARKER}", "z".repeat(500));
         let mut protected = vec![
             user(&long),
-            assistant_calls(&["a"]),
-            tool_msg(&["a"], "short output"),
-            assistant_calls(&["b"]),
-            tool_msg(&["b"], &long),
-            assistant_calls(&["c"]),
-            tool_msg(&["c"], &long),
+            assistant_calls(&["a", "b", "c"]),
+            Message::Tool {
+                results: vec![
+                    ToolResult {
+                        call_id: "a".into(),
+                        tool_name: "read_file".into(),
+                        content: "short output".into(),
+                        is_error: false,
+                    },
+                    ToolResult {
+                        call_id: "b".into(),
+                        tool_name: "read_file".into(),
+                        content: at_guard,
+                        is_error: false,
+                    },
+                    ToolResult {
+                        call_id: "c".into(),
+                        tool_name: "read_file".into(),
+                        content: already_marked,
+                        is_error: false,
+                    },
+                ],
+            },
+            assistant_calls(&["d"]),
+            tool_msg(&["d"], &long),
+            assistant_calls(&["e"]),
+            tool_msg(&["e"], &long),
         ];
         let before = protected.clone();
         compact(&mut protected, 0);
@@ -1302,46 +2068,359 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_note_sent_once_at_half_budget() {
+    async fn budget_bands_emit_encourage_and_urgent_once() {
         let tb = default_toolbox();
         let reads = |n: usize| -> Vec<_> {
             (1..=n)
                 .map(|i| tools_turn(vec![read(&format!("c{i}"), "src/a.rs")]))
                 .collect()
         };
+        let encourage = "Step budget: 3 of 12 steps used. Keep going through the changed code you have not checked yet, and batch independent lookups in one turn.";
+        let urgent = "Step budget: 3 steps left before only submit_answer is offered. Finish the check you are on, then call submit_answer with every finding and dismissal so far.";
 
-        let mut script = reads(5);
-        script.push(tools_turn(vec![submit("c6", "ok")]));
+        let mut script = reads(11);
+        script.push(tools_turn(vec![submit("c12", "ok")]));
         let chat = ScriptedChat::new(script);
-        run(&chat, AgentTools::Full(&tb), &AgentConfig::new(6))
-            .await
-            .unwrap();
+        let config = AgentConfig {
+            wrap_up_steps: 2,
+            budget_bands: true,
+            ..AgentConfig::new(12)
+        };
+        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
         let reqs = chat.requests();
-        let note = "Step budget: 3 of 6 steps used. Gather only the evidence you still need, then call submit_answer.";
+        assert_eq!(reqs.len(), 12);
         for (step, req) in reqs.iter().enumerate() {
-            assert_eq!(count_notes(req), usize::from(step >= 3), "step {step}");
-            assert_paired(&req.messages);
+            assert_eq!(count_user(req, encourage), usize::from(step >= 3), "{step}");
+            assert_eq!(count_user(req, urgent), usize::from(step >= 7), "{step}");
+            assert_eq!(
+                count_notes(req),
+                usize::from(step >= 3) + usize::from(step >= 7)
+            );
         }
-        assert_eq!(msg_text(reqs[3].messages.last().unwrap()), Some(note));
-        assert_eq!(count_user(&reqs[3], WRAP_UP), 0);
-        assert_eq!(count_user(&reqs[5], WRAP_UP), 1);
+        assert_eq!(msg_text(reqs[3].messages.last().unwrap()), Some(encourage));
+        assert_eq!(msg_text(reqs[7].messages.last().unwrap()), Some(urgent));
+        for note in [encourage, urgent] {
+            assert!(!note.contains("as soon as") && !note.contains("extra steps"));
+        }
+        assert_append_only(&reqs);
 
-        // No note when halfway starts wrap-up, for budgets < 4, or without repository tools.
-        let mut window = AgentConfig::new(4);
-        window.wrap_up_steps = 2;
-        for (tools, config, steps) in [
-            (AgentTools::Full(&tb), window, 4),
-            (AgentTools::Full(&tb), AgentConfig::new(3), 3),
-            (AgentTools::SubmitOnly, AgentConfig::new(6), 6),
+        // No band note under 6 steps, with `budget_bands` off (a 7-step Verifier-shaped run),
+        // or without repository tools.
+        for (tools, config) in [
+            (
+                AgentTools::Full(&tb),
+                AgentConfig {
+                    budget_bands: true,
+                    ..AgentConfig::new(5)
+                },
+            ),
+            (AgentTools::Full(&tb), AgentConfig::new(7)),
+            (
+                AgentTools::SubmitOnly,
+                AgentConfig {
+                    wrap_up_steps: 2,
+                    budget_bands: true,
+                    ..AgentConfig::new(12)
+                },
+            ),
         ] {
+            let steps = config.max_steps;
             let chat = ScriptedChat::new(reads(steps));
             let err = run(&chat, tools, &config).await.unwrap_err();
             assert!(matches!(err, AgentError::Unparseable(_)), "{err:?}");
             let reqs = chat.requests();
             assert_eq!(reqs.len(), steps);
             assert!(reqs.iter().all(|r| count_notes(r) == 0), "{steps} steps");
-            assert_eq!(count_user(&reqs[steps - 1], WRAP_UP), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn coverage_debt_note_is_append_only_and_sent_on_change() {
+        let tb = hundred_line_toolbox();
+        let grep = |id: &str| call(id, "grep", json!({"pattern": "line"}));
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![grep("g1")]),
+            tools_turn(vec![grep("g2")]),
+            tools_turn(vec![read_lines("r1", "src/a.rs", 1, 10)]),
+            tools_turn(vec![read_lines("r2", "./src/a.rs", 40, 60)]),
+            tools_turn(vec![report("s1", "done", &[])]),
+        ]);
+        let config = AgentConfig {
+            coverage_ledger: Some(ledger(&[("src/a.rs", &[(1, 3), (50, 52)])])),
+            ..AgentConfig::new(20)
+        };
+        run_with(&chat, AgentTools::Full(&tb), &SubmitReport::new(), &config)
+            .await
+            .unwrap();
+        let reqs = chat.requests();
+        let both = "Unread changed code. You have not opened these changed lines with read_file yet:\n- src/a.rs: lines 1-3, 50-52\nRead them before you call submit_findings. Only read_file opens code; search and directory results show where it is, not what it does.";
+        let second = both.replace("lines 1-3, 50-52", "lines 50-52");
+        // The first request is the prompt alone; the note follows the first step's results.
+        assert!(debt_notes(&reqs[0]).is_empty());
+        assert_eq!(debt_notes(&reqs[1]), [both]);
+        assert_eq!(msg_text(reqs[1].messages.last().unwrap()), Some(both));
+        // A grep covers nothing: no new note.
+        assert_eq!(debt_notes(&reqs[2]), [both]);
+        // Reading lines 1-10 covers the first hunk only.
+        assert_eq!(debt_notes(&reqs[3]), [both, second.as_str()]);
+        // Nothing pending: no further note, earlier notes stay.
+        assert_eq!(debt_notes(&reqs[4]), [both, second.as_str()]);
+        assert_append_only(&reqs);
+
+        // Never during wrap-up (every step after the first wraps up here).
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![grep("g1")]),
+            tools_turn(vec![grep("g2")]),
+            tools_turn(vec![report("s1", "done", &[])]),
+        ]);
+        let config = AgentConfig {
+            max_steps: 3,
+            wrap_up_steps: 2,
+            ..config.clone()
+        };
+        run_with(&chat, AgentTools::Full(&tb), &SubmitReport::new(), &config)
+            .await
+            .unwrap();
+        assert!(chat.requests().iter().all(|r| debt_notes(r).is_empty()));
+
+        // Docs and tests carry no debt.
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![grep("g1")]),
+            tools_turn(vec![report("s1", "done", &[])]),
+        ]);
+        let config = AgentConfig {
+            coverage_ledger: Some(ledger(&[
+                ("README.md", &[(1, 3)]),
+                ("tests/e2e.rs", &[(1, 3)]),
+            ])),
+            ..AgentConfig::new(20)
+        };
+        run_with(&chat, AgentTools::Full(&tb), &SubmitReport::new(), &config)
+            .await
+            .unwrap();
+        assert!(chat.requests().iter().all(|r| debt_notes(r).is_empty()));
+    }
+
+    #[tokio::test]
+    async fn gate_refuses_early_submit_and_recovers_held_on_unparseable() {
+        let tb = hundred_line_toolbox();
+        let spec = SubmitReport::new();
+
+        // (a) A read in the same turn as the submit does not count: refused once, not an
+        // error; the next submit is accepted.
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![
+                read_lines("r1", "src/a.rs", 40, 60),
+                report("s1", "early", &["f1"]),
+            ]),
+            tools_turn(vec![report("s2", "later", &["f2"])]),
+        ]);
+        let out = run_with(&chat, AgentTools::Full(&tb), &spec, &gated(20))
+            .await
+            .unwrap();
+        assert_eq!(out.result.findings, ["f2"]);
+        assert!(out.gate_refused && !out.cut_short);
+        assert_eq!(out.opened_files, HashSet::from(["src/a.rs".to_owned()]));
+        let results = tool_results(chat.requests()[1].messages.last().unwrap()).to_vec();
+        assert!(!results[0].is_error);
+        assert_eq!(results[1].tool_name, REPORT);
+        assert!(!results[1].is_error);
+        assert_eq!(results[1].content, GATE_REFUSAL);
+
+        // (b) A failed read does not satisfy the gate; (c) two submits of one turn are both
+        // refused.
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![read_lines("r1", "src/a.rs", 60, 50)]),
+            tools_turn(vec![
+                report("s1", "one", &["f1"]),
+                report("s2", "two", &["f2"]),
+            ]),
+            tools_turn(vec![report("s3", "three", &["f3"])]),
+        ]);
+        let out = run_with(&chat, AgentTools::Full(&tb), &spec, &gated(20))
+            .await
+            .unwrap();
+        assert_eq!(out.result.findings, ["f3"]);
+        assert!(out.opened_files.is_empty());
+        let reqs = chat.requests();
+        assert!(tool_results(&reqs[1].messages[2])[0].is_error);
+        let refused = tool_results(reqs[2].messages.last().unwrap());
+        assert_eq!(refused.len(), 2);
+        assert!(
+            refused
+                .iter()
+                .all(|r| !r.is_error && r.content == GATE_REFUSAL)
+        );
+
+        // (d) Early prose JSON is refused with a user message; (e) when the run then ends
+        // unparseable, the held submission is returned.
+        let chat = ScriptedChat::new(vec![
+            text_turn(r#"{"review_log": "held", "findings": ["h1"]}"#),
+            text_turn("no json"),
+            text_turn("still no json"),
+        ]);
+        let out = run_with(&chat, AgentTools::Full(&tb), &spec, &gated(20))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.result,
+            Report {
+                review_log: "held".into(),
+                findings: vec!["h1".into()],
+            }
+        );
+        assert!(out.cut_short && out.gate_refused);
+        let reqs = chat.requests();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(count_user(&reqs[1], GATE_REFUSAL), 1);
+        assert_eq!(count_user(&reqs[2], &NUDGE.replace(SUBMIT, REPORT)), 1);
+    }
+
+    #[tokio::test]
+    async fn gate_skipped_when_insufficient_steps_or_no_tools() {
+        let tb = hundred_line_toolbox();
+        let spec = SubmitReport::new();
+        let early = || {
+            ScriptedChat::new(vec![
+                tools_turn(vec![report("s1", "r", &["f1"])]),
+                tools_turn(vec![report("s2", "r", &["f2"])]),
+            ])
+        };
+
+        // 4 steps: 4 - 1 - 1 = 2 investigating steps left, so the gate refuses.
+        let chat = early();
+        let out = run_with(&chat, AgentTools::Full(&tb), &spec, &gated(4))
+            .await
+            .unwrap();
+        assert_eq!(out.result.findings, ["f2"]);
+        assert!(out.gate_refused);
+
+        // 3 steps (3 - 1 - 1 < 2), a 2-step wrap-up, or no repository tools: accepted at once.
+        let mut window = gated(4);
+        window.wrap_up_steps = 2;
+        for (tools, config) in [
+            (AgentTools::Full(&tb), gated(3)),
+            (AgentTools::Full(&tb), window),
+            (AgentTools::SubmitOnly, gated(20)),
+        ] {
+            let chat = early();
+            let out = run_with(&chat, tools, &spec, &config).await.unwrap();
+            assert_eq!(out.result.findings, ["f1"]);
+            assert!(!out.gate_refused);
+            assert_eq!(out.steps_used, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_empty_resubmit_keeps_earlier_findings() {
+        let tb = hundred_line_toolbox();
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![report("s1", "first", &["a", "b"])]),
+            tools_turn(vec![read_lines("r1", "src/a.rs", 40, 60)]),
+            tools_turn(vec![report("s2", "second", &[])]),
+        ]);
+        let out = run_with(
+            &chat,
+            AgentTools::Full(&tb),
+            &SubmitReport::new(),
+            &gated(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.result,
+            Report {
+                review_log: "second".into(),
+                findings: vec!["a".into(), "b".into()],
+            }
+        );
+        assert!(out.gate_refused && !out.cut_short);
+        assert_eq!(out.steps_used, 3);
+    }
+
+    #[tokio::test]
+    async fn no_tools_on_last_step_strips_tools_and_accepts_prose() {
+        let tb = default_toolbox();
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![read("c1", "src/a.rs")]),
+            tools_turn(vec![read("c2", "src/b.rs")]),
+            text_turn(r#"Verdict: {"answer": "final"}"#),
+        ]);
+        let config = AgentConfig {
+            no_tools_on_last_step: true,
+            ..AgentConfig::new(3)
+        };
+        let out = run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        assert_eq!(out.result, "final");
+        assert!(!out.cut_short);
+        assert_eq!(out.steps_used, 3);
+        assert!(out.mean_step.is_some());
+        assert_eq!(
+            out.opened_files,
+            HashSet::from(["src/a.rs".to_owned(), "src/b.rs".to_owned()])
+        );
+
+        let reqs = chat.requests();
+        assert_eq!(tool_names(&reqs[0]).len(), 5);
+        assert_eq!(tool_names(&reqs[1]).len(), 5);
+        assert!(reqs[2].tools.is_empty());
+        assert_eq!(
+            msg_text(reqs[1].messages.last().unwrap()),
+            Some(VERDICT_DUE)
+        );
+        assert_eq!(count_user(&reqs[1], VERDICT_DUE), 1);
+        assert_eq!(count_user(&reqs[2], VERDICT_DUE), 1);
+        assert_eq!(
+            msg_text(reqs[2].messages.last().unwrap()),
+            Some(
+                "This is your last step and no tools are available. Reply with only your final result as the JSON object you would pass to submit_answer, based on what you have read."
+            )
+        );
+        assert_eq!(count_user(&reqs[2], WRAP_UP), 0);
+        assert_append_only(&reqs);
+    }
+
+    #[tokio::test]
+    async fn widen_short_reads_expands_narrow_line_ranges() {
+        let tb = hundred_line_toolbox();
+        let chat = ScriptedChat::new(vec![
+            tools_turn(vec![
+                read_lines("r1", "src/a.rs", 30, 35),
+                read_lines("r2", "src/a.rs", 5, 8),
+                read_lines("r3", "src/a.rs", 30, 60),
+            ]),
+            tools_turn(vec![submit("s1", "ok")]),
+        ]);
+        let config = AgentConfig {
+            widen_short_reads: true,
+            ..AgentConfig::new(20)
+        };
+        run(&chat, AgentTools::Full(&tb), &config).await.unwrap();
+        let reqs = chat.requests();
+        let results = tool_results(&reqs[1].messages[2]);
+        let headers: Vec<&str> = results
+            .iter()
+            .map(|r| r.content.lines().next().unwrap())
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                "[src/a.rs: lines 10-45 of 100]",
+                "[src/a.rs: lines 1-18 of 100]",
+                "[src/a.rs: lines 30-60 of 100]",
+            ]
+        );
+        // The conversation keeps the call as the model sent it.
+        assert_eq!(
+            reqs[1].messages[1],
+            Message::Assistant {
+                parts: vec![
+                    AssistantPart::ToolCall(read_lines("r1", "src/a.rs", 30, 35)),
+                    AssistantPart::ToolCall(read_lines("r2", "src/a.rs", 5, 8)),
+                    AssistantPart::ToolCall(read_lines("r3", "src/a.rs", 30, 60)),
+                ],
+            }
+        );
     }
 
     #[tokio::test]

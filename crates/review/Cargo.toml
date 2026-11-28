@@ -33,3 +33,5 @@ chrono.workspace = true
 redis.workspace = true
 # `test-util`: paused clock (`start_paused`) for the agent's time-based wrap-up tests.
 tokio = { workspace = true, features = ["test-util"] }
+# Captures the `review stages finished` log line in the engine tests.
+tracing-subscriber.workspace = true

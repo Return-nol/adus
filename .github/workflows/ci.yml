@@ -3,10 +3,10 @@ name: ci
 on:
   push:
     branches:
-      - feat/adus-v1
+      - main
   pull_request:
     branches:
-      - feat/adus-v1
+      - main
 
 concurrency:
   group: ci-${{ github.ref }}

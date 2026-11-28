@@ -11,8 +11,13 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Match, Regex};
 
+use crate::prompt::truncate_with_marker;
+
 /// What a masked value is replaced with.
 pub(crate) const REDACTED: &str = "[REDACTED]";
+
+/// Most characters of a model's rationale kept for a log line.
+pub(crate) const RATIONALE_LOG_CHARS: usize = 300;
 
 /// Shortest value of a named assignment that is masked.
 const MIN_VALUE_CHARS: usize = 8;
@@ -81,6 +86,12 @@ fn build(pattern: &str) -> Option<Regex> {
 }
 
 static PATTERNS: LazyLock<Option<Patterns>> = LazyLock::new(Patterns::compile);
+
+/// A model's rationale for a log line: secret-redacted, then cut to [`RATIONALE_LOG_CHARS`]
+/// characters plus an ellipsis.
+pub(crate) fn log_rationale(text: &str) -> String {
+    truncate_with_marker(&redact_secrets(text), RATIONALE_LOG_CHARS, "…").into_owned()
+}
 
 /// `text` with every value that looks like a secret replaced by [`REDACTED`];
 /// `Cow::Borrowed` when nothing matched.

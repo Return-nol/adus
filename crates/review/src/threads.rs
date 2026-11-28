@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::agent::{AgentLlm, chat_low_effort};
+use crate::agent::LlmContext;
 use crate::command::{Command, HELP, MAX_MEMORY_CHARS, parse_command};
 use crate::discussion::format_threads;
 use crate::engine::{Engine, EngineError, chat_error, db_error, is_retryable};
@@ -230,15 +230,21 @@ impl Engine {
             review_id: None,
             repository_id: Some(repository_id),
         };
-        let llm = AgentLlm {
+        let llm = LlmContext {
             chat: self.chat.as_ref(),
             provider_id,
             model: &fast_model,
-            system: REPLY_SYSTEM,
-            effort: Some(ReasoningEffort::Low),
             usage: &usage,
+            token_budget: None,
         };
-        let text = match chat_low_effort(&llm, None, prompt, REPLY_MAX_TOKENS).await {
+        let reply = llm.single_turn(
+            "thread_reply",
+            REPLY_SYSTEM,
+            Some(ReasoningEffort::Low),
+            prompt,
+            REPLY_MAX_TOKENS,
+        );
+        let text = match reply.await {
             Ok(text) => text,
             Err(err) if is_retryable(&err) => return Err(chat_error(err)),
             Err(err) => {
@@ -495,13 +501,12 @@ impl Engine {
             repository_id: Some(repo.id),
         };
         let (provider_id, fast_model) = fast;
-        let llm = AgentLlm {
+        let llm = LlmContext {
             chat: self.chat.as_ref(),
             provider_id,
             model: fast_model,
-            system: VALIDATE_SYSTEM,
-            effort: Some(ReasoningEffort::Low),
             usage: &usage,
+            token_budget: None,
         };
 
         let mut confirmed_fixed = 0usize;
@@ -521,7 +526,14 @@ impl Engine {
             batch_start = batch_end;
 
             let prompt = validation_prompt(batch, &pr_diff);
-            let text = match chat_low_effort(&llm, None, prompt, VALIDATE_MAX_TOKENS).await {
+            let validate = llm.single_turn(
+                "thread_validate",
+                VALIDATE_SYSTEM,
+                Some(ReasoningEffort::Low),
+                prompt,
+                VALIDATE_MAX_TOKENS,
+            );
+            let text = match validate.await {
                 Ok(text) => text,
                 Err(err) => {
                     tracing::warn!(repository_id = %repo.id, pr_number = pr.number, error = %err, "push validation LLM call failed");

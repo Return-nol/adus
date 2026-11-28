@@ -9,8 +9,10 @@ Repo: https://github.com/Return-nol/adus · GHCR image: `ghcr.io/return-nol/adus
 1. **Task brief / active change spec** (any unmerged feature spec in `docs/superpowers/specs/` currently being implemented)
 2. **Living technical spec (binding):** [SPEC.md](docs/SPEC.md)
 3. **Web visual design (binding for `web/`):** [DESIGN.md](docs/DESIGN.md) · **Web conventions:** [web/AGENTS.md](web/AGENTS.md)
-4. **Existing Adus code** and this file
-5. **Backlog of deferred minor findings:** [docs/superpowers/backlog.md](docs/superpowers/backlog.md)
+4. **System architecture overview:** [ARCHITECTURE.md](docs/ARCHITECTURE.md) (crate topology, worker/queue flow, Generalist & Specialists review flows, and ReAct loop)
+5. **Existing Adus code** and this file
+6. **Backlog of deferred minor findings:** [docs/superpowers/backlog.md](docs/superpowers/backlog.md)
+7. **Check for remote updates** on `main` branch before starting plan or checking-out to feature branch.
 
 Historical dated specs and plans live under `docs/superpowers/specs/` and `docs/superpowers/plans/`. If a spec and a plan conflict, the spec wins.
 
@@ -21,9 +23,10 @@ For new work, follow `brainstorming` → `writing-plans` → `subagent-driven-de
 **Whenever SDD (or any feature/spec-driven change) completes, before committing the final state or merging:**
 
 1. **Update [docs/SPEC.md](docs/SPEC.md)** so it reflects all implemented behavior, schema migrations, API endpoints, settings, and invariants introduced by the branch (and update [DESIGN.md](docs/DESIGN.md) if visual tokens or UI patterns changed).
-2. **Mark the dated change spec** (`docs/superpowers/specs/YYYY-MM-DD-*.md`) as `Status: implemented` (keep the file as the historical ADR/delta) and add/update its entry in Section 10 of [docs/SPEC.md](docs/SPEC.md).
-3. **Update `AGENTS.md` / [web/AGENTS.md](web/AGENTS.md) selectively** — only add or adjust cross-cutting guardrails, commands, or environment gotchas. Keep subsystem details in [docs/SPEC.md](docs/SPEC.md) so `AGENTS.md` stays concise and never truncates.
-4. **Plan & reviewer enforcement:** Every new implementation plan must include **"Sync `docs/SPEC.md` and mark spec implemented"** as its final task, and SDD/whole-branch reviewers must flag missing `docs/SPEC.md` updates on behavior-, schema-, or API-changing branches as **Important**.
+2. **Update [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) when necessary** — whenever crate boundaries, trait seams, worker/queue lifecycle, timeout hierarchy, Generalist/Specialist review stages, or the agentic core loop (`run_react_loop`, `CoverageLedger`, `TokenBudget`, Sharded Rules, Verifier, post-verify funnel) change, update its prose and Mermaid diagrams to match.
+3. **Mark the dated change spec** (`docs/superpowers/specs/YYYY-MM-DD-*.md`) as `Status: implemented` (keep the file as the historical ADR/delta) and add/update its entry in Section 10 of [docs/SPEC.md](docs/SPEC.md).
+4. **Update `AGENTS.md` / [web/AGENTS.md](web/AGENTS.md) selectively** — only add or adjust cross-cutting guardrails, commands, or environment gotchas. Keep subsystem details in [docs/SPEC.md](docs/SPEC.md) so `AGENTS.md` stays concise and never truncates.
+5. **Plan & reviewer enforcement:** Every new implementation plan must include **"Sync `docs/SPEC.md` (and `docs/ARCHITECTURE.md` if needed) and mark spec implemented"** as its final task, and SDD/whole-branch reviewers must flag missing `docs/SPEC.md` or `docs/ARCHITECTURE.md` updates on behavior-, schema-, architecture-, or API-changing branches as **Important**.
 
 ## Layout
 
@@ -33,7 +36,7 @@ crates/db       sqlx Postgres: connect(), embedded migrations/, queries (users, 
 crates/git      GitProvider, GitProviderFactory, CloneSpec, diff utilities, GitHub & Azure clients
 crates/llm      LlmClient, OpenAI / Anthropic / Gemini / OpenAI-compatible clients, ReasoningEffort, LlmRouter (ChatService)
 crates/queue    Redis Streams job queue, delivery dedup, per-PR lock, worker heartbeats
-crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, specialists, finder, verifier, dedup, budget, small_pr, prompt, parse, command, engine
+crates/review   workspace (GitCliCloner, RepoWorkspace, RepoPath), tools, redact, repo_instructions, agent, coverage, specialists, finder, rules_judge, rules_evidence, verifier, discussion, dedup, severity, enrich, budget, small_pr, prompt, parse, trace, command, threads, learn, engine
 crates/server   axum: router(), state.rs, error.rs, auth.rs, spa.rs, webhooks.rs, doctor.rs, api/*
 crates/adus     binary (serve, gen-secret, check-config, doctor, healthcheck), worker loop & scheduler
 migrations/     sqlx migrations (0001..0010), embedded by crates/db
@@ -54,6 +57,8 @@ pnpm -C web check                                           # must report 0 erro
 pnpm -C web build                                           # required before spa tests and release builds
 pnpm -C web dev                                             # http://localhost:5173, proxies /api and /webhooks to :8000
 ADUS_PUBLIC_URL=http://localhost:8000 cargo run -p adus     # http://localhost:8000
+cargo run -p adus -- serve --trace > .superpowers/run.log 2>&1  # live LLM trace of every review (SPEC §8.4)
+cargo run -q -p adus -- rereview <repository_id> <pr>       # queue a full re-review on the running serve
 ```
 
 CI (`.github/workflows/ci.yml`): `rust` (`fmt`, `clippy`, `cargo test` with Postgres/Redis) and `web` (`check`, `fmt:check`). Release (`.github/workflows/release.yml`): pushes multi-arch image on `v*` tags. On Windows, if `cargo` is missing from `PATH`, check `%USERPROFILE%\.cargo\bin` (MSVC toolchain).
@@ -65,6 +70,24 @@ CI (`.github/workflows/ci.yml`): `rust` (`fmt`, `clippy`, `cargo test` with Post
 - **Docker Desktop:** If tests fail with `PoolTimedOut`, start Docker Desktop and re-run dev compose.
 - **Disk space & linking on Windows:** `target/` grows rapidly (`LNK1318` if C: fills; deleting `target/debug/incremental` or running `cargo clean` recovers space). Always pass `-j 2` to `cargo test` to avoid `os error 1455`.
 - **No browser automation for UI checks:** Headless Chrome automation previously hung >13 min against this dashboard. Verify UI changes via `pnpm -C web check`, code inspection, and `curl` against `/api/v1/*`, and state this explicitly in reports.
+
+## Debugging Reviews (Live Trace)
+
+Use the trace, not guesses, to diagnose review quality, refusals, timeouts or token use. Full behaviour: [docs/SPEC.md §8.4](docs/SPEC.md) "Live tracing".
+
+1. **Run:** `cargo run -p adus -- serve --trace > .superpowers/run.log 2>&1` (or set `ADUS_TRACE=true`; `--trace` adds `adus_review=debug,adus_review::trace=trace` to `RUST_LOG`; the log has no colour codes when redirected).
+2. **Trigger:** in a second terminal, `cargo run -q -p adus -- rereview <repository_id> <pr_number>` queues a full review on the running serve (`repository_id` is in the review logs). Findings Adus already posted on the PR are dropped by Dedup, so use a fresh PR (or count `finding already raised in an existing thread` lines) when measuring detections.
+3. **Read:** wait for `job finished`, then search `.superpowers/run.log` for these events:
+   - `agent prompt`, which carries `call=` on single-turn calls (dedup, severity, enrich, prose_recovery, rule_shard, rule_judge, verify_diff_only, learn, thread_reply, thread_validate);
+   - `agent reasoning`, `agent text`, `agent tool call` and `agent tool result` for each step;
+   - the `finder` / `verify` spans, and `rule_shard` / `rule_evidence` for the Sharded Rules;
+   - `finder review log`, `finder dismissed` and `review stages finished`, which hold the stage counts, budget and timings.
+
+Rules:
+
+- Every new LLM call goes through `agent::run_react_loop` or `agent::chat_single_turn` (with a new `call` label), so it is traced. Never call `ChatService::chat` directly from review code.
+- Every traced or debug-logged model text passes through `redact_secrets`; trace events live only in `crates/review/src/trace.rs`.
+- A trace contains source code and full prompts. Keep run logs under `.superpowers/` (git-ignored), never commit them, and never enable `--trace` in production or Docker defaults.
 
 ## Cross-Cutting Code Conventions
 
@@ -78,7 +101,7 @@ Full subsystem specs live in [docs/SPEC.md](docs/SPEC.md). Follow these standing
   - `display_name` is server-only (`repositories::label` / `display_name_sql`).
   - Normalize repo paths with `normalize_path` (no leading `/`; add `/` only for Azure API calls).
   - Every comment Adus posts carries `<!-- adudu -->`, and comments containing it are ignored.
-  - Keep worker/engine timeout hierarchy intact (`REVIEW_TIMEOUT < SPECIALISTS_REVIEW_TIMEOUT < JOB_TIMEOUT < LOCK_TTL / RECLAIM_IDLE / STALE_AFTER`, enforced by compile-time asserts).
+  - Keep worker/engine timeout hierarchy intact (`REVIEW_TIMEOUT < SPECIALISTS_REVIEW_TIMEOUT`, `SPECIALISTS_REVIEW_TIMEOUT + VALIDATE_TIMEOUT < JOB_TIMEOUT < LOCK_TTL / RECLAIM_IDLE / STALE_AFTER`, enforced by compile-time asserts).
   - Never send a saved LLM key to a modified `base_url`; model-list cache uses HMAC under `ADUS_SECRET_KEY`.
 - **Frontend (`web/`):** Read [web/AGENTS.md](web/AGENTS.md) and [DESIGN.md](docs/DESIGN.md) before touching `web/`. Always use `#lib/...` (never `$lib`), follow [DESIGN.md](docs/DESIGN.md) OKLCH theming, and ship matching skeletons on every data page. Release/Docker builds must run `pnpm -C web build` before `cargo build --release`.
 - **Testing (no redundant tests):** Check existing tests before writing new ones; extend or parameterize existing cases instead of duplicating them. Do not write unit tests that mirror coverage already verified by integration tests or that only test trivial wrappers, getters, or `serde` derives — every test must cover a distinct behavior, edge case, invariant, or regression. Reuse existing fakes/fixtures (`FakeGitFactory`/`FakeGit`, `crates/review/tests/common/mod.rs`, `#[sqlx::test(migrations = "../../migrations")]`).

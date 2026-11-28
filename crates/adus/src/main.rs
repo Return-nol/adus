@@ -1,21 +1,22 @@
-use std::{collections::HashMap, process::ExitCode, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::IsTerminal, process::ExitCode, sync::Arc, time::Duration};
 
 use adus::{JOB_TIMEOUT, STALE_SWEEP_EVERY, run_scheduler, run_worker};
 use adus_core::{
     config::{self, Config, Level},
     crypto::{Cipher, generate_secret_key},
+    job::{Job, Trigger},
 };
 use adus_git::{GitProviderFactory, HttpGitProviderFactory};
 use adus_llm::router::{ChatService, LlmRouter};
 use adus_queue::Queue;
-use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT};
+use adus_review::engine::{Engine, REVIEW_TIMEOUT, SPECIALISTS_REVIEW_TIMEOUT, VALIDATE_TIMEOUT};
 use adus_review::workspace::{GitCliCloner, cleanup_orphaned_workspaces};
 use adus_server::{
     AppState,
     doctor::{self, Report, Verdict},
     router,
 };
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, builder::FalseyValueParser};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -26,20 +27,36 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// Probe `/healthz` dibatasi waktu ini, supaya `HEALTHCHECK` Docker tidak menggantung.
 const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Log directives `--trace` adds to `RUST_LOG`: the review engine's debug logs and spans, and
+/// the live trace of every LLM call (`adus_review::trace`).
+const TRACE_DIRECTIVES: &str = "adus_review=debug,adus_review::trace=trace";
+
 #[derive(Parser)]
 #[command(
     version,
-    about = "Self-hosted AI code review. Without a command, `adus` runs `serve`."
+    about = "Self-hosted AI code review. Without a command, `adus` runs `serve`.",
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// `serve` options, also accepted without the `serve` command.
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Args, Debug, PartialEq)]
+struct ServeArgs {
+    /// Log every LLM call a review makes (prompt, reasoning, reply, tool calls and results;
+    /// secrets redacted, source code not) plus the review engine's debug logs. For debugging only.
+    #[arg(long, env = "ADUS_TRACE", value_parser = FalseyValueParser::new())]
+    trace: bool,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Start the web server, workers and scheduler (the default)
-    Serve,
+    Serve(ServeArgs),
     /// Print a new random ADUS_SECRET_KEY (needs no environment)
     GenSecret,
     /// Validate the environment variables; exit 1 if any is wrong
@@ -48,13 +65,21 @@ enum Command {
     Doctor,
     /// Probe /healthz on this machine; exit 0 if it answers (for Docker HEALTHCHECK)
     Healthcheck,
+    /// Queue a full review of a pull request for a running `adus serve`, as if it had just opened
+    Rereview {
+        /// Repository id (`repository_id` in the review logs)
+        repository_id: uuid::Uuid,
+        /// Pull request number
+        pr_number: i64,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    match Cli::parse().command.unwrap_or(Command::Serve) {
-        Command::Serve => {
-            serve().await?;
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Command::Serve(cli.serve)) {
+        Command::Serve(args) => {
+            serve(args).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::GenSecret => {
@@ -64,6 +89,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Command::CheckConfig => Ok(check_config()),
         Command::Doctor => Ok(doctor().await),
         Command::Healthcheck => Ok(healthcheck().await),
+        Command::Rereview {
+            repository_id,
+            pr_number,
+        } => rereview(repository_id, pr_number).await,
     }
 }
 
@@ -99,12 +128,23 @@ async fn build_state(
     })
 }
 
-async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let directives = if args.trace {
+        format!("{rust_log},{TRACE_DIRECTIVES}")
+    } else {
+        rust_log
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::try_new(directives).unwrap_or_else(|_| EnvFilter::new("info")))
+        // No colour codes when the log is redirected to a file.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
+    if args.trace {
+        tracing::warn!(
+            "--trace is on: every LLM prompt and reply is logged, including source code"
+        );
+    }
 
     let state = build_state(Config::from_env()?, true).await?;
     // Sebelum worker jalan: review yang tertinggal `queued`/`running` dari proses sebelumnya.
@@ -128,6 +168,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         cloner: Arc::new(GitCliCloner::default()),
         review_timeout: REVIEW_TIMEOUT,
         specialists_review_timeout: SPECIALISTS_REVIEW_TIMEOUT,
+        validate_timeout: VALIDATE_TIMEOUT,
     });
 
     let shutdown = CancellationToken::new();
@@ -221,6 +262,26 @@ async fn doctor() -> ExitCode {
     }
 }
 
+/// Queues `Job::ReviewPr` with `Trigger::Opened`, so the review runs in full (no
+/// incremental diff against the last reviewed head). Findings Adus already posted on the PR are
+/// still filtered out by Semantic Dedup (`already_raised`).
+async fn rereview(
+    repository_id: uuid::Uuid,
+    pr_number: i64,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let config = Config::from_env()?;
+    let queue = Queue::connect(&config.redis_url, "adus").await?;
+    let job = Job::ReviewPr {
+        repository_id,
+        pr_number,
+        trigger: Trigger::Opened,
+        mode_override: None,
+    };
+    queue.enqueue(&job).await?;
+    println!("queued review of PR #{pr_number} (repository {repository_id}) as opened");
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Hanya membaca `ADUS_BIND_ADDR` (bawaan `0.0.0.0:8000`) dan memeriksa port itu di 127.0.0.1.
 async fn healthcheck() -> ExitCode {
     let bind = std::env::var("ADUS_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
@@ -260,5 +321,27 @@ async fn wait_for_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn trace_flag_works_with_and_without_the_serve_command() {
+        Cli::command().debug_assert();
+        let parse = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).expect("parses");
+            match cli.command.unwrap_or(Command::Serve(cli.serve)) {
+                Command::Serve(args) => args.trace,
+                _ => panic!("not serve"),
+            }
+        };
+        assert!(parse(&["adus", "--trace"]));
+        assert!(parse(&["adus", "serve", "--trace"]));
+        assert!(!parse(&["adus"]));
+        assert!(Cli::try_parse_from(["adus", "--trace", "doctor"]).is_err());
     }
 }

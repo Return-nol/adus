@@ -21,7 +21,7 @@ argon2 = "0.5"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 globset = "0.4"
@@ -34,7 +34,7 @@ regex = "1"
 redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 similar = "3"
 sqlx = { version = "0.8", default-features = false, features = ["derive", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls", "chrono", "uuid", "json"] }
