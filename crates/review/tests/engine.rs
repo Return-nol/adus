@@ -3204,16 +3204,14 @@ async fn review_applies_precedents_to_comments_counts_and_threads(pool: PgPool) 
         {
             "file": "src/a.rs",
             "line": 2,
-            "severity": "critical",
-            "title": "Unauthenticated route",
+            "category": "security",
             "body": "Missing auth check.",
             "precedent": 0
         },
         {
             "file": "src/a.rs",
             "line": 4,
-            "severity": "warning",
-            "title": "Possible overflow",
+            "category": "bug",
             "body": "Counter can wrap.",
             "precedent": 1
         }
@@ -3221,8 +3219,31 @@ async fn review_applies_precedents_to_comments_counts_and_threads(pool: PgPool) 
     s.chat.push(Ok(&findings.to_string()));
     s.chat
         .push_stage(Stage::Dedup, Reply::text(r#"{"keep_indices": [0, 1]}"#));
+    s.chat.push_stage(
+        Stage::Severity,
+        Reply::text(
+            r#"{"severities": [{"index": 0, "severity": "critical"}, {"index": 1, "severity": "warning"}]}"#,
+        ),
+    );
+    s.chat.push_for(
+        Stage::Enrich,
+        "Missing auth check.",
+        Reply::text(r#"{"title": "Unauthenticated route"}"#),
+    );
+    s.chat.push_for(
+        Stage::Enrich,
+        "Counter can wrap.",
+        Reply::text(r#"{"title": "Possible overflow"}"#),
+    );
 
     run(&s, Trigger::Opened).await.unwrap();
+
+    // Enrichment must run before `apply_precedent`, so it sees only the verified Finder body.
+    let enrich = s.chat.enrich_calls();
+    assert_eq!(enrich.len(), 2);
+    for call in &enrich {
+        assert!(!call.user.contains("**Precedent:**"), "{}", call.user);
+    }
 
     {
         let git = s.git.state();

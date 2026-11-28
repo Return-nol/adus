@@ -108,7 +108,7 @@ const SYNTHESIS_TASK: &str = "Second look. You already reviewed this change once
 
 const PROSE_RECOVERY_SYSTEM: &str = "You turn a code reviewer's free-text notes into structured findings. You do not review code yourself, and you never add a defect the notes do not state.";
 
-const PROSE_RECOVERY_TASK: &str = "The notes in <reviewer_notes> describe defects in prose instead of submitting them. Extract every concrete defect the notes report as real; leave out suspicions they rule out or call safe. Answer with only a JSON array. Each element is an object with `file` (one of the paths in <batch_files>, written exactly as there), `line` (the new-file line number the notes give), `category` (\"bug\", \"security\", \"performance\" or \"repo_instruction\") and `body` (what triggers the defect, what goes wrong and where, in the notes' own terms). Skip a defect whose file is not in <batch_files> or whose line the notes do not give. Answer [] when the notes report no defect.";
+const PROSE_RECOVERY_TASK: &str = "The notes in <reviewer_notes> describe defects in prose instead of submitting them. Extract every concrete defect the notes report as real; leave out suspicions they rule out or call safe. Answer with only a JSON array. Each element is an object with `file` (one of the paths in <batch_files>, written exactly as there), `line` (the new-file line number the notes give), `category` (\"bug\", \"security\", \"performance\" or \"repo_instruction\"), `body` (what triggers the defect, what goes wrong and where, in the notes' own terms), and optional `precedent` (the non-negative integer `[index]` from <memories> if the notes cite a matching exception or fix pattern). Skip a defect whose file is not in <batch_files> or whose line the notes do not give. Answer [] when the notes report no defect.";
 
 /// LLM calls one Finder agent may make on a batch of `files` files.
 fn finder_max_steps(files: usize) -> usize {
@@ -438,7 +438,10 @@ pub(crate) fn collect_candidates(
             skipped.extend(batch.files.iter().map(|file| (file.path.clone(), reason)));
         }
     }
-    Ok((dedup_exact(candidates, |c| &c.suggestion), filtered_dropped))
+    Ok((
+        dedup_exact(candidates, |c| &mut c.suggestion),
+        filtered_dropped,
+    ))
 }
 
 /// Generalist rule of spec decision 8: when some Finder task failed and every failure was a
@@ -721,18 +724,32 @@ fn synthesis_prompt(
 }
 
 /// Appends the findings of `added` that no finding of `findings` already has (same normalized
-/// file, line and normalized body prefix); returns how many were appended.
+/// file, line and normalized body prefix); returns how many were appended. A `precedent` on a
+/// merged duplicate is preserved when the existing finding lacks one.
 fn merge_findings(findings: &mut Vec<FinderFinding>, added: Vec<FinderFinding>) -> usize {
-    let mut seen: HashSet<(String, u32, String)> = findings
+    let mut positions: HashMap<(String, u32, String), usize> = findings
         .iter()
-        .map(|finding| merge_key(&finding.suggestion))
+        .enumerate()
+        .map(|(index, finding)| (merge_key(&finding.suggestion), index))
         .collect();
     let before = findings.len();
-    findings.extend(
-        added
-            .into_iter()
-            .filter(|finding| seen.insert(merge_key(&finding.suggestion))),
-    );
+    for finding in added {
+        let key = merge_key(&finding.suggestion);
+        match positions.get(&key).copied() {
+            Some(at) => {
+                if let Some(existing) = findings.get_mut(at) {
+                    existing.suggestion.precedent = existing
+                        .suggestion
+                        .precedent
+                        .or(finding.suggestion.precedent);
+                }
+            }
+            None => {
+                positions.insert(key, findings.len());
+                findings.push(finding);
+            }
+        }
+    }
     findings.len() - before
 }
 
@@ -1306,13 +1323,21 @@ mod tests {
                 call("g1", "grep", json!({ "pattern": long_pattern })),
             ]),
             submit_turn("s1", vec![finding_arg("src/a.rs", 2, "First")]),
-            // Pass 2 opens a caller, then submits a missed finding and a repeat of Pass 1's.
+            // Pass 2 opens a caller, then submits a missed finding and a repeat of Pass 1's (which
+            // carries a precedent Pass 1 missed).
             tools_turn(vec![call("r2", "read_file", json!({ "path": "src/b.rs" }))]),
             submit_turn(
                 "s2",
                 vec![
                     finding_arg("src/a.rs", 3, "Missed"),
-                    finding_arg("src/a.rs", 2, "First again"),
+                    json!({
+                        "file": "src/a.rs",
+                        "line": 2,
+                        "severity": "warning",
+                        "title": "First again",
+                        "body": "why",
+                        "precedent": 2,
+                    }),
                 ],
             ),
         ]);
@@ -1329,11 +1354,14 @@ mod tests {
         let merged: Vec<_> = outcome
             .result
             .iter()
-            .map(|f| (f.suggestion.line, f.origin))
+            .map(|f| (f.suggestion.line, f.origin, f.suggestion.precedent))
             .collect();
         assert_eq!(
             merged,
-            [(2, FinderPass::Pass1), (3, FinderPass::SynthesisRescue)]
+            [
+                (2, FinderPass::Pass1, Some(2)),
+                (3, FinderPass::SynthesisRescue, None)
+            ]
         );
         assert_eq!(run.synthesis_candidates, 1);
         assert_eq!(run.synthesis_skipped, None);
@@ -1477,7 +1505,7 @@ mod tests {
                 json!({ "review_log": review_log, "findings": [] }),
             )]),
             text_turn(
-                r#"[{"file": "src/a.rs", "line": 2, "body": "b is never validated"},
+                r#"[{"file": "src/a.rs", "line": 2, "body": "b is never validated", "precedent": 1},
                     {"file": "src/other.rs", "line": 1, "body": "outside the batch"}]"#,
             ),
         ]);
@@ -1496,6 +1524,7 @@ mod tests {
         assert_eq!(found[0].origin, FinderPass::ProseRecovery);
         assert_eq!(found[0].suggestion.file, "src/a.rs");
         assert_eq!(found[0].suggestion.line, 2);
+        assert_eq!(found[0].suggestion.precedent, Some(1));
         assert_eq!(
             found[0].suggestion.category,
             SpecialistKind::Security.category()

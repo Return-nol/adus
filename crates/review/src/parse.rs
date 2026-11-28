@@ -504,34 +504,40 @@ pub(crate) fn keep_valid_batch<T: AsRef<Suggestion> + AsMut<Suggestion>>(
         s.file = file;
         Some(item)
     });
-    dedup_exact(valid, AsRef::as_ref)
+    dedup_exact(valid, AsMut::as_mut)
 }
 
 /// Drops exact `(file, line, title)` duplicates of `items` (the body stands in for an empty
 /// title, so two untitled lean findings on one line merge only when they say the same thing),
-/// keeping the first position. When
-/// the kept entry has no `start_line` and a later duplicate has one, the later entry takes that
-/// position: its suggestion was written for the span it replaces.
+/// keeping the first position. When the kept entry has no `start_line` and a later duplicate has
+/// one, the later entry takes that position: its suggestion was written for the span it replaces.
+/// A `precedent` on either copy is preserved (earlier wins when both carry one).
 pub(crate) fn dedup_exact<T>(
     items: impl IntoIterator<Item = T>,
-    finding: impl Fn(&T) -> &Suggestion,
+    mut finding: impl FnMut(&mut T) -> &mut Suggestion,
 ) -> Vec<T> {
     let mut kept: Vec<T> = Vec::new();
     let mut positions: HashMap<(String, u32, String), usize> = HashMap::new();
-    for item in items {
-        let s = finding(&item);
-        let text = if s.title.is_empty() {
-            &s.body
-        } else {
-            &s.title
+    for mut item in items {
+        let (key, has_range) = {
+            let s = finding(&mut item);
+            let text = if s.title.is_empty() {
+                &s.body
+            } else {
+                &s.title
+            };
+            (
+                (s.file.clone(), s.line, text.clone()),
+                s.start_line.is_some(),
+            )
         };
-        let key = (s.file.clone(), s.line, text.clone());
-        let has_range = s.start_line.is_some();
         match positions.get(&key).and_then(|&at| kept.get_mut(at)) {
             Some(slot) => {
+                let precedent = finding(slot).precedent.or(finding(&mut item).precedent);
                 if has_range && finding(slot).start_line.is_none() {
                     *slot = item;
                 }
+                finding(slot).precedent = precedent;
             }
             None => {
                 positions.insert(key, kept.len());
@@ -956,20 +962,25 @@ mod tests {
         let patch = "@@ -1,1 +1,4 @@\n a\n+b\n+c\n+d\n";
         let range = CommentableRange::from_patch(patch);
         let allowed = HashMap::from([("src/a.rs".to_string(), &range)]);
+        let with_prec = |mut s: Suggestion, precedent: Option<usize>| {
+            s.precedent = precedent;
+            s
+        };
         let got = keep_valid_batch(
             vec![
-                sugg("src/a.rs", 3, "T"),
-                sugg("src/a.rs", 4, "other"),
-                sugg_span("src/a.rs", Some(2), 3, "T"),
-                sugg_span("src/a.rs", Some(3), 3, "T"),
+                with_prec(sugg("src/a.rs", 3, "T"), Some(2)),
+                with_prec(sugg("src/a.rs", 4, "other"), None),
+                with_prec(sugg_span("src/a.rs", Some(2), 3, "T"), Some(9)),
+                with_prec(sugg_span("src/a.rs", Some(3), 3, "T"), None),
+                with_prec(sugg("src/a.rs", 4, "other"), Some(5)),
             ],
             &allowed,
         );
         assert_eq!(
             got,
             vec![
-                sugg_span("src/a.rs", Some(2), 3, "T"),
-                sugg("src/a.rs", 4, "other"),
+                with_prec(sugg_span("src/a.rs", Some(2), 3, "T"), Some(2)),
+                with_prec(sugg("src/a.rs", 4, "other"), Some(5)),
             ]
         );
     }

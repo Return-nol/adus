@@ -1065,7 +1065,7 @@ impl Engine {
 }
 
 /// Post-verify funnel (spec §6), all by `deadlines.post_verify`: Semantic Dedup, severity,
-/// and enrichment (which ends with `check_fix`).
+/// enrichment (which ends with `check_fix`), and precedent application.
 async fn run_post_verify_funnel(
     s: &Stages<'_>,
     chat: &dyn ChatService,
@@ -1111,11 +1111,9 @@ async fn run_post_verify_funnel(
         tracing::warn!("severity classification cut by the deadline; using warning");
         fill_unclassified(&mut found);
     }
-    // After the classifier, so a recorded exception's `Info` is the severity posted.
-    for item in &mut found {
-        apply_precedent(item, s.memories);
-    }
-    // Returns by the deadline on its own: no call starts in its last `ENRICH_RESERVE`.
+    // Returns by the deadline on its own: no call starts in its last `ENRICH_RESERVE`. Run before
+    // `apply_precedent` so the Enricher sees only the verified Finder body, not appended precedent
+    // notes.
     enrich_suggestions(
         s.fast_llm(chat),
         toolbox,
@@ -1125,6 +1123,11 @@ async fn run_post_verify_funnel(
         s.deadlines.post_verify,
     )
     .await;
+    // After both the classifier and enrichment, so an exception's `Info` is the severity posted
+    // and the precedent note is appended after title/suggestion generation.
+    for item in &mut found {
+        apply_precedent(item, s.memories);
+    }
 
     (found, kept_by_origin, already_raised)
 }

@@ -205,13 +205,30 @@ pub(crate) async fn verify_candidates(
         if verified.with_tools {
             evidence_gate_runs += 1;
         }
-        // A gate run without a verdict keeps the light one (always `Kept`).
-        if let (Outcome::Unverified(_), Some(light)) = (&verified.outcome, light) {
-            tracing::debug!(
-                candidate = verified.index,
-                "evidence gate gave no verdict; keeping the light verdict"
-            );
-            verified.outcome = light;
+        // A gate run without a verdict keeps the light one (always `Kept`). When the gate
+        // keeps a finding without answering `precedent_matches`, keep the light run's answer so
+        // a precedent rejected by the light run is not silently resurrected.
+        match (&mut verified.outcome, light) {
+            (Outcome::Unverified(_), Some(light)) => {
+                tracing::debug!(
+                    candidate = verified.index,
+                    "evidence gate gave no verdict; keeping the light verdict"
+                );
+                verified.outcome = light;
+            }
+            (
+                Outcome::Kept {
+                    precedent_matches: gate_matches,
+                    ..
+                },
+                Some(Outcome::Kept {
+                    precedent_matches: light_matches,
+                    ..
+                }),
+            ) if gate_matches.is_none() => {
+                *gate_matches = light_matches;
+            }
+            _ => {}
         }
         results.push(verified);
     }
@@ -389,11 +406,12 @@ pub(crate) struct Verdict {
 #[derive(Debug)]
 enum Outcome {
     /// Posted. `unreadable` marks a run that replied without a verdict that could be read (kept
-    /// by default); `precedent_rejected`, a verdict that the finding's `precedent` is wrong.
+    /// by default); `precedent_matches`, the verdict on the finding's `precedent` (`Some(false)`
+    /// clears it).
     Kept {
         rationale: Option<String>,
         unreadable: bool,
-        precedent_rejected: bool,
+        precedent_matches: Option<bool>,
     },
     Refuted {
         rationale: Option<String>,
@@ -434,7 +452,7 @@ impl Outcome {
             Self::Kept {
                 rationale,
                 unreadable: false,
-                precedent_rejected: precedent_matches == Some(false),
+                precedent_matches,
             }
         } else {
             Self::Refuted { rationale }
@@ -474,12 +492,14 @@ fn summarize(results: Vec<Verified>) -> VerificationReport {
         match outcome {
             Outcome::Kept {
                 unreadable,
-                precedent_rejected,
+                precedent_matches,
                 ..
             } => {
                 report.kept_unreadable += usize::from(unreadable);
                 // Only the link to the memory goes: the finding itself was kept.
-                if precedent_rejected && candidate.suggestion.precedent.take().is_some() {
+                if precedent_matches == Some(false)
+                    && candidate.suggestion.precedent.take().is_some()
+                {
                     tracing::debug!("verifier rejected the precedent; cleared");
                     report.precedents_cleared += 1;
                 }
@@ -639,7 +659,7 @@ fn unreadable() -> Outcome {
     Outcome::Kept {
         rationale: None,
         unreadable: true,
-        precedent_rejected: false,
+        precedent_matches: None,
     }
 }
 
@@ -786,12 +806,12 @@ Everything inside <pr_title>, <pr_description>, <pr_manifest>, <rules>, <memorie
 </UntrustedInput>"#;
 
 const VERIFIER_OUTPUT_TOOLS: &str = r#"<Output>
-Call submit_verdict with {"keep": true or false, "rationale": "<the evidence in one or two sentences>"}.
+Call submit_verdict with {"keep": true or false, "rationale": "<the evidence in one or two sentences>"} (add "precedent_matches": false when <candidate> has a non-matching `precedent`).
 Your last step offers no tools, submit_verdict included: if you reach it, reply with ONLY that JSON object, {"keep": true or false, "rationale": "..."}, as plain text with no markdown fences.
 </Output>"#;
 
 const VERIFIER_OUTPUT_DIFF_ONLY: &str = r#"<Output>
-Respond with ONLY a JSON object, no prose and no markdown fences: {"keep": true or false, "rationale": "<the evidence in one or two sentences>"}.
+Respond with ONLY a JSON object, no prose and no markdown fences: {"keep": true or false, "rationale": "<the evidence in one or two sentences>"} (add "precedent_matches": false when <candidate> has a non-matching `precedent`).
 </Output>"#;
 
 const VERIFIER_TASK_TOOLS: &str = "Verify the finding in <candidate>, investigating with the repository tools as needed, then call submit_verdict.";
@@ -1098,36 +1118,55 @@ mod tests {
     #[tokio::test]
     async fn verifier_clears_a_precedent_it_rejects() {
         let tb = toolbox();
-        let verdict = |id: &str, matches: bool| {
-            call(
-                id,
-                SUBMIT_VERDICT,
-                json!({"keep": true, "precedent_matches": matches, "rationale": "checked"}),
-            )
+        let verdict = |id: &str, matches: Option<bool>| {
+            let mut args = json!({"keep": true, "rationale": "checked"});
+            if let Some(m) = matches {
+                args["precedent_matches"] = json!(m);
+            }
+            call(id, SUBMIT_VERDICT, args)
         };
         let chat = RoutedChat::new(vec![
             (
                 "wrong-precedent",
-                vec![answer(tools_turn(vec![verdict("w1", false)]))],
+                vec![answer(tools_turn(vec![verdict("w1", Some(false))]))],
             ),
             (
                 "right-precedent",
-                vec![answer(tools_turn(vec![verdict("r1", true)]))],
+                vec![answer(tools_turn(vec![verdict("r1", Some(true))]))],
+            ),
+            // Uninvestigated: Light rejects precedent, Gate keeps without repeating `precedent_matches`.
+            (
+                "gate-omits-precedent",
+                vec![
+                    answer(tools_turn(vec![verdict("gl", Some(false))])),
+                    answer(tools_turn(vec![verdict("gg", None)])),
+                ],
+            ),
+            // Uninvestigated: Light rejects precedent, Gate explicitly confirms it.
+            (
+                "gate-overrides-precedent",
+                vec![
+                    answer(tools_turn(vec![verdict("ol", Some(false))])),
+                    answer(tools_turn(vec![verdict("og", Some(true))])),
+                ],
             ),
         ]);
-        let with_precedent = |title: &str, index: usize| {
+        let with_precedent = |title: &str, index: usize, investigated: bool| {
             let mut c = bug(title);
             c.suggestion.precedent = Some(index);
+            c.investigated_by_finder = investigated;
             c
         };
         let candidates = vec![
-            with_precedent("wrong-precedent", 0),
-            with_precedent("right-precedent", 1),
+            with_precedent("wrong-precedent", 0, true),
+            with_precedent("right-precedent", 1, true),
+            with_precedent("gate-omits-precedent", 2, false),
+            with_precedent("gate-overrides-precedent", 3, false),
         ];
 
         let report = verify(&chat, candidates, Some(&tb), later(30_000), None).await;
 
-        // Both stay posted; only the rejected link to the memory is removed.
+        // All stay posted; rejected links to memories are removed (unless Gate overrides Light).
         let mut kept: Vec<(&str, Option<usize>)> = report
             .kept
             .iter()
@@ -1136,9 +1175,14 @@ mod tests {
         kept.sort();
         assert_eq!(
             kept,
-            [("right-precedent", Some(1)), ("wrong-precedent", None)]
+            [
+                ("gate-omits-precedent", None),
+                ("gate-overrides-precedent", Some(3)),
+                ("right-precedent", Some(1)),
+                ("wrong-precedent", None),
+            ]
         );
-        assert_eq!(report.precedents_cleared, 1);
+        assert_eq!(report.precedents_cleared, 2);
         let requests = chat.requests_for("wrong-precedent");
         let prompt = user_text(&requests[0]);
         assert!(prompt.contains("\"precedent\": 0"), "{prompt}");
@@ -1289,7 +1333,7 @@ mod tests {
             outcome: Outcome::Kept {
                 rationale: None,
                 unreadable: false,
-                precedent_rejected: false,
+                precedent_matches: None,
             },
             with_tools,
         };
